@@ -1,0 +1,112 @@
+name: build web bundle
+
+# docs/ctxfold.web.js is generated from src/. Without this, any src/ change
+# silently leaves the landing-page profiler running stale code.
+#
+# Triggers on src/ only — never on docs/ — so this workflow's own commit
+# cannot retrigger it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - '.github/workflows/build-web-bundle.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-web-bundle
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      # esbuild is pinned so output stays byte-reproducible; an unpinned
+      # version would churn the bundle on every run and commit noise.
+      - name: Build bundle
+        run: |
+          V=$(node -p "require('./package.json').version")
+          npx --yes esbuild@0.21.5 src/index.js \
+            --bundle \
+            --format=iife \
+            --global-name=ctxfold \
+            --target=es2019 \
+            --banner:js="/* ctxfold ${V} — browser bundle. GENERATED from src/ by esbuild; do not edit by hand. */" \
+            --outfile=docs/ctxfold.web.js
+
+      # Reference build: 930 lines / 38,831 bytes at v0.2.0.
+      # Not asserted — src/ changes are supposed to move these — but logged
+      # so an unexpected jump is visible in the run output.
+      - name: Verify bundle
+        run: |
+          echo "lines: $(wc -l < docs/ctxfold.web.js)  bytes: $(wc -c < docs/ctxfold.web.js)"
+          cat > /tmp/smoke.cjs <<'EOF'
+          const vm = require("vm");
+          const fs = require("fs");
+
+          // Only `console` in scope: proves the bundle needs no Node globals.
+          const sandbox = { console };
+          vm.createContext(sandbox);
+          vm.runInContext(fs.readFileSync("docs/ctxfold.web.js", "utf8"), sandbox);
+
+          const cf = sandbox.ctxfold;
+          if (!cf) {
+            console.error("FAIL: global `ctxfold` was not defined");
+            process.exit(1);
+          }
+
+          const need = ["compress", "decompress", "validate", "estimateTokens", "profile", "renderProfile"];
+          const missing = need.filter((k) => typeof cf[k] !== "function");
+          if (missing.length) {
+            console.error("FAIL: missing exports: " + missing.join(", "));
+            process.exit(1);
+          }
+
+          // Happy path: a foldable JSON array should be detected and profiled.
+          const rows = Array.from({ length: 40 }, (_, i) => ({
+            id: i, name: "user" + i, city: "Madison", plan: "pro",
+          }));
+          const ok = cf.profile(JSON.stringify(rows, null, 2));
+          if (ok.format !== "json") {
+            console.error("FAIL: expected format=json, got " + ok.format);
+            process.exit(1);
+          }
+          if (!cf.renderProfile(ok).includes("[ctxfold profile]")) {
+            console.error("FAIL: renderProfile output malformed");
+            process.exit(1);
+          }
+
+          // Decline path: malformed input must return reasons, not throw.
+          const bad = cf.profile("[{\"a\":1},]");
+          if (bad.format !== "none" || !Array.isArray(bad.reasons)) {
+            console.error("FAIL: malformed input did not decline cleanly");
+            process.exit(1);
+          }
+
+          console.log("smoke ok — " + ok.verdict);
+          EOF
+          node /tmp/smoke.cjs
+
+      - name: Commit if changed
+        run: |
+          if git diff --quiet -- docs/ctxfold.web.js; then
+            echo "bundle unchanged — nothing to commit"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/ctxfold.web.js
+          git commit -m "docs: rebuild web bundle [skip ci]"
+          git push
+          echo "bundle updated and pushed"

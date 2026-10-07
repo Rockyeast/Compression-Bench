@@ -1,0 +1,982 @@
+                                                                    CLLMs: Consistency Large Language Models
+
+
+                                                                  Siqi Kou * 1 Lanxiang Hu * 2 Zhezhi He 3 Zhijie Deng 1 Hao Zhang 2
+
+
+                                                                   Abstract                                      number of tokens generated, resulting in high latency.
+                                               Parallel decoding methods such as Jacobi decod-                   Existing methods address this issue from various perspec-
+                                               ing show promise for more efficient LLM infer-                    tives. For example, speculative decoding (Leviathan et al.,
+arXiv:2403.00835v4 [cs.CL] 13 Jun 2024
+
+
+
+
+                                               ence as it breaks the sequential nature of the LLM                2023; Chen et al., 2023) introduces a small draft LLM to
+                                               decoding process and transforms it into paral-                    guess tokens and let the target LLM verify them in paral-
+                                               lelizable computation. However, in practice, it                   lel. Although they can opportunistically generate multiple
+                                               achieves little speedup compared to traditional                   tokens in a single evaluation of the target LLM, obtaining
+                                               autoregressive (AR) decoding, primarily because                   a small yet effective draft model is non-trivial; managing
+                                               Jacobi decoding seldom accurately predicts more                   multiple models within a single system remains a challeng-
+                                               than one token in a single fixed-point iteration                  ing engineering task. Medusa (Cai et al., 2024) alternatively
+                                               step. To address this, we develop a new ap-                       augments the target LLM with extra guess heads to enable
+                                               proach aimed at realizing fast convergence from                   self-speculation with as much as 3× speedup on various
+                                               any state to the fixed point on a Jacobi trajec-                  tasks. Yet, the number of added parameters can be signifi-
+                                               tory. This is accomplished by refining the target                 cant (e.g., Medusa2 with 5 extra heads adds 1.6B parameters
+                                               LLM to consistently predict the fixed point given                 for a 6.7B target LLM). Increased memory consumption
+                                               any state as input. Extensive experiments demon-                  could limit generation length and negatively affect infer-
+                                               strate the effectiveness of our method, showing                   ence latency due to the reduction in available memory for
+                                               2.4× to 3.4× improvements in generation speed                     key-value (KV) cache (Pope et al., 2023).
+                                               while preserving generation quality across both
+                                               domain-specific and open-domain benchmarks.                       On the other hand, originating from the Jacobi and Gauss-
+                                               Our code is available at https://github.com/hao-ai-               Seidel fixed-point iteration for solving nonlinear equa-
+                                               lab/Consistency LLM.                                              tions (Ortega & Rheinboldt, 2000; Song et al., 2021a), the
+                                                                                                                 Jacobi decoding method (Santilli et al., 2023) first ran-
+                                                                                                                 domly guesses the next n tokens in a sequence (referred to
+                                                                                                                 as n-token sequence hereinafter) from an input prompt. The
+                                         1. Introduction
+                                                                                                                 n-token sequence, along with the prompt, is then fed to the
+                                         Large language models (LLMs), including GPT-4 (Achiam                   LLM to iteratively update itself. Eventually, the n-token
+                                         et al., 2023), LLaMA (Touvron et al., 2023a;b), PaLM (Anil              sequence converges to the same output generated by AR de-
+                                         et al., 2023), are pushing the limit of artificial intelligence.        coding under a greedy strategy (see Figure 1). The evolution
+                                         As LLMs are integrated into more applications (Zheng et al.,            of the n-token sequence forms a Jacobi trajectory between
+                                         2023; Wu et al., 2023), the inference latency of LLMs plays             a randomly initialized sequence to the n-token sequence
+                                         a crucial role in ensuring a positive user experience and high          generated by AR decoding (i.e., the fixed point).
+                                         service quality. However, LLM serving operates in an AR
+                                                                                                                 However, vanilla Jacobi decoding for LLMs shows only
+                                         paradigm, generating one token at a time due to the attention
+                                                                                                                 marginal speedup over AR decoding in practice, e.g., an
+                                         mechanism’s need for previous token states to generate the
+                                                                                                                 average of 1.05× speedup in Santilli et al. (2023). This is
+                                         next one. To produce a lengthy response, one must execute
+                                                                                                                 because a LLM can rarely yield a correct token when there
+                                         forward passes through the LLMs as many times as the
+                                                                                                                 are incorrection1 in its preceding tokens due to the attention
+                                           *
+                                             Equal contribution 1 Qing Yuan Research Institute, SEIEE,           mechanism, resulting in a long trajectory as illustrated on the
+                                         Shanghai Jiao Tong University 2 University of California, San           left side of Figure 2. Lookahead decoding (Fu et al., 2024)
+                                         Diego 3 School of Electronic Information and Electrical Engineer-       improves the efficiency by leveraging n-grams generated
+                                         ing, Shanghai Jiao Tong University. Correspondence to: Zhijie           from previous Jacobi iterations and verify them in parallel
+                                         Deng <zhijied@sjtu.edu.cn>.
+                                                                                                                 during the decoding process. However, both work are unable
+                                         Proceedings of the 41 st International Conference on Machine               1
+                                                                                                                      By correctness, we mean alignment with the AR decoding
+                                         Learning, Vienna, Austria. PMLR 235, 2024. Copyright 2024 by
+                                                                                                                 result under a greedy sampling strategy.
+                                         the author(s).
+
+                                                                                                             1
+                                                           CLLMs: Consistency Large Language Models
+
+           <BOS> The prompt … Answer: This    is correct       !            xed point       Our method and CMs share the notion of directly map-
+             ✔  ✔ ✔           ✔    ✔   ✔ ✔ ✔ ✔
+                                                                                            ping intermediate states of a solving process (of non-linear
+              ❄  pre x            converged n-token seq
+                                                                                            systems or ODEs) to its final solution for inference accel-
+                                                                                            eration. Based on these, we refer to our trained models as
+           <BOS> The prompt … Answer: This    is   one   try
+             ✔  ✔ ✔           ✔    ✔    ✔ ✔ ❌            ❌
+                                                                                            Consistency Large Language Models (CLLMs). In com-
+              ❄  pre x                  n-token seq      🔥
+                                                                                            parison with previous methods like speculative decoding
+                                                                                            and Medusa, CLLM doesn’t introduce extra memory cost to
+                                                                   k iterations             accommodate auxiliary model components while delivering
+                                                                                            significant speedup with minimal performance degradation.
+                            Autoregressive LM                                               To implement this learning strategy, it only requires model
+                                                                                            training with two loss terms. Following CMs, we can con-
+                                                                                            vert the aforementioned learning objective into a consistency
+                                                                                            loss where the model is demended to map arbitrary point on
+                                                                          Jacobi
+              ❄     pre x               n-token seq      🔥                trajectory        the Jacobi trajectory to the fixed point. CLLMs also include
+                                                                                            an AR loss to avoid deviating from the distribution of the
+           <BOS> The prompt …     The   …    The prompt …
+                                                                                            target LLM and hence ensure the generation quality.
+             ✔     ✔    ✔     ✔    ❌    ❌    ❌     ❌       ❌
+                                                                                            The fine-tuning cost of CLLMs is moderate, e.g., training
+              ❄     pre x          random n-token seq
+                                                                                            on only ∼ 1M tokens for LLaMA-7B to achieve a 3.4×
+                                                         randomly initialized point         speedup on the Spider dataset. We further empirically iden-
+                                                                                            tify that such acceleration is likely to stem from the existence
+          Figure 1. An instance of Jacobi trajectory. “n-token seq” refers to
+          the n-token sequence that is iteratively updated in Jacobi iterations.            of 1) fast forwarding, where multiple consecutive tokens
+                                                                                            are correctly predicted in a single forward pass, and 2) sta-
+          to achieve the same level of speedup as Meudsa.                                   tionary tokens, which are correctly predicted and remain
+                                                                                            unaltered through subsequent iterations, despite being pre-
+          This work aims to achieve all three goals by refining the                         ceded by inaccurate tokens. An illustration of the examples
+          target LLM. Specifically, we propose to fine-tune the LLM                         is shown in Figure 2.
+          so that it can yield multiple, instead of one, subsequent
+          tokens of a prefix at once. In the ideal case, with the prompt                    To summarize, our key contributions are as follows:
+          and a randomly initialized n-token sequence as input, our
+                                                                                            • We propose Consistency Large Language Models
+          goal is to train a LLM that can generate the same n-token
+                                                                                              (CLLMs), a new family of LLMs specialized for the
+          sequence as AR decoding (the fixed point) using only one
+                                                                                              Jacobi decoding method for latency reduction.
+          step. Our preliminary experiments
+                                     1
+                                                   show the single-step
+fi   fi
+          learning task is difficult when n is large, and leads to slow                     • We empirically observe the existence of fast forwarding
+          model convergence. We therefore ease the learning process                           and stationary tokens phenomena in Jacobi decoding of
+          by also taking intermediate points on the Jacobi trajectory                         CLLMs. Empirically, CLLMs can lead to a 2.0× to 6.8×
+          with more correct tokens into account. In particular, for                           improvement in the count of fast-forwarded tokens and
+          the second to last point on the trajectory, the learning is                         stationary tokens compared to the original LLM.
+          identical to AR modeling, at which the target LLM without
+                                                                                            • We demonstrate the efficacy of CLLMs on a variety of
+          adaptation has already excelled.
+                                                                                              benchmarks. On domain-specific benchmarks including
+          We argue such a learning strategy that a single model is                            GSM8K, CodeSearchNet Python, and Spider, CLLMs
+          tuned to solve a series of learning problems of mapping                             can achieve 2.4× to 3.4× speedup using Jacobi decoding
+          any arbitrary point on the trajectory to the fixed-point is                         with nearly no loss in accuracy. On open-domain bench-
+          beneficial to model convergence (see Figure 4 and Fig-                              mark MT-bench, CLLMs can achieve 2.4× speedup on
+          ure 5). Imagining the evolution of the n-token sequence as                          ShareGPT with state-of-the-art performance, scoring 6.4.
+          the denoising process of a natural image (Ho et al., 2020;
+          Song et al., 2021b), we surprisingly find that the above                          2. Related Work
+          learning procedure draws a sharp analogy to the acceler-
+          ation technique for diffusion models named consistency                            Efficient LLM Inference. This body of work can be
+          models (CMs) (Song et al., 2023; Song & Dhariwal, 2023).                          broadly categorized into two streams: methods that neces-
+          CMs aim to achieve single-step image generation using                             sitate additional training and those that do not. The high
+          the denoising objective by minimizing distances between                           AR inference cost in LLMs has sparked a surge in research
+          consecutive denoising steps along the probability flow ordi-                      aimed at efficient LLM inference, primarily focused on ac-
+          nary differential equation (ODE) trajectory during training.                      celerating the AR decoding process.
+
+                                                                                        2
+                                         CLLMs: Consistency Large Language Models
+
+The methods that do not require additional training include           LLM’s output distribution.
+speculative decoding, as introduced in studies by Leviathan
+                                                                      Consistency Models. Diffusion models (Ho et al., 2020;
+et al. (2023) and Chen et al. (2023). These techniques en-
+                                                                      Song et al., 2021b) suffer from slow iterative sampling pro-
+hance LLM decoding speed by leveraging a smaller draft
+                                                                      cess. Consistency models overcome this limitation by map-
+model to predict the outputs of a larger target model which
+                                                                      ping any point along the probability flow ODE of the dif-
+subsequently verifies these predictions. Another category
+                                                                      fusion process back to the original point, corresponding to
+of training-free approaches involves system- or hardware-
+                                                                      the initial image, in a single step (Song et al., 2023). In this
+oriented optimizations. Notable examples include PagedAt-
+                                                                      work, we highlight that a parallelism can be drawn between
+tention (Kwon et al., 2023), which optimizes KV cache
+                                                                      the few-step generation capability of CLLMs and that of the
+management for throughput using memory paging, and
+                                                                      consistency models.
+FlashAttention (Dao et al., 2022; Dao, 2023), which ac-
+celerates attention module computations by reducing HBM
+access via softmax tiling. Other strategies enhance LLM               3. Methodology
+inference speed by optimizing model designs, reducing
+                                                                      This section begins with a review of the Jacobi decoding
+weight/activation precision, and utilizing sparsity, includ-
+                                                                      method (Santilli et al., 2023) for accelerating LLM infer-
+ing multi-query and grouped-query attention mechanisms
+                                                                      ence, then elaborates on CLLMs, a refinement of pre-trained
+with fused heads (Shazeer, 2019; Ainslie et al., 2023), post-
+                                                                      LLMs to enjoy higher speedup from Jacobi decoding. In this
+training quantization (Dettmers et al., 2022; Xiao et al.,
+                                                                      paper, we only consider greedy sampling and leave other
+2023; Frantar et al., 2022; Lin et al., 2023), and various
+                                                                      sampling strategies to future work. We also empirically
+pruning techniques (Sun et al., 2023; Frantar & Alistarh,
+                                                                      identify the fast-forwarding phenomenon and the emera-
+2023; Ashkboos et al., 2024).
+                                                                      gence of stationary tokens from CLLMs, which serve as the
+For methods that necessitate training, they often require in-         source of such acceleration.
+tegration of auxiliary components, such as additional LM or
+AR heads, to facilitate faster AR generation (Cai et al., 2024;       3.1. Preliminary: Jacobi Decoding
+Li et al., 2024). It may also involve significant modifica-
+tions to the model weights or architecture, as seen in various        Given a prompt x and a pre-trained LLM p(·|x), we obtain
+pruning approaches (Ma et al., 2023; Xia et al., 2022; 2023).         the model response typically with the standard AR decoding
+Moreover, training can enhance certain training-free tech-            method under the greedy strategy, i.e.,
+niques, like speculative decoding, by capturing the behavior
+                                                                              yi = arg max p(y|y<i , x) for i = 1, . . . , n      (1)
+of the original, larger model in a smaller student model                                y
+through distillation, thereby retaining performance with re-
+duced size (Zhou et al., 2023b; Liu et al., 2023). An detailed        where y<i denotes {y1 , . . . , yi−1 }. As shown, n forward
+analysis that compare CLLMs with different SOTA baseline              passes of the LLM are required to obtain n tokens y≤n . The
+methods are further discussed and compared in Section B               sequential nature of AR decoding hinders the fast genera-
+and Table 7. It’s worthy noticing that CLLMs requires nei-            tion of a lengthy response in practice. Speculative decod-
+ther modification to pre-trained models nor any auxiliary             ing (Leviathan et al., 2023; Zhou et al., 2023b; Liu et al.,
+components. This brings higher memory efficiency and                  2023) and Medusa (Cai et al., 2024) are existing remedia-
+adaptability to users at inference time.                              tions to such an issue, but the former suffers from the diffi-
+                                                                      culties in finding a suitable draft model and managing both
+LLM Distillation. Knowledge distillation (KD) serves as a             models in a single system, and the latter causes significant
+technique for creating smaller models that replicate the func-        increases in model size and architecture.
+tionality of larger ones. While traditional KD approaches
+often fall short for LLMs, (Gu et al., 2023) has adapted              In comparison, Jacobi decoding has shown the capacity to
+KD for autoregressive LLMs, focusing on minimizing the                reduce the inference cost of LLMs without extra model
+reverse KL divergence between student and teacher models              components (Santilli et al., 2023) and is therefore more
+through student-driven decoding. In another advancement,              applicable. Concretely, supposing f (yi , y<i , x) := yi −
+Agarwal et al. (2023) introduces generalized knowledge                arg maxy p(y|y<i , x), Jacobi decoding re-frames the LLM
+distillation (GKD), which balances forward and reverse KL             inference process in Equation (1) as solving a system of
+divergences by employing a mix of data sampled from both              nonlinear equations w.r.t. yi :
+teacher and student models.
+                                                                                  f (yi , y<i , x) = 0 for i = 1, . . . , n.      (2)
+CLLMs are distinct from these works as our proposed
+method can be regarded as a self-distillation approach with           It can be solved in parallel using the Jacobi fix-point
+a Jacobi trajectory training dataset that matches the target          iteration method (Ortega & Rheinboldt, 2000), starting
+                                                                      from a randomly initialized n-token sequence y (0) =
+
+                                                                  3
+                                           CLLMs: Consistency Large Language Models
+
+
+
+
+                                                                                                  GROUP BY
+                                                                                                  H AV ING
+                                                                                                  count ( *)
+
+                                                                                Target LLM     a lot of collocations   CLLM
+
+
+
+Figure 2. Comparison of Jacobi trajectory between a target LLM and CLLMs on Spider. Each point along the Jacobi trajectory is a
+color-coded sequence: blue for correct tokens matching with AR results, and red for inaccurate ones. CLLM demonstrates enhanced
+efficiency, converging to the fixed point 2× faster than the target LLM. This increased efficiency in the CLLM can be attributed to the
+consistency loss which facilitates the learning of the structure of each n-token sequence given a prefix.
+
+  (0)        (0)
+{y1 , . . . , yn } and iteratively updating it by the follow-            state by at least one token and 2) save the KV cache of fixed
+ing rule:                                                                tokens along with the decoding procedure. We elaborate on
+               (j+1)                                                    this in Algorithm 3.
+                y        = arg max p(y|x)
+               1
+              
+                              y
+                                                                         3.2. Consistency Large Language Models (CLLMs)
+              
+                 (j+1)                   (j)
+              y2       = arg max p(y|y1 , x)
+              
+              
+                               y
+                                                           (3)           Despite the promise, the speedup effect of Jacobi decod-
+                       ..
+              
+              
+                        .                                               ing for vanilla LLMs is minimal in practice (Santilli et al.,
+              yn(j+1) = arg max p(y|y<n  (j)
+              
+              
+                                             , x).                      2023; Fu et al., 2024). The reason is that AR-trained LLMs
+                                y                                        can usually generate only one correct token in each Jacobi
+Notably, for LLM, the above n maximization problems                      iteration as such models can rarely yield a correct token
+can be solved in parallel by using a causal attention mask,              when there are incorrect preceding tokens. To address this,
+i.e., only one forward pass of the LLM is required to obtain             we propose to adapt pre-trained LLMs to consistently map
+y (j+1) based on y (j) . The iteration exits at some k such that         any point y on the Jacobi trajectory J to the fixed point y ∗ .
+y (k) = y (k−1) and we define y ∗ := y (k) as the fixed point.           Surprisingly, such an objective is analogous to that of con-
+Let J := {y (1) , . . . , y (k) } denote the Jacobi trajectory. It       sistency models (Song et al., 2023; Song & Dhariwal, 2023),
+can be proven that y ∗ is identical to AR decoding under                 a leading acceleration approach for diffusion models (Ho
+greedy strategy (Song et al., 2021a). The acceleration effect            et al., 2020; Song et al., 2021b).
+of Jacobi decoding primarily stems from the fact that each               This section first delineates our data preparation procedure
+forward pass of the LLM could potentially generate more                  for tuning CLLM and then elaborates on the training proce-
+than one fixed token within the n-token sequence, so the                 dure of CLLM. Lastly, we discuss some possible sources of
+number of queries to the LLM could be smaller than that of               the reason for CLLMs’ acceleration.
+AR decoding, i.e., k ≤ n.
+Generally, for a prefix x of length nx , each forward pass               3.2.1. JACOBI T RAJECTORY C OLLECTION
+in Jacobi decoding deals with a longer sequence of length                Let p denote the target LLM we aim to adapt. Let qθ (·|x)
+nx + n, demanding more FLOPs than AR decoding that                       denote the CLLM with parameters θ initialized with those
+deals with a shorter sequence length at nx + i, 1 ≤ i ≤ n.               of p. To realize the aforementioned adaptation, we collect
+Yet, the added overhead can be minimal when nx is large or               a set of Jacobi trajectories by running the Jacobi decoding
+n is small. Besides, we can integrate the KV cache mech-                 algorithm with the target LLM p on prompts from a certain
+anism (Pope et al., 2023) into Jacobi decoding to further                domain of interest, forming an original training set D. We
+reduce the additional overhead, as detailed below.                       summarize the algorithm for dataset generation in Algo-
+Jacobi Decoding with KV Cache. The sequential nature                     rithm 1. Note that to generate a lengthy response l of N
+of LLMs ensures that each token generation is dependent                  (N ≫ n) tokens, we can sequentially perform Jacobi de-
+only on preceding tokens. Namely, we have an increasing                  coding for every truncation of n tokens to avoid slow model
+number of fixed tokens, which are correctly aligned with the             evaluation on lengthy input. Consequently, l amounts to the
+AR generations. We don’t need to iteratively update them                 concatenation of a set of consecutive fixed points.
+and recompute their keys and values for computing attention              Data augmentation. In a typical Jacobi iteration process,
+in subsequent iterations thanks to the KV cache technique.               the correct tokens often appear one after another, and n-
+So, we 1) progressively reduce the length of the iteration
+
+                                                                     4
+                                           CLLMs: Consistency Large Language Models
+
+Algorithm 1 Generate dataset to train a CLLM                              Algorithm 2 Training algorithm for a CLLM
+  Input: prompt set O, n-token sequence size n, max new tokens              Input: Jacobi trajectory dataset D, n-token sequence size n,
+  N , target LLM p                                                          the weight factor ω, CLLM qθ (·|x)
+  repeat                                                                    repeat
+    Sample prompt x from origin dataset O.                                    Sample prompt x, Jacobi trajectory J , and full response l
+    while <EOS> is not generated and length generated < N                     from D
+    do                                                                        Calculate LAR using Equation (6)
+        J = {y (0) , . . . , y ∗ } ← Jacobi Decoding(p, x)                    Sample y from J
+        x ← cat(x, y ∗ )                                                      Calculate Lconsistency using Equation (4) or Equation (5)
+        if use data augmentation then                                         Calculate L(θ) and update the parameters θ
+           for all y ∈ J do                                                 until convergence
+              Augment y with false tokens corrected randomly
+           end for
+        end if
+        Append x and J to Training Dataset D                              reverse KL, and their mixture (i.e., the Jensen-Shannon di-
+    end while                                                             vergence) as popular examples (Agarwal et al., 2023). We
+  until all prompts in origin dataset O are used                          primarily experiment with the forward KL.
+                                                                          Alternatively, we can also achieve the goal that CLLM con-
+token sequences usually exhibit a “correct, correct, wrong,               sistently maps all intermediate states to the fixed point with
+wrong, wrong” pattern. In comparison, patterns like “cor-                 a local consistency (LC) loss following CMs (Song et al.,
+rect, correct, wrong, correct, wrong” can be rare. To enhance             2023), where the adjacent states (y (j) , y (j+1) in the Jacobi
+the learning and generalization capabilities of CLLMs, we                 trajectory J are demanded to yield the same outputs:
+augment the dataset D by randomly correcting erroneously                                                        h
+predicted tokens within the samples.                                        LLC = E(x,J )∼D,(y(j) ,y(j+1) )∼J
+Data post-processing. Since the target LLM itself can                                 n                                      i (5)
+                                                                                                      (j+1)           (j)
+                                                                                      X
+make errors for some prompts, it often leads to low-quality                                 D qθ− (·|y<i , x)||qθ (·|y<i , x) .
+generations in the Jacobi trajectories. We find training a                            i=1
+CLLM with n-token sequences with token-level (Holtzman
+et al., 2019) or sentence-level repetitions (Polišenská et al.,         We compare LGC and LLC empirically in Table 6, where
+2015) often results in to repetitive content generation and               the results show that the global consistency loss is more
+noticeably degrades performance. Recognizing the signif-                  efficacious to train CLLMs. This is probably attributed to
+icance of high-quality datasets for training LLMs (Zhou                   that LLC only implicitly aims at mapping from any point
+et al., 2023a), we perform post-processing to eliminate the               consistently to the fixed point by minimizing the distance
+low-quality samples from our training dataset D based on a                between consecutive points. However, there is still a gap
+rule-based detector.                                                      between LLC and the goal of predicting multiple tokens at
+                                                                          once, because there is typically only one more correct token
+3.2.2. T RAINING                                                          in y (j+1) than y (j) in the collected Jacobi trajectory.
+We jointly optimize two losses for tuning CLLMs, one guar-                AR Loss. To avoid deviating from the distribution of the
+anteeing the prediction of multiple tokens at once and the                target LLM, we incorporate the traditional AR loss based
+other avoiding the CLLM from deviating from the target                    on the generation l of the target LLM p:
+LLM so as to maintain generation quality.
+                                                                                                h XN                     i
+Consistency Loss. For a prompt x with the Jacobi trajectory                       LAR = E(x,l)∼D −   log qθ (li |l<i , x) .          (6)
+J , let y and y ∗ denote a random state on the trajectory and                                           i=1
+the fixed point respectively. We can directly push CLLM to
+output y ∗ with y as the input by minimizing the following                This term contributes to maintaining generation quality sub-
+loss:                                                                     stantially (see Table 6).
+                           h
+  LGC = E(x,J )∼D,y∼J                                                     Consequently, the total loss for training a CLLM is:
+                  n
+                  X                                           i (4)
+                                   ∗
+                        D (qθ− (·|y<i , x)||qθ (·|y<i , x))                                 L(θ) = Lconsistency + wLAR               (7)
+                  i=1
+
+        −                                                                 where ω represents a weighting coefficient, Lconsistency can
+where θ = stopgrad(θ) and we abuse notations to repre-
+                                                                          be either LGC or LLC and we adopt LGC in our experiments.
+sent uniform sampling from the dataset. D(·||·) denotes
+the distance between two distributions, with forward KL,                  The training procedure is detailed in Algorithm 2.
+
+                                                                      5
+                                         CLLMs: Consistency Large Language Models
+
+3.3. Acceleration Mechanisms in CLLMs
+                                                                      Table 1. Comparison of CLLMs with other baselines including
+Next, we compare the Jacobi trajectory of the target LLM              speculative decoding using distilled draft model, Medusa, and
+and CLLM in Figure 2 to chase an in-depth understanding               fine-tuned model using LLaMA2-7B as the backbone model. Per-
+of acceleration mechanisms in CLLMs.                                  formance and inference speed are evaluated with applicable gener-
+                                                                      ation techniques. To quantify speed improvements, we measure
+As shown in the left side of Figure 2, target LLMs typically          speedup as the ratio of the wall-clock speed to the baseline AR
+generate only one correct token in one iteration. In contrast,        decoding speed for each model. Results are measured with a batch
+we identify fast forwarding phenomenon where multiple                 size of 1.
+consecutive tokens are correctly predicted in a single for-
+                                                                         Methods         Speed (tokens/s)   Speedup    Metric    Size
+ward pass in CLLMs. The average fast forward count per
+forward pass in CLLMs ranges from 2 to 6 tokens as eval-                                           GSM8K
+uated in Table 3. Moreover, tokens correctly generated in                          Fine-tuned LLaMA2-7B (Chern et al.)
+advance (e.g. “country” and “H” in point 5 and 6 in the                     + AR             43.5        1.0×       59.1
+                                                                          + Jacobi           45.7        1.1×       59.1         6.7B
+left side of Figure 2), are often replaced inaccurately in sub-
+                                                                        + lookahead          74.8        1.7×       59.1
+sequent iterations in target LLMs. Unlike the pre-trained
+models, CLLMs exhibit the capability of predicting correct                                   CLLM-LLaMA2-7B
+                                                                            + AR              43.5     1.0×             56.4
+tokens preemptively, even with preceding incorrect tokens,                + Jacobi            132.4    3.0×             56.4     6.7B
+while ensuring the tokens remain unchanged. We term such                + lookahead           125.2    2.9×             56.4
+tokens as stationary tokens, whose existance allow simulta-
+                                                                                           Medusa-2 + LLaMA2-7B
+neous extension of discontinuous correct tokens within the               + typical            70.2        1.6×          51.3     8.3B
+n-token sequence. Both phenomena contribute to the fast
+                                                                             Fine-tuned LLaMA2-7B + distilled LLaMA-160m
+convergence in Jacobi decoding of CLLMs, thereby leading               + speculative       73.8          1.7×      59.1  6.8B
+to a considerable generation speedup.
+                                                                                            ShareGPT (MT-Bench)
+We observe that CLLMs acquire a crucial linguistic con-
+                                                                                            Fine-tuned LLaMA2-7B
+cept through training – collocations: a series of words or                  + AR               37.6         1.0×         6.5
+terms that co-occur more frequently than one would ex-                    + Jacobi             39.9         1.1×         6.5     6.7B
+pect by random chance (Smadja, 1991). Language is not                   + lookahead            60.8         1.6×         6.5
+solely composed of isolated words but also relies heavily on                                 CLLM-LLaMA2-7B
+specific word pairings. Examples of collocations are abun-                  + AR              36.7     1.0×              6.4
+dant in both natural and coding languages. They include                   + Jacobi            88.4     2.4×              6.4     6.7B
+verb + preposition combinations (e.g., “talk to”, “remind               + lookahead           95.0     2.5×              6.4
+... of ...”), verb + noun structures (e.g., “make a decision”,                             Medusa-2 + LLaMA2-7B
+“catch a cold”), and many more domain-specific syntactical               + typical           102.5        2.7×           6.4     8.3B
+structures (e.g., “SELECT ... FROM ...”, “if ... else” for                   Fine-tuned LLaMA2-7B + distilled LLaMA-160m
+programming). The consistency generation objective allows              + speculative       51.3          1.4×      6.5   6.8B
+CLLMs to infer such structures from any point in the Jacobi
+trajectory, encouraging CLLMs to acquire proficiency in
+numerous collocations and thereby predict multiple words              der) (Yu et al., 2018), Python code generation (Code-
+simultaneously to minimize iteration steps.                           search-Python) (Husain et al., 2019) and graduate school
+                                                                      math (GSM8k) (Cobbe et al., 2021). To test CLLMs gen-
+Notably, lookahead decoding (Fu et al., 2024) collects n-             eralizability on open-domain conversational interactions
+grams generated from previous Jacobi iterations as candi-             and instruction-following scenarios, we also train CLLMs
+date tokens and verifies them in the next iteration to acceler-       on ShareGPT2 data and perform evaluation on the MT-
+ate decoding. CLLMs can also be combined with lookahead               bench (Zheng et al., 2023). The performance metrics are the
+decoding and achieve extra speedup (see Table 1 and Ta-               greedy answers’ problem solve rate (test@1) on GSM8K,
+ble 2) because collocations learned in CLLMs improve the              MT-bench score, execution accuracy on Spider, as well as
+quality of n-grams and thus increase the acceptance rate.             and strict accuracy (pass@1) on Human-Eval. Additionally,
+                                                                      we also run evaluations of CLLMs’ language modeling capa-
+4. Experiments                                                        bility on raw-WikiText2 (Merity et al., 2016) and PTB (Pan
+                                                                      et al., 2020).
+4.1. Evaluations
+                                                                      Reported experiments were conducted using either pre-
+Benchmarks and Setup. We evaluate performance across                  trained coder LLM, Deepseek-coder-7B-instruct (Bi et al.,
+three domain-specific tasks, including text-to-SQL (Spi-
+                                                                         2
+                                                                             http://www.sharegpt.com.
+
+                                                                  6
+                                        CLLMs: Consistency Large Language Models
+
+                                                                    specific tasks and the open-domain MT-bench.
+Table 2. Comparison of CLLMs with other baselines using
+Deepseek-Coder-7B-Instruct as the backbone model.                   Table 1 and Table 2 compare CLLMs against fine-tuned
+                                                                    baseline models across three different generation modes:
+   Methods      Speed (tokens/s)    Speedup   Metric   Size         AR decoding, Jacobi decoding, lookahead decoding, and the
+                           Spider                                   stronger speculative decoding baseline using a distilled draft
+                   Fine-tuned Deepseek-7B                           model. In both Jacobi and lookahead decoding, CLLMs
+      + AR            38.0          1.0×       70.0                 consistently surpass the baselines. Notably, on the Spider
+    + Jacobi          39.5          1.0×       70.0    6.7B         dataset, CLLMs achieve a 3.4× speedup with negligible per-
+  + lookahead         55.3          1.5×       70.0                 formance loss using Jacobi decoding. When benchmarked
+                    CLLM-Deepseek-7B                                against other SOTA methods for efficient LLM inference,
+      + AR           38.0       1.0×           69.3                 particularly those necessitating training, CLLMs exhibit
+    + Jacobi         127.4      3.4×           69.3    6.7B
+  + lookahead        135.2      3.6×           69.3
+                                                                    the ability of fast consistency generation while maintain-
+                                                                    ing lower memory and computational demands with lowest
+                  Medusa-2 + Deepseek-7B                            memory consumption in comparison with Medusa and spec-
+   + typical        104.2          2.7×        66.4    8.3B
+                                                                    ulative decoding. In these cases, we can still see CLLMs
+       Fine-tuned Deepseek-7B + distilled LLaMA-160m                consistently outperform speculative decoding with distilled
+ + speculative        66.8           1.8×     70.0   6.8B
+                                                                    draft model and achieve better accuracy with comparable
+                   Code-Search-Net Python                           and even better inference speedup on datasets like Spi-
+                   Fine-tuned Deepseek-7B                           der and GSM8K, where collocations are more common.
+      + AR            40.1          1.0×       60.4                 CLLMs can also seamlessly integrate with lookahead de-
+    + Jacobi          43.2          1.1×       60.4    6.7B         coding and more speedup is gained compared to lookahead
+  + lookahead         68.0          1.7×       60.0                 decoding applied in fine-tuned LLMs.
+                    CLLM-Deepseek-7B
+      + AR           38.5       1.0×           59.2
+                                                                    We highlight CLLMs’ advantage over speculative decoding
+    + Jacobi         102.1      2.5×           59.2    6.7B         with distilled draft models and Medusa is its high adaptabil-
+  + lookahead        115.7      2.9×           59.2                 ity. This is because CLLMs’ are models tailored for Jacobi
+                  Medusa-2 + Deepseek-7B                            decoding. Jacobi decoding requires no modification to the
+   + typical        128.0          3.2×        48.3    8.3B         original models. In the contrary, both speculative decod-
+       Fine-tuned Deepseek-7B + distilled LLaMA-160m
+                                                                    ing and Meudsa require either auxiliary components like
+ + speculative        59.3           1.5×     60.4   6.8B           LM head, tree-based attention mask, or draft model, which
+                                                                    usually come with the cost of searching for the optimal
+                                                                    configuration. This is further summarized in Table 7.
+2024) or LLaMA-2-7B (Touvron et al., 2023a;b) depending             Moreover, the language modeling results in Table 5 show
+on the task. Both training and evaluation are carried out on        CLLMs are able to maintain a low perplexity while render-
+servers equipped with 8 NVIDIA A100 40GB GPUs and                   ing at least 2× speedup, suggesting CLLMs’ potential to be
+128 AMD EPYC 7742 64-core processors.                               trained as pre-trained LLM with higher inference efficiency.
+Baselines. In this section, we compare CLLMs with a
+range of alternative models that employ various strategies to       4.2. Acceleration Mechanisms in CLLMs
+speed up the inference process. This includes Medusa (Cai           With insights provided in Section 3.3, we investigate the
+et al., 2024), which modifies the underlying architecture,          fast-forwarding phenomenon and the emergence of station-
+and approaches utilizing distilled draft models for specula-        ary tokens in Jacobi decoding to provide further empirical
+tive decoding (Zhou et al., 2023b; Liu et al., 2023). Along-        evidences for our hypothesis. We compare fast-forwarded
+side these, we also consider fine-tuned baseline models for         and stationary token counts in target LLMs and CLLMs
+a comprehensive comparison. Our evaluation tests each               across the four datasets in Table 3.
+model under different decoding paradigms the model is
+compatible with to thoroughly assess their inference quality        From the table, there is a consistent 2.0x to 6.8x improve-
+and speed. The decoding algorithms include vanilla AR               ment in both fast-forwarded token and stationary token
+decoding, Jacobi decoding (Song et al., 2021a), speculative         counts across all four datasets. In particular, for domain-
+decoding (Leviathan et al., 2023), and lookahead decod-             specific datasets, such improvement is much more signifi-
+ing (Fu et al., 2024).                                              cant than open-domain dataset profiled on MT-bench. The
+                                                                    results align with the observations from Section 3.3, where
+Results. To evaluate the performance and inference speedup          we see more distinctive collocations and easy syntactical
+of CLLMs across various tasks, we conduct an extensive              structures like blank space, newline tokens, and repetitive
+comparison with the SOTA baselines on the three domain-
+
+                                                                7
+                                        CLLMs: Consistency Large Language Models
+
+
+Table 3. Profiling results for fast-forwarded and stationary token counts in fine-tuned models and CLLMs. The numbers are
+reported for each n-token sequence, with the best-performing model and an accompanying n-gram size. Fast-forwarded token count
+reported in the table includes the one token that will be predicted right even without fast-forwarding.
+
+                     Models                      n-token sequence length             Fast-forward token count    Stationary token count
+                                                            Spider
+     Fine-tuned Deepseek-coder-7B-instruct                 16                                  1.1                         0.4
+   CLLM-Deepseek-coder-7B-instruct (size 16)               16                                  5.7                         1.6
+                                                    Code-Search-Net Python
+     Fine-tuned Deepseek-coder-7B-instruct                 32                                  1.1                         0.4
+   CLLM-Deepseek-coder-7B-instruct (size 32)               32                                  4.0                         6.8
+                                                           GSM8K
+            Fine-tuned LLaMA-2-7B                          16                                  1.1                         0.1
+          CLLM-LLaMA-2-7B (size 16)                        16                                  2.8                         2.0
+                                                          ShareGPT
+            Fine-tuned LLaMA-2-7B                          32                                  1.1                         0.3
+          CLLM-LLaMA-2-7B (size 32)                        32                                  2.2                         4.8
+
+
+                                                                                                                                       1.0
+special characters in specialized domains like coding as                       3.0                                         Accuracy
+demonstrated in Figure 2, versus open-domain conversa-
+                                                                               2.5                                                     0.8
+tions in ShareGPT and MT-bench with a significantly more
+diverse set of collocations.                                                   2.0                                                     0.6
+
+
+
+
+                                                                                                                                        Accuracy
+                                                                     Speedup
+
+
+
+4.3. Ablation Studies                                                          1.5
+                                                                                                                                       0.4
+In this section, we evaluate the impact of various hyperpa-                    1.0
+rameter selections on the performance of CLLMs.                                                                                        0.2
+                                                                               0.5
+Dataset sizes and generalizability. In Section 3.2.1, Ja-
+                                                                               0.0   16       32           64        128         256   0.0
+cobi trajectory datasets are collected to conduct training for                                Length of n-token sequence
+efficient Jacobi decoding. Table 4 demonstrates larger Ja-
+cobi trajectory datasets bring more significant speedup, and         Figure 3. Accuracy and speedup of models trained with different
+the speedup gradually saturates as the dataset size scales.          n-token sequences lengths on GSM8K dataset. The sequence
+Moreover, CLLMs trained with more data can perform well              length for generation matches the training settings. Speedup is
+even at the n-token sequence lengths it’s not trained on and         measured as the ratio of the wall-clock generation throughput when
+introduce more deployment-time robustness.                           employing Jacobi decoding, and that of the baseline AR decoding.
+
+Different lengths of n-token sequence. We investigate how
+different n-token sequence lengths in the Jacobi trajectory          efficacy of CLLMs using both consistency global loss and
+dataset affect CLLMs’ performance on GSM8K. We employ                consistency local loss. Table 6 demonstrates that the global
+varying lengths to generate the Jacobi dataset and train the         loss is more efficacious in the training of CLLMs.
+CLLMs accordingly. Figure 3 illustrates that CLLMs con-
+sistently maintain generation quality while the models are
+                                                                     4.4. Limitations and Discussion
+trained with different lengths. In practice, longer sequence
+lengths come at cost of increased computational overhead             In our experiments, we observe that achieving significant
+during inference. In Figure 3, significant degradation infer-        speedup while maintaining good generation quality with
+ence speed can thus be observed when the n-token sequence            a CLLM relies strongly on having a high-quality Jacobi
+length exceeds 64.                                                   trajectory dataset. Therefore, data cleaning is crucial, as
+                                                                     discussed in Section 3.2.1. Dataset size also plays a role as
+Loss design. We adjust the ratio of consistency loss to
+                                                                     described in Section 4.3 and shown in Table 4, although to
+autoregressive loss described in Section 3.2.2 and evaluate
+                                                                     a lesser extent. For instance, Jacobi trajectories generated
+different loss ratios’ performance on GSM8K. As illustrated
+                                                                     with only 10% of the Code-Search-Net Python dataset is
+in Table 6, increasing the emphasis on autoregressive loss
+                                                                     able to yield a 2.9× speedup as demonstrated in Table 2.
+does indeed enhance accuracy, though it slightly compro-
+                                                                     However, for open-domain datasets like ShareGPT, more
+mises the speedup gains. Additionally, we compare the
+                                                                     data is necessary for improved efficiency. The computa-
+
+                                                                 8
+                                         CLLMs: Consistency Large Language Models
+
+
+       Table 4. Comparison the performance of CLLMs trained with different sizes of Jacobi trajectory datasets on ShareGPT.
+
+                                                              I NFERENCE SPEEDUP ( VARYING LENGTHS )
+                  T RAJECTORY C OUNT          MT- BENCH
+                                                                16        32       64       128         256
+                            20 K                  6.1         1.7×       1.8×     1.4×     1.2×         1.1×
+                           100 K                  6.4         2.5×       2.4×     2.1×     2.0×         1.5×
+                           500 K                  6.4         2.7×       2.7×     2.2×     2.1×         1.8×
+
+
+
+Table 5. CLLMs’ performance versus the fine-tuned baseline on        Table 6. Comparison the performance of CLLMs trained with dif-
+language modeling tasks.                                             ferent loss design. All models are trained on GSM8K.
+
+      Methods      Speed (tokens/s)    Speedup   PPL (↓)                       L OSS               S PEEDUP     ACCURACY
+                       raw-WikTtext2                                           LCTG + LAR            3.2×          51.3
+                                                                               LCTG + 10 · LAR       3.0×          56.4
+                   fine-tuned LLaMA2-7B                                        LCTL + LAR            2.8×          55.2
+        + AR             41.2        1.0×           8.0                        LCTL + 10 · LAR       2.4×          56.0
+      + Jacobi           36.9        1.0×           8.0
+    + lookahead          58.1        1.6×           8.0
+                    CLLM-LLaMA2-7B
+        + AR           40.1      1.0×               9.5              for LLM pre-training. This modification would equip the
+      + Jacobi         83.2      2.1×               9.5              pre-trained model with both a strong language modeling
+    + lookahead        89.5      2.2×               9.5
+                                                                     capability, as existing models possess, and a high generation
+                            PTB                                      speed when employing Jacobi decoding for inference. We
+                   fine-tuned LLaMA2-7B                              leave the opportunities of adapting CLLMs to pre-trained
+        + AR             43.8        1.0×          15.6              jobs for future work.
+      + Jacobi           41.8        1.0×          15.6
+    + lookahead          62.0        1.5×          15.6
+                                                                     5. Conclusion
+                    CLLM-LLaMA2-7B
+        + AR           43.6      1.0×              15.3              In this work, we introduce CLLMs, a new family of LLMs
+      + Jacobi         98.1      2.3×              15.3              that excel in efficient parallel decoding, designed to signif-
+    + lookahead       101.5      2.3×              15.3
+                                                                     icantly enhance the efficiency of Jacobi decoding. Unlike
+                                                                     other existing techniques for efficient LLM inference, which
+                                                                     often require either additional architectural components (Cai
+tion cost for CLLMs training is moderate and discussed in            et al., 2024; Li et al., 2024) or draft models (Leviathan et al.,
+Appendix D.                                                          2023; Zhou et al., 2023b; Liu et al., 2023), CLLMs are di-
+                                                                     rectly adapted from a target pre-trained LLM. This reduces
+In our proposed method and experiments, we primarily use
+                                                                     the complexity associated with additional architecture de-
+output sequences from the teacher (Kim & Rush, 2016)
+                                                                     signs or managing two different models in a single system.
+to collect Jacobi trajectories and train a CLLM. This intro-
+                                                                     In addition, CLLMs can also be integrated seamlessly with
+duces some additional overhead in comparison with conven-
+                                                                     other techniques for efficient LLM inference (Dao, 2023; Fu
+tional model training. On-policy GKD proposed in Agarwal
+                                                                     et al., 2024; Ainslie et al., 2023) to achieve greater speedup.
+et al. (2023) suggests LLM distillation using a mixture of
+                                                                     We have demonstrated the efficacy of CLLMs on both spe-
+teacher and student samples or even student samples by
+                                                                     cific and open domains, revealing a significant improvement
+themselves can yield high-performance models. One miti-
+                                                                     in generation speed while preserving generation quality.
+gation is therefore to use n-token sequences generated by
+the trained model itself as the training samples. This can
+remove the Jacobi trajectory collection overhead, making             Acknowledgments
+our proposed method potentially feasible for pre-training.
+                                                                     This work was supported by Key R&D Program of Shan-
+Results from our language modeling experiments, as de-               dong Province, China (2023CXGC010112), NSF of China
+tailed in Table 5, demonstrate the robustness of the CLLM            (Nos. 62306176, 62102257), National Key R&D Program
+when trained on pre-training jobs with a notable speedup. By         of China (2022YFB4500200), Natural Science Founda-
+incorporating on-policy GKD, it is conceivable that a mod-           tion of Shanghai (No. 23ZR1428700), and CCF-Baichuan-
+ified version of our proposed method could be employed               Ebtech Foundation Model Fund.
+
+                                                                9
+                                        CLLMs: Consistency Large Language Models
+
+Impact Statement                                                     Dao, T. Flashattention-2: Faster attention with bet-
+                                                                       ter parallelism and work partitioning. arXiv preprint
+This work presents a challenge in machine learning and                 arXiv:2307.08691, 2023.
+proposes a solution, the potential negative consequences
+are not apparent. While it is theoretically possible for any         Dao, T., Fu, D., Ermon, S., Rudra, A., and Ré, C. Flashat-
+technique to be misused, the likelihood of such misuse                 tention: Fast and memory-efficient exact attention with
+occurring at the current stage is low.                                 io-awareness. Advances in Neural Information Process-
+                                                                       ing Systems, 35:16344–16359, 2022.
+References                                                           Dettmers, T., Lewis, M., Belkada, Y., and Zettlemoyer, L.
+Achiam, J., Adler, S., Agarwal, S., Ahmad, L., Akkaya, I.,             Llm. int8 (): 8-bit matrix multiplication for transformers
+  Aleman, F. L., Almeida, D., Altenschmidt, J., Altman, S.,            at scale. arXiv preprint arXiv:2208.07339, 2022.
+  Anadkat, S., et al. Gpt-4 technical report. arXiv preprint
+                                                                     Frantar, E. and Alistarh, D. Sparsegpt: Massive language
+  arXiv:2303.08774, 2023.
+                                                                       models can be accurately pruned in one-shot. 2023.
+Agarwal, R., Vieillard, N., Stanczyk, P., Ramos, S., Geist,          Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D. Gptq:
+  M., and Bachem, O. Gkd: Generalized knowledge distilla-              Accurate post-training quantization for generative pre-
+  tion for auto-regressive sequence models. arXiv preprint             trained transformers. arXiv preprint arXiv:2210.17323,
+  arXiv:2306.13649, 2023.                                              2022.
+Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y.,            Fu, Y., Bailis, P., Stoica, I., and Zhang, H. Break the se-
+  Lebrón, F., and Sanghai, S. Gqa: Training generalized               quential dependency of llm inference using lookahead
+  multi-query transformer models from multi-head check-                decoding. arXiv preprint arXiv:2402.02057, 2024.
+  points. arXiv preprint arXiv:2305.13245, 2023.
+                                                                     Gu, Y., Dong, L., Wei, F., and Huang, M. Knowledge
+Anil, R., Dai, A. M., Firat, O., Johnson, M., Lepikhin,                distillation of large language models. arXiv preprint
+  D., Passos, A., Shakeri, S., Taropa, E., Bailey, P., Chen,           arXiv:2306.08543, 2023.
+  Z., et al. Palm 2 technical report. arXiv preprint
+  arXiv:2305.10403, 2023.                                            Ho, J., Jain, A., and Abbeel, P. Denoising diffusion proba-
+                                                                       bilistic models. Advances in neural information process-
+Ashkboos, S., Croci, M. L., do Nascimento, M. G., Hoefler,             ing systems, 33:6840–6851, 2020.
+  T., and Hensman, J. Slicegpt: Compress large language
+  models by deleting rows and columns, 2024.                         Holtzman, A., Buys, J., Du, L., Forbes, M., and Choi, Y. The
+                                                                       curious case of neural text degeneration. arXiv preprint
+Bi, X., Chen, D., Chen, G., Chen, S., Dai, D., Deng, C.,               arXiv:1904.09751, 2019.
+  Ding, H., Dong, K., Du, Q., Fu, Z., et al. Deepseek llm:
+  Scaling open-source language models with longtermism.              Husain, H., Wu, H.-H., Gazit, T., Allamanis, M., and
+  arXiv preprint arXiv:2401.02954, 2024.                               Brockschmidt, M. CodeSearchNet challenge: Evalu-
+                                                                       ating the state of semantic code search. arXiv preprint
+Cai, T., Li, Y., Geng, Z., Peng, H., Lee, J. D., Chen, D.,             arXiv:1909.09436, 2019.
+  and Dao, T. Medusa: Simple llm inference acceleration
+  framework with multiple decoding heads. arXiv preprint             Kim, Y. and Rush, A. M. Sequence-level knowledge distil-
+  arXiv:2401.10774, 2024.                                              lation. arXiv preprint arXiv:1606.07947, 2016.
+Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre,           Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+  L., and Jumper, J. Accelerating large language model                C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+  decoding with speculative sampling. arXiv preprint                  memory management for large language model serving
+  arXiv:2302.01318, 2023.                                             with pagedattention. In Proceedings of the 29th Sym-
+                                                                      posium on Operating Systems Principles, pp. 611–626,
+Chern, E., Zou, H., Li, X., Hu, J., Feng, K., Li, J., and             2023.
+  Liu, P. Generative ai for math: Abel. URL https:
+  //github.com/GAIR-NLP/abel.                                        Leviathan, Y., Kalman, M., and Matias, Y. Fast inference
+                                                                       from transformers via speculative decoding. In Inter-
+Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,              national Conference on Machine Learning, pp. 19274–
+  Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,            19286. PMLR, 2023.
+  R., Hesse, C., and Schulman, J. Training verifiers to solve
+  math word problems. arXiv preprint arXiv:2110.14168,               Li, Y., Wei, F., Zhang, C., and Zhang, H. Eagle: Speculative
+  2021.                                                                 sampling requires rethinking feature uncertainty, 2024.
+
+                                                                10
+                                         CLLMs: Consistency Large Language Models
+
+Lin, J., Tang, J., Tang, H., Yang, S., Dang, X., and                     2021b. URL https://openreview.net/forum?
+  Han, S. Awq: Activation-aware weight quantization                      id=PxTIG12RRHS.
+  for llm compression and acceleration. arXiv preprint
+  arXiv:2306.00978, 2023.                                              Song, Y., Dhariwal, P., Chen, M., and Sutskever, I. Consis-
+                                                                         tency models. In Proceedings of the 40th International
+Liu, X., Hu, L., Bailis, P., Stoica, I., Deng, Z., Cheung, A.,           Conference on Machine Learning, ICML’23. JMLR.org,
+  and Zhang, H. Online speculative decoding, 2023.                       2023.
+Ma, X., Fang, G., and Wang, X. Llm-pruner: On the struc-               Sun, M., Liu, Z., Bair, A., and Kolter, J. Z. A simple and
+ tural pruning of large language models. arXiv preprint                  effective pruning approach for large language models.
+ arXiv:2305.11627, 2023.                                                 arXiv preprint arXiv:2306.11695, 2023.
+Merity, S., Xiong, C., Bradbury, J., and Socher, R.                    Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,
+ Pointer sentinel mixture models.     arXiv preprint                     M.-A., Lacroix, T., Rozière, B., Goyal, N., Hambro, E.,
+ arXiv:1609.07843, 2016.                                                 Azhar, F., et al. Llama: Open and efficient foundation lan-
+Ortega, J. M. and Rheinboldt, W. C. Iterative solution of                guage models. arXiv preprint arXiv:2302.13971, 2023a.
+  nonlinear equations in several variables. SIAM, 2000.
+                                                                       Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi,
+Pan, H., Wang, C., Qiu, M., Zhang, Y., Li, Y., and Huang,                A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P.,
+  J. Meta-kd: A meta knowledge distillation framework                    Bhosale, S., et al. Llama 2: Open foundation and fine-
+  for language model compression across domains. arXiv                   tuned chat models. arXiv preprint arXiv:2307.09288,
+  preprint arXiv:2012.01266, 2020.                                       2023b.
+
+Polišenská, K., Chiat, S., and Roy, P. Sentence repetition:          Wu, S., Fei, H., Qu, L., Ji, W., and Chua, T.-S. Next-
+  What does the task measure? International Journal of                  gpt: Any-to-any multimodal llm. arXiv preprint
+  Language & Communication Disorders, 50(1):106–118,                    arXiv:2309.05519, 2023.
+  2015.
+                                                                       Xia, M., Zhong, Z., and Chen, D. Structured pruning
+Pope, R., Douglas, S., Chowdhery, A., Devlin, J., Bradbury,              learns compact and accurate models. arXiv preprint
+  J., Heek, J., Xiao, K., Agrawal, S., and Dean, J. Efficiently          arXiv:2204.00408, 2022.
+  scaling transformer inference. Proceedings of Machine
+  Learning and Systems, 5, 2023.                                       Xia, M., Gao, T., Zeng, Z., and Chen, D. Sheared llama:
+                                                                         Accelerating language model pre-training via structured
+Santilli, A., Severino, S., Postolache, E., Maiorca, V., Man-            pruning. arXiv preprint arXiv:2310.06694, 2023.
+  cusi, M., Marin, R., and Rodolà, E. Accelerating trans-
+  former inference for translation via parallel decoding.              Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., and Han,
+  arXiv preprint arXiv:2305.10427, 2023.                                 S. Smoothquant: Accurate and efficient post-training
+                                                                         quantization for large language models. In International
+Shazeer, N. Fast transformer decoding: One write-head is                 Conference on Machine Learning, pp. 38087–38099.
+  all you need. arXiv preprint arXiv:1911.02150, 2019.                   PMLR, 2023.
+Smadja, F. From n-grams to collocations: An evaluation                 Yu, T., Zhang, R., Yang, K., Yasunaga, M., Wang, D., Li,
+  of xtract. In 29th Annual Meeting of the Association for               Z., Ma, J., Li, I., Yao, Q., Roman, S., et al. Spider:
+  Computational Linguistics, pp. 279–284, 1991.                          A large-scale human-labeled dataset for complex and
+Song, Y. and Dhariwal, P. Improved techniques for training               cross-domain semantic parsing and text-to-sql task. arXiv
+  consistency models. arXiv preprint arXiv:2310.14189,                   preprint arXiv:1809.08887, 2018.
+  2023.
+                                                                       Zheng, L., Chiang, W.-L., Sheng, Y., Zhuang, S., Wu, Z.,
+Song, Y., Meng, C., Liao, R., and Ermon, S. Accelerating                 Zhuang, Y., Lin, Z., Li, Z., Li, D., Xing, E., et al. Judging
+  feedforward computation via parallel nonlinear equation                llm-as-a-judge with mt-bench and chatbot arena. arXiv
+  solving. In International Conference on Machine Learn-                 preprint arXiv:2306.05685, 2023.
+  ing, pp. 9791–9800. PMLR, 2021a.
+                                                                       Zhou, C., Liu, P., Xu, P., Iyer, S., Sun, J., Mao, Y., Ma, X.,
+Song, Y., Sohl-Dickstein, J., Kingma, D. P., Kumar, A.,                  Efrat, A., Yu, P., YU, L., Zhang, S., Ghosh, G., Lewis,
+  Ermon, S., and Poole, B. Score-based generative mod-                   M., Zettlemoyer, L., and Levy, O. LIMA: Less is more
+  eling through stochastic differential equations. In In-                for alignment. In Thirty-seventh Conference on Neural
+  ternational Conference on Learning Representations,                    Information Processing Systems, 2023a.
+
+                                                                  11
+                                     CLLMs: Consistency Large Language Models
+
+Zhou, Y., Lyu, K., Rawat, A. S., Menon, A. K., Ros-
+  tamizadeh, A., Kumar, S., Kagy, J.-F., and Agarwal,
+  R. Distillspec: Improving speculative decoding via
+  knowledge distillation. arXiv preprint arXiv:2310.08461,
+  2023b.
+
+
+
+
+                                                             12
+                                                       CLLMs: Consistency Large Language Models
+
+A. Illustration of Consistency Loss Learning Objectives
+In our proposed method described in Section 3.2, we use Jacobi trajectories collected from a target model to train the model
+with a loss that encourages single-step convergence during Jacobi iterations. This is achieved with either choice of the two
+consistency loss:
+
+• Global consistency loss: directly minimize the distance D between any arbitrary point y on a Jacobi trajectory and the
+  fixed point y∗ in Equation 4.
+• Local consistency loss: minimize the distance D between any arbitrary point y(j) on a Jacobi trajectory with its adjacent
+  state y(j+1) in Equation 5, which thereby also implicitly minimizes the distance between y(j+1) and the fixed point y∗ .
+
+An illustration further depict the global consistency loss and the local consistency loss in Figure 4 and Figure 5.
+
+                                                                                                                fixed point
+                                                                                   k=4 (4th iteration):
+                                                                                   Converged, same result as greedy AR decoding.
+
+                                                                                            Yes    I     am            .   Nice     to       meet
+                                prefix                  k-th n-token sequence
+
+                                                                                           Yes     I     am        .       Nice    to        chat
+
+
+
+                                                                                                        k=3 (3rd iteration)
+
+
+
+
+                                                                                           Yes     I     am      one       one    smart    gadget
+                                      Autoregressive LM
+                                                                                                        k=2 (2nd iteration)
+
+
+
+
+                                                                                           Yes    a     LLM        !       one    fun     meet
+
+
+                                                                                                        k=1 (1-st iteration)
+                                prefix                 (k-1)-th n-token sequence
+                                                                                           You    ?      Are     LLM        ?      a      you
+
+                  <BOS>   Are   you      a   LLM   ?
+                                                                                                        k=0 (initialization)
+
+
+
+                                                                                                         random initialization                      Jacobi trajectory
+                  input
+
+
+
+Figure 4. The image illustrates global consistency loss where we aim to directly learn a model qθ that maps arbitrary n-token sequence
+y(0) , y(1) , etc.) to the fixed point y∗ .
+
+                                                                                                                fixed point
+                                                                                   k=4 (4th iteration):
+                                                                                   Converged, same result as greedy AR decoding.
+
+                                                                                            Yes    I     am            .   Nice     to       meet
+                                prefix                  k-th n-token sequence
+
+                                                                                           Yes     I     am        .       Nice    to        chat
+
+
+
+                                                                                                        k=3 (3rd iteration)
+
+
+
+
+                                                                                           Yes     I     am      one       one    smart    gadget
+                                      Autoregressive LM
+                                                                                                        k=2 (2nd iteration)
+
+
+
+
+                                                                                           Yes    a     LLM        !       one    fun     meet
+
+
+                                                                                                        k=1 (1-st iteration)
+                                prefix                 (k-1)-th n-token sequence
+                                                                                           You    ?      Are     LLM        ?      a      you
+
+                  <BOS>   Are   you      a   LLM   ?
+                                                                                                        k=0 (initialization)
+
+
+
+                                                                                                         random initialization                      Jacobi trajectory
+                  input
+
+
+
+Figure 5. The image illustrates local consistency loss where we aim to learn a model qθ that maps an arbitrary n-token sequence y(j) to
+its next adjacent state, and implicitly mapping the point to the fixed point y∗ .
+
+                                                                                   13
+                                                CLLMs: Consistency Large Language Models
+
+B. Comparison with Baseline Algorithms
+In this section, we present a comparative analysis of baseline algorithms for efficient LLM inference. Key features considered
+are listed below. Table 7 underlines that CLLMs, our proposed method, stands out for its memory efficiency and adaptability,
+requiring no modifications to the existing model architecture while achieving up to 3.4× inference speedup.
+
+• Lossless: whether the method generates exactly the same output distribution as AR decoding does in the backbone model.
+
+• Training-free: whether the method requires training.
+
+• Architecture-design-free: whether the method requires modifications or adding auxiliary components to pre-trained
+  LLMs (like extra MLP layers, LM heads (Cai et al., 2024), autoregressive heads (Li et al., 2024), etc.).
+
+• Attention-modification-free: whether the methods require modifications to exisiting attention mechanism in transformers.
+  For example, this includes tree token verification as appears in Cai et al. (2024).
+
+• Extra-memory-free: whether the method requires extra memory conmsumption in the system to accommodate speculative
+  model or extra parameters.
+
+• Speedup: Whether the method can effectively deliver inference speedup in practical use cases.
+
+Table 7. All speedups are relative to the vanilla AR. CLLMs has the best memory efficiency and adaptability as it requires no modifications
+to the model. yes∗ refers to capability of achieving more than 3× speedup on at least one of our benchmarks. Jacobi decoding doesn’t
+always lead to a speedup as discussed in Section 3.1, so we denote it with yes.
+
+           Methods                Lossless     Training-free      Arch-design-free       Attention-mod-free        Extra-memory-free   Speedup
+          Vanilla AR                 yes             yes                  yes                     yes                     yes            no
+      Jacobi Decoding                yes             yes                  yes                     yes                     yes            yes
+    Speculative Decoding             yes             yes                  yes                     yes                     no             yes
+    Lookahead Decoding               yes             yes                  yes                     yes                     no             yes
+  SD with Distilled Student          yes             no                   yes                     yes                     no             yes
+             Eagle                   yes             no                   no                      no                      no            yes∗
+           Medusa                    no              no                   no                      no                      no            yes∗
+      CLLMs ( Ours )                 no              no                   yes                     yes                     yes           yes∗
+
+
+C. Pesudo Code for Jacobi Decoding with KV Cache
+
+Algorithm 3 Jacobi Decoding with KV Cache
+ 1: Input: prompt x, n-gram size n, past KV cache K, LLM, Jacobi trajectory J
+ 2: y ← random tokens from x
+ 3: nt ← 0 {Initialization of accurate length}
+ 4: y0 , K ← LLM(x) {Prefill phase: generate the first token}
+ 5: znext ← cat(y0 , y≥1 )
+ 6: repeat
+ 7:    z current ← z next
+ 8:    z next , K ← LLM(z current , K)
+ 9:    i∗ ← max{i | z<i   current
+                                  = z<inext
+                                            , i ∈ {0, . . . , len(z current ) − 1}} {Fast-forwarded token count}
+                                       ′
+                               next
+10:    ynt ≤i′ <nt +i∗ ← z<i∗ {i denotes a dummy variable}
+11:    nt ← nt + i∗
+                                next
+                                     
+12:    Append cat y<nt , z≥i        ∗ to J
+13:    Remove KV cache of false tokens from K
+14:    z next ← z≥inext
+                      ∗
+15: until nt = n
+16: Ouput: J and y
+
+
+
+                                                                          14
+                                           CLLMs: Consistency Large Language Models
+
+D. Computation cost for CLLMs training
+For the computation required for dataset generation, the cost is low and it’s a one-time overhead. In the cases where
+the dataset size is large, for example for CodeSearchNet-Python, only 10% of the dataset is required to generate Jacobi
+trajectories and the trained CLLMs obtain around 2.5× speedup on average. More details are shown in the table below.
+
+
+Table 8. Computation required for dataset generation. The estimated generation time is based on sequential generation with batch size =
+1. We can further reduce the generation time with serving systems like vLLM (Kwon et al., 2023) with batch size = 16 or more. We give
+an example of estimated training time with vLLM using batch size = 16 in the table as well. All time is estimated by a single A100 40G
+GPU*hours.
+
+     Dataset                      ♯ Generated tokens       Estimated generation time       Estimated generation time(vLLM)
+     Spider                                2M                            5                                  <1
+     GSM8K                                10M                           14                                  ∼1
+     CodeSearchNet-Python                 100M                         100                                   8
+     ShareGPT                             200M                         120                                  10
+
+For the computation required for consistency training, we conclude the time and resources required for training a CLLM
+                                                                               ♯tokens required for training a CLLM
+in the table below. For the percentage of pre-training cost, we estimate it by                                      , where
+                                                                                  ♯tokens required for pre-training
+♯tokens required for pre-training is 1T for LLaMA-7B (Touvron et al., 2023a).
+
+
+                                       Table 9. Computation required for consistency training.
+                  Dataset                      Training time      % of pre-training cost      Training resources
+                  Spider                          2 hours                < 0.01%             8 A100 40GB GPUs
+                  GSM8K                           12 hours               ∼ 0.01%             8 A100 40GB GPUs
+                  CodeSearchNet-Python            22 hours               ∼ 0.1%              8 A100 40GB GPUs
+                  ShareGPT                        30 hours               ∼ 0.2 %             8 A100 40GB GPUs
+
+
+
+
+                                                                  15
+

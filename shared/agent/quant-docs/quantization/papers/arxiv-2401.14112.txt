@@ -1,0 +1,1396 @@
+                                            FP6-LLM: Efficiently Serving Large Language Models Through FP6-Centric
+                                                                  Algorithm-System Co-Design
+
+                                                 Haojun Xia                   Zhen Zheng            Xiaoxia Wu                                Shiyang Chen               Zhewei Yao
+                                             University of Sydney              Microsoft             Microsoft                              Rutgers University            Microsoft
+                                                     Stephen Youn              Arash Bakhtiari                 Michael Wyatt                           Donglin Zhuang
+                                                       Microsoft                 Microsoft                      Microsoft                             University of Sydney
+arXiv:2401.14112v2 [cs.LG] 4 Mar 2024
+
+
+
+
+                                                   Zhongzhu Zhou                    Olatunji Ruwase                       Yuxiong He                   Shuaiwen Leon Song
+                                                  University of Sydney                 Microsoft                           Microsoft                        Microsoft
+                                                                 Abstract                                                                   TC-FPx_W6A16              TensorRT_LLM_W8A16
+                                                                                                                                            AWQ_W4A16_SIMT            cuBLAS_W16A16
+                                        Six-bit quantization (FP6) can effectively reduce the size of                             2.5
+
+                                        large language models (LLMs) and preserve the model quality
+
+
+                                                                                                                 Kernel Speedup
+                                                                                                                                   2
+                                                                                                                                                                                       FP16
+                                        consistently across varied applications. However, existing sys-                                                                            Tensor Cores
+                                        tems do not provide Tensor Core support for FP6 quantization                              1.5
+                                        and struggle to achieve practical performance improvements                                 1
+                                        during LLM inference. It is challenging to support FP6 quanti-
+                                        zation on GPUs due to (1) unfriendly memory access of model                               0.5
+                                                                                                                                                                 FP32 SIMT Cores
+                                        weights with irregular bit-width and (2) high runtime overhead
+                                                                                                                                   0
+                                        of weight de-quantization. To address these problems, we pro-                                   1     2   4    8    16   32     64   128      256    512
+                                        pose TC-FPx, the first full-stack GPU kernel design scheme                                                    Inference Batch Size
+                                        with unified Tensor Core support of float-point weights for var-
+                                        ious quantization bit-width. We integrate TC-FPx kernel into            Figure 1: Performance of a linear layer within the llama-
+                                        an existing inference system, providing new end-to-end sup-             65b [32] model. The shapes of the weight/activation matrices
+                                        port (called FP6-LLM) for quantized LLM inference, where                are (8192, 22016) and (22016, Batch Size).
+                                        better trade-offs between inference cost and model quality
+                                        are achieved. Experiments show that FP6-LLM enables the
+                                        inference of LLaMA-70b using only a single GPU, achieving                  Model quantization [4, 7, 14, 30, 38, 42, 44] reduces both
+                                        1.69×-2.65× higher normalized inference throughput than                 GPU memory footprint and DRAM data access. It uses fewer
+                                        the FP16 baseline. The source code is publicly available at             bits to represent each model weight, resulting in a more com-
+                                        https://github.com/usyd-fsalab/fp6_llm.                                 pact representation of the model. However, only a small set of
+                                                                                                                bit-widths (i.e. 4-bit and 8-bit) are efficiently supported in ex-
+                                                                                                                isting systems [3, 14, 15, 26] on modern GPUs. Recent studies
+                                        1   Introduction                                                        show that 6-bit quantization is a good trade-off between in-
+                                                                                                                ference cost and model quality for LLM deployment [30, 35].
+                                        Large Language Models (LLMs) [1, 28, 32–34, 41] are                     However, there is still no efficient system support for the 6-bit
+                                        renowned for their capacity to process diverse language-                linear layer execution (i.e., matrix multiplication) on modern
+                                        related tasks [2, 9, 10, 27]. However, it is challenging to             GPUs. It is urgent to develop the system support for 6-bit
+                                        deploy LLMs as these models are also characterized by                   quantization fully leveraging the computing power of GPUs.
+                                        their expansive size, e.g., 175 billion parameter GPT-3 [1]                On one hand, more efficient LLM inference can be achieved
+                                        and 1.76 trillion parameter GPT-4 [28]. On one hand, it re-             with 6-bit quantization compared to larger-bit quantization
+                                        quires large amounts of GPU memory (326 GB for GPT-3                    (e.g., 8-bit). Firstly, more GPU memory can be saved, e.g.
+                                        in FP16) only to accommodate model weights, whereas an                  around 40 GB memory can be saved if deploying the GPT-3
+                                        A100/H100 GPU [20, 21] only has up to 80 GB memory. On                  model with 6-bit rather than 8-bit quantization. Secondly,
+                                        the other hand, LLM inference faces severe "memory wall"                LLM inference can be further accelerated as the time of
+                                        issues [12, 36] during token generation, where the speed of             reading model weights from GPU DRAM can be effec-
+                                        LLM inference is mainly limited by the time reading model               tively reduced. As shown in Figure 1, the linear layer im-
+                                        weights from GPU DRAM. It makes LLM inference memory                    plemented with our newly proposed 6-bit quantization system
+                                        bounded, under-utilizing the computational power of GPUs.               design (TC-FPx_W6A16) is constantly faster (up to 1.45×)
+
+
+                                                                                                           1
+than the state-of-the-art support for 8-bit quantization (Ten-           • We evaluate FP6-LLM on various LLM models and demon-
+sorRT_LLM_W8A16). On the other hand, 6-bit quantiza-                       strate that it substantially outperforms the baseline.
+tion can more effectively preserve model quality compared
+to smaller-bit quantization (e.g., 4-bit). Despite the potential
+shown by recent 4-bit techniques [6,39] in compressing LLMs              2     Background
+with minimal quality loss, they are predominantly geared
+towards zero-shot evaluations. Recent research [35] demon-               2.1     Quantization of Large Language Models
+strates that in tasks extending beyond zero-shot measurements,
+such as code generation and summarization, 4-bit methods                 Although large language models (LLMs) are known for
+underperform and lack robustness, whereas 6-bit quantiza-                their impressive performance, their large size also creates
+tion displays strong and consistent performance across these             challenges for model deployment. Thus, model quantiza-
+varied applications.                                                     tion [4,7,14,30,38,42,44] is commonly used for LLM deploy-
+   Motivated by the above observations, we propose TC-FPx,               ment, resulting in a more compact representation of the model.
+the first full-stack GPU system design scheme with unified               Weight-only quantization [7, 14] only reduces the precision of
+Tensor Core [20,21] support of float-point weights for various           model weights (e.g., INT8, using an 8-bit integer to represent
+quantization bit-width (6-bit, 5-bit, 3-bit, etc.), mitigating the       each weight) while still using an FP16 value to represent each
+"memory wall" issues during LLM inference. TC-FPx breaks                 activation. The major targets to be quantized are the weights
+the limitations of the underlying GPU hardware, allowing                 of linear layers (i.e., matrix multiplication), which account
+the GPU to support linear layer calculations involving model             for more than 99% of the overall LLM weights. The activa-
+weights of arbitrary bit width. In TC-FPx, Tensor Cores are              tions can also be quantized during inference [4, 38]. In this
+utilized for intensive computation of matrix multiplications,            paper, we describe the precision of Weights and Activations
+while SIMT cores are effectively leveraged for weight de-                with the term "WxAy", where x/y denotes the bit-width of
+quantization, transforming the x-bit model weights to FP16               weights/activations. Besides, the process of "dequantization"
+type during runtime before feeding them to Tensor Cores. We              refers to transforming the quantized weights back to FP16.
+propose Ahead-of-time Bit-level Pre-packing (Section 5.2)
+to resolve the challenge of unfriendly memory access for
+                                                                         2.2     IEEE Standard for Floating-Point
+weights with irregular bit-width (Section 4.2.1), enabling opti-
+mal GPU memory access. Besides, we propose SIMT-Efficient                The IEEE 754 float-point standard defines a binary format
+GPU Runtime (Section 5.3) to minimize the runtime overhead               for representing real numbers. Each floating point number
+of weight de-quantization (Section 4.2.2). Last but not least,           consists of three parts: the sign bit (S), the exponent bits (E),
+we present the software pipeline of TC-FPx kernel, where                 and the mantissa bits (M). The corresponding value f of a
+SIMT cores, Tensor Cores, and the GPU memory hierarchy                   float-point number can be calculated via:
+cooperate efficiently with high performance.
+   We integrate TC-FPx kernel into a state-of-the-art inference              f = (−1)S × (1.M) × 2E−bias ;       bias = 2len(E)−1 − 1 (1)
+system [19], providing new end-to-end support (called FP6-
+LLM) for quantized LLM inference, where better trade-offs                Please refer to [11] for details, where special cases for values
+between inference cost and model quality are achieved. Cur-              like infinity, zero, and NaN (Not a Number) are also defined.
+rently, FP6-LLM mainly supports 6-bit quantization (FP6) for
+popular LLMs such as LLaMA [32], OPT [41] with various
+sizes. Evaluations show that FP6-LLM enables the inference               2.3     Tensor Cores vs. SIMT Cores
+of LLaMA-70b using only a single GPU, achieving 1.69×-
+                                                                         SIMT cores 1 are responsible for general-purpose process-
+2.65× higher normalized inference throughput than the FP16
+                                                                         ing tasks in GPUs, which handle a wide range of instruc-
+baseline. Besides, FP6-LLM improves the inference through-
+                                                                         tions including integer operations, floating-point operations,
+put of OPT-30b by 1.72×-4.05×.
+                                                                         load/store operations, etc. SIMT cores execute scalar (or vec-
+In summary, we make the following contributions:
+                                                                         tor) instructions operating on individual (or vector) data el-
+• We identify the significance and key challenges in support-            ements. Tensor cores [20, 21] are specialized hardware de-
+  ing FP6 quantization on modern GPUs.                                   signed for accelerating matrix multiplication. Tensor cores
+• We propose TC-FPx, the first full-stack GPU kernel de-                 have 16.0×/14.8× higher FLOPS than SIMT cores on A100
+  sign scheme with unified Tensor Core support of float-point            [20]/H100 [21] GPUs. Besides, Tensor cores work at a coarse-
+  weights with various bit-width, e.g. FP6.                              grained granularity, e.g. performing a matrix multiplication
+                                                                         between two FP16 matrices of shape 16 × 16 and 16 × 8 with
+• We provide new end-to-end inference support for quantized              a single mma (matrix multiply and accumulate) instruction.
+  LLMs through the integration of TC-FPx, achieving better
+  trade-offs between inference cost and model quality.                       1 Or referred to as CUDA cores on NVIDIA GPUs.
+
+
+
+
+                                                                     2
+3    Motivations                                                                Table 1: Zero-shot evaluations, averaging over five datasets
+                                                                                including PTB [17], Wikitext [18], and C4 [29]. Metric: per-
+                                                                                plexity, lower is better.
+8-bit [4, 38] and 4-bit quantization [7, 14, 42] are the most
+widely applied schemes for the current post-training LLMs.                                                    FP16     FP6     INT4        INT4
+However, recent algorithmic research [30, 35] has demon-                            Fine-Grain Quantization      /      ✗         ✓           ✗
+strated that superior trade-offs between inference cost and                         LLaMA-1B                  24.13   24.83    564.73      288.22
+model quality can be achieved with FP6 quantization, com-                           LLaMA-13B                 13.16   13.09     14.19       14.13
+                                                                                    LLaMA-65B                  6.41    6.42      6.61        7.17
+pared to 8-bit and 4-bit quantization.
+   (I) Lower inference cost than 8-bit quantization. Com-                       Table 2: Code Generation in HumanEval-X (JavaScript) [43].
+pared to the 8-bit quantization, the cost of deploying LLMs
+can be further reduced through more aggressive 6-bit quanti-                                                   Metric: pass@1↑, higher is better
+zation without a visible accuracy drop. On one hand, the size                                                 FP16     FP6         INT4          INT4
+of LLM weights can be significantly reduced, nearly 2.7×                            Fine-Grain Quantization     /       ✗           ✓                 ✗
+smaller than the FP16 baseline. Less GPU memory is required                         CodeGeeX2-6B [43]         31.50   31.61        28.35            25.15
+to store model weights, thereby requiring fewer GPUs and                            StarCoder-15B [13]        33.67    33.6        32.32            32.18
+reducing the serving cost of deploying LLMs. On the other                           CodeLLaMA-34B [16]        45.05   44.51        43.22            43.45
+hand, 6-bit quantization can also more effectively accelerate
+the inference of LLMs. Given that the LLM inference is usu-
+ally memory-bounded2 during token generation, faster LLM                        4      Design Choices and Challenges
+inference can be achieved through reducing GPU DRAM
+access of the model weights. As shown in Figure 1, the ex-                      4.1       Design Choices
+ecution of the linear layer within llama-65b model [32] is
+consistently faster (up to 1.42× faster) with our newly pro-                    Although there is an increasing demand for high-performance
+posed 6-bit quantization system design (TC-FPx_W6A16)                           support of post-training FP6 quantization, currently there is
+compared to the state-of-the-art 8-bit quantization support                     no such efficient FP6-centric system design available that
+(TensorRT-LLM_W8A16 [26]). Given that linear layers are                         enables the aforementioned trade-offs against 4-bit and 8-bit
+the most time-consuming part of the large language models,                      quantization. Specifically, existing supports for linear layers
+this speedup will directly translate to performance improve-                    are mainly designed for data types whose bit-width is an
+ments for end-to-end inference scenarios (See Section 7.3).                     exponent of 2 (e.g., 4-bit, 8-bit, and 16-bit). Given that it is
+                                                                                not clear how to support FP6 efficiently on modern GPUs, we
+   (II) Better model quality than 4-bit quantization. Although                  illustrate two important design choices in this section.
+4-bit quantization more aggressively reduces memory foot-                          Necessity in enabling Tensor Cores. We find it essential to
+print and DRAM access, it unavoidably causes degradation in                     support Tensor Cores when performing inference of quantized
+model quality. In contrast, near-lossless model compression                     LLMs. For example, we have evaluated the performance of
+can be achieved with 6-bit quantization. As shown in Table 1                    AWQ’s [14, 15] pure SIMT-core execution on various batch
+and Table 2, FP6 displays strong and consistent performance                     sizes to test its scalability. As shown in Figure 1, the runtime
+across various tasks including code generation and zero-shot                    performance of linear layers without Tensor Core support
+perplexity performance. It also shows high robustness across                    (AWQ_W4A16_SIMT) becomes extremely low as the infer-
+various model sizes, e.g., 1B, 13B, and 65B LLaMA [32]                          ence batch size increases. The reason behind this is twofold.
+models. We also find that INT4 quantization heavily relies on                   On one hand, traditional SIMT cores are an order of magni-
+Fine-Grained Quantization (FGQ) methods to maintain high                        tude slower than Tensor Cores for linear layer execution as
+model quality, whereas our FP6 quantization already works                       described in Section 2.3. On the other hand, a large fraction
+well on coarse-grained quantization. Note that the data points                  of the SIMT core’s computational power will be used to de-
+in Table 1 and Table 2 are picked from [35]. For more details,                  quantize the model weights at runtime, which further reduces
+please refer to this paper. In conclusion, at algorithmic level,                the available computational power of SIMT cores for comput-
+FP6 quantization is a practical alternative to further democra-                 ing matrix multiplication. This motivates us to enable tensor
+tize the deployment of LLMs without significantly sacrificing                   cores for intensive computation of matrix multiplication while
+model quality on complex tasks and various model sizes.                         leveraging versatile SIMT cores for weight de-quantization.
+                                                                                   Unified kernel solution rather than dual kernels. The
+                                                                                unique character of WxA16 quantization is that the activation
+   2When the execution is memory-bounded, it means that the rate at which       matrices use FP16 but the weight matrices are stored in a
+data is transferred to or from the GPU’s memory is the bottleneck, rather       narrower bit-width. However, Tensor Cores require both the
+than the computational capabilities of the GPU cores.                           weights and activations matrices to be stored in the same
+
+
+                                                                            3
+                 W (FPx)   A (FP16)            W (FPx)      A (FP16)                8                     T0       T1    T2    T3              2*x bits
+                                                                                                          T4       T5    T6    T7
+                                                                                                                                            FP-x       FP-x
+
+
+
+
+                                                                              8
+      Kernel-1 De-quantization                 on-the-fly                                                 T8       T9    T10   T11
+                                               DeQuant                                                    T12      T13   T14   T15
+                                                                                                                                            Distributing a
+                      W’ (FP16)       Single                                                              T16      T17   T18   T19
+                                                     W’ (FP16)                                                                               submatrix to
+                                      Kernel                                            Weights
+                                                                                                          T20      T21   T22   T23
+                                                                                                                                            different GPU
+                                                                                                          T24      T25   T26   T27
+      Kernel-2     MatMul (FP16)                 MatMul (FP16)                          Matrix                                                  threads.
+                                                                                                          T28      T29   T30   T32
+
+
+                     O (FP16)                      O (FP16)                       Translating to Linear Memory Space                    X-bit Weight
+                                                                             0 1 2 3 4 5 6 7 … 8 9 101112131415 … 5657585960616263 …
+Figure 2: Two different methods to support weight-only                        T0 T1 T2 T3               T4 T5 T6 T7                  T28 T29 T30 T31
+WxA16 quantization during LLM inference. (Left) Dual ker-
+nels. (Right) Unified kernel.                                                (a) Required Data Layout of Tensor Cores Input. T0 Means Thread #0.
+
+                                                                                                  Two 6-bit Weights needed by Thread #4.
+                                                                             T0    T1   T2   T3     …    T4   T5    T6    T7    …     T28 T29 T30 T31     …
+data type, e.g. FP16/INT8/INT4. The straightforward solution
+(i.e., dual kernel solution) adds an extra GPU kernel that de-                  W1          W2             W3          W4                W15        W16
+quantizes the weights to FP16 before calling the normal FP16                 Aligned 32-bit Words       Aligned 32-bit Words          Aligned 32-bit Words
+kernel. However, such inference speed would be even slower                         (b) Accessing 6-bit weights at the granularity of 32-bit Words.
+than that of the model without quantization. As shown in
+Figure 2 (Left), two GPU kernels will be launched for the                  Figure 3: Memory Access of X-bit Weights for each Thread.
+linear layer execution, and the de-quantized FP16 weights
+will be written to GPU DRAM before being read by the
+second GPU kernel, resulting in 2× DRAM access. It is more                 threads’ registers3 , each thread must put the model weights
+efficient to fuse the de-quantization and the matrix-multiply              that are needed by itself to its private registers on its own.
+process into a single GPU kernel, eliminating the read/write               This process can become extremely challenging when the
+                                 ′
+of the de-quantized weights (W in FP16).                                   weights are stored with irregular bit-width (not 2n , e.g., 6 bit),
+                                                                           given the rigid data layout requirements of Tensor Cores. As
+                                                                           shown in Figure 3a, the minimal input of FP16 Tensor Cores
+4.2     Design Challenges                                                  is a 8 × 8 sub-matrix in modern GPU architecture, and each
+Given the design choices in Section 4.1, it is challenging to              GPU thread should hold a pair of weights in its register. In
+design a unified GPU kernel supporting FP6×FP16 matrix                     normal cases, each weight is stored with 16 bits, and each
+multiplication on modern GPUs. On one hand, modern GPU                     pair of weights can be naturally read from shared memory
+memory systems do not naturally support irregular bit-width                at the granularity of 32-bit words. However, each weight is
+(not an exponent of 2) because the minimal access size of                  stored with x-bits in our work4 , which makes memory access
+GPU global/shared memory is 8/32 bits per thread and the                   extremely unfriendly to modern GPU memory hierarchy.
+memory addresses to access must be aligned. The complex                       On-chip Memory Access with Unused Bits: We use 6-bit
+data layout requirement of Tensor Cores makes it even more                 quantization as an example to show the inefficiency in ac-
+challenging for irregular bit-widths. On the other hand, the               cessing weights with irregular bit-width. As shown in Figure
+de-quantization computation is expensive as it requires a large            3b, weights are already buffered in shared memory, and each
+amount of complex bit-level operations. Thus, how to fuse                  GPU thread needs to read a pair of weights (12 bits, 2 ∗ 6bits)
+the de-quantization into the linear layer computation without              from shared memory. However, shared memory has 32 mem-
+hurting the overall performance is also non-trivial.                       ory banks and each memory bank outputs a 32-bit word per
+                                                                           memory request on GPU. Thus, a large fraction of bits read
+                                                                           from shared memory will be unused, resulting in a signifi-
+4.2.1    Hardware-Unfriendly Memory Access
+                                                                           cant waste of shared memory bandwidth. For instance, T0
+During the execution of linear layers on modern GPUs, model                (Thread #0) in Figure 3b only needs 12 bits. However, a 32-
+weights should be loaded from DRAM to registers before the                 bit word (W1) will be read, resulting in 20 out of 32 bits
+corresponding multiplication calculations can be performed.                (62.5%) unused. The waste of unused bits can get even more
+Usually, the model weights are loaded in two steps, to hide the            severe due to the requirement of aligned memory access5
+high access latency of DRAM for high performance. Specifi-                 in modern GPU memory hierarchy. As shown in Figure 3b,
+cally, model weights are first loaded from GPU DRAM and                    the bits needed by T2 (Thread #2) are distributed in both W1
+buffered into on-chip memory (e.g., shared memory) for data                   3 Each GPU thread is allocated and owns a distinct portion of the whole
+reusing. After that, the buffered weights are then read from               registers available on GPU processors.
+shared memory to registers for the actual computation.                        4 Our design principles support not only 6-bit but also any other bit widths.
+
+  Given that each GPU thread cannot directly access other                     5 Memory access must be aligned, i.e., its address is a multiple of its size.
+
+
+
+
+                                                                       4
+and W2. Thus, T2 needs to read both W1 and W2, reading
+2 ∗ 32 bits from shared memory. However, only 6 ∗ 2 bits will                                            Tensor Core                             Tensor Core
+                                                                                                        mma                                    mma
+be eventually used, resulting in 52 out of 64 bits (81.25%)
+                                                                                                          Registers                               Registers
+unused and wasted. It is also worth noting that the memory
+management and access on GPU DRAM and registers suffer                                             Dequant [W]
+                                                                                                                                           Ldmatrix       Ldmatrix
+from similar problems due to the irregular bit-width.                                                     Registers                        [Weight]      [Activation]
+                                                                                                     Lds [W]       Ldmatrix [A]
+                                                                                                       Shared Memory                           Shared Memory
+
+
+
+
+                                                                                                                                                                  Async_Copy
+                                                                                                                            Async_Copy
+4.2.2        High Computation Overhead of De-quantization
+                                                                                                          L2 Cache                                L2 Cache
+The runtime overhead of FPx-FP16 de-quantization can be                                              W: FP-x      A: FP16                   W: FP16     A: FP16
+extremely high, which easily slows down the overall execu-                                             Global Memory                           Global Memory
+tion. On one hand, large amounts of model weights need to be
+                                                                                                      (a) TC-FPx Design.                 (b) Traditional GEMM Design.
+de-quantized at runtime, e.g. 70 billion FPx weights should
+be de-quantized for each LLM decoding step6 for LLaMA-                                                           Figure 4: Design Overview.
+70b [33] inference. On the other hand, the runtime overhead
+to de-quantize each FPx weight is high, requiring complex
+bit-wise operations. According to Equation 2, new sign, expo-                                that the FP16 weights are not written back to shared memory
+nent, and mantissa all need to be calculated during runtime,                                 but stored in registers for future use, eliminating unnecessary
+to obtain the FP16 with the equivalent value of a given FPx.                                 round-trip access to shared memory. Another difference is
+         f p16 −bias f p16                         f px −bias f px                           that TC-FPx loads x-bit weights from shared memory to regis-
+    2E                       × (1.M f p16 ) = 2E                     × (1.M f px ) (2)       ters using fine-grained lds (load shared) instructions instead
+                                                                           f px              of using the coarse-grained intrinsic ldmatrix (load matrix),
+In Equation 2, bias f p16 = 15 and bias f px = 2len(E )−1 − 1.                               which has a strict layout requirement and is less flexible.
+The sign field of the FP16 is identical to that of the FPx, and
+the mantissa of the FP16 can also be calculated by padding
+zeros to that of the FPx. What’s more, the exponent of FP16                                  5.2    Ahead-of-time Bit-level Pre-packing
+should be E f p16 = E f px + bias f p16 − bias f px , which is more
+computationally expensive. In summary, how to de-quantize                                    As described in Section 4.2.1, memory access to weights with
+FPx values efficiently also becomes a major challenge.                                       irregular bit-width is unfriendly to modern GPU memory hi-
+                                                                                             erarchy. To address this problem, we propose the insight that
+                                                                                             we can combine the memory read of every 32 x-bit weights,
+5        Design Methodology                                                                  resulting in x request of 4-byte word per GPU thread. In this
+                                                                                             case, all the memory access would be aligned at the granular-
+In this section, we first provide an overview of our designs                                 ity of 32-bit words rather than the irregular bit-width.
+in Section 5.1. To solve the challenge of unfriendly memory                                     However, it is not trivial to combine the memory read of
+access (Section 4.2.1), we propose Ahead-of-time Bit-level                                   weights due to the rigid data layout requirements of Tensor
+Pre-packing in Section 5.2. To deal with the challenge of                                    Cores, because the weights needed by each GPU thread are
+the high computational overhead of de-quantization (Section                                  not stored in continuous memory space. To solve this problem,
+4.2.2), we presented our designs to achieve SIMT-Efficient                                   we propose to optimize the runtime memory access pattern
+GPU Runtime in Section 5.3. At last, we presented our soft-                                  by reordering the weights within each weight matrix and
+ware pipeline designs in Section 5.4, where SIMT cores, Ten-                                 pre-pack the weights ahead of time. As model weights are
+sor Cores, and GPU memory hierarchy work collaboratively                                     statically determined after the model is trained and quantized,
+with full performance.                                                                       complicated memory layout transformation can be applied
+                                                                                             to the weights ahead of time and thus introduces no runtime
+5.1         Overview                                                                         overhead. Besides, we only need to pre-pack the weights once,
+                                                                                             thus the overhead of weight pre-packing can be effectively
+Figure 4 compares TC-FPx, the x-bit weight-only quantized
+                                                                                             amortized by each inference service and becomes negligible.
+linear layer kernel in our design, with the traditional design for
+                                                                                                In general, weight pre-packing consists of two steps. In
+general-purpose matrix multiplication (GEMM) where both
+                                                                                             the first step, we gather all the weights needed by each GPU
+input matrices are in FP16. The model weight is stored with
+                                                                                             thread and combine these weights locally. Given that the
+a reduced number of bits for TC-FPx. Consequently, an addi-
+                                                                                             weights needed by each GPU thread are not originally in con-
+tional de-quantization stage (Dequant W) is introduced at the
+                                                                                             tinuous locations (see Figure 3a) within each weight matrix,
+register level, where the FP6 weights are de-quantized to FP16
+                                                                                             we must pick the weights for each GPU thread carefully. The
+locally within each thread using SIMT cores. It is worth noting
+                                                                                             weights picked for each thread are then combined locally in
+    6 To generate a sequence with n tokens, n-1 decoding steps are required.                 relative temporal order as they are consumed by Tensor Cores
+
+
+                                                                                         5
+                   64                16        T0 T1 T2 T3 T0 T1 T2 T3
+                                                                                     memory space. During this bit-level pre-packing process, we
+                                               T4 T5 T6 T7 T4 T5 T6 T7
+                                               T8 T9 T10 T11 T8 T9 T10 T11
+                                               T12 T13 T14 T15 T12 T13 T14 T15
+                                                                                     consider the combined weights as continuous data to copy,
+                                               T16 T17 T18 T19 T16 T17 T18 T19
+                                               T20 T21 T22 T23 T20 T21 T22 T23
+                                                                                     temporarily ignoring the meaning of each bit. Specifically,
+                                               T24 T25 T26 T27 T24 T25 T26 T27
+
+                                          16
+                                               T28 T29 T30 T32 T28 T29 T30 T32       128 items with x-bit are considered as 4x items with 32 bits.
+     64                                        T0 T1 T2 T3 T0 T1 T2 T3
+                                               T4 T5 T6 T7 T4 T5 T6 T7
+                                               T8 T9 T10 T11 T8 T9 T10 T11              We propose to assemble the weights of all groups in the
+                                               T12 T13 T14 T15 T12 T13 T14 T15
+                                               T16 T17 T18 T19 T16 T17 T18 T19
+                                               T20 T21 T22 T23 T20 T21 T22 T23
+                                                                                     jagged order shown in Figure 5. To begin with, the first 32-
+                                               T24 T25 T26 T27 T24 T25 T26 T27
+                                               T28 T29 T30 T32 T28 T29 T30 T32
+                                                                                     bit item of each thread is concatenated together. After that,
+          A Tile of Weights        A Slice Inputs for a mma instruction              the second 32-bit item of each thread is concatenated and
+                                                                                     appended to the previous results. By repeating this process, all
+                        128 * [x bits]                  4x * [32 bits]
+                                                                                     weights can be stored continuously in a linear memory space
+             T0
+                                                                                     and well-aligned (128-byte aligned). In this way, all weights
+              T1                                                                     can be simply copied from DRAM to shared memory at the
+      Step1 T2
+                        ……                Step2
+                                                             ……                      granularity of 128-byte blocks without any changes, easily
+                                                                                     achieving optimal DRAM access. Besides, these weights can
+              T30                                                                    then be loaded from shared memory with optimal performance
+             T31                                                                     as well during runtime. Specifically, a WARP of threads will
+                                                                                     read consecutive 32-bit items in shared memory for each
+   Figure 5: Ahead-of-time Bit-level Weight Pre-packing.                             memory request, fully avoiding bank conflict.
+
+
+at runtime. In the second step, we combine all the weights                           5.3    SIMT-Efficient GPU Runtime
+needed by the whole GPU WARP (consisting of 32 GPU
+                                                                                     Parallel De-quantization To reduce the runtime overhead
+threads) into a unified linear memory space, in which order
+                                                                                     of FP-x weight de-quantization, we implemented FP-x de-
+the weights will be stored in GPU DRAM before runtime. To
+                                                                                     quantization with optimized bit-wise SIMT core instructions.
+fully eliminate shared memory bank conflict7 , we propose to
+                                                                                     Besides, we propose to de-quantize multiple FPx weights
+combine the 32-bit word of each thread in a jagged order.
+                                                                                     in parallel, further reducing the SIMT overhead by 4× by
+   It is worth noting that all the techniques discussed in this
+                                                                                     exploiting the bit-level parallelism within each 32-bit register.
+subsection are independent of the actual bit-width (denoted
+                                                                                        (1) Optimized Bit-wise Operations: As described in Sec-
+using x the whole time) of the model weights. Thus, our
+weight pre-packing can be naturally applied to any bit-width.                        tion 4.2.2, the exponent for FP16 should be E f p16 = E f px +
+                                                                                     bias f p16 − bias f px , when casting an FPx to the equivalent
+                                                                                     FP16. To simplify this process, we adopted the mathe-
+Step 1: Per-thread Weight Gathering Figure 5 demon-
+                                                                                     matical transformation in [35], calculating the exponent of
+strates the weights picked by T0 (Thread #0) and the order
+                                                                                     FP16 with E f p16 = E f px instead. To maintain correctness,
+to combine them. We suppose the WARP-level tiling size
+                                                                                     the result FP16 is then multiplied with the FP16 constant
+is 64 × 64, which means each weight matrix is divided into                                f p16    f px
+64 × 64 data tiles and loaded to GPU’s shared memory at this                         2bias −bias :
+granularity for each WARP. Each weight tile is then further                                                                            f p16 −bias f px
+                                                                                           cast(W f px ) = new_cast(W f px ) × 2bias                      .   (3)
+divided into four slices, as the weights are loaded from shared
+memory and used for Tensor Core computations on a slice-                             Fig.6a shows the optimized FP16 to FP6 conversion. Al-
+by-slice basis. What’s more, each slice is divided into four                         though we only draw the cast from FP6 to FP16 for demon-
+16 × 16 chunks, as Tensor Core processes 16 × 16 data items                          stration, it can be applied to any bit-width. The sign field of
+in each instruction. Within each 16 × 16 chunk, four pairs                           FP16 is identical to that of FPx. Besides, the lower bits of the
+of FPx weights are picked for T0 and combined. As shown                              exponent field and the higher bits of the mantissa field can
+in Figure 5, we get 32 (i.e., the WARP size) groups of FPx                           be copied from FPx to FP16 together for efficiency. What’s
+weights after Step 1. The weights are combined and stored                            more, other bits of FP16 should be padded with zeros.
+continuously within each group and each group of weights
+                                                                                        With careful designs, we succeeded in achieving cast from
+will be consumed by a certain GPU thread. In summary, each
+                                                                                     FP6 to FP16 with only two bit-wise "and", one "shifting", and
+64 × 64 weight tile is eventually assigned to 32 threads (a
+                                                                                     one "or" as shown in ❶ of Figure 6b. The sign field is copied
+WARP), and each thread will consume 128 x-bit weights.
+                                                                                     from FP6 to FP16 with the first "and" and all other bits of the
+                                                                                     FP16 are initialized to zeros at the same time eliminating the
+Step 2: Bit-level Assembling per WARP In Step 2, we                                  need to pad zeros to the exponent and mantissa fields later.
+assemble all the weights of different groups into a unified                          All bits of the FP6 are then shifted right with the bit-wise
+   7 Bank conflicts occur in shared memory when multiple threads access              "right shifting". After that, the lower bits of the exponent and
+data in the same memory bank simultaneously, leading to lower throughput.            the higher bits of the mantissa in FP6 are first selected via the
+
+
+                                                                                 6
+                                                        Slot 2           Slot 4                  Slot 1              Slot 3
+       S     E     M(1) S_[1] = S[1]            R1 1 2 3 4 5 6       1 2 3 4 5 6       1 2 3 4 5 6              1 2 3 4 5 6       R2 = R1 & 0x80808080
+       1 2 3 4 5 6 (2) S_[2:6] = S[2:4]+12                                                                                        R1 = R1 >> 2
+                    (3) S_[7:8] = S[5:6]                                                                                          R1 = R1 & 0x1f1f1f1f
+                    (4) S_[9:16] = 00…0                                                                                                              1
+                                                R2 1     2 3 4 5 6 1       2 3 4 5 6 1            2 3 4 5 6 1           2 3 4 5 6 R2 = R2 | R1
+       1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+                                                                                                                                  R1 = R2 & 0x9f009f00
+                                                R1 1     2 3 4 5 6                     1          2 3 4 5 6                       [#2 FP16, #1 FP16] 2
+                      (1) S_[1]    = S[1]
+       1 2 3 4 5 6    (2) S_[2:3] = 00
+                      (3) S_[4:8] = S[2:6]      R2                   1     2 3 4 5 6                            1       2 3 4 5 6 R2 =R2&0x009f009f 3
+                      (4) S_[9:16] = 00…0                                                                                         R2 = R2 << 8
+       1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16   R2 1     2 3 4 5 6                      1         2 3 4 5 6                       [#4 FP16, #3 FP16] 4
+
+           (a) Optimized FP6 to FP16 cast.                       (b) 4-Way parallel de-quantization within 32-bit registers.
+
+                                        Figure 6: SIMT-Efficient On-the-fly Parallel De-quantization.
+
+
+"and" between the FP6 and the bit mask "0x1f1f1f1f", and                               Int* Frag1_PTR
+                                                                                        # 2 # 6 # 10# 14 # 4 # 8 # 12# 16 # 1 # 5 # 9 # 13 # 3 # 7 # 11# 15
+then copied to the FP16 with the bit-wise operation "or".                               1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2
+   (2) Bit-level Parallelism: Given the insight that we can ex-                         1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2 1 2
+                                                                                       Int* Frag2_PTR
+ploit the bit-level parallelism within each 32-bit word, we                               #2      #6      #4      #8      #1      #5      #3      #7
+propose to de-quantize multiple FPx weights in parallel, fur-                           3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6
+                                                                                        3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6
+ther reducing the runtime overhead of de-quantization. The                              3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6
+detailed design is demonstrated in Figure 6b using FP6 as an                            3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6 3 4 5 6
+
+example. The 32-bit registers are treated as four processing                                                             Weight Extraction & Stitching
+                                                                                       #2                 #4                #1             #3
+slots, where each slot works independently with the same                           1 1 2                  1 2               1 2            1 2
+instruction but different input FP6 data. Before the start of                               #2              #4                #1             #3
+                                                                                   2 3456                 3 4 5 6           3 4 5 6        3 4 5 6
+de-quantization, four FP6 should be stored in R1 (Register #1)                     3   3 4 5 6                3 4 5 6           3 4 5 6        3 4 5 6
+with the initial data layout shown in the figure. With the code                    4 123456               1 2 3 4 5 6       1 2 3 4 5 6    1 2 3 4 5 6
+
+snippet ❶, these four FP6 can be simultaneously de-quantized
+into four FP16, where only the first 8 bits of each FP16 are                                     Figure 7: Parallel Weight Stitching.
+stored in R2. After that, the first and the second FP16 are
+extracted to R1 with their last 8 bits padded with zeros, with
+the code snippet ❷. Finally, with the code snippet ❸ and ❹,
+the third and the fourth FP16 are extracted to R2.                           Frag1_PT R points to two 32-bit registers containing 32 2-bit
+                                                                             segments while Frag2_PT R points to four 32-bit registers
+                                                                             containing 32 4-bit segments. With our parallel stitching, four
+Weight Split and Stitching We will then demonstrate the
+                                                                             FP6 weights are reconstructed simultaneously, reducing the
+method to efficiently reconstruct the 6-bit weights from the
+                                                                             number of SIMT core instructions by 4×. As shown in Figure
+2+4 scheme [35] on GPUs with a carefully designed memory
+                                                                             7, four 2-bit segments are first extracted to Register #1 (❶),
+layout, which can also be applied to other bit-width.
+                                                                             and four 4-bit segments are then extracted to Register #2 (❷).
+   (1) Ahead-of-time Weight Split: To store the weights in a
+                                                                             After that, Register #2 is right-shifted (❸) and its valid bits are
+well-aligned manner in GPU’s 32-bit registers, we split each
+                                                                             copied to Register #1 (❹), resulting in complete 6-bit weights.
+weight into several segments, where the bit-width of each
+segment is 2n , e.g. each 6-bit weight can be split into either                 (3) Bit Reordering: To extract and stitch the weight in par-
+2+4 or 4+2. Based on this scheme, the index calculations for                 allel, it is necessary to enforce the initial data layout in Figure
+the following designs are significantly simplified. Note that                7. The key observation is that each four continuous segments
+the techniques described in Section 5.2 can be applied to any                must be placed in the order shown in the figure, e.g. the first
+bit-width, thus the 2-bit and 4-bit segments can be pre-packed               four segments must be stored in the order of #2, #4, #1, and
+separately and efficiently according to Section 5.2.                         #3. Besides, the stride between each pair of 2/4-bit segments
+   (2) Runtime Weight Stitching: Before the de-quantization,                 should be 6/4, respectively. Otherwise, it is not possible to
+the weights are first loaded from shared memory to registers.                stitch four segments simultaneously with only four SIMT core
+As each weight is split into several segments, the complete                  instructions. To satisfy the initial data layout requirements in
+weights need to be reconstructed at the register level during                Figure 7, we propose to ensure this layout via reordering the
+runtime. To reduce this runtime overhead, we propose to                      weight segments before runtime with no runtime overhead.
+extract and stitch the weights in parallel. As shown in Figure               Besides, this technique is supposed to be superimposed on
+7, two sets of registers are used to store 32 FP6 weights, where             the technique described in Section 5.2 as an additional pass.
+
+
+                                                                         7
+Overall Pseudo Code Algorithm 1 shows the pseudo code                                                      Double Buffers Implemented with GPU Registers
+                                                                                                             A1          A0          B1          B0
+(GPU code) including both Parallel De-quantization and                                                          (1) Load Shared;
+                                                                                                                                         Load Matrix
+Weight Stitching. All the input and output variables in the                                                     (2) SIMT-efficient
+                                                                                                                                          (“ldmatrix”)
+                                                                                                                    De-quantization
+pseudo code are stored in registers. As demonstrated in Fig-                                                                                  BSlice
+ure 7, Algorithm 1 de-quantizes 32 FP6 weights in total. For
+
+
+
+
+                                                                                                            ASlice
+                                                                                                                       FP-x                      FP16
+each outer loop, four FP16 weights are generated and stored                                                           Weights                  Activation
+with two registers at the end of the code. The transformations
+                                                                                                            ATile [Shared Mem]          BTile [Shared Mem]           Tensor cores
+in Figure 7 (❶, ❷, ❸, and ❹) are achieved with the SIMT core
+operations of lines 6, 7, 9, and 10 in Algorithm 1, respectively.                                                         (a) Slice-by-slice De-quantization.
+The output register array (OutputReg) is then directly used by
+Tensor Cores as inputs.                                                                              cp.async                                                                cp.async
+                                                                                                                                           cp.async
+
+
+
+
+                                                                                   On-chip Buffers
+                                                                                                      A0         De-quant                  De-quant               Dequant
+Algorithm 1 Weight Stitching & De-quantization.                                                       A1                        De-quant               De-quant              Dequant
+ 1: Inputs: int Frag1_ptr[], int Frag2_ptr[], half Scales[]                                           B0             ldmatrix              ldmatrix               ldmatrix
+ 2: Output: int Out putReg[]                                                                          B1                        ldmatrix               ldmatrix              ldmatrix
+ 3: #pragma unroll                                                                                                                                                                      Time
+                                                                                                                                 mma        mma         mma        mma        mma
+ 4: for int i = 0; i < 8; i + + do                                                                                                k=0       k=1       k=2     k=3
+ 5:     //Weight Extraction                                                                  Initializing Pipeline                                                   More Loops…
+                                                                                                                                              1st Loop
+ 6:     unsigned int R1 = (∗Frag1_ptr)&0xc0c0c0c0;                    ▷❶                                Write/Read                Write/Read       Data         async_copy_barrier();
+                                                                                                        Shared                    Registers        Dependency    __sync_threads();
+ 7:     unsigned int R2 = (∗Frag2_ptr)&0x f 0 f 0 f 0 f 0;            ▷❷
+ 8:     //Weight Stitching                                                                                      (b) Space-time Diagram of the Kernel Pipeline.
+ 9:     R2 = R2 >> 2;                                                 ▷❸
+10:     R1 = R1|R2;                                                   ▷❹
+11:     //Advancing to next register or shifting current register.
+                                                                                                 Figure 8: Software Pipeline of TC-FPx GPU Kernel.
+12:     if i%4 == 3 then
+13:          Frag1_PT R + +;
+14:     else                                                                     each step, only a slice of FPx weights is loaded from shared
+15:          (∗Frag1_PT R) = (∗Frag1_PT R) << 2;
+                                                                                 memory to registers, de-quantized into FP16 weights with
+16:     if i%2 == 1 then
+17:          Frag2_PT R + +;
+                                                                                 SIMT-Efficient GPU Runtime (Section 5.3), and then stored in
+18:     else                                                                     the register buffer A1 or A2 as inputs for Tensor Cores. ASlice
+19:          (∗Frag2_PT R) = (∗Frag2_PT R) << 4;                                 and BSlice are then multiplied using Tensor Cores.
+20:     //4-Way Parallel de-quantization.                                           Compared to de-quantizing the whole tile at once, our slice-
+21:     ∗R2 = ∗R1&0x80808080;                                                    by-slice de-quantization reduces the number of registers re-
+22:     ∗R1 = ∗R1 >> 2;
+23:     ∗R1 = ∗R1&0x1 f 1 f 1 f 1 f ;                                            quired to store the FP16 weights by 4×, significantly reducing
+24:     ∗R2 = ∗R2| ∗ R1;                                                         register pressure. Besides, more opportunities are created for
+25:     ∗R1 = ∗R2&0x9 f 009 f 00;                                                instruction-level parallelism, since Censor Cores can be used
+26:     ∗R2 = ∗R2&0x009 f 009 f ;
+                                                                                 immediately for computations once a slice of weights is de-
+27:     ∗R2 = ∗R2 << 8;           ▷ R1 and R2 now each has 2 FP16 weights.
+28:     //Multiplying with quantization scales & Output to registers.            quantized, rather than waiting for the entire tile.
+29:     Out putReg[i ∗ 2] = Multiply(R1, Scales[i/2 ∗ 2]);
+30:     Out putReg[i ∗ 2 + 1] = Multiply(R1, Scales[i/2 ∗ 2 + 1]);
+                                                                                 Effective Overlapping The software pipeline is illustrated
+                                                                                 via the space-time diagram in Figure 8b, where SIMT cores
+                                                                                 (working on de-quantization), Tensor Cores (working on ma-
+5.4     Software Pipeline Design                                                 trix multiplication), and GPU memory hierarchy work collab-
+                                                                                 oratively, achieving high instruction-level parallelism.
+To reduce the usage of GPU registers, we de-quantize the                            Firstly, global memory read is executed asynchronously
+weights slice by slice. Besides, we seamlessly fuse the pro-                     using the cp.async [20] intrinsic, fully overlapped with other
+cess of de-quantization into the traditional software pipeline                   operations. Memory barrier and thread block synchronization
+of linear layer execution, completely hiding the runtime over-                   are issued after the third slice is processed (at the end of k=2),
+head of de-quantization via effective instruction parallelism.                   making sure that the data for the next main loop is ready in
+                                                                                 shared memory so that the "De-quant" (de-quantization) and
+Slice-by-slice De-quantization Instead of de-quantizing all                      the "ldmatrix" operations can be started when k=3.
+the weights at once, we de-quantize the FPx weights slice                           Secondly, shared memory read is also overlapped with ten-
+by slice. As shown in Figure 8a, we assume that an FPx                           sor core operations. When the ith slice is being computed,
+weights tile and an FP16 activation tile are already copied                      the data of the (i + 1)th slice are read from shared memory
+from DRAM to shared memory. The whole tile of weight                             simultaneously via "De-quant" and "ldmatrix".
+in shared memory is then de-quantized in several steps. In                          Last but not least, the SIMT core operations for weight
+
+
+                                                                             8
+de-quantization are also effectively overlapped with Tensor           Baselines. The baselines we compare include the W16A16
+Core operations. Within the "De-quant" process of the ith             kernels from cuBLAS [22] and the W8A16 kernels from
+slice, the FPx weights are first loaded from shared memory            TensorRT-LLM (commit: 6837c81) [26]. What’s more, we
+to registers using the hardware intrinsic load shared (LDS),          also include the W4A16 (FP4) support from BitsandBytes
+and then immediately de-quantized into FP16 weights with              (commit: f1ef74f) [3] as a baseline.
+SIMT cores. At the same time, Tensor Cores are computing
+the (i − 1)th slice with no data dependency.
+                                                                      Results. Figure 9 shows the latency speedups of TC-FPx
+                                                                      and other baselines. We use the performance of cuBLAS to
+6     Implementation                                                  normalize the performance of all GPU kernels. As shown
+                                                                      in Figure 9, TC-FPx outperforms BitsandBytes (W4A16),
+We implemented the TC-FPx kernel supporting matrix multi-             cuBLAS (W16A16), and TensorRT_LLM (W8A16, INT8
+ply C = A × B, where A is the weight matrix of shape [M, K]           weights) by up to 8.9×, 2.6×, and 1.9×. On average, TC-
+and B is the activation matrix of shape [K, N]. The weight            FPx outperforms BitsandBytes, cuBLAS and TensorRT_LLM
+matrices are stored in our customized format described in             by 7.6×/7.5×/6.6×, 2.2×/2.2×/2.0×, and 1.3×/1.3×/1.2×
+Section 5.2, and the input and output activation matrices are         when the batch size is 8/16/32, respectively.
+stored in column-major. Thus, our TC-FPx kernel could be a
+drop-in replacement of cuBLAS kernels in inference frame-             Performance Analysis With extensive kernel profiling, We
+works for quantized LLMs. Our GPU kernel is implemented               demonstrate the utilization8 of each GPU hardware unit and
+with more than 1.2K lines of CUDA codes, on top of the code           provide more in-depth insights into the source of our perfor-
+of Flash-LLM [37]. Our TC-FPx kernels could be compiled               mance improvements. During the execution of linear layers,
+separately into a .so dynamic link-able library, and we provide       as for the cuBLAS baseline, the DRAM bandwidth (shown
+a set of C++ APIs to call the kernels. Thus, our kernels could        as the yellow lines in Figure 10a) is almost exhausted (>80%)
+be easily used and integrated. Besides, we also provided C++          while the GPU Tensor Cores (shown as the yellow bar in Fig-
+APIs to pre-pack the weight matrices (See Section 5.2). More          ure 10a) are not fully used (<50%), when the inference batch
+importantly, we provide new system support for end-to-end             size is smaller than 128. It is a common issue during the infer-
+inference of quantized LLMs, by integrating our kernel into           ence of large language models caused by the auto-regressive
+the state-of-the-art inference framework DeepSpeed [19].              inference scheme of large language models. With our sup-
+                                                                      port of 6-bit quantization, the DRAM access is significantly
+7     Evaluation                                                      reduced (up to 2.7×), mitigating the bottleneck of insufficient
+                                                                      DRAM bandwidth. Consequently, the Tensor Cores can be
+We evaluate the performance at two levels: kernel-level bench-        more effectively utilized for matrix computations, shown as
+marking using TC-FPx GPU kernels and model-level end-to-              blue bars compared to yellow bars in Figure 10a. In summary,
+end inference using DeepSpeed integration (which we call              our kernel mitigated the "memory wall" issue and achieved
+FP6-LLM). The kernel-level evaluation is conducted on the             higher computational efficiency (higher utilization of Tensor
+NVIDIA A100-40GB platform with CUDA 11.8, and we                      Cores) by supporting 6-bit quantization on Tensor Cores.
+mainly evaluate the performance of linear layers within LLMs             Furthermore, it explains that our kernel can outperform
+during the token generation phase. The utilization of each            TensorRT-LLM’s W8A16 kernel because we are more effec-
+GPU hardware unit during runtime (Section 7.1) is measured            tive in reducing DRAM access of model weights. Note that
+using NVIDIA Nsight Compute [23]. For end-to-end eval-                the performance of our TC-FPx kernel, cuBLAS kernel, and
+uations, we conduct the inference of typical LLMs on the              TensorRT-LLM’s W8A16 kernel will eventually converge to
+NVIDIA A100-SXM4-80GB DGX platform with CUDA                          the same performance when the inference batch size is larger
+11.8. The inference latency and the latency breakdown (Sec-           (bigger than 128), as their performance will all be bounded
+tion 7.3) are measured using NVIDIA Nsight System [24].               by the peak computing power of Tensor Cores.
+                                                                         We also observed that BitsandBytes is constantly slower
+                                                                      than cuBLAS, which is 29.6% as fast as cuBLAS on aver-
+7.1    Linear Layer Speedups to 8-/16- bit                            age. After further investigation, we found that BitsandBytes
+                                                                      adopted the dual-kernel method (discussed in Section 4.1) to
+Workloads. We evaluate the performance of TC-FPx on
+                                                                      support FP4 quantization. During the execution of the first
+linear layers under different shapes, coming from the shapes
+                                                                      kernel, the FP4 model weights will be first loaded from global
+of the weight matrices within LLaMA models [32] (llama-7b,
+                                                                      memory, de-quantized into FP16, and then written back to
+llama-13b, llama-33b, and llama-65b) and OPT models [41]
+                                                                      global memory in the FP16 data type. After that, a normal
+(OPT-30b, OPT-65b, and OPT-175b). For each model, we
+evaluated the latency of each GPU kernel at three typical                8 "Utilization" typically refers to the degree to which a particular hardware
+
+inference batch sizes, i.e. 8, 16, and 32.                            resource is being actively used during the execution of a GPU kernel.
+
+
+                                                                  9
+                           BitsandBytes_W4A16_FP4                           cuBLAS_W16A16          TensorRT_LLM_W8A16               TC_FPx_W6A16
+ 2.5                Batch Size = 8
+   2
+ 1.5
+   1
+ 0.5
+   0
+ 2.5               Batch Size = 16
+   2
+ 1.5
+   1
+ 0.5
+   0
+ 2.5               Batch Size = 32
+   2
+ 1.5
+   1
+ 0.5
+   0
+                                  5k
+
+                                  5k
+
+
+
+
+                                  8k
+
+                                  5k
+           4k
+
+
+
+
+                                  5k
+
+
+
+
+                                  5k
+
+
+
+
+                                    k
+
+                                  5k
+
+                                  8k
+
+
+
+
+                                  7k
+
+
+
+
+                                  7k
+
+                                  8k
+
+                                  9k
+
+
+
+
+                                  9k
+
+
+                        36 k
+
+                        12 k
+
+                        48 k
+
+                        12 k
+
+                                   k
+                                   k
+
+
+
+
+                                   k
+                                  4k
+
+                                   k
+
+
+
+
+                                   k
+
+
+
+
+                                   k
+
+
+
+
+                                   k
+
+
+
+
+                                   k
+                                *4
+
+
+
+
+                                 .5
+                                75
+
+
+
+
+                                *5
+
+
+
+
+                                  5
+
+
+
+
+                                *8
+
+
+
+
+                                *7
+
+
+
+
+                                *9
+
+
+
+
+                                  6
+
+                                12
+
+                                12
+
+                                12
+
+                                48
+         k*
+
+
+
+
+                               k*
+
+
+
+
+                               6.
+
+
+
+
+                               6.
+
+                               7.
+
+                               k*
+
+
+
+
+                               k*
+
+
+
+
+                               k*
+
+                              *2
+
+                               k*
+
+
+
+
+                               k*
+
+                              *3
+                               k*
+
+                               3.
+
+
+
+
+                               k*
+
+                               1.
+                              k*
+
+
+
+
+                             *6
+                             4k
+
+
+
+
+                             5k
+
+
+
+
+                             8k
+
+
+
+
+                             7k
+
+
+
+
+                             9k
+
+
+
+
+                             k*
+
+                             k*
+
+                             k*
+
+                             k*
+                             0.
+
+
+
+
+                           *1
+
+
+
+
+                           *2
+                            k*
+
+
+
+
+                            k*
+
+                           *1
+   12
+
+
+
+
+                           15
+
+
+
+
+                           24
+
+
+
+
+                           21
+
+
+
+
+                           28
+
+
+
+
+                           27
+
+
+
+
+                           36
+                            .5
+
+
+
+
+                            .5
+                             5
+
+
+
+
+                           7k
+
+
+
+
+                           9k
+                          5k
+                          *1
+                          .7
+
+
+
+
+                       13
+
+
+
+
+                       21
+                         .5
+
+
+
+
+                         .5
+                       5k
+
+
+
+
+                       8k
+                        5k
+                      6.
+                         10
+
+                     4k
+
+
+
+
+                     19
+
+
+
+
+                     17
+
+
+
+
+                         Llama-7b                Llama-13b              Llama-33b      Llama-65b         OPT-30b          OPT-66b          OPT-175b
+                     6.
+
+
+
+
+                                        Figure 9: Linear layer speedups compared to the baselines for token generation phase.
+
+
+                   TC_cuBLAS        TC_TC-FPx        DRAM_cuBLAS         DRAM_TC-FPx         the utilization of the FMA unit is increased from 0.33% to
+                   100
+   Utilization %
+
+
+
+
+                    80                                                                       16.64%. Given that both ALU and FMA units are part of the
+                    60
+                    40                                                                       SIMT cores, the de-quantization operations will not consume
+                    20                                                                       the computing power of Tensor Cores. More importantly, the
+                     0
+                              1     8       16       32     64    128     256    512         runtime overhead of SIMT cores can be effectively hidden by
+           (a) Tensor core and DRAM utilization at different batch sizes.                    overlapping these SIMT instructions with other operations,
+                                                                                             with our novel designs described in Section 5.4.
+                   ALU_cuBLAS           ALU_TC-FPx        FMA_cuBLAS      FMA_TC-FPx
+   Utilization %
+
+
+
+
+                   40
+                   30                                                                        7.2   Performance Comparison to 4-bit
+                   20
+                   10                                                                        Workloads As described in Section 3, 6-bit quantization is
+                    0
+                                                                                             more appealing than 4-bit quantization in terms of preserving
+                           1       8        16       32     64    128      256   512
+                   (b) ALU and FMA unit utilization at different batch sizes.
+                                                                                             model quality. However, we still compare the performance
+                                                                                             of our W6A16 kernels to the state-of-the-art W4A16 kernels,
+                               Figure 10: Performance Analysis.                              fully demonstrating that our 6-bit quantization can achieve
+                                                                                             comparable inference speed to the existing 4-bit quantization
+                                                                                             methods. We evaluate the performance of the linear layers
+cuBLAS kernel is launched computing the matrix multipli-                                     within the LLaMA-65b model [32] under different batch sizes.
+cation as the second kernel. Thus, the FP4 GPU kernel is
+always slower than the original FP16 cuBLAS kernel due to                                    Baselines The major baselines here include the W4A16
+the overhead of the extra GPU kernel for FP4 de-quantization.                                support of row-wise quantization (Coarse-grained_W4A16)
+                                                                                             and the W4A16 support of group-wise quantization (Fine-
+Analysis of on-the-fly De-quantization Figure 10b shows                                      grained_W4A16) from TensorRT-LLM [26] (commit:
+the overhead of FP6-to-FP16 de-quantization in two aspects.                                  6837c81) with state-of-the-art performance. We also include
+On one hand, the FP6-to-FP16 de-quantization introduces                                      cuBLAS [22] here as the performance baseline, clearly show-
+a significant number of bit-wise operations even with our                                    ing the benefits of each quantization method.
+SIMT-efficient designs. As a result, the utilization of the Arith-
+metic/Logic Unit (ALU) has increased from 6.36% to 38.8%                                     Results Figure 11 shows the latency speedups of TC-FPx
+on average. It is also strong evidence that the SIMT-efficient                               and other baselines running four different linear layers (i.g.
+designs (Section 5.3) for de-quantization are essential. On the                              L1, L2, L3, and L4) within the LLaMA-65b models. We use
+other hand, the FP6-to-FP16 de-quantization also introduces                                  cuBLAS’ performance to normalize the performance of other
+more float-point multiplications, computing the multiplication                               GPU kernels. As shown in Figure 11, TC-FPx_W6A16, Fine-
+between the weights and the quantization scales. On average,                                 grained_W4A16, and Coarse-grained_W4A16 outperform
+
+
+                                                                                        10
+        cuBLAS_W16A16                TC-FPx_W6A16
+        Fine-grained_W4A16           Coarse-grained_W4A16                               300                                                 MatMul          MHA           NCCL       Others
+                                                                                                      FP6-LLM - 1GPU                       200
+ 3                                                                                      250           FP16 - 2GPU
+
+
+
+
+                                                                       Token / GPU-Second
+                                                                                                                                           150
+ 2                                                                                      200
+
+
+
+
+                                                                                                                                     Tims (s)
+                                                                                                                                           100
+ 1                                                                                      150
+                                                                                                                                                 50
+ 0                                                                                      100
+     L1 L2 L3 L4 Sum L1 L2 L3 L4 Sum L1 L2 L3 L4 Sum                                                                                             0
+                                                                                            50
+       Batch Size = 8 Batch Size = 16 Batch Size = 32                                                                                                 1 2 4 8 1632 1 2 4 8 1632
+                                                                                             0                                                              FP16               FP6-LLM
+                                                                                                  1    2       4       8   16   32                         2 GPU                1 GPU
+Figure 11: Linear layer speedups compared to using 4-bit                                     (a) Generation throughput.                 (b) Inference latency breakdown.
+weights for token generation phase of the LLaMA-65b model.
+                                                                       Figure 12: LLaMA-70b inference at different batch sizes. Mat-
+                                                                       Mul: linear layers, implemented with cuBLAS or our TC-FPx;
+cuBLAS_W16A16 by up to 2.4×, 3.0×, and 3.3×. More                      MHA: multi-head attention; NCCL: cross-GPU communica-
+importantly, TC-FPx achieves similar performance with Fine-            tions; Others: other GPU kernels or GPU idle time.
+grained_W4A16, which is 1.06×/1.04×/0.94× faster than
+Fine-grained_W4A16 when running all these linear layers at
+batch size 8/16/32, respectively. Besides, TC-FPx is only 16%                               350                                                 MatMul       MHA          NCCL       Others
+                                                                                                      FP6-LLM - 1GPU                            80
+/ 17% / 24% slower than Coarse-grained_W4A16 at batch size                                  300       FP16 - 1GPU
+
+
+
+                                                                       Token / GPU-Second
+8/16/32. Since 6-bit quantization can provide significantly                                 250                                                  60
+
+
+
+
+                                                                                                                                      Tims (s)
+higher model quality, it is a worthwhile trade-off.                                         200                                                  40
+                                                                                            150                                                  20
+                                                                                            100
+7.3    End2End Inference                                                                                                                          0
+                                                                                            50                                                        1    2      4   1    2     4   8 16
+Workloads We evaluate the end-to-end inference perfor-                                       0                                                             FP16            FP6-LLM
+mance of FP6-LLM on large language models of vari-                                                1        2       4       8    16                        1 GPU             1 GPU
+ous model sizes, i.g. LLaMA-13b [33], OPT-30b [41], and                                      (a) Generation throughput.                 (b) Inference latency breakdown.
+LLaMA-70b [33]. For each model, we evaluated its token
+generation throughput at different batch sizes, starting from 1                             Figure 13: OPT-30b inference at different batch sizes.
+until GPU memory is exhausted.
+                                                                       model for the FP16 baseline, since the model weights (≈ 130
+Metric. We use the metric tokens per GPU-second to in-                 GB) can not be fit into a single GPU.
+dicate the normalized inference throughput with the consid-
+eration of both execution time and hardware cost (i.e., the
+number of GPUs used). It is calculated with this equation:             LLaMA-70b Figure 12a shows token generation through-
+                                                                       put on the LLaMA-70b model using our FP6-LLM (FP6-
+                                          Ntoken                       LLM-1GPU) and the FP16 baseline (FP16-2GPU). Accord-
+           In f erence_Per f ormance =     N
+                                                            (4)
+                                           GPU
+                                         ∑i=1  Ti                      ing to our experiments, both our FP6-LLM and FP16 baseline
+                                                                       can at most set the inference batch size to 32 before running
+Ntoken means the number of tokens generated, whereas NGPU              out of GPU memory, whereas FP6-LLM only requires a sin-
+and Ti mean the GPU number and the time spent on the i’th              gle GPU and the baseline uses two GPUs. The results show
+GPU for execution. We use this metric to evaluate the end-to-          that FP6-LLM can achieve 1.69×-2.65× higher normalized
+end inference performance in this section.                             inference throughput than the FP16 baseline.
+                                                                          We conduct a careful latency breakdown of this end-to-end
+Settings and Baselines We set the prefill/prompt length                inference process. As shown in Figure 12b, our TC-FPx ker-
+of each request to 0.5K, and generate 1.5K tokens for each             nel (used in FP6-LLM) is 1.20× faster than cuBLAS kernel
+request ignoring the "EOS" (end of sequence) token. We inte-           (used in FP16 baseline) on average, even with half number
+grate our TC-FPx kernel into DeepSpeed [19] for end-to-end             of GPUs. Besides, the NCCL [25] overhead (cross-GPU com-
+evaluation and call this new system support FP6-LLM. The               munications) is fully avoided using FP6-LLM since only a
+baseline for comparison is the FP16 execution of the original          single GPU is required. We also notice that the FP16 base-
+DeepSpeed system. With our FP6-LLM, only a single 80GB                 line has accelerated the computation of MHA (multi-head
+A100 GPU is used for the inference for all the workloads,              attention) with 2-way tensor parallelism [31]. Overall, our
+including the LLaMA-70b model [33]. In contrast, two 80GB              FP6-LLM achieves up to 2.65× higher throughput than the
+A100 GPUs are used for the inference of the LLaMA-70b                  FP16 baseline as for tokens per GPU-second.
+
+
+                                                                  11
+                                                                                                         superiority in accuracy and versatility. Besides, [30] verified
+                     700                                       MatMul       MHA    NCCL    Others
+                               FP6-LLM - 1GPU                 100                                        that the FP6 data format can closely match FP32 for infer-
+                     600       FP16 - 1GPU
+Token / GPU-Second
+
+
+
+
+                                                                   80                                    ence after quantization-aware fine-tuning. However, there is
+                     500
+
+
+
+
+                                                        Tims (s)
+                                                                   60                                    no hardware support for the proposed data types. Their in-
+                     400
+                                                                   40                                    ference/training experiments can only be done via software
+                     300
+                                                                   20                                    emulations. FP6-LLM can provide high-performance GPU
+                     200                                           0                                     support for the inference of LLMs after FP6 quantization.
+                     100                                                1 2 4 8 1632 1 2 4 8 1632
+                      0                                                     FP16       FP6-LLM
+                           1    2   4   8   16     32                      1 GPU        1 GPU            System Supports for Quantization TensorRT-LLM [26]
+                      (a) Generation throughput.           (b) Inference latency breakdown.              has state-of-the-art kernel supports for weight-only quanti-
+                                                                                                         zation. However, it only supports weights in INT4 (W4A16
+    Figure 14: LLaMA-13b inference at different batch sizes.                                             [7,14]) or INT8 (W8A16 and W8A8 [38]) data types while we
+                                                                                                         provide better trade-offs by supporting weights in 6 bits. Be-
+                                                                                                         sides, TensorRT-LLM does not support float-point data type
+OPT-30b Figure 13a shows token generation throughput                                                     (e.g. FP6), which is much more complicated to de-quantize
+on the OPT-30b model using FP6-LLM (FP6-LLM-1GPU)                                                        during runtime than the integer type. Bitsandbytes [3] mainly
+and the FP16 baseline (FP16-1GPU). According to our ex-                                                  supports INT8 weights (W8A8) and has very naive support
+periments, FP6-LLM can at most set the inference batch size                                              for FP4 (W4A16) with poor performance. Llama.cpp [8] has
+to 16 before running out of GPU memory while the FP16                                                    2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit quantization support
+baseline can at most serve 4 requests in a batch. As a result,                                           on CPUs or GPU SIMT cores. However, it does not support
+FP6-LLM can at most achieve 319.1 tokens per GPU-second                                                  weights in float point data type and it can not make use of
+(4.05× higher) with batch size 16 while the FP16 baseline                                                GPU tensor cores. AWQ [14] has GPU kernel implemen-
+can at most achieve 78.8 tokens per GPU-second with batch                                                tation [15] for memory-efficient 4-bit Linear (W4A16) in
+size 4, given the same GPU budget. Besides, FP6-LLM can                                                  PyTorch. OPTQ [7] has a basic GEMV implementation [5]
+achieve 1.91×/1.84×/1.72× higher generation throughput                                                   for weights in INT3 (W3A16) data type. To the best of our
+compared to the FP16 baseline when their batch sizes are set                                             knowledge, this work is the first system supporting weight-
+to 1/2/4. These overall performance improvements mainly                                                  only quantization with FP6 weights on Tensor cores.
+come from the reduction of time in executing linear layers.
+As shown in Figure 13b, TC-FPx kernel is 2.39× faster than
+the FP16 cuBLAS kernel on average.                                                                       Related Design Techniques [40] and [35] has previously
+                                                                                                         proposed 4+2 weight split. However, they only presented intu-
+                                                                                                         itive thoughts without comprehensive system designs. Flash-
+LLaMA-13b Figure 14a shows the token generation                                                          LLM [36] has proposed the load-as-sparse and compute-as-
+throughput on the LLaMA-13b model using FP6-LLM (FP6-                                                    dense approach for the weight-only-pruning. It does not tackle
+LLM-1GPU) and the FP16 baseline (FP16-1GPU). According                                                   the problems of supporting quantization.
+to the experiments, FP6-LLM and the FP16 baseline can at
+most set the inference batch size to 32 before running out of
+memory. On average, FP6-LLM can achieve 1.23× higher                                                     9   Conclusions
+generation throughput compared to the FP16 baseline using
+the same batch size. The overall performance improvements                                                In this paper, we introduce TC-FPx, the first full-stack GPU
+on this model are less significant compared to the previous                                              kernel design scheme with unified tensor core support for
+two models due to the non-kernel overhead. According to                                                  float-point weights of various quantization bit-width, miti-
+Figure 14b, the execution time of linear layers has been sig-                                            gating the "memory wall" issues during LLM inference. We
+nificantly reduced (2.11× faster on average) with TC-FPx                                                 integrate TC-FPx kernel into a state-of-the-art inference sys-
+kernel. However, the portion of running other GPU kernels                                                tem, providing new end-to-end support (called FP6-LLM) for
+plus the GPU idle time increases, weakening the overall per-                                             quantized LLM inference, where better trade-offs between
+formance gains. The reason is that GPUs tend to have a larger                                            inference cost and model quality are achieved. FP6-LLM tack-
+proportion of idle time due to kernel launch latency and GPU                                             les the problems of hardware-unfriendly memory access and
+synchronizations as the model size gets smaller.                                                         high computation overhead of de-quantization with a set of
+                                                                                                         novel techniques, achieving faster inference speed with signif-
+                                                                                                         icantly less GPU memory. Evaluations show that FP6-LLM
+8                     Related Work                                                                       enables the inference of LLaMA-70b using only a single GPU,
+                                                                                                         achieving 1.69×-2.65× higher normalized inference through-
+Six-bit Quantization [35] shows that FP6 performs ro-                                                    put than the FP16 baseline. Besides, FP6-LLM improves the
+bustly across various algorithms and tasks, demonstrating its                                            inference throughput of OPT-30b by 1.72×-4.05×.
+
+
+                                                                                                    12
+References                                                           [13] Raymond Li, Loubna Ben Allal, Yangtian Zi, Niklas
+                                                                          Muennighoff, Denis Kocetkov, Chenghao Mou, Marc
+ [1] Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie                     Marone, Christopher Akiki, Jia Li, Jenny Chim, Qian
+     Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind                     Liu, Evgenii Zheltonozhskii, Terry Yue Zhuo, Thomas
+     Neelakantan, Pranav Shyam, Girish Sastry, Amanda                     Wang, Olivier Dehaene, Mishig Davaadorj, Joel Lamy-
+     Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen               Poirier, João Monteiro, Oleh Shliazhko, Nicolas Gon-
+     Krueger, Tom Henighan, Rewon Child, Aditya Ramesh,                   tier, Nicholas Meade, Armel Zebaze, Ming-Ho Yee, Lo-
+     Daniel M. Ziegler, Jeffrey Wu, Clemens Winter, Christo-              gesh Kumar Umapathi, Jian Zhu, Benjamin Lipkin, Muh-
+     pher Hesse, Mark Chen, Eric Sigler, Mateusz Litwin,                  tasham Oblokulov, Zhiruo Wang, Rudra Murthy, Ja-
+     Scott Gray, Benjamin Chess, Jack Clark, Christopher                  son Stillerman, Siva Sankalp Patel, Dmitry Abulkhanov,
+     Berner, Sam McCandlish, Alec Radford, Ilya Sutskever,                Marco Zocca, Manan Dey, Zhihan Zhang, Nour Fahmy,
+     and Dario Amodei. Language models are few-shot learn-                Urvashi Bhattacharyya, Wenhao Yu, Swayam Singh,
+     ers, 2020.                                                           Sasha Luccioni, Paulo Villegas, Maxim Kunakov, Fe-
+                                                                          dor Zhdanov, Manuel Romero, Tony Lee, Nadav Timor,
+ [2] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan,
+                                                                          Jennifer Ding, Claire Schlesinger, Hailey Schoelkopf,
+     Henrique Ponde de Oliveira Pinto, Jared Kaplan, Harri
+                                                                          Jan Ebert, Tri Dao, Mayank Mishra, Alex Gu, Jen-
+     Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman,
+                                                                          nifer Robinson, Carolyn Jane Anderson, Brendan Dolan-
+     et al. Evaluating large language models trained on code.
+                                                                          Gavitt, Danish Contractor, Siva Reddy, Daniel Fried,
+     arXiv preprint arXiv:2107.03374, 2021.
+                                                                          Dzmitry Bahdanau, Yacine Jernite, Carlos Muñoz Fer-
+ [3] Tim Dettmers. bitsandbytes. "https://github.com/                     randis, Sean Hughes, Thomas Wolf, Arjun Guha, Lean-
+     TimDettmers/bitsandbytes", 2023.                                     dro von Werra, and Harm de Vries. Starcoder: may the
+                                                                          source be with you!, 2023.
+ [4] Tim Dettmers, Mike Lewis, Younes Belkada, and Luke
+     Zettlemoyer. Llm.int8(): 8-bit matrix multiplication for        [14] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Xingyu
+     transformers at scale, 2022.                                         Dang, Chuang Gan, and Song Han. Awq: Activation-
+                                                                          aware weight quantization for llm compression and ac-
+ [5] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan              celeration, 2023.
+     Alistarh. gptq. "https://github.com/IST-DASLab/
+     gptq", 2022.                                                    [15] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Xingyu
+                                                                          Dang, and Song Han. llm-awq. "https://github.
+ [6] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan
+                                                                          com/mit-han-lab/llm-awq", 2023.
+     Alistarh. Gptq: Accurate post-training quantization
+     for generative pre-trained transformers. arXiv preprint
+                                                                     [16] Bingchang Liu, Chaoyu Chen, Cong Liao, Zi Gong,
+     arXiv:2210.17323, 2022.
+                                                                          Huan Wang, Zhichao Lei, Ming Liang, Dajun Chen,
+ [7] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan              Min Shen, Hailian Zhou, Hang Yu, and Jianguo Li. Mft-
+     Alistarh. Optq: Accurate quantization for generative                 coder: Boosting code llms with multitask fine-tuning.
+     pre-trained transformers. In The Eleventh International              arXiv preprint arXiv, 2023.
+     Conference on Learning Representations, 2022.
+                                                                     [17] Mary Ann Marcinkiewicz. Building a large annotated
+ [8] Georgi Gerganov. llama.cpp. "https://github.com/                     corpus of english: The penn treebank. Using Large
+     ggerganov/llama.cpp", 2023.                                          Corpora, page 273, 1994.
+
+ [9] Github. Copilot. "https://github.com/features/                  [18] Stephen Merity, Caiming Xiong, James Bradbury, and
+     copilot", 2022.                                                      Richard Socher. Pointer sentinel mixture models. In
+                                                                          International Conference on Learning Representations,
+[10] Google. Bard. "https://bard.google.com/", 2023.
+                                                                          2017.
+[11] William Kahan. Ieee standard 754 for binary floating-
+     point arithmetic. Lecture Notes on the Status of IEEE,          [19] Microsoft. Deepspeed github. "https://github.com/
+     754(94720-1776):11, 1996.                                            microsoft/DeepSpeed", 2023.
+
+[12] Sehoon Kim, Coleman Hooper, Thanakul Wattanawong,               [20] NVIDIA.     Nvidia a100 tensor core gpu ar-
+     Minwoo Kang, Ruohan Yan, Hasan Genc, Grace Dinh,                     chitecture.     "https://images.nvidia.com/
+     Qijing Huang, Kurt Keutzer, Michael W Mahoney, et al.                aem-dam/en-zz/Solutions/data-center/
+     Full stack optimization of transformer inference: a sur-             nvidia-ampere-architecture-whitepaper.pdf",
+     vey. arXiv preprint arXiv:2302.14017, 2023.                          2020.
+
+
+                                                                13
+[21] NVIDIA.     Nvidia h100 tensor core gpu archi-                      [33] Hugo Touvron, Louis Martin, Kevin Stone, Peter Al-
+     tecture. "https://www.hpctech.co.jp/catalog/                             bert, Amjad Almahairi, Yasmine Babaei, Nikolay Bash-
+     gtc22-whitepaper-hopper_v1.01.pdf", 2022.                                lykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale,
+                                                                              Dan Bikel, Lukas Blecher, Cristian Canton Ferrer, Moya
+[22] NVIDIA. cublas. "https://developer.nvidia.                               Chen, Guillem Cucurull, David Esiobu, Jude Fernan-
+     com/cublas", 2023.                                                       des, Jeremy Fu, Wenyin Fu, Brian Fuller, Cynthia Gao,
+                                                                              Vedanuj Goswami, Naman Goyal, Anthony Hartshorn,
+[23] NVIDIA.       Nsight compute profiling guide.
+                                                                              Saghar Hosseini, Rui Hou, Hakan Inan, Marcin Kardas,
+     "https://docs.nvidia.com/nsight-compute/
+                                                                              Viktor Kerkez, Madian Khabsa, Isabel Kloumann, Artem
+     ProfilingGuide/#introduction", 2023.
+                                                                              Korenev, Punit Singh Koura, Marie-Anne Lachaux,
+[24] NVIDIA. Nsight system. "https://developer.                               Thibaut Lavril, Jenya Lee, Diana Liskovich, Yinghai Lu,
+     nvidia.com/nsight-systems", 2023.                                        Yuning Mao, Xavier Martinet, Todor Mihaylov, Pushkar
+                                                                              Mishra, Igor Molybog, Yixin Nie, Andrew Poulton,
+[25] NVIDIA. Nvidia collective communications library                         Jeremy Reizenstein, Rashi Rungta, Kalyan Saladi, Alan
+     (nccl). "https://developer.nvidia.com/nccl",                             Schelten, Ruan Silva, Eric Michael Smith, Ranjan Sub-
+     2023.                                                                    ramanian, Xiaoqing Ellen Tan, Binh Tang, Ross Taylor,
+                                                                              Adina Williams, Jian Xiang Kuan, Puxin Xu, Zheng
+[26] NVIDIA. Tensorrt-llm. "https://github.com/                               Yan, Iliyan Zarov, Yuchen Zhang, Angela Fan, Melanie
+     NVIDIA/TensorRT-LLM/", 2023.                                             Kambadur, Sharan Narang, Aurelien Rodriguez, Robert
+                                                                              Stojnic, Sergey Edunov, and Thomas Scialom. Llama 2:
+[27] OpenAI. Chatgpt.         "https://openai.com/blog/
+                                                                              Open foundation and fine-tuned chat models, 2023.
+     chatgpt", 2022.
+                                                                         [34] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+[28] OpenAI. Gpt-4 technical report, 2023.                                    Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser,
+[29] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine                      and Illia Polosukhin. Attention is all you need. Advances
+     Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei                      in neural information processing systems, 30, 2017.
+     Li, and Peter J Liu. Exploring the limits of transfer learn-        [35] Xiaoxia Wu, Haojun Xia, Stephen Youn, Zhen Zheng,
+     ing with a unified text-to-text transformer. The Journal                 Shiyang Chen, Arash Bakhtiari, Michael Wyatt, Yux-
+     of Machine Learning Research, 21(1):5485–5551, 2020.                     iong He, Olatunji Ruwase, Leon Song, and Zhewei Yao.
+[30] Bita Darvish Rouhani, Ritchie Zhao, Ankit More,                          Zeroquant(4+2): Redefining llms quantization with a
+     Mathew Hall, Alireza Khodamoradi, Summer Deng,                           new fp6-centric strategy for diverse generative tasks.
+     Dhruv Choudhary, Marius Cornea, Eric Dellinger,                          arXiv preprint arXiv: 2312.08583, 2023.
+     Kristof Denolf, Stosic Dusan, Venmugil Elango, Maxi-                [36] Haojun Xia, Zhen Zheng, Yuchao Li, Donglin Zhuang,
+     milian Golub, Alexander Heinecke, Phil James-Roxby,                      Zhongzhu Zhou, Xiafei Qiu, Yong Li, Wei Lin, and
+     Dharmesh Jani, Gaurav Kolhe, Martin Langhammer,                          Shuaiwen Leon Song. Flash-llm: Enabling cost-
+     Ada Li, Levi Melnick, Maral Mesmakhosroshahi, An-                        effective and highly-efficient large generative model
+     dres Rodriguez, Michael Schulte, Rasoul Shafipour, Lei                   inference with unstructured sparsity. Proc. VLDB En-
+     Shao, Michael Siu, Pradeep Dubey, Paulius Micikevi-                      dow., 17(2):211–224, oct 2023.
+     cius, Maxim Naumov, Colin Verrilli, Ralph Wittig, Doug
+     Burger, and Eric Chung. Microscaling data formats for               [37] Haojun Xia, Zhen Zheng, Yuchao Li, Donglin Zhuang,
+     deep learning, 2023.                                                     Zhongzhu Zhou, Xiafei Qiu, Yong Li, Wei Lin, and
+                                                                              Shuaiwen Leon Song. Flash-llm github. "https://
+[31] Mohammad Shoeybi, Mostofa Patwary, Raul Puri,                            github.com/AlibabaResearch/flash-llm", 2023.
+     Patrick LeGresley, Jared Casper, and Bryan Catanzaro.
+     Megatron-lm: Training multi-billion parameter lan-                  [38] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu,
+     guage models using model parallelism. arXiv preprint                     Julien Demouth, and Song Han. Smoothquant: Accu-
+     arXiv:1909.08053, 2019.                                                  rate and efficient post-training quantization for large
+                                                                              language models, 2023.
+[32] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier
+     Martinet, Marie-Anne Lachaux, Timothée Lacroix, Bap-                [39] Zhewei Yao, Xiaoxia Wu, Cheng Li, Stephen Youn, and
+     tiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar,                   Yuxiong He. Zeroquant-v2: Exploring post-training
+     Aurelien Rodriguez, Armand Joulin, Edouard Grave,                        quantization in llms from comprehensive study to low
+     and Guillaume Lample. Llama: Open and efficient foun-                    rank compensation. arXiv preprint arXiv:2303.08302,
+     dation language models, 2023.                                            2023.
+
+
+                                                                    14
+[40] Zhewei Yao, Xiaoxia Wu, Cheng Li, Stephen Youn, and
+     Yuxiong He. Zeroquant-v2: Exploring post-training
+     quantization in llms from comprehensive study to low
+     rank compensation, 2023.
+[41] Susan Zhang, Stephen Roller, Naman Goyal, Mikel
+     Artetxe, Moya Chen, Shuohui Chen, Christopher De-
+     wan, Mona Diab, Xian Li, Xi Victoria Lin, Todor Mi-
+     haylov, Myle Ott, Sam Shleifer, Kurt Shuster, Daniel
+     Simig, Punit Singh Koura, Anjali Sridhar, Tianlu Wang,
+     and Luke Zettlemoyer. Opt: Open pre-trained trans-
+     former language models, 2022.
+
+[42] Yilong Zhao, Chien-Yu Lin, Kan Zhu, Zihao Ye, Lequn
+     Chen, Size Zheng, Luis Ceze, Arvind Krishnamurthy,
+     Tianqi Chen, and Baris Kasikci. Atom: Low-bit quanti-
+     zation for efficient and accurate llm serving, 2023.
+[43] Qinkai Zheng, Xiao Xia, Xu Zou, Yuxiao Dong, Shan
+     Wang, Yufei Xue, Zihan Wang, Lei Shen, Andi Wang,
+     Yang Li, Teng Su, Zhilin Yang, and Jie Tang. Codegeex:
+     A pre-trained model for code generation with multilin-
+     gual evaluations on humaneval-x. In KDD, 2023.
+[44] Xunyu Zhu, Jian Li, Yong Liu, Can Ma, and Weiping
+     Wang. A survey on model compression for large lan-
+     guage models. arXiv preprint arXiv:2308.07633, 2023.
+
+
+
+
+                                                              15
+

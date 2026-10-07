@@ -1,0 +1,937 @@
+                                              FGMP: Fine-Grained Mixed-Precision Weight and Activation
+                                                Quantization for Hardware-Accelerated LLM Inference
+                                                             Coleman Hooper1,2∗ , Charbel Sakr1 , Ben Keller1 , Rangharajan Venkatesan1 ,
+                                                                         Kurt Keutzer2 , Sophia Shao2 , Brucek Khailany1
+                                                                                       1 NVIDIA, 2 University of California, Berkeley
+
+
+                                         Abstract
+                                         Quantization is a powerful tool to improve large language model
+                                         (LLM) inference efficiency by utilizing more energy-efficient low-
+                                         precision datapaths and reducing memory footprint. However, ac-
+arXiv:2504.14152v1 [cs.AR] 19 Apr 2025
+
+
+
+
+                                         curately quantizing LLM weights and activations to low preci-
+                                         sion is challenging without degrading model accuracy. We pro-
+                                         pose fine-grained mixed precision (FGMP) quantization, a post-
+                                         training mixed-precision quantization methodology that maintains
+                                         accuracy while quantizing the majority of weights and activations
+                                         to reduced precision. We co-design hardware which exploits the
+                                         mixed-precision data representation to achieve greater energy effi-
+                                         ciency and which quantizes activations to mixed precision on the
+                                         fly. Our work makes the following contributions: 1) We develop a
+                                         policy that uses the perturbation in each value, weighted by the
+                                         Fisher information, to select which weight and activation blocks
+                                         to keep in higher precision. This approach preserves accuracy by
+                                         identifying which weight and activation blocks need to be retained          Figure 1: Perplexity degradation (less is better) versus com-
+                                         in higher precision to minimize the perturbation in the model loss.         pression rate (higher is better), evaluated using Llama-2-7B
+                                         2) We also propose a sensitivity-weighted clipping approach for             on Wikitext-103 with 4-bit weight-activation quantization.
+                                         fine-grained quantization which helps retain accuracy for blocks            Compression rate is computed as 16 divided by the aver-
+                                         that are quantized to low precision. 3) We then propose hardware            age bit width for weights and activations (assuming 4K con-
+                                         augmentations to leverage the efficiency benefits of FGMP quan-             text length). We group prior work into algorithm-only ap-
+                                         tization. Our hardware implementation encompasses i) datapath               proaches that use integer quantization (“Algo.”), prior work
+                                         support for FGMP at block granularity, and ii) a mixed-precision            on microscaling quantization (“𝜇scale”), and prior methods
+                                         activation quantization unit to assign activation blocks to high or         for mixed-precision quantization (“MP”). Our method, FGMP,
+                                         low precision on the fly with minimal runtime and energy overhead.          (shown here with 70%, 80%, and 90% of blocks in FP4) at-
+                                         Our design, prototyped using NVFP4 (an FP4 format with microscal-           tains reduced perplexity degradation relative to existing post-
+                                         ing) as the low-precision datatype and FP8 as the high-precision            training quantization methods.1
+                                         datatype, facilitates efficient FGMP quantization, attaining <1%            data with recent LLMs can make QAT difficult and motivates post-
+                                         perplexity degradation on Wikitext-103 for the Llama-2-7B model             training quantization (PTQ) approaches [10, 16]. In this paper, we
+                                         relative to an all-FP8 baseline design while consuming 14% less             explore techniques to improve PTQ inference accuracy.
+                                         energy during inference and requiring 30% less weight memory.                   Using low precision (e.g. 4-bit) quantization for weights and
+                                                                                                                     activations for LLMs is desirable since it allows the use of energy-
+                                         1    Introduction                                                           efficient low-precision compute datapaths (in addition to mem-
+                                         Large language models (LLMs) are scaling rapidly in both model              ory savings). However, accurate post-training quantization with
+                                         size and computational requirements, which makes it challenging to          weights and activations in 4-bit precision is challenging; prior works
+                                         efficiently perform inference using these networks. One approach            still have substantial accuracy degradation when quantizing to low
+                                         for reducing both computational and memory requirements for                 precision for both weights and activations [2, 19, 26, 32]. The rea-
+                                         LLM inference is quantization of model weights and activations to           son that these methods struggle to retain accuracy in aggressive
+                                         low-precision number formats. However, aggressive quantization              regimes like 4-bit quantization is due to challenges with numerical
+                                         of all weights and activations is challenging due to the presence of        outliers which skew the quantization range [6, 7, 15], as well as
+                                         data particularly sensitive to perturbations, such as large-magnitude       disproportionately sensitive values [15]. To address this challenge,
+                                         outliers in weights and activations. Quantization-aware training            previous works have applied mixed-precision quantization, where a
+                                         (QAT) may be employed to mitigate these perturbations [13, 20];             mixture of high-precision and low-precision quantization is used
+                                         however, the costs of re-training and unavailability of training            to preserve accuracy by retaining particularly sensitive or hard to
+                                                                                                                     1 Note that 6-bit configurations are reported for [26, 32] since the corresponding W4A4
+                                                                                                                     configurations have greater than 1 PPL loss, and [26, 35] quantize the KV cache
+                                         ∗ Work done during internship at NVIDIA                                     activations in addition to the linear layers.
+                                                                                                                 1
+            Activation
+
+                                             Weight
+
+
+ Block Size BS
+
+
+                                        BS
+                                    1
+                    FP8             Large impact on      FP8
+                                     model output
+    1               FP4
+                                                                                              Dot Product Dimension
+                                    Small impact on
+                                     model output        FP4
+   a) FGMP Visualization                                         b) Sample block precision assignments with our policy
+
+Figure 2: a) Diagram outlining our approach for FGMP quantization at block granularity. We quantize both weights and
+activations to mixed precision, preserving sensitive blocks in higher precision (FP8) and quantizing the rest to low precision
+(NVFP4). b) Visualization of a slice of the activation and weight precision assignments for Layer 7 Fully Connected 1 (“FC1”) in
+the Llama-2-7B model using our policy with 10% of blocks in FP8 and with our sensitivity-weighted clipping method applied.
+The NVFP4 and FP8 blocks are interleaved in an unstructured manner.
+quantize parts of the network in higher precision [1, 35]. However,          majority of blocks. We pursue FGMP quantization where the major-
+existing methods typically perform coarse-grained mixed precision            ity of LLM weights and activations are quantized to low precision
+(e.g., at the granularity of rows of a matrix [1, 35]). As oulined in        (e.g. FP4), with only a small percentage of values kept in higher
+Figure 2, the distribution of sensitive and hard-to-quantize values is       precision (e.g. FP8). As outlined in Figure 2, we quantize the weights
+unstructured in both LLM weights and activations; existing coarse-           and activations at block granularity. We use microscaling, which
+grained mixed-precision quantization methods cannot fully adapt              defines a fine-grained scaling factor as metadata for each block of
+to these unstructured distributions.                                         data, to reduce quantization error for the blocks that are quantized
+   Our work addresses the challenges with existing mixed-precision           to low precision. Microscaling has been shown to enable more ac-
+quantization methods by leveraging fine-grained mixed-precision              curate low-precision quantization [5, 24] with minimal hardware
+(FGMP) quantization, in which we identify small, contiguous re-              overhead. Specifically, we leverage NVFP4 [21] as our low-precision
+gions of hard-to-quantize weights and activations to be retained in          datatype in order to accurately quantize each block to reduced preci-
+a higher-precision data format while the majority of weights and             sion. Additionally, we propose hardware augmentations to support
+activations are quantized to a lower-precision format. We pursue             FGMP at block granularity while performing the majority of compu-
+mixed-precision quantization at much finer block granularity. We             tation using low-precision datapaths. Figure 1 highlights how our
+define a block as a small (<100 elements) 1-dimensional vector along         methodology achieves reduced perplexity degradation for the same
+the dot product dimension of each tensor (as in [12]). We perform            compression ratio relative to existing work on weight/activation
+FGMP quantization by independently assigning each block to either            quantization. As highlighted in Section 5.4, utilizing low-precision
+a higher-precision or lower-precision data format (see Figure 2).            datapaths also provides distinct energy savings, with NVFP4 dat-
+This provides improved accuracy since it allows for more flexible            apaths with microscaling consuming 33% less energy than FP8.
+precision assignment, adapting to different distributions of sensitive       Our prototype demonstrates the efficiency benefits of our FGMP
+values (both inter-layer and intra-layer). However, although FGMP            methodology.
+is a promising approach for maintaining model accuracy with the                 Our work makes the following contributions:
+majority of values in reduced precision, it is challenging to leverage
+the potential efficiency benefits due to the difficulty of performing
+computation using different precisions for adjacent blocks. There                (1) We develop a policy to determine which blocks of weights
+are also distinct challenges with applying FGMP quantization to                      and activations need to be retained in higher precision. We
+activations, as we need to be able to efficiently identify hard-to-                  leverage sensitivity information with respect to the final
+quantize activation blocks online during inference to quantize the                   model output to determine which blocks can be quantized
+output activations of each layer. Even if we leveraged low-precision                 to reduced precision without degrading the accuracy of the
+datapaths for the majority of computations, software implementa-                     network. Importantly, we ensure that this saliency policy is
+tions for dynamically selecting precisions when quantizing blocks                    computationally efficient and can be computed on-the-fly
+of activations may be impractical.                                                   for activations, thereby allowing for fast mixed-precision
+   Our work aims to address these challenges through hardware-                       activation quantization.
+software co-design in order to enable fine-grained mixed-precision               (2) We also design a fine-grained weight clipping strategy to
+quantization while supporting low-precision computation for the                      improve the representation capacity for the blocks that
+                                                                                     are retained in lower precision. We tune the scale factor
+                                                                         2
+          for each low-precision block to minimize the impact of             In this work, we aim to perform post-training weight-activation
+          quantizing the block on the model’s output.                        quantization in order to exploit low-precision compute units, while
+      (3) We co-design the hardware to accelerate FGMP quantiza-             maintaining accuracy through retaining a small portion of blocks
+          tion: i) We adapt a Vector Multiply-Accumulate (VMAC)              in higher precision.
+          datapath to allow for performing mixed-precision dot prod-
+          ucts at 1D block granularity. Our datapath design supports
+          FGMP quantization for both weights and activations. ii) We         2.2    Mixed-Precision Quantization
+          also design a mixed-precision activation quantization unit         Several works have noted the presence of distinct outliers in both
+          to assign activation blocks to low or high precision on the        weights and activations, which significantly increase quantization
+          fly based on runtime statistics, thereby allowing for dynam-       difficulty [4, 6, 7, 15]. Previous works have split LLM weight matri-
+          ically identifying and preserving regions of the activations       ces into a dense low-precision matrix and an unstructured sparse
+          that are challenging to quantize in higher precision.              high-precision matrix, which is used to accurately store numerical
+   By leveraging our FGMP quantization method with NVFP4 and                 outliers and highly sensitive values [4, 7, 15]. Although these ap-
+FP8 as the low and high precision number formats, we are able                proaches achieved high accuracy with low memory consumption
+to attain the efficiency benefits of low-precision quantization for          for weight quantization, they cannot be easily applied for activa-
+LLM inference while maintaining accuracy. For the Llama-2-7B                 tion quantization and they lead to efficiency overheads in use cases
+model, we attain 14% energy savings in dot product computations              that are not memory bandwidth-bound. [12] employed fine-grained
+during inference with < 1% accuracy degradation (measured as                 mixed-precision quantization at the 1D block granularity for LLM
+perplexity on Wikitext-103). Figure 1 also demonstrates how our              weights by leveraging sensitivity information, demonstrating the
+method acheives less perplexity degradation for a target compres-            advantages of exploiting sensitivity information when determining
+sion ratio relative to prior methods. Our approach also requires 30%         which blocks to retain in higher precision. However, this work was
+less parameter memory than serving the model in FP8, enabling                restricted to weight-only quantization, and was therefore unable to
+the serving of a larger model with the same memory budget.                   leverage standard low-precision compute datapaths.
+                                                                                 There have also been previous works on coarse-grained struc-
+                                                                             tured mixed precision, in which a fixed block of the matrix is kept
+2     Related Work
+                                                                             in higher precision, and the remainder of the matrix is quantized
+This section outlines prior work relevant to FGMP quantization.              to low precision. Several prior works have assigned different preci-
+We first provide an overview of prior work on quantizing both                sions to different layers (aiming to preserve more sensitive layers
+weights and activations in LLMs. We then discuss previous efforts            in higher precision) [8, 9, 30, 34]. Other works have performed
+to leverage mixed-precision quantization to improve accuracy with            structured mixed-precision quantization by preserving a subset of
+low-precision quantization. Finally, we include a discussion of ex-          input channels in higher precision. [6] preserved large-magnitude
+isting hardware support for mixed-precision quantization.                    activation input channels (and the corresponding input channels in
+                                                                             weights) in high precision, while quantizing the remaining values.
+2.1     LLM Quantization                                                     [1, 35] reordered input channels in order to group large-magnitude
+Quantization is a popular model compression method to improve                activation channels together at the end of the matrix, and then left
+inference efficiency. Most existing quantization strategies have em-         a portion of the input channels at the end of the matrix in higher
+ployed either integer or floating-point quantization [10, 17]. More          precision for both weights and activations. These works were able
+complex non-uniform quantization schemes allow for more flexible             to leverage low-precision datapaths for part of the computation
+quantizaton signpost placement compared to integer and floating-             since they quantize both weights and activations. However, these
+point quantization [15]; however, since quantization signposts are           methods were unable to adapt to the unstructured nature of impor-
+no longer uniformly placed, quantized values must first be dequan-           tant values in weights and activations. In contrast, our fine-grained
+tized and computation must be performed in higher precision. Prior           mixed-precision approach can adapt to unstructured sensitive val-
+work has also leveraged microscaling in order to enable accurate             ues in both weights and activations, while still performing the
+low-precision quantization [5, 24]. Microscaling formats leverage a          majority of computation using low precision datapaths.
+fine-grained scaling factor for each block, which better preserves               There have also been prior works which searched for the opti-
+the values in the block by adjusting the represented range.                  mal mixed-precision configuration, either by using reinforcement
+   Typical quantization methods for LLMs have performed either               learning [30] or by formulated the search as a Neural Architecture
+weight-only [10, 17] or weight-activation [1, 26] quantization. In the       Search problem [31]. However, existing automatic mixed precision
+weight-only regime, prior methods have been able to maintain high            search methods are challenging to apply for LLMs, as these methods
+accuracy while compressing the model to 4-bit quantization; how-             require repeated evaluation of the network with different precision
+ever, these approaches cannot utilize standard low-precision com-            configurations for each layer, which can be prohibitively expensive.
+pute datapaths, as they still represented activations using higher           Additionally, these approaches have previously been applied for
+precision. In the weight-activation regime, it is possible to leverage       layer wise mixed precision. With mixed precision at the 1D block
+low-precision compute datapaths to attain higher energy efficiency.          granularity, the search space of potential precision assignments is
+However, existing methods have struggled to retain accuracy in this          much greater than the layer wise precision assignment problem. It
+regime due to the challenges of accurately quantizing both weights           is therefore infeasible to leverage existing automatic methods to
+and activations to low precision without retraining [19, 26, 32].            search for the optimal fine-grained mixed precision assignment.
+                                                                         3
+2.3      Hardware Support for Mixed-Precision                                                 the perturbation in the model output, which is desirable for main-
+         Quantization                                                                         taining accuracy.
+                                                                                                 When we quantize an activation or weight value 𝑣 to precision
+Several prior works have investigated methods for adding archi-
+                                                                                              𝑝 using quantization function 𝑄 𝑝 , we will express the quantization
+tecture support for representing numerical outliers in order to
+                                                                                              error at precision 𝑝, Δ𝑝 𝑣, as follows:
+improve low-precision quantization. GOBO [33] combines outlier-
+aware quantization with non-uniform quantization for better low-
+precision representation. However, this approach requires sepa-                                                         Δ𝑝 𝑣 = 𝑄 𝑝 (𝑣) − 𝑣                       (2)
+rately loading outliers and dense values (as the sparse values are                               In order to perform FGMP quantization, we first develop a policy
+stored in a separate sparse matrix), as well as separate datapaths                            to determine which weights and activations need to be retained in
+for outlier processing. OLIVE [11] employs an outlier-aware encod-                            higher precision to preserve model accuracy. While our experimen-
+ing, storing outlier values across multiple positions (sacrificing the                        tal results in this work leverage FP8 and NVFP4 as the higher and
+neighboring dense values). They repurposed one of the 16 repre-                               lower precision number formats, respectively, our precision assign-
+sentative 4-bit values to indicate whether an outlier is present in                           ment policy developed in this section is generalizable to any choice
+a neighboring value, which amounts to an overhead of 1 bit per 4                              of high-precision and low-precision formats. We calibrate offline
+elements. This has the benefit of allowing for a structured data stor-                        for a target sensitivity level above which the block is preserved in
+age format, but it negatively impacts the representation of nearby                            higher precision, and we apply a single threshold across different
+values. One concurrent work, MicroScopiQ [23], also retains outlier                           layers to allocate more high-precision blocks to more sensitive lay-
+values in higher precision by pruning out a portion of non-outlier                            ers. Finally, we develop a fine-grained weight clipping approach
+values and repurposing the saved bits to represent the outliers in                            to improve the quantized representation of low-precision blocks
+higher precision. SPARK [18] employs a variable-precision encod-                              with microscaling. Taken together, our methodology facilitates ac-
+ing scheme where large and small magnitude values are encoded                                 curate fine-grained mixed-precision quantization with only a small
+with different precisions, and a bit at the start of each element                             portion of blocks retained in higher precision.
+indicates which precision is stored in that location. This requires
+per-element metadata (eg. a bit for each low-precision element) to                            3.1    Precision Assignment Policy
+mark whether that element is in low or high precision. Both OLIVE                             Our precision assignment policy determines which blocks to keep
+and SPARK [11, 18] employ decoder modules at the boundary of a                                in higher precision in order to avoid degrading the accuracy of the
+systolic array in order to decode their compact data format into a                            model. We can avoid this accuracy degradation by minimizing the
+format that can be fed into an array of processing elements. While                            degradation in the model’s loss L when the weights and activations
+these works perform decoding at the per-element level, we instead                             are perturbed. We first consider how the loss is affected by pertur-
+implement FGMP at block granularity. This dramatically reduces                                bation in a single weight or activation value 𝑣 at a given layer 𝑙. The
+metadata overhead compared to the per-element approach by amor-                               loss can be expressed using Taylor expansion as follows (neglecting
+tizing the cost of the metadata across all elements in a block (so for                        higher-order terms), where the gradient 𝑔 is the derivative of the
+a block size of 16, it requires only a single bit per 16 elements) and                        loss with respect to the corresponding value, 𝜕𝜕𝑣L :
+only requires performing a comparison with a single bit per block
+rather than performing per-element comparisons. FGMP greatly
+improves the efficiency of the hardware implementation by amor-                                                 L (𝑄 (𝑣)) = L (𝑣) + 𝑔 × Δ𝑣 + . . .               (3)
+tizing control overhead and enabling the use of efficient vector                                 To minimize the expected degradation in model loss, we therefore
+multiply-accumulate operations, while still providing sufficiently                            study the minimization of the following expression:
+fine granularity to maintain high accuracy.
+
+                                                                                                       E𝑣 |L (𝑣) − L (𝑄 (𝑣))| 2 = E𝑣 𝑔2 × (Δ𝑣) 2
+                                                                                                                                              
+3     Fine-Grained Mixed-Precision Quantization                                                                                                                  (4)
+                                                                                                                                 = E𝑣 𝑔2 × E𝑣 (Δ𝑣) 2
+                                                                                                                                                  
+In this work, we focus on joint weight / activation quantization,                                                                                                (5)
+specifically targeting the linear layers in LLM matrices, where a                                Equation 5 holds under the assumption that 𝑔 and Δ𝑣 are inde-
+weight matrix W and activation matrix X are multiplied in order to                            pendent, meaning that the impact of perturbation in each weight
+compute the output Y, i.e. Y = W × X.2 The model is composed of                               or activation value on the model loss is independent
+𝐿 layers, and the weights and activations for layer 𝑙 will be denoted                                                                               of the pertur-
+                                                                                              bations in other values [25]. The expression E𝑣 𝑔2 corresponds
+as W (𝑙 ) and X (𝑙 ) , respectively. The model is trained by optimizing                       to the diagonal Fisher information matrix. Empirically, this can be
+in order to reduce its loss L, which is a function of both the weights                        evaluated by averaging the squares of the gradients over a set of
+and the activations corresponding to a given input data, as well as                           calibration data. For weight matrices, we calculate this by averag-
+the ground truth labels corresponding to this data:                                           ing the squared gradients over a sample dataset 𝐷 (in our case, 512
+                                                                                              samples of sequence length 512 from the Wikitext-103 training set).
+                   L ({X (𝑙 ) }𝑙=1
+                               𝐿
+                                   , {W (𝑙 ) }𝑙=1
+                                              𝐿
+                                                  )             (1)                           Since activation values are dynamic during inference, we do not
+  By minimizing the increase in the loss due to perturbation from                             have access to their gradients at runtime. We instead use the aver-
+quantizing the weights and activations, we can thereby minimize                               age of the square of the gradients for each input channel (computed
+2 Throughout this work, we use capital boldface letters to refer to matrices and lower-       offline on the calibration set) to estimate per-channel sensitivity for
+case boldface letters to refer to 1D blocks.                                                  activations. For the remainder of the section, we will assume that
+                                                                                          4
+gradients have been calibrated, and consequently, expectations are             threshold across the entire model (one for weights and one for
+implied.                                                                       activations). Since our sensitivity-weighted policy for precision
+   Considering a one-dimensional block v (either an activation or              assignment estimates the impact that quantizing the block will
+weight block in layer 𝑙) containing 𝑁 elements, we can express the             have on the final model output, it is already normalized across
+impact 𝐼 L of quantizing the block v on the model’s loss as the sum            different layers (meaning that we can use the same threshold across
+of the sensitivity-weighted quantization error for each element 𝑣𝑖             different layers in the network even if they have different average
+in v (ignoring layer indices):                                                 magnitudes). This allows for preserving a different proportion of
+                                                                               sensitive blocks for particular layers which have a greater or lesser
+                                      𝑁
+                                      ∑︁                                       impact on the final model loss. For a target mixed-precision ratio 𝑅,
+                         𝐼 L (v) =          𝑔𝑖2 (Δ𝑣𝑖 ) 2             (6)       we therefore set threshold 𝑇𝑔𝑙𝑜𝑏𝑎𝑙 to be the 𝑅-th percentile of the
+                                      𝑖=1
+                                                                               impact score 𝐼 L′ (v), computed over all blocks across all weight or
+   The above metric is used as a ranking mechanism to identify the
+most sensitive blocks, which are then preferentially kept in higher            activation tensors W (𝑙 ) or X (𝑙 ) (across all layers):
+precision. The increase in error for value 𝑣 when it is quantized in
+                                                                                                                  ′
+low precision 𝑝𝑙 rather than high precision 𝑝ℎ can be expressed as                              𝑇𝑔𝑙𝑜𝑏𝑎𝑙 = 𝑃𝑅 ({{𝐼 L (v ( 𝑗 ) )} 𝐽𝑗=1
+                                                                                                                                  𝑙   𝐿
+                                                                                                                                     }𝑙=1 )      (10)
+follows:
+                                                                                  Note that this threshold is computed separately for weights and
+                      Δ𝑝ℎ →𝑝𝑙 𝑣 = Δ𝑝𝑙 𝑣 − Δ𝑝ℎ 𝑣                  (7)           for activations since the input activation size will vary at inference
+                                                                               time. Figure 7 in Section 5.3 visualizes how our global threshold pol-
+   The impact on the final model output when a block v of size 𝑁
+                                                                               icy allows for retaining a greater portion of blocks in high precision
+containing values 𝑣𝑖 is quantized in low precision rather than high
+                                                                               for particular layers.
+precision is therefore:
+
+                                𝑁
+                                ∑︁                                             3.3    Fine-Grained Sensitivity-Weighted Clipping
+                      ′
+                     𝐼L (v) =         𝑔𝑖2 (Δ𝑝ℎ →𝑝𝑙 𝑣𝑖 ) 2            (8)       Improving accuracy with low-precision quantization can provide
+                                𝑖=1                                            noticeable benefits even in the context of FGMP quantization, as
+                             ′ (v) to identify the weight and activa-
+   We use the impact score 𝐼 L                                                 it can allow us to retain a greater portion of blocks in low pre-
+tion blocks for which low-precision quantization has the biggest               cision without compromising accuracy. One method to improve
+impact on the model’s output, and we preferentially preserve these             low-precision quantization is clipping, where we reduce the rep-
+blocks in higher precision.                                                    resentable range of numbers in order to give us better resolution
+                                                                               within this range. In the context of low-precision quantization
+3.2    Setting the Threshold for Precision                                     with microscaling, performing clipping by adjusting the per-block
+       Assignment                                                              scale factors can provide significant benefits as it allows us to
+In order to determine which blocks can be quantized to reduced                 perform fine-grained adjustments to best represent the values in
+precision, we need to determine the threshold for the importance               a given block. To improve the representation of blocks that are
+        ′ (v), above which the block must be retained in higher
+score 𝐼 L                                                                      quantized to reduced precision, we therefore pursue clipping with
+precision. One option would be to compute the threshold for a                  the per-block scale factors. In particular, we develop a sensitivity-
+target ratio of high-precision to low-precision blocks dynamically             weighted approach for fine-grained clipping to accurately quantize
+for each layer. However, sweeping over the activation tensor for               low-precision blocks without perturbing the model loss. For a given
+                                             ′ (v) for each block and
+layer 𝑙 online during inference to compute 𝐼 L                                 block v with 𝑁 elements in a weight layer W (𝑙 ) , the objective is
+then computing the target threshold for that layer would lead to               to minimize the squared quantization error in v weighted by the
+unacceptable inference overhead (since we would need to write out              square of the gradients 𝑔. We therefore want to choose the scaling
+each output block from the previous operation in both precisions               factor 𝑠 which minimizes this objective:
+before we knew which precision was going to be used). It is there-
+                                                                                                                 𝑁
+fore preferable to calibrate offline to determine the threshold for                                              ∑︁         𝑠
+                                                                                                           min         𝑔𝑖2 ( Δ𝑣𝑖 ) 2             (11)
+activations for a target mixed-precision ratio. Namely, for a target                                        𝑠
+                                                                                                                 𝑖=1
+mixed-precision ratio 𝑅, we can assign 𝑅% of blocks to be in higher
+                                                                                          𝑠
+precision by setting the threshold 𝑇𝑙𝑜𝑐𝑎𝑙 to be the 𝑅-th percentile               where Δ𝑣𝑖 is the quantization error for element 𝑣𝑖 when the
+                      ′ (v), computed over all 𝐽 blocks v in a single
+of the impact score 𝐼 L                         𝑙                              per-block scaling factor is 𝑠. With the low-precision datatype used
+weight or activation tensor W (𝑙 ) or X (𝑙 ) :                                 in this work, the per-block scale factors are restricted to FP8 values,
+                                                                               and as such there are only a limited number of possible values
+                                     ′                                         for 𝑠. We can therefore perform a brute-force search over possible
+                     𝑇𝑙𝑜𝑐𝑎𝑙 = 𝑃𝑅 ({𝐼 L (v ( 𝑗 ) )} 𝐽𝑗=1
+                                                     𝑙
+                                                        )            (9)
+                                                                               values for 𝑠 in order to identify the scale factors which minimize the
+   where 𝑃𝑅 () denotes the 𝑅-th percentile. Additionally, different            sensitivity-weighted quantization error. Note that we only apply
+layers in the network exhibit differing sensitivities in terms of their        sensitivity-weighted clipping offline for the weight matrices, and we
+impacts on the model output. In order to allow our policy to adapt             use dynamic-max clipping online for activations, as it is not possible
+to varying sensitivities at different layers, instead of calibrating for       to efficiently compute the optimal scale factors for activations online
+a separate threshold for each layer, we instead set a single global            during inference.
+                                                                           5
+3.4    Additional Baseline Policies                                           Figure 4. We use NVFP4 as our low precision datatype [21], which
+In order to justify our precision assignment policy, we compare with          uses microscaling to improve the quantization accuracy in low pre-
+multiple potential baseline methods for selecting which blocks to             cision, as in [5, 14, 24]. NVFP4 uses a block size of 16 and performs
+retain in higher precision (the comparison is provided in Figure 6 in         quantization using FP4 (E2M1) representation for the values with
+Section 5.3). Our first baseline policy (referred to as “Quantization         FP8 (E4M3) microscaling factors. Throughout the remainder of this
+Error”) determines which blocks to retain in higher precision using           work, when we refer to a block being quantized in FP4, this block
+only the quantization error for each block within a single layer 𝑙.           is quantized using the NVFP4 datatype. We set the microscaling
+The error when a 1D block v of size 𝑁 is quantized in low precision           block size and the FGMP block size (𝐵𝑆) equal to the VMAC vector
+𝑝𝑙 rather than high precision 𝑝ℎ can be expressed as:                         length to improve hardware efficiency. We use a single metadata bit
+                                                                              alongside each block to indicate whether the block contains high
+                                   𝑁
+                                   ∑︁                                         or low precision values.
+                       ′
+                      𝐼𝑄𝐸 (v) =           (Δ𝑝ℎ →𝑝𝑙 𝑣𝑖 ) 2         (12)
+                                    𝑖=1                                       4.1    Mixed-Precision Datapath
+   where Δ𝑝ℎ →𝑝𝑙 gives the increase in error from quantizing ele-             Figure 3b outlines the multi-lane mixed-precision VMAC datapath
+ment 𝑣𝑖 to low precision rather than high precision.                          which is required for performing efficient mixed-precision computa-
+   As a second baseline, we also include an “Output Error” policy,            tion. The datapath contains FP4, FP8, and mixed FP4/8 dot-product
+which minimizes the error at the layer output for layer 𝑙 in order            units. In a single cycle, the active dot-product unit in each lane
+to determine which blocks to retain in higher precision for that              (determined by inspecting the metadata bit associated with each
+layer. For this policy, we first calibrate for the average squared            weight and activation block) computes 𝐵𝑆-wide dot products across
+input channel magnitude across the other tensor Q. For quantizing             𝐿 parallel lanes and adds this FP32 partial sum to the previously
+a block v in weight matrix W (𝑙 ) , we compute the average squared            accumulated partial sum, thereby performing 2 · 𝐵𝑆 · 𝐿 operations
+magnitudes for the corresponding input channels in X (𝑙 ) , and for           per cycle. The dot-product units with at least one FP4 input also
+quantizing a block v in activation matrix X (𝑙 ) we compute the               perform the scale factor multiplication before adding the partial
+average squared magnitudes for the corresponding input channels               sum to the accumulated value. The remaining three dot-product
+in W (𝑙 ) . We compute the average squared magnitudes for the input           units in each lane are inactive and are clock-gated or data-gated
+channels in X (𝑙 ) statically using calibration data from the Wikitext-       appropriately to minimize switching power. When computing a
+103 training set. Using this policy, the error when a 1D block v of           matrix multiplication between a weight tile A and an activation tile
+size 𝑁 is quantized in low precision 𝑝𝑙 rather than high precision            B, we assume a weight-stationary dataflow in which A is held sta-
+𝑝ℎ can be expressed as:                                                       tionary and blocks in B are streamed in one per cycle and broadcast
+                                                                              across all lanes. Note that we maintain the same math throughput
+                             𝑁
+                  ′
+                             ∑︁                                               per cycle regardless of the precision of the weights and inputs being
+                 𝐼𝑂𝐸 (v) =         avg(𝑄𝑖2 )(Δ𝑝ℎ →𝑝𝑙 𝑣𝑖 ) 2       (13)        consumed, which improves energy efficiency by maximizing tem-
+                             𝑖=1
+                                                                              poral reuse of A and spatial reuse of B while avoiding complicated
+   where avg(𝑄𝑖2 ) is the average squared input channel magnitude             control logic. Our proposed design contains independent FP4×FP8
+in the other tensor. For both baseline policies, in order to set the          and FP8×FP4 dot-product units in each lane so that the 𝐴 input can
+mixed-precision ratio 𝑅, we set the threshold 𝑇 to be the 𝑅-th                be consistently held constant during the innermost temporal loop,
+               ′ (v) / 𝐼 ′ (v) computed dynamically over all blocks
+percentile of 𝐼𝑄𝐸       𝑂𝐸                                                    improving energy efficiency at the cost of area overhead. Note that
+v in a single weight or activation layer W (𝑙 ) or X (𝑙 ) .                   datapath components could be shared to reduce area; however, this
+                                                                              would come at the cost of increased energy consumption. Using
+4     Hardware Support for Fine-Grained                                       shared hardware for all four dot-product combinations would obvi-
+      Mixed-Precision Quantization                                            ate any energy gains of FGMP. Sharing hardware between two or
+                                                                              three dot-product formats could still realize some (reduced) energy
+Hardware support is required to use low-precision datapaths for the           savings.
+majority of computations when we leverage FGMP quantization.
+Hardware support for quantizing activations to mixed-precision on-
+line during inference is also needed to realize the energy efficiency
+                                                                              4.2    Post-Processing Activation Quantization
+benefits of FGMP quantization, as these benefits would otherwise                     Unit
+be negated by the overheads of performing mixed-precision quan-               Figure 4 provides a diagram of our mixed-precision activation quan-
+tization in software. Our proposed design (outlined in Figure 3a)             tization unit, which is a post-processing unit that quantizes output
+consists of an array of processing elements (PEs), each of which              activation blocks before writing them out to memory. In a typi-
+contains a Vector Multiply-Accumulate (VMAC) datapath consist-                cal single-precision datapath, values are locally accumulated in
+ing of multiple parallel lanes that each compute one VMAC per                 high precision (e.g., FP32) before being sent to a PPU for scaling
+cycle [29]. The hardware augmentations required for supporting                and quantization to the (single) activation data format. In contrast,
+FGMP quantization for both weights and activations includes i) dat-           our mixed-precision PPU must dynamically determine whether to
+apath modifications to support FGMP which are outlined in Figure              quantize the accumulated values to FP8 or FP4 by using the average
+3b, and ii) a post-processing unit (PPU) that efficiently quantizes           per-input channel Fisher information to compute the sensitivity-
+activations to mixed precision during inference which is outlined in          weighted sum of the quantization error for each output block. The
+                                                                          6
+                                                                                         Activation Buffer
+                                                                                                                                   Weight Buffer                                             Weight Buffer
+                                   Processing
+                                 Element Array
+                                                                                         Activation Collector
+                                                                                                                                   Weight Collector                                          Weight Collector
+                                 PE    …     PE                                                          A FP8?   W FP8?
+                                                                                                                                             BS
+                                                                                                                                                               A FP8?      W FP8?
+                                                                                                                                                                                                       BS
+                                                                           BS                BS
+                                       …                                                                 Select DPath                                           Select DPath
+    Memory System
+
+
+
+                                 …
+
+
+                                             …
+
+                                                                               …              Sa          Sw
+                                 PE    …     PE               x       x              x   x
+                                                                                                                                                                    …
+                                                                                                                                                              L Vector Lanes
+
+
+                                                                           +
+                                                                                                     x                       FP4      FP8    FP4/8    FP8/4                            FP4     FP8    FP4/8     FP8/4
+                                                                               x
+                              VU       …     VU             Partial
+                                                            sum in                                                                                                                      Vector MAC Datapaths
+                              PPU            PPU
+                                                                               +
+                                                                                   Partial sum out
+                         Vector Units (Contain                                                              Select DPath                                                Select DPath
+                         Post-Processing Units)
+
+                              a) Accelerator                 b) Mixed-Precision, Multi-                                            Output Collector
+                                                                                                                                                          Partial sum back
+                                                                                                                                                          to datapath
+                                                                                                                                                                                             Output Collector
+                               Architecture                 Lane Vector-MAC Datapath                                                                                …
+                                                                                                                                                Fully accumulated sums to PPU
+
+Figure 3: a) High-level accelerator architecture, consisting of a PE array (each of which contains a VMAC-based datapath), as
+well as one or more vector units which contain our post-processing activation quantization unit (outlined in detail in Figure 4).
+b) Datapath support for FGMP quantization with four dot-product units per lane to perform FGMP VMAC operations. The
+portion of the figure highlighted in gray is synthesized for hardware measurements.
+
+                                      Output Activation Block                      Per-Channel                             4.3      Experimental Approach
+                                                                                    Sensitivity
+                                             BS             VMax                   Information                             We prototype our hardware implementation using SystemC and
+                                                                                                                           the Siemens Catapult High-Level Synthesis tool to generate RTL.
+                                                          Get 𝝁-scale
+                                                                                                                           RTL simulations are performed using Synopsys VCS with synthetic
+                    Quantize (FP8)         Quantize (FP4)                                                                  data sampled from an appropriately scaled Gaussian random dis-
+                                                                          BS
+                                                                          Mixed-Precision                                  tribution, where the proportion of weight and activation blocks
+                                                                             Activation                                    in FP4 and FP8 are independently adjusted to generate representa-
+                                                            FP4/8?        Quantization Unit
+                             Quantized Output                                                                              tive input stimulus. We leverage the Synopsys Fusion Compiler for
+                              Activation Block                                                                             synthesis targeting a 1 GHz clock period in a 5 nm process, and we
+                                                                                                                           replay the test stimulus on the gate netlist to gather activity factors
+                      Threshold               (Q(Y)-Y)2               (Q(Y)-Y)2                                            for power measurements using Synopsys PrimePower (TT 0.67 V
+                                                                                                                           corner). All measurements use a prototype design with 𝐿 = 16 and
+                    FP4/8?                                  -                                                              𝐵𝑆 = 16, as in [5].
+                             >
+                                                                                                                              In order to collect energy estimates with a realistic workload,
+                                                                                                                           we need to leverage relevant estimates for the proportion of FP4
+                                Mixed-Precision Activation                                                                 and FP8 blocks in different layers and for varying global threshold
+                             Quantization Post-Processing Unit                                                             settings. As outlined in Figure 7 in Section 5.3, different layers have
+Figure 4: A diagram of the post-processing unit for quantizing                                                             very different distributions of FP4 versus FP8 blocks, but measuring
+activations to mixed-precision online during inference.                                                                    power for all possible layer configurations is runtime-intractable.
+                                                                                                                           In order to collect realistic data, we first profiled the portion of
+                                                                                                                           FP8 and FP4 blocks across different layers for both weights and
+activation block is then written out as either FP4 or FP8, depend-                                                         activations. We collected this data for different global ratios of FP8 to
+ing on whether the sum is greater than the configured threshold.                                                           FP4 blocks (from 90% to 10%). We then treated each configuration as
+The threshold is calibrated offline for a given model and is fixed                                                         a set of features, normalized each feature, and performed K-means
+throughout inference. Note that our approach for leveraging per-                                                           clustering to compute 100 representative configurations across all
+input channel metadata for weighting the parameters in a block in                                                          layers. After running power analysis on small kernels derived from
+order to determine the block’s importance is agnostic to how this                                                          each of these 100 configurations, we scaled up the results to match
+metadata is computed. For example, this approach could also be                                                             the shapes of each of the corresponding layers in order to estimate
+used to run the baseline “Output Error” configuration described in                                                         total energy consumption.
+Section 3.4, since it also uses statically calibrated per-input channel
+metadata to weight the values in each block when determining
+importance.
+                                                                                                                   7
+                                                                   No Clip                       Clip            NVFP4            1% Error                  FP8                BF16
+                         Llama-2-7B Tradeoff Curve                                                        Llama-2-13B Tradeoff Curve                                     Nemotron-4-15B Tradeoff Curve
+                                                                                              4.76                                                              6.20
+             5.25                                                                             4.74
+                                                                                                                                                                6.15
+                                                                                              4.72
+             5.20
+Perplexity
+
+
+
+
+                                                                                 Perplexity
+
+
+
+
+                                                                                                                                                   Perplexity
+                                                                                              4.70                                                              6.10
+
+             5.15                                                                             4.68                                                              6.05
+                                                                                              4.66                                                              6.00
+             5.10                                                                             4.64
+                                                                                              4.62                                                              5.95
+
+                100           80           60       40            20         0                   100        80       60      40      20       0                    100        80       60      40      20       0
+                    Percentage of Blocks in 4-bit Precision (%)                                      Percentage of Blocks in 4-bit Precision (%)                       Percentage of Blocks in 4-bit Precision (%)
+                             GPT3-1.3B Tradeoff Curve                                                      GPT3-8.3B Tradeoff Curve                                          GPT3-22B Tradeoff Curve
+                                                                                              7.60                                                              6.70
+             10.4                                                                                                                                               6.68
+                                                                                              7.55
+                                                                                                                                                                6.66
+             10.3
+                                                                                                                                                                6.64
+Perplexity
+
+
+
+
+                                                                                 Perplexity
+
+
+
+
+                                                                                                                                                   Perplexity
+                                                                                              7.50
+             10.2                                                                                                                                               6.62
+                                                                                              7.45                                                              6.60
+             10.1                                                                                                                                               6.58
+                                                                                              7.40                                                              6.56
+             10.0
+                                                                                                                                                                6.54
+                100           80           60       40            20         0                   100        80       60      40      20       0                    100        80       60      40      20       0
+                    Percentage of Blocks in 4-bit Precision (%)                                      Percentage of Blocks in 4-bit Precision (%)                       Percentage of Blocks in 4-bit Precision (%)
+ Figure 5: Perplexity evaluation on Wikitext-103 for different models in the Llama-2, GPT3, and Nemotron model families. We
+ report FGMP quantization results with and without our sensitivity-weighted weight clipping approach. Note that for GPT3-22B
+ and Nemotron-4-15B, we did not apply sensitivity-weighted clipping as it did not yield perplexity improvements, and for
+ Nemotron-4-15B, we exclude the BF16 baseline as it exhibited worse perplexity than FP8.
+
+Table 1: Perplexity on Wikitext-103 when applying                                                                         implementation in order to confirm the efficiency benefits of our
+sensitivity-weighted weight clipping “SW-Clip") for Llama-                                                                approach. Sections 5.1 and 5.2 provide results for our methodology
+2-7B and Llama-2-13B. We report results for weight-only                                                                   using perplexity as measured on Wikitext-103 and using down-
+FP4 quantization with microscaling, both with and without                                                                 stream task evaluation, respectively. Section 5.3 provides ablations
+sensitivity-weighted clipping. All configurations use BF16                                                                for our precision assignment policy, as well as analysis for the distri-
+for activations.                                                                                                          bution of sensitive blocks across different layers and the runtime for
+                                                                                                                          computing Fisher information for quantization. Section 5.4 presents
+                              Weight Precision       Llama-2-7B           Llama-2-13B                                     detailed evaluation of our hardware implementation.
+                                    BF16                   5.06              4.61
+                                    FP4                    5.18              4.69
+                              FP4 (w/ SW-Clip)             5.13              4.67                                         5.1     Perplexity Evaluation
+Table 2: Average 5-shot evaluation results on MMLU for dif-                                                               We evaluate our proposed mixed-precision block assignment pol-
+ferent models in the Llama-2, GPT3, and Nemotron model                                                                    icy using models in the Llama-2, GPT3, and Nemotron families
+families.                                                                                                                 [3, 22, 28]. We used FP8 without microscaling and NVFP4 as the
+                                                                                                                          higher and lower precision data formats. Figure 5 shows the per-
+                                     Llama-2                  GPT3                        Nemotron-4
+                                                                                                                          plexity on Wikitext-103 versus the percentage of blocks that are
+                     Model
+                                    7B     13B      1.3B      8.3B         22B               15B                          kept in FP8, including results with and without our sensitivity-
+                      BF16         0.458    0.551   0.247         0.252    0.387                0.643                     weighted clipping approach. Our results show that with only a
+                      FP8          0.462    0.550   0.249         0.248    0.383                0.647
+                      FP4          0.430    0.533   0.258         0.258    0.371                0.634                     small percentage of blocks retained in FP8, we can attain significant
+                    90% FP4        0.448    0.543   0.252         0.253    0.382                0.637                     accuracy improvements relative to quantizing all blocks to FP4.
+                    70% FP4        0.451    0.547   0.256         0.251    0.382                0.642
+                                                                                                                          These results also demonstrate the perplexity improvements from
+                                                                                                                          incorporating our sensitivity-weighted weight clipping approach
+ 5            Results                                                                                                     (particularly when a higher proportion of blocks are quantized in
+We report a comprehensive accuracy evaluation of our quantiza-                                                            FP4). Figure 1 also provides comparisons against previous methods
+tion method and simulated energy measurements of our prototyped                                                           for the Llama-2-7B model, demonstrating how our method is able to
+                                                                                                                      8
+                                                                                                Table 3: Results on a selection of lm-eval-harness down-
+                                             Quantization Error
+                                             Output Error                                       stream evaluation tasks for different models in the Llama-2,
+             5.25                            FGMP (w/o Global Threshold / Clipping)             GPT3, and Nemotron model families.
+                                             FGMP (w/o Clipping)
+                                             FGMP                                                                                    Llama-2-7B
+                                             NVFP4
+             5.20                            FP8
+Perplexity
+
+
+
+
+                                                                                                     Precision   RACE    Hellaswag     PIQA    Winogrande   BoolQ   Average
+                                             BF16                                                       BF16     0.440     0.570       0.780        0.696   0.795    0.656
+                                                                                                        FP8      0.435     0.570       0.780        0.680   0.791    0.651
+                                                                                                        FP4      0.429     0.561       0.768        0.680   0.773    0.642
+             5.15                                                                                     90% FP4    0.427     0.564       0.777        0.684   0.782    0.647
+                                                                                                      70% FP4    0.450     0.569       0.777        0.695   0.788    0.656
+
+                                                                                                                                    Llama-2-13B
+             5.10
+                                                                                                     Precision   RACE    Hellaswag     PIQA    Winogrande   BoolQ   Average
+                                                                                                        BF16     0.448     0.602       0.797        0.723   0.822    0.678
+                                                                                                        FP8      0.450     0.603       0.792        0.721   0.824    0.678
+                100       80            60             40             20              0                 FP4      0.440     0.595       0.785        0.715   0.809    0.669
+                      Percentage of Blocks in 4-bit Precision (%)                                     90% FP4
+                                                                                                      70% FP4
+                                                                                                                 0.446
+                                                                                                                 0.445
+                                                                                                                           0.596
+                                                                                                                           0.600
+                                                                                                                                       0.787
+                                                                                                                                       0.792
+                                                                                                                                                    0.724
+                                                                                                                                                    0.725
+                                                                                                                                                            0.817
+                                                                                                                                                            0.815
+                                                                                                                                                                     0.674
+                                                                                                                                                                     0.675
+
+
+ Figure 6: Perplexity evaluation on Wikitext-103 with the                                                                            GPT3-1.3B
+
+ Llama-2-7B model (lower is better) with different percent-                                          Precision   RACE    Hellaswag     PIQA    Winogrande   BoolQ   Average
+
+ ages of blocks retained in FP8. We provide an ablation of our                                          BF16     0.363     0.439       0.742        0.591   0.648    0.557
+                                                                                                        FP8      0.365     0.439       0.737        0.580   0.642    0.552
+ approach against several baseline policies, and also highlight                                         FP4      0.359     0.429       0.731        0.577   0.642    0.548
+ the perplexity benefits from using a single global thresh-                                           90% FP4    0.362     0.433       0.727        0.590   0.644    0.551
+                                                                                                      70% FP4    0.360     0.435       0.739        0.594   0.637    0.553
+ old and from applying sensitivity-weighted clipping to the
+ weights.                                                                                                                            GPT3-8.3B
+                                                                                                     Precision   RACE    Hellaswag     PIQA    Winogrande   BoolQ   Average
+                                                                                                        BF16     0.415     0.546       0.780        0.680   0.689    0.622
+ attain improved perplexity for the same compression rate relative                                      FP8      0.416     0.546       0.774        0.672   0.691    0.620
+                                                                                                        FP4      0.415     0.533       0.774        0.665   0.683    0.614
+ to prior methods.                                                                                    90% FP4    0.413     0.538       0.770        0.665   0.688    0.615
+                                                                                                      70% FP4    0.415     0.541       0.773        0.667   0.690    0.617
+
+ 5.2            Downstream Task Evaluation                                                                                           GPT3-22B
+ Tables 2 and 3 show the results of evaluating our methodology                                       Precision   RACE    Hellaswag     PIQA    Winogrande   BoolQ   Average
+ on downstream tasks. We compare FGMP against single-precision                                          BF16     0.434     0.579       0.789        0.707   0.746    0.651
+ quantization on MMLU in Table 2 as well as on a selection of tasks                                     FP8      0.434     0.577       0.790        0.702   0.751    0.651
+                                                                                                        FP4      0.441     0.568       0.788        0.699   0.745    0.648
+ from lm-eval-harness (RACE, Hellaswag, PIQA, Winogrande, and                                         90% FP4    0.441     0.573       0.784        0.707   0.740    0.649
+ BoolQ) in Table 3 (with sensitivity-weighted weight clipping applied                                 70% FP4    0.435     0.575       0.792        0.700   0.740    0.648
+
+ for Llama-2-7B/13B and GPT3-1.3B/8.3B). On MMLU, we observe                                                                       Nemotron-4-15B
+ 58-89% less accuracy degradation when we use FGMP with 70%                                          Precision   RACE    Hellaswag     PIQA    Winogrande   BoolQ   Average
+ of blocks in FP4, relative to the degradation observed when going                                      BF16     0.471     0.620       0.812        0.756   0.787    0.689
+ from FP8 to FP4 quantization.3 On lm-eval-harness, we observe                                          FP8      0.482     0.625       0.813        0.757   0.736    0.683
+                                                                                                        FP4      0.457     0.615       0.791        0.743   0.689    0.659
+ less than 0.4% average accuracy degradation for all models when                                      90% FP4    0.478     0.618       0.807        0.753   0.720    0.675
+ leveraging FGMP with 70% of blocks in FP4 relative to FP8-only                                       70% FP4    0.471     0.623       0.809        0.770   0.751    0.684
+
+ quantization. Overall, our results demonstrate that our method
+ helps retain downstream task performance even with the majority                                (“FGMP (w/o Global Threshold / Clipping)”), and with applying
+ of blocks quantized to reduced precision.                                                      the global threshold but not applying our sensitivity-weighted clip-
+                                                                                                ping method (“FGMP (w/o Clipping)”). These results demonstrate
+ 5.3            Ablation Studies                                                                the superiority of our sensitivity-weighted precision assignment
+ Figure 6 compares our FGMP approach with several other meth-                                   policy, which factors in the impact of each parameter on the fi-
+ ods, including minimizing only the unweighted quantization er-                                 nal model output when assigning blocks to different precisions.
+ ror (“Quantization Error”) and minimizing the quantization error                               These results also highlight the benefits of our global threshold-
+ weighted by the average magnitude of the elements in the other                                 ing approach for maintaining high accuracy with the majority of
+ tensor in order to minimize the error for the output of that particu-                          blocks in low precision, as well as the perplexity benefits of our
+ lar layer (“Output Error”). Additionally, we provide a comparison                              sensitivity-weighted weight clipping method. Table 1 also provides
+ with using a per-layer dynamically-computed threshold in order                                 additional evaluation for our sensitivity-weighted weight clipping
+ to determine which blocks for that layer should be in FP4 or FP8                               approach, demonstrating the perplexity benefits in the weight-only
+                                                                                                quantization regime.
+ 3 Note that for GPT-3 1.3B/8.3B, the baseline accuracy on MMLU was close to 25%,
+                                                                                                   We also provide analysis for the portion of blocks retained in high
+ which is essentially random since each question is multiple choice with four possible
+ answers. This means that the results on these two models cannot be used to differentiate       precision across different layers. Figure 7 shows the percentage of
+ between configurations, and we therefore excluded these models from this calculation.          sensitive blocks that are retained in FP8 when using 90% FP4 blocks
+                                                                                            9
+                                                                          Activations
+                            100                                                                                                         QKV_proj
+                                 80                                                                                                     O_proj
+                                                                                                                                        FC1
+          % Blocks in FP8
+
+
+                                 60                                                                                                     FC2
+                                 40
+                                 20
+                                 0
+                                                                          Layer Number
+
+                                                                           Weights
+                                 50
+                                                                                                                                        QKV_proj
+                                 40                                                                                                     O_proj
+                                                                                                                                        FC1
+               % Blocks in FP8
+
+
+
+
+                                 30                                                                                                     FC2
+                                 20
+                                 10
+                                 0
+                                       1
+                                       2
+                                       3
+                                       4
+                                       5
+                                       6
+                                       7
+                                       8
+                                       9
+                                      10
+                                      11
+                                      12
+                                      13
+                                      14
+                                      15
+                                      16
+                                      17
+                                      18
+                                      19
+                                      20
+                                      21
+                                      22
+                                      23
+                                      24
+                                      25
+                                      26
+                                      27
+                                      28
+                                      29
+                                      30
+                                      31
+                                      32
+                                                                          Layer Number
+Figure 7: Percentage of blocks retained in FP8 when using FGMP with sensitivity-weighted clipping targeting 90% FP4 / 10% FP8
+for the Llama-2-7B model. We show the percentage of blocks in FP8 for all 32 QKV projection (“QKV_proj”), Output projection
+(“O_proj”), Fully Connected 1 (“FC1”), and Fully Connected 2 (“FC2”) layers.
+
+
+                                                                                                           100 FP4/8                   FP8         28
+
+
+
+
+                                                                                                                                                   Datapath Energy (fJ/op)
+                                                                                                           75
+                                                                                        Activations %FP8
+
+
+
+
+                                                                                                                                                   26
+
+
+                                                                                                           50                                      24
+
+
+                                                                                                           25                                      22
+
+Figure 8: Memory savings for the Llama-2-7B model weights                                                   0   FP4                    FP8/4       20
+when using FGMP (shown for configurations with 70% and
+90% of blocks in FP4).                                                                                           0     25   50    75    100
+                                                                                                                        Weight %FP8
+                                                                                 Figure 9: Energy efficiency of the FGMP datapath processing
+and 10% FP8 blocks (profiled using a sample of sequence length                   different proportions of weights and activations in FP8. The
+4096 from the Wikitext-103 test set). This profiling demonstrates                four labeled points show the energy efficiency when only a
+how our policy is able to adapt to differing sensitivities at different          single dot-product unit is active over the entire test.
+layers by allocating a larger or smaller portion of FP8 blocks to those
+layers (for example, retaining a greater portion of QKV projection               5.4        Hardware Evaluation
+layer activation blocks and Output projection layer weight blocks                5.4.1 Memory Savings. Figure 8 highlights the memory savings
+in FP8 at the early layers).                                                     from leveraging our FGMP method for the Llama-2-7B model. We
+   Additionally, to better understand the quantization efficiency of             are able to attain 30% and 39% memory savings using our FGMP
+our method, we profiled the runtime for collecting the weight and                approach with 70% and 90% of blocks in FP4, respectively. We also
+activation Fisher information matrices. For the Llama-2-7B model,                provide a breakdown of memory consumption, showing both the
+we found that computing the Fisher information matrices (for 512                 overhead of microscaling for the FP4 format as well as the overhead
+samples of sequence length 512) took less than 3 minutes on a single             of the FGMP metadata (the per-block bit to distinguish FP4 and FP8
+A100 GPU. Note that this is a one-time cost for calibrating the model            blocks).
+and can be performed ahead of inference time. This demonstrates
+that our calibration procedure is lightweight and allows for quickly             5.4.2 Energy Analysis. Figure 9 shows the energy efficiency of our
+quantizing new models.                                                           FGMP datapaths for different percentages of FP8 blocks in both
+                                                                            10
+                                                                                                     Table 4: Area breakdown for the FGMP datapath and post-
+                            5.275                                     FGMP                           processing unit (post-synthesis area in a 5nm process). Data-
+                                                                      NVFP4                          path areas are reported for 16 lanes, and all values assume
+                            5.250                                     FP8
+Perplexity (Wikitext-103)
+
+
+
+
+                                                                      1% Error                       a block size of 16. Note that the PPU area can be amortized
+                            5.225                                     FGMP (70% NVFP4)               across multiple PEs (since it is only invoked when writ-
+                            5.200                                                                    ing out activations, which is performed infrequently). Note
+                                                                                                     that “FP8/NVFP4” refers to the datapath which supports FP8
+                            5.175                                                                    weights and NVFP4 activations.
+                            5.150                                                                                            Configuration     Area (𝑢𝑚 2 )
+
+                            5.125                                                                                            FP8 Datapath
+                                                                                                                            NVFP4 Datapath
+                                                                                                                                                   2995
+                                                                                                                                                   1811
+                                                                                                                          FP8/NVFP4 Datapath       2669
+                            5.100                                                                                         NVFP4/FP8 Datapath       2630
+                                                                                                                            FGMP Datapath         10356
+                            5.075                                                                                             FGMP PPU            8848
+                                0.65   0.70    0.75   0.80   0.85   0.90   0.95   1.00   1.05
+                                              Normalized Energy Consumption
+   Figure 10: Perplexity on Wikitext-103 versus normalized en-                                       hardware. Furthermore, it is important to note that datapath area is
+   ergy consumption using FGMP with sensitivity-weighted                                             often a small portion of the area of a DNN accelerator. For example,
+   clipping with different percentages of blocks retained in FP8,                                    the datapath is only 11% of the area of a processing element in [27].
+   using the Llama-2-7B model.                                                                       The processing elements are an even smaller portion of full system
+   weights and activations. When evaluated only with stimulus re-                                    area, which tends to be memory-dominated.
+   stricted to a single data format (the labeled boxes in the figure),                                  Additionally, the PPU has an 85% area overhead relative to the
+   the NVFP4 datapath consumes 33% less energy relative to the FP8                                   FGMP datapath with 16 lanes. However, the PPU overhead can be
+   datapath, while the FP4/8 and FP8/4 (Weight / Activation) datapaths                               amortized by increasing the number of lanes, or by sharing a PPU
+   consume 16% and 17% less energy than the FP8 baseline, respec-                                    across multiple PEs. Given 𝑃 PEs with 𝐿 vector lanes per PE and
+   tively. The additional overheads of muxing between the different                                  𝑈 PPUs, and assuming block size of 16, the time for the datapaths
+   dot-product units at fine granularity imposes a small “tax" to en-                                to process an (𝑀 by 𝐾) × (𝐾 by 𝑁 ) matrix (assuming a balanced
+   able FGMP, such that “mostly FP8" data costs slightly more energy                                 pipeline) would be 𝑀       𝐾 𝑁
+                                                                                                                           𝐿 · 16 · 𝑃 cycles, whereas the time for PPU
+   than 100% FP8 data. However, this overhead is small compared to                                   processing would be 𝑀      𝑁
+                                                                                                                           16 · 𝑈 cycles. For a typical Llama-2-7B matrix
+   the energy savings of performing lower-precision arithmetic when                                  multiplication with 4K context length (4096 by 4096 × 4096 by 4096),
+   most blocks are quantized to FP4.                                                                 a single PPU would be able to support up to 256 16-lane PEs without
+      We also measured the energy consumption of the mixed-precision                                 stalling; the area overhead of the PPU is therefore minimal when
+   activation quantization unit performing on-the-fly activation quan-                               the cost is amortized across several PEs.
+   tization under random stimulus. The energy consumption of per-
+   forming quantization on a single block is 25.7 pJ. However, this                                  6   Conclusion
+   operation need only be performed after reduction, so it is amor-
+                                                                                                     In this paper, we propose a post-training methodology for fine-
+   tized over the dot product dimension of the input tensors, which is
+                                                                                                     grained mixed-precision quantization with both weights and ac-
+   at least 4096 for the layers of the Llama-2-7B network. Accordingly,
+                                                                                                     tivations. This approach allows us to retain the performance of
+   this energy cost is just 0.20 fJ/op, which is less than 1% of the en-
+                                                                                                     the base model with only a small percentage of blocks retained in
+   ergy cost of the dot products themselves and is therefore negligible
+                                                                                                     higher precision. This is achieved by leveraging sensitivity infor-
+   when considering system energy consumption.
+                                                                                                     mation with respect to the final model output to determine which
+      Figure 10 shows the perplexity on Wikitext103 when using our
+                                                                                                     blocks should be preferentially retained in higher precision in order
+   approach under different energy consumption budgets. FP4 and
+                                                                                                     to preserve model accuracy. Additionally, we develop a sensitivity-
+   FP8 baseline measurements are included for reference. This data
+                                                                                                     weighted clipping approach for weights that significantly improves
+   shows how our implementation is able to attain high accuracy with
+                                                                                                     accuracy and allows for a greater portion of blocks to be quantized
+   low energy consumption. In particular, with less than 1% accuracy
+                                                                                                     to low precision with minimal accuracy loss. In order to leverage the
+   degradation relative to the FP8 baseline, we are able to attain 14%
+                                                                                                     efficiency benefits of performing multiplications in reduced preci-
+   energy savings. These results highlight the efficiency gains from
+                                                                                                     sion, we propose custom hardware support for FGMP quantization
+   leveraging fine-grained mixed-precision quantization in order to
+                                                                                                     at the dot product level. Our hardware implementation includes
+   enable accurate low-precision LLM inference.
+                                                                                                     datapath support for performing dot products between two FP4
+   5.4.3 Area Analysis. Table 4 shows the area consumption of our                                    blocks, two FP8 blocks, or one FP4 and one FP8 block. Our hardware
+   custom design. The area overhead is 3.5× from a standalone FP8 dat-                               implementation also includes a mixed-precision activation quanti-
+   apath, or a 2.2× overhead from a datapath supporting only coarse-                                 zation unit that assigns activation blocks to low and high precision
+   grained mixed precision in FP8 and FP4. As noted in Section 4, we                                 on-the-fly. Our approach facilitates FGMP quantization, attaining
+   chose a hardware design point that spends area to maximize energy                                 the benefits of low-precision quantization while preserving the
+   efficiency; area overhead could be reduced by sharing datapath                                    accuracy of inference with the high-precision values.
+                                                                                                11
+References                                                                                         Accessed: 2025-04-05..
+ [1] Saleh Ashkboos, Ilia Markov, Elias Frantar, Tingxuan Zhong, Xincheng Wang, Jie           [22] Jupinder Parmar, Shrimai Prabhumoye, Joseph Jennings, Mostofa Patwary,
+     Ren, Torsten Hoefler, and Dan Alistarh. 2023. Towards end-to-end 4-bit inference              Sandeep Subramanian, Dan Su, Chen Zhu, Deepak Narayanan, Aastha Jhunjhun-
+     on generative large language models. arXiv preprint arXiv:2310.09259 (2023).                  wala, Ayush Dattagupta, et al. 2024. Nemotron-4 15B Technical Report. arXiv
+ [2] Saleh Ashkboos, Amirkeivan Mohtashami, Maximilian Croci, Bo Li, Pashmina                      preprint arXiv:2402.16819 (2024).
+     Cameron, Martin Jaggi, Dan Alistarh, Torsten Hoefler, and James Hensman.                 [23] Akshat Ramachandran, Souvik Kundu, and Tushar Krishna. 2024. MicroScopiQ:
+     2024. Quarot: Outlier-free 4-bit inference in rotated llms. Advances in Neural                Accelerating Foundational Models through Outlier-Aware Microscaling Quanti-
+     Information Processing Systems 37 (2024), 100213–100240.                                      zation. arXiv preprint arXiv:2411.05282 (2024).
+ [3] Tom B Brown. 2020. Language models are few-shot learners. arXiv preprint                 [24] Bita Darvish Rouhani, Ritchie Zhao, Ankit More, Mathew Hall, Alireza Kho-
+     arXiv:2005.14165 (2020).                                                                      damoradi, Summer Deng, Dhruv Choudhary, Marius Cornea, Eric Dellinger,
+ [4] Wanyun Cui and Qianle Wang. 2024. Cherry on Top: Parameter Heterogeneity                      Kristof Denolf, et al. 2023. Microscaling data formats for deep learning. arXiv
+     and Quantization in Large Language Models. arXiv preprint arXiv:2404.02837                    preprint arXiv:2310.10537 (2023).
+     (2024).                                                                                  [25] Charbel Sakr, Yongjune Kim, and Naresh Shanbhag. 2017. Analytical Guarantees
+ [5] Steve Dai, Rangha Venkatesan, Mark Ren, Brian Zimmer, William Dally, and                      on Numerical Precision of Deep Neural Networks. In Proceedings of the 34th
+     Brucek Khailany. 2021. Vs-quant: Per-vector scaled quantization for accurate                  International Conference on Machine Learning (Proceedings of Machine Learning
+     low-precision neural network inference. Proceedings of Machine Learning and                   Research, Vol. 70), Doina Precup and Yee Whye Teh (Eds.). PMLR, 3007–3016.
+     Systems 3 (2021), 873–884.                                                                    https://proceedings.mlr.press/v70/sakr17a.html
+ [6] Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. 2022. Llm.               [26] Wenqi Shao, Mengzhao Chen, Zhaoyang Zhang, Peng Xu, Lirui Zhao, Zhiqian
+     int8 (): 8-bit matrix multiplication for transformers at scale. arXiv preprint                Li, Kaipeng Zhang, Peng Gao, Yu Qiao, and Ping Luo. 2023. Omniquant: Omni-
+     arXiv:2208.07339 (2022).                                                                      directionally calibrated quantization for large language models. arXiv preprint
+ [7] Tim Dettmers, Ruslan Svirschevski, Vage Egiazarian, Denis Kuznedelev, Elias                   arXiv:2308.13137 (2023).
+     Frantar, Saleh Ashkboos, Alexander Borzunov, Torsten Hoefler, and Dan Alistarh.          [27] Yakun Sophia Shao, Jason Cemons, Rangharajan Venkatesan, Brian Zimmer,
+     2023. SpQR: A Sparse-Quantized Representation for Near-Lossless LLM Weight                    Matthew Fojtik, Nan Jiang, Ben Keller, Alicia Klinefelter, Nathaniel Pinckney,
+     Compression. arXiv preprint arXiv:2306.03078 (2023).                                          Priyanka Raina, et al. 2021. Simba: scaling deep-learning inference with chiplet-
+ [8] Zhen Dong, Zhewei Yao, Daiyaan Arfeen, Amir Gholami, Michael W Mahoney,                       based architecture. Commun. ACM 64, 6 (2021), 107–116.
+     and Kurt Keutzer. 2020. Hawq-v2: Hessian aware trace-weighted quantization               [28] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yas-
+     of neural networks. Advances in neural information processing systems 33 (2020),              mine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhos-
+     18518–18529.                                                                                  ale, et al. 2023. Llama 2: Open foundation and fine-tuned chat models. arXiv
+ [9] Zhen Dong, Zhewei Yao, Amir Gholami, Michael W Mahoney, and Kurt Keutzer.                     preprint arXiv:2307.09288 (2023).
+     2019. Hawq: Hessian aware quantization of neural networks with mixed-                    [29] Rangharajan Venkatesan, Yakun Sophia Shao, Miaorong Wang, Jason Clemons,
+     precision. In Proceedings of the IEEE/CVF International Conference on Computer                Steve Dai, Matthew Fojtik, Ben Keller, Alicia Klinefelter, Nathaniel Pinckney,
+     Vision. 293–302.                                                                              Priyanka Raina, et al. 2019. Magnet: A modular accelerator generator for neural
+[10] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. 2022. Gptq:                 networks. In 2019 IEEE/ACM International Conference on Computer-Aided Design
+     Accurate post-training quantization for generative pre-trained transformers.                  (ICCAD). IEEE, 1–8.
+     arXiv preprint arXiv:2210.17323 (2022).                                                  [30] Kuan Wang, Zhijian Liu, Yujun Lin, Ji Lin, and Song Han. 2019. Haq: Hardware-
+[11] Cong Guo, Jiaming Tang, Weiming Hu, Jingwen Leng, Chen Zhang, Fan Yang,                       aware automated quantization with mixed precision. In Proceedings of the
+     Yunxin Liu, Minyi Guo, and Yuhao Zhu. 2023. Olive: Accelerating large language                IEEE/CVF conference on computer vision and pattern recognition. 8612–8620.
+     models via hardware-friendly outlier-victim pair quantization. In Proceedings of         [31] Bichen Wu, Yanghan Wang, Peizhao Zhang, Yuandong Tian, Peter Vajda, and
+     the 50th Annual International Symposium on Computer Architecture. 1–15.                       Kurt Keutzer. 2018. Mixed precision quantization of convnets via differentiable
+[12] Wei Huang, Haotong Qin, Yangdong Liu, Yawei Li, Xianglong Liu, Luca                           neural architecture search. arXiv preprint arXiv:1812.00090 (2018).
+     Benini, Michele Magno, and Xiaojuan Qi. 2024. SliM-LLM: Salience-Driven                  [32] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song
+     Mixed-Precision Quantization for Large Language Models. arXiv preprint                        Han. 2023. Smoothquant: Accurate and efficient post-training quantization for
+     arXiv:2405.14917 (2024).                                                                      large language models. In International Conference on Machine Learning. PMLR,
+[13] Benoit Jacob, Skirmantas Kligys, Bo Chen, Menglong Zhu, Matthew Tang, An-                     38087–38099.
+     drew Howard, Hartwig Adam, and Dmitry Kalenichenko. 2018. Quantization                   [33] Ali Hadi Zadeh, Isak Edo, Omar Mohamed Awad, and Andreas Moshovos. 2020.
+     and training of neural networks for efficient integer-arithmetic-only inference.              Gobo: Quantizing attention-based nlp models for low latency and energy ef-
+     In Proceedings of the IEEE conference on computer vision and pattern recognition.             ficient inference. In 2020 53rd Annual IEEE/ACM International Symposium on
+     2704–2713.                                                                                    Microarchitecture (MICRO). IEEE, 811–824.
+[14] Ben Keller, Rangharajan Venkatesan, Steve Dai, Stephen G Tell, Brian Zimmer,             [34] Ben Zandonati, Adrian Alan Pol, Maurizio Pierini, Olya Sirkin, and Tal Kopetz.
+     William J Dally, C Thomas Gray, and Brucek Khailany. 2022. A 17–95.6 TOPS/W                   2022. Fit: A metric for model sensitivity. arXiv preprint arXiv:2210.08502 (2022).
+     deep learning inference accelerator with per-vector scaled 4-bit quantization for        [35] Yilong Zhao, Chien-Yu Lin, Kan Zhu, Zihao Ye, Lequn Chen, Size Zheng, Luis
+     transformers in 5nm. In 2022 IEEE Symposium on VLSI Technology and Circuits                   Ceze, Arvind Krishnamurthy, Tianqi Chen, and Baris Kasikci. 2024. Atom: Low-
+     (VLSI Technology and Circuits). IEEE, 16–17.                                                  bit quantization for efficient and accurate llm serving. Proceedings of Machine
+[15] Sehoon Kim, Coleman Hooper, Amir Gholami, Zhen Dong, Xiuyu Li, Sheng Shen,                    Learning and Systems 6 (2024), 196–209.
+     Michael W Mahoney, and Kurt Keutzer. 2023. SqueezeLLM: Dense-and-Sparse
+     Quantization. arXiv preprint arXiv:2306.07629 (2023).
+[16] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen
+     Wang, Guangxuan Xiao, Xingyu Dang, Chuang Gan, and Song Han. 2024. AWQ:
+     Activation-aware Weight Quantization for On-Device LLM Compression and
+     Acceleration. Proceedings of Machine Learning and Systems 6 (2024), 87–100.
+[17] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Xingyu Dang, and Song Han.
+     2023. AWQ: Activation-aware Weight Quantization for LLM Compression and
+     Acceleration. arXiv preprint arXiv:2306.00978 (2023).
+[18] Fangxin Liu, Ning Yang, Haomin Li, Zongwu Wang, Zhuoran Song, Songwen
+     Pei, and Li Jiang. 2024. SPARK: Scalable and Precision-Aware Acceleration of
+     Neural Networks via Efficient Encoding. In 2024 IEEE International Symposium
+     on High-Performance Computer Architecture (HPCA). IEEE, 1029–1042.
+[19] Zechun Liu, Changsheng Zhao, Igor Fedorov, Bilge Soran, Dhruv Choudhary,
+     Raghuraman Krishnamoorthi, Vikas Chandra, Yuandong Tian, and Tijmen
+     Blankevoort. 2024. Spinquant: Llm quantization with learned rotations. arXiv
+     preprint arXiv:2405.16406 (2024).
+[20] Markus Nagel, Marios Fournarakis, Rana Ali Amjad, Yelysei Bondarenko, Mart
+     Van Baalen, and Tijmen Blankevoort. 2021. A white paper on neural network
+     quantization. arXiv preprint arXiv:2106.08295 (2021).
+[21] NVIDIA Corporation. 2021. BlockScaling: NVFP4 Datatype. NVIDIA Corpora-
+     tion. https://docs.nvidia.com/deeplearning/cudnn/frontend/v1.10.0/operations/
+     BlockScaling.html NVIDIA cuDNN Frontend Documentation, Version 1.10.0.
+
+                                                                                         12
+

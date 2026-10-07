@@ -1,0 +1,1121 @@
+                                                                Quartet II: Accurate LLM Pre-Training in NVFP4
+                                                                  by Improved Unbiased Gradient Estimation
+
+
+                                                                 Andrei Panferov 1 Erik Schultheis 1 Soroush Tabesh 1 Dan Alistarh 1 2
+
+
+                                                                  Abstract                                  the linear projections in attention and MLPs, and so, reduc-
+                                               The NVFP4 lower-precision format, supported in               ing the precision of these GEMMs is one of the most direct
+                                               hardware by NVIDIA Blackwell GPUs, promises                  levers for lowering end-to-end training costs.
+arXiv:2601.22813v2 [cs.LG] 1 Jun 2026
+
+
+
+
+                                               to allow, for the first time, end-to-end fully-              This motivation has driven a steady progression of mixed-
+                                               quantized pre-training of massive models such as             precision training recipes, from FP16/BF16 to FP8 (Mi-
+                                               LLMs. Yet, existing quantized training methods               cikevicius et al., 2022), and now toward 4-bit microscaling
+                                               still sacrifice some of the representation capacity          floating point formats such as MXFP and NVFP. In these
+                                               of this format in favor of more accurate unbiased            formats, values are stored in a 4-bit floating-point encoding,
+                                               quantized gradient estimation by stochastic round-           but each small block is accompanied by a higher-precision,
+                                               ing (SR), losing noticeable accuracy relative to             e.g. FP8, scale, preserving dynamic range while enabling
+                                               standard FP16 and FP8 training. In this paper, im-           tensor-core acceleration. Recent GPU accelerators provide
+                                               prove the state of the art for quantized training in         native support for such formats, with 2-4x throughput gains
+                                               NVFP4 via a novel unbiased quantization routine              over FP8 for individual matmuls (NVIDIA, 2024).
+                                               for micro-scaled formats, called MS-EDEN, that
+                                               has more than 2x lower quantization error than SR.           The key challenge is to retain FP16/FP8-quality optimiza-
+                                               We integrate it into a novel fully-NVFP4 quan-               tion while performing most operations at 4-bit precision (Xi
+                                               tization scheme for linear layers, called Quartet            et al., 2023; Chmiel et al., 2024). At this scale, naive quan-
+                                               II. We show analytically that Quartet II achieves            tization leads to divergence over long pre-training runs.
+                                               consistently better gradient estimation across all           Emerging work on stable FP4 native training (Tseng et al.,
+                                               major matrix multiplications, both on the forward            2025; Castro et al., 2025; Chmiel et al., 2025) has converged
+                                               and on the backward passes. In addition, our                 on two guiding principles. First, the forward pass should
+                                               proposal synergizes well with recent training im-            seek to maximize representation capacity by minimizing the
+                                               provements aimed specifically at NVFP4. We fur-              quantization error of activations and weights, typically mea-
+                                               ther validate Quartet II on end-to-end LLM train-            sured via mean-square error (MSE). Second, the backward
+                                               ing with up to 1.9B parameters on 38B tokens. We             pass is especially sensitive to bias: as such, biased gradient
+                                               provide kernels for execution on NVIDIA Black-               estimators can accumulate systematic error over many steps,
+                                               well GPUs with up to 4.2x speedup over BF16.                 making unbiased (or carefully controlled) gradient quan-
+                                               Our code is available at https://github.                     tization essential for stable convergence. These insights
+                                               com/IST-DASLab/Quartet-II.                                   underpinned NVIDIA’s first end-to-end NVFP4 pre-training
+                                                                                                            recipe (NVIDIA et al., 2025) and subsequent refinements, in-
+                                                                                                            cluding forward-pass scale selection heuristics (Cook et al.,
+                                        1. Introduction                                                     2025) and improved NVFP4 stability mechanisms (Chen
+                                                                                                            et al., 2025b). Yet, current state-of-the-art FP4 recipes still
+                                        The computational cost of training state-of-the-art founda-         drop significant accuracy relative to FP8 and FP16.
+                                        tion models has been increasing at a roughly exponential
+                                                                                                            Contributions. In this paper, we improve the current state
+                                        pace, putting into question the sustainability of the area,
+                                                                                                            of the art for NVFP4 native training by revisiting the ques-
+                                        e.g. (Amodei & Hernandez, 2018; Sevilla et al., 2022). Pre-
+                                                                                                            tion of unbiased gradient estimation for the NVFP4 mi-
+                                        training modern Transformer-based foundation values is
+                                                                                                            croscaling format. Surprisingly, we show that the prevailing
+                                        dominated by dense matrix multiplications (GEMMs), e.g.
+                                                                                                            prior solution, element-wise FP4 stochastic rounding (SR),
+                                           1
+                                            Institute of Science and Technology Austria 2 Red Hat AI.       can be significantly improved. We do so by introducing a
+                                        Correspondence to: Dan Alistarh <Dan.Alistarh@ist.ac.at>.           new unbiased quantization routine for microscaling formats,
+                                                                                                            called MicroScaling EDEN (MS-EDEN), that reduces quan-
+                                        Proceedings of the 43 rd International Conference on Machine
+                                        Learning, Seoul, South Korea. PMLR 306, 2026. Copyright 2026
+                                                                                                            tization error by moving the stochasticity from individual
+                                        by the author(s).                                                   FP4 values to the microscale factors, while retaining prov-
+
+                                                                                                        1
+               Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+able unbiasedness in expectation. Based on MS-EDEN, we               NVFP4, employing careful RTN quantization and selective
+build Quartet II, a fully-NVFP4 linear-layer computation             stochastic rounding, with larger-scale (1T token) emulated
+graph that combines (i) a high-capacity forward pass using           training results. NVIDIA et al. (2025) introduced the first
+native NVFP4 scaling augmented with the “Four-over-Six”              large-scale recipe for NVFP4, leveraging square block quan-
+scale selection heuristic (Cook et al., 2025), with (ii) an          tization, Hadamard rotations on the backward pass, and
+unbiased backward pass based on MS-EDEN and efficient                setting some layers in higher precision. TetraJetV2 (Chen
+inner-dimension randomized block rotations. We provide               et al., 2025b) enhanced the NVIDIA approach via improved
+an analytic comparison showing that Quartet II yields con-           outlier control and oscillation-reduction techniques. The
+sistently improved gradient estimation across the major ma-          FourOverSix technique (Cook et al., 2025) provided an or-
+trix multiplications in transformer training, and we validate        thogonal improvement via an MSE-reducing specialized
+these improvements in end-to-end LLM pre-training. Fi-               grid selection algorithm.
+nally, we provide kernels enabling efficient execution on
+                                                                     TetraJet-v2 was proposed by Chen et al. (2025b) as an up-
+NVIDIA Blackwell GPUs, making the proposed recipe prac-
+                                                                     grade over NVIDIA et al. (2025). It introduces a num-
+tical at scale. In summary, our contributions are as follows:
+                                                                     ber of corrections to the scheme as well as a number of
+                                                                     heuristics to further stabilize it: i) they correct the activa-
+   • A new unbiased quantization primitive called MS-                tions re-quantization in the backward pass to better align
+     EDEN tailored to microscaling FP4 formats that                  with the chain rule and add weigh re-quantization similar
+     substantially reduces quantization error relative to            to Castro et al. (2025); ii) they introduce intermediate-level
+     FP4 stochastic rounding while remaining hardware-               FP32 scales and selective outlier channels. The practicality
+     compatible and efficient.                                       of these format changes is hard to validate, as it requires
+   • A fully-NVFP4 linear-layer training graph called Quar-          substantially more complicated kernel support that is not
+     tet II that combines improved forward-pass quantiza-            provided by the authors. In light of that, when referencing
+     tion with improved unbiased backward-pass quantiza-             TetraJet-v2 later in the paper, we will refer to the following
+     tion (MS-EDEN), yielding better gradient estimates.             GPU-feasible scheme: NVFP4 quantization with RTN with-
+                                                                     out square-block-scales on the forward pass, and SR quanti-
+   • Empirical validation: we perform extensive ablations            zation with RHT on the inner dimension for both GEMMs
+     and end-to-end accuracy validation via training runs            on the backward pass. We will not, however, re-implement
+     showing consistent accuracy improvements over prior             their intermediate FP32 scales or outlier channels. This sep-
+     NVFP4 recipes.                                                  arates the logical scheme from design decisions that would
+   • Efficient kernels: we show that our scheme is effi-             be difficult to implement in practice.
+     ciently implementable on the NVIDIA Blackwell gen-              All the above techniques employ some variant of stochas-
+     eration of GPUs, with up to 4.2x speedup vs BF16.               tic rounding (SR) to preserve unbiasedness on the back-
+                                                                     ward pass. We re-consider this choice, and propose a new
+2. Related Work                                                      unbiased gradient estimator (MS-EDEN) which provides
+                                                                     significantly better MSE, and validation loss.
+Lower-precision training. Low-precision training is a long-
+standing direction in deep learning, e.g. (Courbariaux et al.,       Unbiased quantization and rotations. Unbiased stochas-
+2015; Esser et al., 2019; Panferov et al., 2025a; Micikevicius       tic quantization is a key technique in distributed op-
+et al., 2022; Hernández-Cano et al., 2025). Early demon-            timization (Alistarh et al., 2017; Suresh et al., 2017;
+strations of 4-bit training and 4-bit matrix multiplications         Davies et al., 2020), as it leads to convergence guarantees
+focused on INT4, and established that careful handling of            for communication-reduced SGD. Stochastic rounding is
+scaling and outliers can maintain accuracy in constrained            the standard unbiased primitive in low-precision training,
+regimes (Xi et al., 2023; Chmiel et al., 2024).                      but can substantially inflate variance at lower bitwidths.
+                                                                     EDEN (Vargaftik et al., 2022) combined randomized rota-
+Training in microscaling FP4. The recent introduction                tions with a corrective rescaling to obtain (nearly) unbiased
+of NVFP4 and MXFP4 microscaling floating point for-                  estimators in distributed optimization. Yet, this technique
+mats (NVIDIA, 2024) has led to renewed interest in this              is not directly applicable in our setting, as we discuss in
+direction. Tseng et al. (2025) investigated having only the          Section 3.2. Our MS-EDEN routine addresses this issue
+backward pass in MXFP4, highlighting how microscaling                by enabling unbiasedness while reducing error relative to
+choices and kernel behavior interact with optimization sta-          SR. More broadly, rotations have also been used for dis-
+bility. Castro et al. (2025) and Chmiel et al. (2025) con-           tribution smoothing in the case of weight and activation
+currently proposed the first stable fully-quantized training         quantization (Tseng et al., 2024; Ashkboos et al., 2024).
+recipes. The former focused on MXFP4 and used a com-
+bination of Hadamard rotations and MSE-optimal clipping,
+providing GPU kernel results, whereas the latter focused on
+
+                                                                 2
+                                       Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+                               E W, Q(E T) Q(X T)T            Q(E) W, E T X             Q(E) Q(W T)T, E T X          Q(E) W, Q(E T) Q(X T)T Q(E) Q(W T)T, Q(E T) Q(X T)T
+                       0.007
+                                           SR                            N=30M
+C4 Val Loss Increase
+
+
+                                           Micro-EDEN                    N=50M
+                       0.005
+                                                                         N=100M
+                       0.003
+
+                       BF16
+                                     102                103      102              103         102             103           102             103        102           103
+                                       D/N                         D/N                          D/N                           D/N                        D/N
+                                       (a)                         (b)                          (c)                           (d)                        (e)
+
+Figure 1. Impact of selective NVFP4 backward pass quantization on C4 Validation Loss relative to BF16 pre-training for N -parameter
+Llama-2-like LLMs with D/N tokens-per-parameter. Axis captions indicate which tensors of the two backward pass GEMMs are
+quantized.
+
+
+3. Backward Pass Quantization                                                                       global scale. Then, Stochastic Rounding (SR) is defined as:
+A d-dimensional quantization operator Q applied to vectors
+                                                                                                                                   16
+xd ∈ Rd is usually defined as (possibly stochastic) mapping                                           xFP32 = max |xi |/(6.0 ×        × 448.0),
+Q(xd , ω) → Rd where the argument ω ∈ Ω is given by                                                           i=1...d              17
+                                                                                                                                                          
+probability samples used to unbias the result. In practice,                                                                                     |xi |
+                                                                                                      xFP8
+                                                                                                        g   = RTN   FP8       max                            ,
+users can sample the (pseudo-) randomness ω reproducibly                                                                 i=16·g...16·g+15 xFP32 × 6.0 × 16
+                                                                                                                                                        17
+from its distribution Ω. Then, unbiasedness w.r.t. ω is
+                                                                                                                                            !
+                                                                                                        FP4                    xi
+defined as follows:                                                                                   xi = SRF P 4                        ,ω .
+                                                                                                                         xFP8
+                                                                                                                          i//16 × x
+                                                                                                                                     FP32
+
+
+
+                                   ∀xd ∈ Rd : Eω Q(xd , ω) = xd .
+                                                         
+                                                                                                    Here, 448.0 is the absolute maximum value representable
+                                                                                                    by FP8, 6.0 is the absolute maximum value representable by
+                                                                                                    FP4 and 16/17 is the maximum factor by which RTNFP8
+We will focus on unbiasedness in backward pass quantiza-                                            can increase the underlying values. The latter is necessary
+tion for LLM pre-training, where it was shown to be crucial                                         to ensure that −6.0 ≤ xFP8 x×x   FP32 ≤ 6.0, similar to the
+                                                                                                                                   i
+
+for stable long-term convergence (Chmiel et al., 2024; Tseng                                                                        i//16
+
+et al., 2025; Castro et al., 2025; NVIDIA et al., 2025). Intu-                                      3/4 factor of Tseng et al. (2025) for MXFP4. SRFP4 is the
+itively, this is because consistent bias in gradient estimation                                     probabilistic rounding operation w.r.t. randomness ω which
+can lead to persistently incorrect descent directions.                                              preserves its argument in expectation. Given the choice
+                                                                                                    of constants, stochastic rounding SRFP4 does not clip its
+3.1. NVFP4 and Stochastic Rounding                                                                  arguments, and the resulting estimation is unbiased, that is:
+
+The end goal of quantized training is to achieve higher                                                               h                       i
+throughput via the use of specialized low-precision                                                                 Eω xFP4
+                                                                                                                        i   × xFP8
+                                                                                                                               i//16 × x
+                                                                                                                                         FP32
+                                                                                                                                                = xi .
+GEMMs; in particular, recent GPUs from NVIDIA and
+AMD support micro-scaling formats called MXFP4 and
+NVFP4. The NVFP4 format was shown to yield superior                                                 To our knowledge, all existing FP4 training meth-
+accuracy to MXFP4 (NVIDIA et al., 2025; Egiazarian                                                  ods (Chmiel et al., 2025; Castro et al., 2025; NVIDIA et al.,
+et al., 2025; Chen et al., 2025a). It represents tensors                                            2025; Chen et al., 2025b; Tseng et al., 2025) utilize element-
+mapping values to the E2M1 floating point format with two                                           wise stochastic rounding for unbiasedness.
+levels of scales: one E4M3 scale per 16 values, and a single
+FP32 scale per tensor, for range extension. Formally, the                                           3.2. EDEN Rescaling: A Theoretically-Justified Solution
+quantized representation QSR of x becomes                                                           A popular tool in the context of LLM quantization is given
+                                                                                                    by randomized rotations such as the Randomized Hadamard
+                                            
+                                              FP4     d
+                                                                                                    Transform (RHT) (Xi et al., 2023; Tseng et al., 2024; Ashk-
+                                            x ∈ R
+                                            
+                                                                                                    boos et al., 2024; Tseng et al., 2025). An alternative use of
+                                     d
+                           QSR (x ∈ R , ω) → x ∈ Rd//16
+                                              FP8                             → Rd ,                the RHT comes from distributed optimization (Suresh et al.,
+                                            xFP32 ∈ R
+                                            
+                                                                                                    2017; Davies et al., 2020; Vargaftik et al., 2021). One such
+                                                                                                    method is EDEN (Vargaftik et al., 2022), which uses RHT
+                                                                                                    (seeded by the random variable ω) to ensure co-linearity
+where xFP4 ∈ Rd is the vector of FP4 elements, xFP8 ∈                                               between the high-precision rotated vector RHT(x, ω) and
+Rd//16 is the set of group scales, and xFP32 is the scalar                                          the expectation of the quantized vector Q(RHT(x, ω)). The
+
+                                                                                              3
+                Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+Algorithm 1 MS-EDEN                                                  Table 1. Quadratic error over N (0, 1) for a number of NVFP4
+                                                                     rounding schemes with native (1x16) or square-block (16x16)
+  Input: vector x, rotation seed ωRHT , rounding seed ωSR ,          scales. Addition of Four Over Six (Cook et al., 2025) is indicated
+  grid max s                                                         by “+4/6”. Highlighted are the chosen schemes for Quartet II for-
+  for h in range(0, d, 128): do                                      ward pass and backward pass.
+     xRHT
+      [h:h+128] = RHT(x[h:h+128] , ωRHT )
+                                                                       Method          Group Size      MSE ×10−3         Unbiased
+  end for
+  {xFP4 , xFP8 , xFP32 } = QRTN (xRHT , s)                             RTN                 1x16              9.0
+  xRTN = xFP4 × xFP8 × xFP32                                            +4/6               1x16              7.6
+  for h in range(0, d, 16): do                                         RTN                16x16             12.4
+                ⟨xRHT         ,xRHT       ⟩                             +4/6              16x16             12.4
+     Sh//16 = ⟨x[h:h+16]
+                RHT
+                           [h:h+16]
+                         ,xRTN      ⟩
+                   [h:h+16]    [h:h+16]
+  end for                                                              SR                  1x16             23.5
+  for g in range(0, d//16): do                                          +4/6               1x16             17.5
+    xFP8   = SRFP8 Sg · xFP8    , ωSR
+                                                                      MS-EDEN             1x16              9.4
+      g                     g
+  end for
+  return {xFP4 , xFP8 , xFP32 }
+                                                                     and a grid scale parameter s. First, we perform an RHT
+                                                                     of the current chunk, seeded by the corresponding pseudo-
+key idea is introducing a bias correction factor S via:              randomness ωRHT . This rotated chunk is then quantized
+                                                                     to NVFP4 via round-to-nearest (RTN) quantization, yield-
+                              ⟨x, x⟩                                 ing substantially lower mean-square-error than standard SR.
+                 S=                           ,                      The second step requires us to address the EDEN scale preci-
+                    ⟨RHT(x, ω), Q(RHT(x, ω))⟩
+                                                                     sion issue. For this, we propose a novel variant that merges
+     QEDEN (x, ω) = S · Q(RHT(x, ω)).           (1)
+                                                                     the EDEN correction factors S into the group micro-scales
+                                                                     via stochastic rounding. The unbiasedness of stochastic
+Given this construction, the EDEN authors show that, if d            rounding guarantees that, in expectation, S is represented
+is the underlying dimension, then:                                   exactly, preserving the unbiasedness end-to-end.
+         lim Eω RHT−1 (QEDEN (x, ω), ω) = x,
+                                         
+                                                                     “Unbiased” NVFP4 RTN Quantization. First, notice that,
+        d→∞
+                                                                     since EDEN guarantees unbiasedness via randomized ro-
+i.e., QEDEN yields unbiased estimates in rotated space. In           tations and re-scaling, we do not need stochastic rounding
+practice, this sequence converges fast enough to be unbiased         (SR) of individual values to FP4. Second, since we not em-
+with RHT performed in groups as small as d = 64.                     ploy SR, we can allow the QRTN operation to possibly clip
+                                                                     some values. Third, the correction factors might sometimes
+The Challenge. Unfortunately, this elegant construction              need to scale xFP8 “up,” meaning that we need to raise the
+cannot be directly applied to gradient estimation for quan-          range ceiling to accommodate these updates. To accomo-
+tized training. As observed by Castro et al. (2025), the scale       date these constraints, we define the clipping RTN NVFP4
+correction factor S proposed by EDEN has values in the               quantization scheme QRTN (x ∈ Rd , s ∈ R) as follows:
+interval [0.94, 1.06] in practice, requiring a high precision
+representation for storage. As such, it is incompatible with                xFP32 = max |xi |/(s × 256.0),
+                                                                                    i=1...d
+the coarse compressed scale representation of NVFP4: the                                                          |xi | 
+minimum relative update that can be accommodated by FP8                     xFP8
+                                                                              g   = RTNFP8         max                    ,
+                                                                                              i=16·g...16·g+15 xFP32 × s
+scales is ×1.0625. Nor can this be merged into the finer
+per-tensor scale, as the scaling groups have to be a subset of
+                                                                                                    xi        
+                                                                            xFP4
+                                                                              i   = RTNFP4 F P 8                 .
+the rotation groups.                                                                          xi//16 × xFP32
+
+3.3. Our Solution: Microscaling EDEN                                 Setting the clipping factor s to 6 × 17     16
+                                                                                                                    or lower makes
+                                                                     the scheme non-clipping. We numerically find that s =
+Overview. We now show how to extend the EDEN bias                      1        16
+correction given in Equation 1 to the NVFP4 microscaling             0.93 ×6× 17 minimizes the expected MSE over N (0, 1). We
+                                                                     use this factor for the rest of the paper. Additionally, relative
+quantization format. The pseudocode of our procedure is
+                                                                     to QSR , FP8 scales are initially capped by 256.0 instead of
+given in Algorithm 1. We first provide an overview, and
+                                                                     448.0 for them not to overflow when applying EDEN correc-
+then discuss some key implementation details.
+                                                                     tion. The only place where we require stochastic rounding is
+The procedure processes the input vector x in chunks of e.g.         for the group scales, in order to address the fact that NVFP4
+128 consecutive entries (any multiple of the quantization            group scales are maintained in E4M3 FP8, which is too
+group size 16 is valid), given rotation and rounding seeds,          coarse to faithfully represent the EDEN rescaling factors.
+
+                                                                 4
+               Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+Guarantees. Formally, the quantizer Q needs to satisfy a             input gradient:
+number of properties for EDEN to be unbiased, such as i)
+sign-symmetry and ii) Q(x) ̸= 0. These properties hold for                        ∂L
+                                                                                     ≈ QFP4 (E) · QFP4 (W T )T .
+non-under-flowing floating point quantization. Specifically,                      ∂X
+NVFP4 was shown to have enough range for the scales not              This effectively halves the backward pass quantization error
+to underflow (Egiazarian et al., 2025; Chen et al., 2025a).          for this matrix product, as seen from stochastic rounding
+Based on Theorem 2.1 of Vargaftik et al. (2022) and the              (SR) performance gaps in Figure 1 (b,c). This improvement,
+properties of stochastic rounding, the following hold:               however, comes at the cost of worse outlier preservation and
+Corollary 3.1. For all x ∈ Rd and scale s ̸= 0, we have:             generally lower representation capacity on the forward pass,
+                                                                     due to effectively having a single FP8 scale per 256 FP4
+                                                                     values, instead of per 16 values. The effect on forward pass
+           x
+           b = QMS−EDEN (x, ωRHT , ωSR , s)                          quantization accuracy can be observed in Figure 2, where
+           EωRHT ,ωSR RHT−1 (b
+                             x, ωRHT ) = x.                          square blocks (“16x16gs”) consistently lag behind NVFP4
+                                                                     native blocks (“1x16gs”) in terms of LLM validation
+                                                                     perplexity. This presents a trade-off between gradient
+In practice, the inverse rotation RHT−1 does not need to be          estimation quality and model representation capacity
+performed, as it naturally cancels out when MS-EDEN is               chosen by enabling or disabling square-group-quantization,
+applied on the inner dimension of a matrix multiplication            which NVIDIA et al. (2025) resolve towards the former.
+to both tensors with the same rotation seed ωRHT . We
+                                                                     We make a different choice here. One first reason is that
+numerically validate unbiasedness in Appendix A.
+                                                                     MS-EDEN requires the application of randomized rota-
+Practical Performance. In Table 1, we show the MSE                   tions along the micro-scaling group dimension, i.e., along
+over normally-distributed data for various NVFP4 quantiz-            the inner GEMM dimension. This creates the need to re-
+ers: round to nearest (RTN) over groups of size 1x16 and             quantize the weight tensor W and activations tensor X
+16x16, and Stochastic Rounding (SR) with and without the             in the backward pass. Second, we argue that, even with
+FourOverSix (4/6) grid heuristic (Cook et al., 2025).                weight re-quantization, MS-EDEN yields lower error than
+                                                                     SR without weight re-quantization, since it has more than
+First, observe that SR achieves unbiasedness at the cost             2x lower quadratic error (Table 1). Moreover, this can be
+of approximately 2.5x increase in MSE over RTN. At the               seen by comparing SR without weight re-quantization in
+same time, MS-EDEN shows much smaller error increase,                Figure 1 (d) with MS-EDEN with weight re-quantization in
+improving by more than 2x over SR. We attribute this to              Figure 1 (e), which shows how this finding extrapolates to
+the fact that (a) per-element stochastic rounding introduces         LLM pre-training (more details in Section 6.1). Thus, MS-
+significant variance that if fully avoided in MS-EDEN, (b)           EDEN enjoys a better forward pass representation, while
+the rescaling with S is small for NVFP4 and (c) stochastic           improving gradient estimation on the backward pass.
+rounding for the 8-bit scales introduces variance an order of
+magnitude smaller than 4-bit quantization itself.
+                                                                     4.2. Forward Pass Using “4/6”
+The reliance on randomized rotations, however, imposes
+additional limitations: Micro-scaling groups have to be sub-         Cook et al. (2025) propose Four Over Six (“4/6”), a modifi-
+divisions of rotation groups. Due to hardware restrictions,          cation to the NVFP4 quantization algorithm that evaluates
+this implies that rotations and scale corrections have to be         two potential scale factors (4.0 and 6.0) for each block of
+applied on the inner dimension of multiplied tensors. Thus,          values, and picks the one that yields lower MSE. They com-
+there are additional considerations about the computation            bine “4/6” with stochastic rounding on backward pass.
+scheme to be made to use MS-EDEN for unbiased gradient               Yet, this combination has a notable correctness issue. In
+estimations in LLMs.                                                 the form proposed, it does not constitute an unbiased es-
+                                                                     timation, as the act of picking a lower MSE scale branch
+4. Forward Pass Quantization                                         introduces bias, even if both scale branches are individu-
+                                                                     ally unbiased via SR. We validate this claim empirically in
+4.1. A Representation-Requantization Trade-Off                       Appendix A. Consequently, their scheme does not produce
+                                                                     unbiased gradient estimations and, as such, we disregard it
+Beyond the use of stochastic rounding, one consistent
+                                                                     from the backward pass comparison.
+feature for the NVIDIA NVFP4 LLM pre-training
+scheme (NVIDIA et al., 2025) and follow-up work (Cook                Its usefulness for forward pass, however, is clear. In their
+et al., 2025) is square-block quantization of the weight             original scheme, this idea is not utilized due to the use of
+tensor W in the forward pass Y = XW T . This is designed             square-block-quantization for the weight tensor. We validate
+to allow the re-use, without re-quantization, of the quantized       this by measuring the quadratic error improvement from
+tensor in the backward pass operation for computing the              “4/6” on N (0, 1) tensors and report the results in Table 1.
+
+                                                                 5
+                              Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+                       0.10
+                               N=30M                       N=50M                          N=100M                        N=200M
+C4 Val Loss Increase
+
+
+                       0.08
+                       0.06
+                                                                                                                                    16x16gs
+                       0.04                                                                                                         16x16gs+4/6
+                                                                                                                                    1x16gs
+                       0.02
+                                                                                                                                    1x16gs+4/6
+                       BF16
+                               102            103         102            103              102             103           102                       103
+                                     D/N                        D/N                             D/N                           D/N
+
+Figure 2. NVFP4 Forward Pass C4 Validation Loss Gaps relative to BF16 pre-training for N -parameter Llama-2-like LLMs with D/N
+tokens-per-parameter. “16x16gs” and “1x16gs” indicate whether square block quantization was used or not and “+4/6” indicates whether
+Four Over Six (Cook et al., 2025) was used.
+
+
+Moreover, we measure the effect of “4/6” on forward pass                       6. Experimental Validation and Extensions
+QAT and report validation loss increase in Figure 2 (see
+Section 6.1). One can see how “4/6” positively synergizes                      6.1. Llama-Family Model Pre-Training
+with native NVFP4 scales on the forward pass, showing                          We now provide experimental validation for Quartet II by ab-
+roughly double the improvement compared to square-block-                       lating its components on LLM pre-training. Specifically, we
+quantization for LLM pre-training.                                             train Transformer models (Vaswani et al., 2023) following
+                                                                               the Llama 2 (Touvron et al., 2023) architecture on language
+5. The Quartet II Computation Graph                                            modeling loss on samples from the C4 dataset (Dodge et al.,
+                                                                               2021) using Adam (Kingma & Ba, 2017) with cosine LR
+We now put everything together to propose Quartet II, a                        schedule (Loshchilov & Hutter, 2017). We train models
+fully-NVFP4 linear layer computation scheme for LLM                            with 30M, 50M, 100M and 200M parameters with data-to-
+pre-training, with unbiased gradient estimation guarantees.                    parameter ratios in 25, 50, 100, 200, 400 and 800 — from
+For the Forward Pass, Quartet II uses Round-to-Nearest                         around compute-optimal (Hoffmann et al., 2022) to heavily
+FP4 rounding with native NVFP4 scaling (one FP8 E4M3                           over-trained. We generally follow the hyper-parameter setup
+scale per 16 elements) and additionally one per-tensor FP32                    of Panferov et al. (2025b), although we scale the learning
+scale for range extension (NVIDIA et al., 2025). This is                       rate for larger models inversely proportional to the model
+augmented by a local scaling level choice for the quantiza-                    width. We reuse all hyper-parameters (including LR and
+tion grid following Cook et al. (2025), which we refer to as                   weight decay) between BF16 baseline and QAT runs. We
+“4/6”. This deterministic rounding operation is applied to                     describe all hyper-parameters in Appendix B.
+both weights and activations in forward pass, and allows na-                   Backward pass quantization. We first validate the accu-
+tive NVFP4 multiplication using tensor cores on Blackwell                      racy of MS-EDEN for backward pass quantization in isola-
+NVIDIA GPUs. The quantized weights and activations are                         tion. We selectively enable quantization of various tensors
+saved for their use on the backward pass.                                      of the two backward pass GEMMs, denoted as E · W and
+For the Backward Pass, a group RHT rotation matrix is                          E T · X, and measure the final validation loss increase rela-
+first generated using pseudo-randomness. The saved quan-                       tive to the BF16 baseline. We test the following schemes:
+tized weights and activations are then de-quantized, trans-
+posed and then re-quantized with MS-EDEN along with                             (a) E ·W T , Q(E T )·Q(X T )T : Quantization of the weight
+the tensors E and E T to yield unbiased estimations of the                          gradient GEMM.
+corresponding tensors. These quantized tensors are then
+                                                                               (b) Q(E) · W, E T · X: Quantization of the input gradient
+multiplied in NVFP4 tensor cores. The product outputs
+                                                                                   GEMM without weight re-quantization.
+need no further processing, as the rotations cancel out along
+the inner GEMM dimensions. They are then fed to the                             (c) Q(E) · Q(W T )T , E T · X: Quantization of the input
+optimizer steps and further in back-propagation.                                    gradient GEMM with weight re-quantization.
+The Computational Graph is illustrated in Figure 3.                            (d) Q(E) · W, Q(E T ) · Q(X T )T : Quantization of both
+This scheme is designed to improve upon the TetraJet-v2                            GEMMs without weight re-quantization.
+scheme (Chen et al., 2025b) and, by extension, the NVIDIA
+recipe (NVIDIA et al., 2025). One key difference is the                         (e) Q(E) · Q(W T )T , Q(E T ) · Q(X T )T : Quantization of
+replacement of SR quantization with MS-EDEN on the                                  both GEMMs with weight re-quantization.
+backward pass and the addition of finer “4/6” (Chen et al.,
+2025a) scale selection on the forward pass.                                    For outlier smoothing, whenever both tensors in a GEMM
+                                                                               are quantized, we perform RHT on the inner dimension of
+
+                                                                        6
+                                     Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+                                                                                                                                                                            To
+                               From                                                                                                                                      Layer I+1
+                              Layer I-1                 BF16                   4/6 RTN                      NVFP4
+                                                      Activations          Quantize to NVFP4                GEMM
+
+                                                                                                                                                      MS-EDEN
+                                                                                                           4/6 RTN                                 Quantize to NVFP4
+                                                                              Dequantize                                          Dequantize
+                                                                                                       Quantize to NVFP4                              Hadamard
+                                                                               Transpose                                           Transpose       Transform, Dim=1
+
+                                                                              Hadamard                                            Hadamard                Transpose
+                                                                                                             FP32
+                                                                           Transform, Dim=1                 Weights            Transform, Dim=1
+                                  To                                                                                                                                           From
+                               Layer I-1                                      MS-EDEN                                             MS-EDEN                                    Layer I+1
+                                                                           Quantize to NVFP4                                   Quantize to NVFP4           BF16
+                                                                                                                                                          Gradient
+
+
+                                                                                NVFP4                                               NVFP4
+                                                                                                           Optimizer                                  Hadamard
+                                                                                GEMM                                                GEMM
+                                                                                                                                                   Transform, Dim=1
+
+                                                                                                                                                      MS-EDEN
+                                                                                                                                                   Quantize to NVFP4
+
+
+                                                                    Figure 3. Quartet II fully-NVFP4 linear layer computation scheme.
+
+
+                       0.12
+                                           N=30M                                           N=50M                                     N=100M                            N=200M
+                       0.10
+C4 Val Loss Increase
+
+
+
+
+                       0.08
+                       0.06                                                                                                                                                              NVIDIA
+                                                                                                                                                                                         4/6
+                       0.04
+                                                                                                                                                                                         TetraJet-v2
+                       0.02                                                                                                                                                              Quartet II
+                       BF16
+                                          102                        103                   102                   103                102             103                102                             103
+                                                D/N                                              D/N                                      D/N                                D/N
+
+Figure 4. Fully-NVFP4 (forward pass and backward pass) C4 Validation Loss Gaps relative to BF16 pre-training for N -parameter
+Llama-2-like LLMs with D/N tokens-per-parameter for Quartet II and baselines.
+
+
+the GEMM in groups of 128. Naturally, MS-EDEN is in-                                                                   Section 2) (Chen et al., 2025b). Figure 4 indicates that Quar-
+compatible with schemes (b) and (d) as it requires weight re-                                                          tet II improves consistently w.r.t. both isolated ablations and
+quantization. Nevertheless, we observe that MS-EDEN con-                                                               prior schemes, by at least 20% in terms of loss.
+sistently outperforms SR for each scheme where both are ap-
+plicable and, more notably, fully-quantized MS-EDEN with                                                               6.2. Nanochat Pre-Training
+weight re-quantization (Figure 1 (e)) outperforms fully quan-
+tized SR without weight re-quantization (Figure 1 (d)).                                                                To validate Quartet II at larger scale and on higher-quality
+                                                                                                                       data, we provide results for the Nanochat (Karpathy, 2025)
+Forward pass quantization. Secondly, we validate the ef-                                                               training pipeline. It differs from the ablations setup of Sec-
+fect of square-group-scaling and “4/6” on forward pass quan-                                                           tion 6.1 in a number of ways: 1) it utilizes the Muon opti-
+tization in isolation. The results, shown in Figure 2, demon-                                                          mizer (Jordan et al., 2024) with WSD LR schedule (Hu et al.,
+strate that “4/6” consistently improves both square-group                                                              2024), 2) QK-normalization (Henry et al., 2020; Dehghani
+scaling and native-group-scaling weights NVFP4 quanti-                                                                 et al., 2023) and 3) ReLU2 MLP activations (So et al., 2022).
+zation, as seen by decreasing performance gap vs. BF16.                                                                Data-wise, Nanochat models are pre-trained on 20 tokens-
+Native weight scales, however, show approximately dou-                                                                 per-parameter from FineWeb-Edu (Lozhkov et al., 2024)
+ble the improvement, which aligns with the fact that “4/6”                                                             and later fine-tuned on training splits of ARC (Clark et al.,
+improves both weights and activations quantization there,                                                              2018), GSM8K (Cobbe et al., 2021), Smol-SmolTalk (Al-
+as opposed to effectively only activations for square-group                                                            lal et al., 2025) and other smaller datasets. We specify all
+scaling. This aligns with the quadratic errors in Table 1.                                                             details in Appendix C.
+Overall, this demonstrates that “4/6” synergizes with native
+group scales — a novel result we incorporate into Quartet                                                              Similar to Section 6.1, we replace all linear layers with
+II.                                                                                                                    a selected QAT scheme, preserving all training hyper-
+                                                                                                                       parameters. We find that Quartet II is stable, and decreases
+Full quantization. Finally, we combine forward pass                                                                    the pre-training loss gap with BF16 by 15-25% relative
+quantization with backward pass quantization and com-                                                                  to existing NVFP4 methods in the pre-training phase, as
+pare Quartet II against NVIDIA et al. (2025), FourOver-                                                                indicated by validation bits-per-byte’s increase over BF16
+Six (Cook et al., 2025) and TetraJet-v2 (as described in                                                               shown in Figure 5. The zero-shot benchmarks, reported
+
+
+                                                                                                                7
+                                                           Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+                                                                   560M Parameters, 11B Tokens                                                                       1.9B Parameters, 38B Tokens
+                                                 2.50
+                            % Increase in BPB
+
+                                                 2.00
+
+                                                 1.50
+
+                                                 1.00
+
+                                                 0.50
+                                                                                      NVIDIA                             TetraJet-v2
+                                                                                      4/6                                Quartet II
+                                                BF16
+                                                           0         2                 4                     6   8              10                              0           10                 20                     30
+                                                                                  Consumed Tokens, B                                                                          Consumed Tokens, B
+                            Figure 5. Validation loss curves for Nanochat pre-training. Plot show relative increase in bits-per-byte (BPB) w.r.t. BF16
+                            pre-training. Inconsistent loss landscape is observed for both BF16 and QAT around 6B tokens but training always stabilizes
+                            later, as seen from reported STD (estimated over 3 restarts) for Quartet II.
+
+                                                Forward+backward speedup vs bf16 (mean ± 2std of 10 runs)                                                            Forward+backward speedup vs bf16 (mean ± 2 std of 10 runs)
+
+                       7x                       Pure GEMM ceiling                   Quartet, MXFP4                                                                   Pure GEMM ceiling                  Quartet, MXFP4
+                                                MXFP8                               Quartet II, NVFP4                                                                MXFP8                              Quartet II, NVFP4
+                       6x                                         1221 TFLOp/s                1241 TFLOp/s                                                      4x                                                    5152 TFLOp/s         5342 TFLOp/s
+                                                                                                                                                                        4720 TFLOp/s          4983 TFLOp/s
+                                            1173 TFLOp/s
+Linear Layer Speedup
+
+
+
+
+                                                                                                                                         Linear Layer Speedup
+                                                                                                                 1162 TFLOp/s
+
+
+                       5x
+                                                                                                                                                                3x
+                       4x
+
+
+                       3x                                                                                                                                       2x
+
+
+                       2x
+                                                                                                                                                                1x
+                       1x
+
+
+                       0x                                                                                                                                       0x
+                                                800M                 3B                          7B                  22B                                             800M                3B                      7B                  22B
+                                                                                 Model Size                                                                                                       Model Size
+
+                                                                  (a) RTX 5090                                                                                                            (b) B200
+Figure 6. Linear layer computation speedup over BF16 for training layers characteristic of particular model sizes. Hollow boxes indicate
+pure matmul speed, and correspondingly visualize the quantization overhead.
+
+
+after additional mid-training and SFT (Appendix C), show                                                                                 hardware-aware implementation heuristic for MS-EDEN:
+insignificant differences between the QAT methods, proba-                                                                                post hoc range alignment for NVFP4 quantization.
+bly due to short instruction tuning and small test datasets.
+                                                                                                                                         In the first kernel, instead of aligning the scales range with
+                                                                                                                                         a pre-computed AbsMax, we skip the alignment and round
+7. Kernel Support                                                                                                                        scales to E8M3 — an extended range proxy for FP8 repre-
+                                                                                                                                         sented in BF16. We then divide tensor values by the scales,
+Fused Re-Quantization Kernel. Hashed regions in Fig-                                                                                     round to FP4. We refer to this combination of E8M3 scales
+ure 3 indicate roughly which operation can be merged to-                                                                                 and FP4 values as extended-range NVFP4 (ER-NVFP4).
+gether for efficient execution on GPUs. In practice, how-                                                                                We reduce the global absolute maximum after rotation and
+ever, these operations cannot be performed in a single kernel                                                                            calculate the EDEN correction factors in the same kernel, re-
+pass because the global maximum reduction, required for                                                                                  moving the need to load and rotate the original tensor twice.
+NVFP4 quantization, acts as a global barrier. It has to be
+performed in a separate kernel, as shown in Figure 7 for                                                                                 In the second kernel, we load the E8M3 pseudo-scales, as
+the re-quantizing MS-EDEN operation as an example. This                                                                                  well as the reduced FP32 global maximum, shift the pseudo-
+doubles the memory bandwidth and matrix multiplication                                                                                   scales into the FP8-representable region, apply the EDEN
+costs, as the entire tensor has to be loaded and rotated twice.                                                                          correction and quantize them to FP8 with stochastic round-
+                                                                                                                                         ing, yielding unbiased gradient estimation. The resulting
+Post Hoc Range Alignment. To avoid double loads and                                                                                      scheme for the re-quantizing MS-EDEN operation, as an
+rotations, we propose the following format-specific and                                                                                  example, is shown in Figure 8. Since the second kernel
+
+                                                                                                                                     8
+                        Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+                                                                                                                           Table 2. Global memory (GMEM) bandwidth
+          N×Fp4, N/16×FP8, FP32                                       N×Fp4, N/16×FP8, FP32
+                                                                                                                           and GEMM instruction complexities for naı̈ve
+                                                                                                                           and post hoc range alignment MS-EDEN re-
+     Dequantize                     Dequantize                   Dequantize
+                                                                                                                           quantization kernels.
+     Transpose                      Transpose                    Transpose
+                                                                                                Quantize to
+                                                                                                IR-NVFP4
+      Rotation
+      GEMM
+                                     Rotation
+                                     GEMM
+                                                                  Rotation
+                                                                  GEMM
+                                                                                                                                  Kernel:         Naı̈ve      Post hoc
+                                                                                                       N/16×BF16
+                     FP32
+                                    Quantize to                                  FP32
+  Aggregate AbsMax
+                                     NVFP4                    Aggregate AbsMax                Align FP8 Range                        Bits moved per element
+                                  Apply MS-EDEN                                               Apply MS-EDEN
+                                    Correction                                                  Correction                    GMEM→SM:            4.5+4.5      4.5+1
+            FP32                           N/16×FP8   N×Fp4             FP32                           N/16×FP8    N×Fp4      SM→GMEM:             0+4.5       5+0.5
+
+Figure 7. Naı̈ve range alignment MS- Figure 8. Improved post hoc range align-                                                    GEMM calls per NVFP4 group
+EDEN re-quantization kernel.         ment MS-EDEN re-quantization kernel.                                                   mma.m16n8k16:            2           1
+
+
+only operates on the scales, it requires substantially less                                           We validate that MS-EDEN’s better guarantees imply better
+memory movement than the initial quantization, leading to                                             model quality and that the proposed scheme benefits from
+a theoretical bandwidth saving of around 20%, as shown                                                additional QAT heuristics. The hardware support we pro-
+in Table 2, and practical latency of the second kernel being                                          vide in the form of CUDA kernels further demonstrates its
+more than 10x less than the first one. We discuss the specific                                        practical potential.
+implementation in Appendix D.
+                                                                                                      Even though we see the main contribution of this paper
+Speedups. We provide and benchmark custom CUDA                                                        in the application of advanced debiasing techniques to the
+kernels tailored for the NVIDIA RTX 5090 GPU and B200                                                 backward pass of deep learning model training, the experi-
+for all three unique Quartet II quantization operations in                                            mental verification focused on a relatively narrower problem
+the backward pass, as well Four Over Six quantization in                                              of pre-training LLMs in the NVFP4 format, which currently
+the forward pass. For the matrix multiplications themselves,                                          is only supported on a single generation of NVIDIA accel-
+we use cuBLAS.                                                                                        erators. From basic statistical properties (i.e., measurably
+                                                                                                      lower MSE on Gaussian source), we expect the approach
+Firstly, to reduce the effect of external factors (e.g., dis-                                         to generalize to other problems and model architectures
+tributed setting, attention implementation, vocabulary size),                                         too, but doing that might require additional hyper-parameter
+we report the isolated speedup of linear layer operations.                                            tuning, such as randomized rotation temporal and spacial
+Figure 6 shows these results on a RTX 5090 (1676 TFLOP/s;                                             granularity.
+theoretical speedup 8× and on a B200 (9000 TFLOP/s; theo-
+retical speedup 4×). Due to power or thermal constraints, as
+well as due to matrix shapes, the actual FLOP/s achieved for
+a pure matmul are below the theoretical speeds, and shown
+as hollow boxes in the plots. The filled boxes indicate the
+actual speeds, with the gaps between the two corresponding
+to the cost of our quantization kernels.
+For the RTX 5090, Quartet II achieves more than 4× linear
+layer speed for large sizes, and still more than 4× even for
+small sizes, and consistently outperforms the implementa-
+tion from Quartet (Castro et al., 2025). On the B200, the
+smaller matrix sizes are entirely dominated by the quantiza-
+tion overhead, and we see actual speedups only starting at
+3B, and get up to 2.5× for 22B. Moreover, we demonstrate a
+more than 1.8x increase over BF16 in real training through-
+put for 1B LLM pre-training (details in Appendix D).
+
+8. Conclusion and Limitations
+We leveraged insights from distributed optimization to pro-
+pose a novel unbiased quantization scheme for microscaling
+formats called MS-EDEN. Based on it, we propose Quartet
+II — a computation scheme for NVFP4 LLM pre-training.
+
+
+                                                                                                 9
+                Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+Impact Statement                                                           Native fp4 training can be optimal for large language mod-
+                                                                           els, 2025. URL https://arxiv.org/abs/2505.
+This paper presents work whose goal is to advance the field                14669.
+of Machine Learning. There are many potential societal
+consequences of our work, none which we feel must be                     Chen, M., Wu, M., Jin, H., Yuan, Z., Liu, J., Zhang, C., Li,
+specifically highlighted here.                                             Y., Huang, J., Ma, J., Xue, Z., Liu, Z., Bin, X., and Luo, P.
+                                                                           Int v.s. fp: A comprehensive study of fine-grained low-bit
+Acknowledgments                                                            quantization formats, 2025a. URL https://arxiv.
+                                                                           org/abs/2510.25602.
+We would like to thank Anjulie Agrusa and Tijmen
+Blankevoort (NVIDIA), for their methodological input and                 Chen, Y., Xu, X., Zhang, P., Beyer, M., Rapp, M., Zhu, J.,
+for reviewing the manuscript. Additionally, we would like                  and Chen, J. Tetrajet-v2: Accurate nvfp4 training for
+to thank our contacts at Datacrunch/Verda, Paul Chang and                  large language models with oscillation suppression and
+Antonio Dominguez, for hardware support that was essen-                    outlier control, 2025b. URL https://arxiv.org/
+tial to this project. Last but certainly not least, we would like          abs/2510.27527.
+to thank Roberto L. Castro for help with efficient NVFP4                 Chmiel, B., Banner, R., Hoffer, E., Yaacov, H. B., and
+matrix multiplication kernels. This work was supported un-                 Soudry, D. Accurate neural training with 4-bit matrix
+der project ID 40 as part of the Swiss AI Initiative, through              multiplications at standard formats, 2024. URL https:
+a grant from the ETH Domain and computational resources                    //arxiv.org/abs/2112.10769.
+provided by the Swiss National Supercomputing Centre
+(CSCS) under the Alps infrastructure. This research was                  Chmiel, B., Fishman, M., Banner, R., and Soudry, D. Fp4 all
+funded in whole or in part by the Austrian Science Fund                    the way: Fully quantized training of llms. arXiv preprint
+(FWF) 10.55776/COE12.                                                      arXiv:2505.19115, 2025.
+                                                                         Clark, P., Cowhey, I., Etzioni, O., Khot, T., Sabharwal,
+References                                                                 A., Schoenick, C., and Tafjord, O. Think you have
+Alistarh, D., Grubic, D., Li, J., Tomioka, R., and Vojnovic,               solved question answering? try arc, the ai2 reasoning
+  M. Qsgd: Communication-efficient sgd via gradient quan-                  challenge, 2018. URL https://arxiv.org/abs/
+  tization and encoding. Advances in neural information                    1803.05457.
+  processing systems, 30, 2017.                                          Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,
+                                                                           Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,
+Allal, L. B., Lozhkov, A., Bakouch, E., Blázquez, G. M.,
+                                                                           R., Hesse, C., and Schulman, J. Training verifiers to solve
+  Penedo, G., Tunstall, L., Marafioti, A., Kydlı́ček, H.,
+                                                                           math word problems, 2021. URL https://arxiv.
+  Lajarı́n, A. P., Srivastav, V., Lochner, J., Fahlgren, C.,
+                                                                           org/abs/2110.14168.
+  Nguyen, X.-S., Fourrier, C., Burtenshaw, B., Larcher, H.,
+  Zhao, H., Zakka, C., Morlon, M., Raffel, C., von Werra,                Cook, J., Guo, J., Xiao, G., Lin, Y., and Han, S. Four
+  L., and Wolf, T. Smollm2: When smol goes big – data-                     over six: More accurate nvfp4 quantization with adaptive
+  centric training of a small language model, 2025. URL                    block scaling, 2025. URL https://arxiv.org/
+  https://arxiv.org/abs/2502.02737.                                        abs/2512.02010.
+Amodei, D. and Hernandez, D. Ai and compute. OpenAI                      Courbariaux, M., Bengio, Y., and David, J.-P. Binarycon-
+ (blog post), May 2018. URL https://openai.com/                            nect: Training deep neural networks with binary weights
+ index/ai-and-compute/. Accessed 2026-01-25.                               during propagations. Advances in neural information
+                                                                           processing systems, 28, 2015.
+Ashkboos, S., Mohtashami, A., Croci, M. L., Li, B.,
+  Cameron, P., Jaggi, M., Alistarh, D., Hoefler, T., and                 Davies, P., Gurunathan, V., Moshrefi, N., Ashkboos, S., and
+  Hensman, J. Quarot: Outlier-free 4-bit inference in ro-                  Alistarh, D. New bounds for distributed mean estimation
+  tated llms, 2024. URL https://arxiv.org/abs/                             and variance reduction. arXiv preprint arXiv:2002.09268,
+  2404.00456.                                                              2020.
+
+Bisk, Y., Zellers, R., Bras, R. L., Gao, J., and Choi, Y.                Dehghani, M., Djolonga, J., Mustafa, B., Padlewski, P.,
+  Piqa: Reasoning about physical commonsense in natural                    Heek, J., Gilmer, J., Steiner, A., Caron, M., Geirhos, R.,
+  language, 2019. URL https://arxiv.org/abs/                               Alabdulmohsin, I., Jenatton, R., Beyer, L., Tschannen,
+  1911.11641.                                                              M., Arnab, A., Wang, X., Riquelme, C., Minderer, M.,
+                                                                           Puigcerver, J., Evci, U., Kumar, M., van Steenkiste, S.,
+Castro, R. L., Panferov, A., Tabesh, S., Sieberling, O., Chen,             Elsayed, G. F., Mahendran, A., Yu, F., Oliver, A., Huot,
+  J., Nikdan, M., Ashkboos, S., and Alistarh, D. Quartet:                  F., Bastings, J., Collier, M. P., Gritsenko, A., Birodkar,
+
+                                                                    10
+               Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+  V., Vasconcelos, C., Tay, Y., Mensink, T., Kolesnikov,              Karpathy, A. nanochat: The best chatgpt that $100 can buy,
+  A., Pavetić, F., Tran, D., Kipf, T., Lučić, M., Zhai, X.,          2025. URL https://github.com/karpathy/
+  Keysers, D., Harmsen, J., and Houlsby, N. Scaling vi-                 nanochat.
+  sion transformers to 22 billion parameters, 2023. URL
+  https://arxiv.org/abs/2302.05442.                                   Kingma, D. P. and Ba, J. Adam: A method for stochastic op-
+                                                                        timization, 2017. URL https://arxiv.org/abs/
+Dodge, J., Sap, M., Marasović, A., Agnew, W., Ilharco,                 1412.6980.
+  G., Groeneveld, D., Mitchell, M., and Gardner, M. Doc-              Loshchilov, I. and Hutter, F. Sgdr: Stochastic gradi-
+  umenting large webtext corpora: A case study on the                   ent descent with warm restarts, 2017. URL https:
+  colossal clean crawled corpus, 2021. URL https:                       //arxiv.org/abs/1608.03983.
+ //arxiv.org/abs/2104.08758.
+                                                                      Lozhkov, A., Ben Allal, L., von Werra, L., and Wolf,
+Egiazarian, V., Castro, R. L., Kuznedelev, D., Panferov, A.,            T. Fineweb-edu: the finest collection of educational
+  Kurtic, E., Pandit, S., Marques, A., Kurtz, M., Ashkboos,             content, 2024. URL https://huggingface.co/
+  S., Hoefler, T., and Alistarh, D. Bridging the gap between            datasets/HuggingFaceFW/fineweb-edu.
+  promise and performance for microscaling fp4 quantiza-
+  tion, 2025. URL https://arxiv.org/abs/2509.                         Micikevicius, P., Stosic, D., Burgess, N., Cornea, M., Dubey,
+  23202.                                                               P., Grisenthwaite, R., Ha, S., Heinecke, A., Judd, P.,
+                                                                       Kamalu, J., et al. Fp8 formats for deep learning. arXiv
+Esser, S. K., McKinstry, J. L., Bablani, D., Appuswamy, R.,            preprint arXiv:2209.05433, 2022.
+  and Modha, D. S. Learned step size quantization. arXiv
+  preprint arXiv:1902.08153, 2019.                                    NVIDIA.     Nvidia blackwell architecture technical
+                                                                       brief.      https://resources.nvidia.com/
+Grattafiori, A. et al. The llama 3 herd of models. arXiv               en-us-blackwell-architecture,                2024.
+  preprint arXiv:2407.21783, 2024. URL https://                        Accessed: 2025-05-13.
+  arxiv.org/abs/2407.21783.                                           NVIDIA, Abecassis, F., Agrusa, A., Ahn, D., Alben, J.,
+                                                                       Alborghetti, S., Andersch, M., Arayandi, S., Bjorlin, A.,
+Henry, A., Dachapally, P. R., Pawar, S., and Chen, Y. Query-           Blakeman, A., Briones, E., Buck, I., Catanzaro, B., Choi,
+  key normalization for transformers, 2020. URL https:                 J., Chrzanowski, M., Chung, E., Cui, V., Dai, S., Rouhani,
+  //arxiv.org/abs/2010.04245.                                          B. D., del Mundo, C., Donia, D., Eryilmaz, B., Estela,
+                                                                       H., Goel, A., Goncharov, O., Guvvala, Y., Hesse, R.,
+Hernández-Cano, A., Garbaya, D., Schlag, I., and Jaggi,
+                                                                       Hewett, R., Hum, H., Kapasi, U., Khailany, B., Khona,
+  M. Towards fully fp8 gemm llm training at scale. arXiv
+                                                                       M., Knight, N., Kondratenko, A., Krashinsky, R., Lanir,
+  preprint arXiv:2505.20524, 2025.
+                                                                       B., Layton, S., Lightstone, M., Lo, D., Micikevicius, P.,
+                                                                       Mishra, A., Moon, T., Narayanan, D., Ni, C., Paithankar,
+Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E.,
+                                                                       A., Pasumarthi, S., Patel, A., Patwary, M., Poojary, A.,
+  Cai, T., Rutherford, E., de Las Casas, D., Hendricks,
+                                                                       Prasad, G., Priyadarshi, S., Qin, Y., Ren, X., Rybakov, O.,
+  L. A., Welbl, J., Clark, A., Hennigan, T., Noland, E.,
+                                                                       Sakr, C., Satheesh, S., Sergienko, S., Shamis, P., Shankar,
+  Millican, K., van den Driessche, G., Damoc, B., Guy,
+                                                                       K., Sharma, N., Shoeybi, M., Siu, M., Smelyanskiy, M.,
+ A., Osindero, S., Simonyan, K., Elsen, E., Rae, J. W.,
+                                                                       Stosic, D., Stosic, D., Su, B.-Y., Sun, F., Tajbakhsh, N.,
+ Vinyals, O., and Sifre, L. Training compute-optimal large
+                                                                       Thomas, S., Tredak, P., Tsykunov, E., Vaithilingam, G.,
+  language models, 2022. URL https://arxiv.org/
+                                                                       Vavre, A., Venkatesan, R., Waleffe, R., Wan, Q., Wang,
+  abs/2203.15556.
+                                                                       H., Wang, M., Wei, L., Wu, H., Wu, E., Wyss, K., Xu, N.,
+Hu, S., Tu, Y., Han, X., He, C., Cui, G., Long, X., Zheng,             Xue, J., Yang, C., Zhai, Y., Zhang, R., Zhu, J., and Zhu,
+  Z., Fang, Y., Huang, Y., Zhao, W., Zhang, X., Thai, Z. L.,           Z. Pretraining large language models with nvfp4, 2025.
+  Zhang, K., Wang, C., Yao, Y., Zhao, C., Zhou, J., Cai,               URL https://arxiv.org/abs/2509.25149.
+ J., Zhai, Z., Ding, N., Jia, C., Zeng, G., Li, D., Liu, Z.,          OLMo, T., Walsh, P., Soldaini, L., Groeneveld, D., Lo, K.,
+  and Sun, M. Minicpm: Unveiling the potential of small                Arora, S., Bhagia, A., Gu, Y., Huang, S., Jordan, M.,
+  language models with scalable training strategies, 2024.             et al. 2 olmo 2 furious. arXiv preprint arXiv:2501.00656,
+  URL https://arxiv.org/abs/2404.06395.                                2024.
+Jordan, K., Jin, Y., Boza, V., You, J., Cesista, F., New-             Panferov, A., Chen, J., Tabesh, S., Castro, R. L., Nikdan,
+  house, L., and Bernstein, J. Muon: An optimizer for                   M., and Alistarh, D. Quest: Stable training of llms
+  hidden layers in neural networks, 2024. URL https:                    with 1-bit weights and activations. arXiv preprint
+  //kellerjordan.github.io/posts/muon/.                                 arXiv:2502.05003, 2025a.
+
+                                                                 11
+               Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+Panferov, A., Chen, J., Tabesh, S., Castro, R. L., Nikdan,              erated learning, 2022. URL https://arxiv.org/
+  M., and Alistarh, D. Quest: Stable training of llms with              abs/2108.08842.
+  1-bit weights and activations, 2025b. URL https://
+  arxiv.org/abs/2502.05003.                                           Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+                                                                        L., Gomez, A. N., Kaiser, L., and Polosukhin, I. Attention
+Sevilla, J., Heim, L., Ho, A., Besiroglu, T., Hobbhahn,                 is all you need, 2023. URL https://arxiv.org/
+  M., and Villalobos, P. Compute trends across three                    abs/1706.03762.
+  eras of machine learning. In International Joint Con-
+  ference on Neural Networks, IJCNN 2022, Padua, Italy,               Xi, H., Li, C., Chen, J., and Zhu, J. Training Transformers
+  July 18-23, 2022, pp. 1–8. IEEE, 2022. doi: 10.1109/                  with 4-bit Integers. In Advances in Neural Information
+  IJCNN55064.2022.9891914. URL https://doi.                             Processing Systems (NeurIPS), 2023.
+  org/10.1109/IJCNN55064.2022.9891914.                                Zellers, R., Holtzman, A., Bisk, Y., Farhadi, A., and
+So, D. R., Mańke, W., Liu, H., Dai, Z., Shazeer, N., and               Choi, Y. Hellaswag: Can a machine really finish your
+  Le, Q. V. Primer: Searching for efficient transformers                sentence?, 2019. URL https://arxiv.org/abs/
+  for language modeling, 2022. URL https://arxiv.                       1905.07830.
+  org/abs/2109.08668.
+Suresh, A. T., Felix, X. Y., Kumar, S., and McMahan, H. B.
+  Distributed mean estimation with limited communica-
+  tion. In International conference on machine learning,
+  pp. 3329–3337. PMLR, 2017.
+Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi,
+  A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P.,
+  Bhosale, S., Bikel, D., Blecher, L., Ferrer, C. C., Chen,
+  M., Cucurull, G., Esiobu, D., Fernandes, J., Fu, J., Fu, W.,
+  Fuller, B., Gao, C., Goswami, V., Goyal, N., Hartshorn,
+  A., Hosseini, S., Hou, R., Inan, H., Kardas, M., Kerkez,
+  V., Khabsa, M., Kloumann, I., Korenev, A., Koura, P. S.,
+  Lachaux, M.-A., Lavril, T., Lee, J., Liskovich, D., Lu, Y.,
+  Mao, Y., Martinet, X., Mihaylov, T., Mishra, P., Moly-
+  bog, I., Nie, Y., Poulton, A., Reizenstein, J., Rungta, R.,
+  Saladi, K., Schelten, A., Silva, R., Smith, E. M., Subra-
+  manian, R., Tan, X. E., Tang, B., Taylor, R., Williams,
+  A., Kuan, J. X., Xu, P., Yan, Z., Zarov, I., Zhang, Y.,
+  Fan, A., Kambadur, M., Narang, S., Rodriguez, A., Sto-
+  jnic, R., Edunov, S., and Scialom, T. Llama 2: Open
+  foundation and fine-tuned chat models, 2023. URL
+  https://arxiv.org/abs/2307.09288.
+Tseng, A., Chee, J., Sun, Q., Kuleshov, V., and Sa, C. D.
+  Quip#: Even better llm quantization with hadamard in-
+  coherence and lattice codebooks, 2024. URL https:
+  //arxiv.org/abs/2402.04396.
+Tseng, A., Yu, T., and Park, Y. Training llms with
+  mxfp4, 2025. URL https://arxiv.org/abs/
+  2502.20586.
+Vargaftik, S., Basat, R. B., Portnoy, A., Mendelson, G.,
+  Ben-Itzhak, Y., and Mitzenmacher, M. Drive: One-bit
+  distributed mean estimation, 2021. URL https://
+  arxiv.org/abs/2105.08339.
+Vargaftik, S., Basat, R. B., Portnoy, A., Mendelson, G., Ben-
+  Itzhak, Y., and Mitzenmacher, M. Eden: Communication-
+  efficient and robust distributed mean estimation for fed-
+
+                                                                 12
+                               Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+                              model.layers.0.self_attn.q_proj.weight               model.layers.0.self_attn.k_proj.weight               model.layers.0.self_attn.v_proj.weight
+
+               100
+||1B G G||22
+
+
+
+
+               10 1
+     ||G||22
+
+
+
+
+                            NVIDIA
+               10 2         NVIDIA+4/6
+                            TetraJet-v2
+                            Quartet II
+               10 3         1/B
+
+                      100                 101           102            103   100           101               102            103   100           101               102            103
+                                     Accumulation Steps B                                 Accumulation Steps B                                 Accumulation Steps B
+
+Figure 9. Concentration of quantized backward average towards unquantized backward for Quartet II and a number of baselines. Methods
+parallel to 1/B are unbiased. Plateauing methods (NVIDIA+4/6) introduce bias.
+
+
+
+A. Unbiasedness Verification
+In this section we verify that Quartet II produces effectively unbiased gradient estimates when applied to backward pass
+quantization in LLMs.
+Firstly, the original EDEN algorithm utilized high-precision unbiasing factors S per every rotation group. Algorithm 1,
+however, calculates correction factors S per-NVFP4-group (16 elements) and then merges them into FP8 shared exponents
+via stochastic rounding (SR). Performing unbiasing in smaller groups allows us to reduce the amount of inter-thread
+communications in GPU kernels when reducing the scalar products for S. At the same time, it preserves the unbiasedness
+argument by considering the larger RHT as a two-level scheme where vectors are first rotated in groups of 16, which yields
+unbiasedness, and then mixed in groups of 128 to further smooth out the outliers.
+Even though EDEN (Vargaftik et al., 2022) only guarantees unbiasedness in the d → ∞ limit and requires rotations to be
+sampled independently, in practice we make a number of compromises to improve hardware compatibility:
+
+
+    1. We use d = 128 to allow efficient rotation on Blackwell GPUs using the mma.m16n8k16 instruction.
+
+
+    2. We apply identical rotations for every rotation group within a tensor for every micro-batch to reformulate the rotation
+       as simple GEMM. I.e., we re-randomize rotations per-tensor per-micro-batch.
+
+
+    3. We don’t perform stochastic rounding on under-flowing FP8 values in MS-EDEN to simplify the bit-manipulation
+       code. This can only affect scales that are at least ≈ 32000x smaller than the largest scale in each tensor, which makes
+       the effect negligible.
+
+
+We numerically verify the unbiasedness for LLMs by performing repeated (B times) quantized backward passes over a
+batch of sample data and calculating the relative quadratic error of the average quantized gradient B1
+                                                                                                           Pb
+                                                                                                              G(ω) w.r.t. the
+reference unquantized gradient G. If Gb is unbiased, i.e., Eω G(ω)
+                                                              b    = G, the error will decrease to arbitrarily small values as
+∼ B1 asymptotically, from the Central Limit Theorem. Figure 9 shows that this property holds in practice for the Quartet
+II implementation with the aforementioned hardware optimization. Additionally, it shows how the gradient estimates
+produced by NVIDIA (NVIDIA et al., 2025) and TetraJet-v2 (Chen et al., 2025b) are also unbiased, while the application of
+Four Over Six (Cook et al., 2025) to the backward pass isn’t.
+For this experiment we used the Llama-3.2-1B (Grattafiori et al., 2024) pre-trained model to verify that the unbiasedness
+is not due to attuning to QAT dynamics. Moreover, in Figure 9 we report error concentration for the attention block 0 - the
+deepest in the model from the backpropagation perspective.
+
+B. Llama-Like Hyper-Parameters
+We list model-specific hyper-parameters in Table 3 and hyper-parameters shared across all experiments in Table 4.
+
+                                                                                              13
+               Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+                              Table 3. Model-specific hyper-parameters used for Llama-like models.
+
+                              Hyperparameter               30M       50M       100M        200M
+                              Number of Layers               6         7          8          10
+                              Embedding Dimension          640        768       1024        1280
+                              Attention Heads                5         6          8          10
+                              Learning Rate               0.0012    0.0012     0.0009     0.00072
+
+
+           Table 4. Common hyper-parameters used across all model sizes and quantization setups for Llama-like models.
+
+                               Hyperparameter                                     Value
+                               Sequence Length                                    512
+                               Batch Size                                         512
+                               Optimizer                                       AdamW
+                               Learning Rate Schedule                    Cosine, 10% warm-up
+                               Gradient Clipping                                  1.0
+                               Weight Decay (γ)                                   0.1
+                               Number of GPUs                                      8
+                               Data Type (optimizer/accumulators)                FP32
+
+
+
+C. Nanochat Details and Extra Evaluation
+For our experiments we use the revision of Nanochat indicated by this commit hash:
+
+
+                                f5425245f99efd4145d2ac71a730af1e96777d6a.
+
+
+At this revision, we focus on two scripts: speedrun.sh that trains a 560M parameters model on 11B tokens and
+run1000.sh that trains a 1.9B parameters model on 38B tokens. We first run the speedrun.sh script as the unquantized
+baseline, then add custom QAT support and run it for every tested QAT method. For pre-training, we perform fully-quantized
+training, i.e., both forward pass and backward pass quantization. For post-training (mid-training and SFT), however, we
+disable backward pass quantization to get the most out of these very short and data-limited phases. After that, we repeat the
+process with the run1000.sh script.
+We report the final normalized pre-training accuracies for Arc-Challenge and Arc-Easy (Clark et al., 2018), PIQA (Bisk et al.,
+2019), HellaSwag (Zellers et al., 2019) and the CORE-Pretrain score nanochat provides. There, we also report bootstrapped
+trust intervals (2 standard deviations) w.r.t. re-running the exact same Quartet II pre-training thrice. From them, one can see
+that the vast majority of the differences between FP4 QAT methods are not statistically significant.
+
+D. Kernel Benchmarks
+D.1. Linear-Wise Speedups
+In Figure 6, we demonstrated FP4 speedups over BF16 for linear layer training. By that, we mean the latency reduction
+for performing a single forward pass and a single backward pass for a set of layers that would normally be present in a
+transformer (Vaswani et al., 2023) model of particular size. The actual tensor shapes used for these measurements are
+presented in Table 6. For these measurements, we use batch size 8 and sequence length 2048. We further assume that the
+abs-max (for global scale) is provided externally; in practice, the abs-max reduction can be fused into the previous kernel
+(optimizer for weights, nonlinearity/norm for activations) with negligible performance cost.
+In addition to the full speed-ups shown in the main body of the paper, Figure 10 shows the speedup on the forward-pass only.
+As most of the more expensive quantization kernels are only required during the backward (forward only needs four-over-six
+rounding), forward-only speedups are much closer to raw matmul speedups.
+
+                                                               14
+                  Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+        Table 5. Nanochat pre-training final bits-per-byte (BPB) and few-shot metrics for BF16 and a number of FP4 QAT methods.
+
+                      Method                    BF16    NVIDIA          4/6    TetraJet-v2   Quartet II   95% CI
+                                             Nanochat Speedrun: 560M Paramters, 11B Tokens
+                      Val BPB ↓                0.7693     0.7813    0.7809         0.7825      0.7790     ±0.0008
+                      Increase over BF16 ↓          -     1.56%     1.51%          1.72%       1.26%      ±0.08%
+                      CORE ↑                    23.5%      21.3%     20.9%         22.5%        21.9%     ±0.6%
+                      ArcC ↑                    13.0%      12.5%     13.3%         12.7%        12.4%     ±4.0%
+                      ArcE ↑                    55.6%      52.4%     53.6%         53.1%        54.2%     ±0.8%
+                      PIQA ↑                    39.4%      39.1%     38.7%         37.8%        37.8%     ±1.5%
+                      HellaSwag ↑               31.3%      29.0%     29.2%         28.9%        29.1%     ±0.6%
+                                              Nanochat 1000$: 1.9B Parameters, 38B Tokens
+                      Val BPB ↓                0.6925     0.7058    0.7047         0.7044      0.7025     ±0.0002
+                      Increase over BF16 ↓          -     1.92%     1.76%          1.72%       1.44%      ±0.02%
+                      CORE ↑                    34.2%      32.0%     31.5%         32.1%        32.2%     ±0.2%
+                      ArcC ↑                    26.5%      25.5%     26.7%         25.5%        25.7%     ±1.6%
+                      ArcE ↑                    64.8%      62.3%     63.5%         62.1%        63.2%     ±0.6%
+                      PIQA ↑                    50.7%      50.4%     49.8%         48.6%        38.4%     ±2.6%
+                      HellaSwag ↑               50.6%      48.2%     48.5%         48.3%        48.4%     ±0.4%
+
+Table 6. Weight shapes characteristic of Llama-like models of certain sizes as [in dim,out dim]. We report speedups for these
+shapes, aggregated as latency for each model size, in Figure 6.
+
+                  Layer             800M                     3B                     7B                    22B
+                  QKV          [2048,6144]            [3072,9216]             [4096,12288]         [6144,18432]
+                  Out          [2048,2048]            [3072,3072]              [4096,4096]          [6144,6144]
+                  UpGate       [2048,11264]          [3072,16384]             [4096,22016]         [6144,32768]
+                  Down         [5632,2048]            [8192,3072]             [11008,4096]         [16384,6144]
+
+
+D.2. End-to-End Speedups
+RTX 5090. In addition to the linear layer only, we also run benchmarks with full model training on a single 5090. As this
+GPU has only 32GB of memory, this limits the maximum model size to using nanochat with a depth of 26, corresponding to
+1.1B parameters. When using master-parameters in BF16, this allows for a batch size of 4. At such small sizes, we found it
+beneficial to fuse the Q, K, and V matrix multiplications into a single kernel call, for both the bf16 baseline and the nvfp4
+version.
+In this setting, the bf16 baseline achieves a training speed of 28 ktok/s, corresponding to an MFU of 92%. The nvfp4 training
+reaches a speed of 52 ktok/s, or 185% that of the baseline. Table 7 shows the contribution of different operations to the total
+runtime. As can be seen, at this model size, about 60% of the time is spent on operations untouched by the FP4 training
+recipe. This ratio is expected to drastically decrease as model size grows, increasing the usefulness of FP4.
+B200. In addition to the layer-wise measurements, we also ran some more realistic end-to-end setups. We used an
+OLMO2 (OLMo et al., 2024) architecture at varying sizes, running for several hundred steps on an 8xB200 server with
+a global batch size of 524288 tokens per AdamW update step. For model sizes 3.3B, 5.6B, 7.1B, 8.8B, and 11B we get
+end-to-end speedups over the BF1 baseline of 1.48, 1.58, 1.59, 1.62 and 1.68. While these speedups seem disappointingly
+small compared to the theoretical 4×, we note that they are generally in line with numbers reported by NVidia 1 for similar
+setups.
+
+
+
+
+   1
+       https://developer.nvidia.com/blog/using-nvfp4-low-precision-model-training-for-higher-throughput-without-losing-accuracy/
+
+                                                                   15
+                                           Quartet II: Accurate LLM Pre-Training in NVFP4 by Improved Unbiased Gradient Estimation
+
+
+
+
+                                           Forward speedup vs bf16 (mean ± 2std of 10 runs)                                                                            Forward speedup vs bf16 (mean ± 2 std of 10 runs)
+                       7x
+                            Pure GEMM ceiling                           Quartet, MXFP4                                                                          Pure GEMM ceiling                    Quartet, MXFP4
+                       6x
+                            MXFP8                                       Quartet II, NVFP4                                                                  4x   MXFP8                                Quartet II, NVFP4
+                                                      1210 TFLOp/s                1222 TFLOp/s                                                                                                                                            5355 TFLOp/s
+                                                                                                                                                                                                                     5132 TFLOp/s
+                            1189 TFLOp/s
+                                                                                                                                                                                           4909 TFLOp/s
+Linear Layer Speedup
+
+
+
+
+                                                                                                                                    Linear Layer Speedup
+                                                                                                               1103 TFLOp/s
+                       5x                                                                                                                                          4548 TFLOp/s
+
+                                                                                                                                                           3x
+
+                       4x
+
+
+                       3x                                                                                                                                  2x
+
+
+                       2x
+                                                                                                                                                           1x
+                       1x
+
+
+                       0x                                                                                                                                  0x
+                             800M                        3B                          7B                  22B                                                    800M                  3B                        7B                  22B
+                                                                     Model Size                                                                                                                Model Size
+
+                                                       (a) RTX 5090                                                                                                                       (b) B200
+Figure 10. Linear layer computation speedup over BF16 for training layers characteristic of particular model sizes. Hollow boxes indicate
+pure matmul speed, and correspondingly visualize the quantization overhead.
+
+
+
+
+Table 7. Breakdown of time spent in different kernels (or kernel types, e.g., backward attention is the sum of three different kernels) in the
+1.1B parameter model at 8192 tokens per pass.
+
+                                                                                     Forward                                                                      Backward
+                                                      OP                              Time [µs]            Fraction                Op                               Time [µs]                 Fraction
+                                                      FP4 GEMM                                   11708                  24%        FP4 GEMM                                       22013                   21%
+                                                      Attention                                   9242                  19%        Attention                                      21500                   20%
+                                                      RMSNorm                                     8498                  17%        LM-Head                                        15734                   15%
+                                                      LM-Head                                     7528                  16%        RMS-bwd                                        12824                   12%
+                                                      Quantization                                3852                   8%        Grad Quant.                                    10212                   10%
+                                                      Relu²                                       3545                   7%        Relu²-bwd                                       5010                    5%
+                                                      Abs-Max                                     1422                   3%        Requant                                         3532                    3%
+                                                      Loss                                         658                   1%        Scale Fixup                                     1036                    1%
+                                                      Other                                       1672                   3%        Other                                          13639                   13%
+
+
+
+
+                                                                                                                              16
+

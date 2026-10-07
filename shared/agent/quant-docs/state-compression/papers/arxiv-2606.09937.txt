@@ -1,0 +1,1202 @@
+                                                               RKSC: Reasoning-Aware KV Cache Sharing
+                                                          and Confident Early Exit for Multi-Step LLM Inference
+
+
+                                                                                              Anirudh Sekar
+
+
+                                                                Abstract                                    et al., 2025b). This multi-branch paradigm incurs two struc-
+                                                                                                            tural redundancies that no production system addresses. (1)
+                                             We introduce RKSC (Reasoning-Aware KV                          Cross-branch KV waste: parallel branches share the ma-
+                                             Cache Sharing), a training-free inference frame-
+arXiv:2606.09937v1 [cs.LG] 7 Jun 2026
+
+
+
+
+                                                                                                            jority of their prefix KV computation yet recompute it in-
+                                             work that eliminates two structural redundancies               dependently, in a Tree of Thoughts (Yao et al., 2023) run
+                                             in multi-branch LLM reasoning pipelines. ASKS                  (branching 4, depth 3), branches diverging at depth 2 share
+                                             (Attention-Similarity KV Sharing) computes the                 66% of KV work by construction. vLLM (Kwon et al.,
+                                             prefix KV cache once and broadcasts it to all                  2023) and SGLang (Zheng et al., 2024) reuse KV blocks on
+                                             semantically similar branches via hidden-state                 exact token matches only, leaving all cross-branch similarity
+                                             cosine similarity, strictly generalising the token-            unexploited. (2) Over-deep verification: process-reward
+                                             exact prefix caching used by vLLM and SGLang.                  verification (Lightman et al., 2023) runs full-depth forward
+                                             CGEE (Confidence-Gated Early Exit) applies                     passes even when the model is already confident; no system
+                                             two complementary exit mechanisms: (1) it skips                exploits per-layer entropy collapse to exit early within a
+                                             the verification forward pass entirely when gen-               single verify pass.
+                                             eration confidence is decisive across branches,
+                                             and (2) it terminates the verification pass at an              We introduce RKSC (Reasoning-Aware KV Cache Shar-
+                                             intermediate layer when per-layer entropy sta-                 ing), a training-free inference framework eliminating both
+                                             bilises, using lightweight hooks on the trans-                 redundancies. Our contributions are:
+                                             former backbone. RSBCM (Reasoning-Selective
+                                             Block Cache Manager) prevents unbounded cache                     • ASKS (§2.2): gates prefix KV reuse across branches
+                                             growth via attention-weighted depth-priority evic-                  via hidden-state cosine similarity with exponentially
+                                             tion. Across five model families (7B–10B),                          weighted later-layer emphasis, strictly generalising
+                                             four benchmarks, and 1,000 evaluated problems,                      token-exact caching. Achieves 28.6% additional reuse
+                                             RKSC achieves a mean speedup of 3.008× over                         where token-exact matching yields 0%.
+                                             the No-KV baseline (peak 3.990×), a 1.66×
+                                                                                                               • CGEE (§2.3): dual-level exit combining (a) verify-skip
+                                             mean improvement over vLLM-equivalent prefix
+                                                                                                                 when generation confidence is decisive, and (b) layer-
+                                             caching, with a CGEE-induced error rate of only
+                                                                                                                 level entropy exit terminating the verify pass when
+                                             0.37% (6 errors out of 1,616 verify calls). No
+                                                                                                                 per-layer logit entropy stabilises.
+                                             fine-tuning or architecture changes are required.
+                                             Code is available at https://github.com/
+                                                                                                            KV caching (Vaswani et al., 2023) and block-level prefix
+                                             AnirudhSekar/RKSC.
+                                                                                                            reuse (vLLM (Kwon et al., 2023), SGLang (Zheng et al.,
+                                                                                                            2024)) require byte-identical token prefixes; ASKS decou-
+                                                                                                            ples reuse from lexical identity. MemShare (Chen et al.,
+                                        1. Introduction                                                     2025a) deduplicates KV states within a single chain via
+                                        Inference-time scaling systems, DeepSeek-R1 (Guo et al.,            step-delimiter segmentation; ASKS operates across parallel
+                                        2025), Qwen3 (An Yang et al., 2025), o1-style models,               branches. Layer-wise early exit has been applied to BERT
+                                        generate multiple reasoning trajectories per problem, with          (Xin et al., 2020) and generation (Schuster et al., 2022;
+                                        the first trajectory correct in the majority of cases (Chen         Elhoushi et al., 2024); for reasoning, (Yang et al., 2025)
+                                                                                                            exit between chains at transition tokens, a token-level mech-
+                                          .          Correspondence   to:          Anirudh     Sekar        anism orthogonal to CGEE’s within-pass layer-level exit.
+                                        <anirudhsekar2008@gmail.com>.                                       Self-consistency (Wang et al., 2023) and process-reward
+                                        Accepted to the ICML 2026 Workshop on Statistical Frameworks        methods (Lightman et al., 2023) motivate multi-branch gen-
+                                        for Uncertainty in Agentic Systems, Seoul, South Korea, 2026.       eration; RKSC accelerates any such pipeline as a drop-in
+                                        Copyright 2026 by the author(s).                                    wrapper, without altering the reasoning algorithm.
+
+                                                                                                        1
+                                    RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+A complementary line of inference acceleration uses a small                     2.1. Problem Setting
+draft model to propose candidate tokens, which a larger tar-
+                                                                                We consider an LLM fθ with L transformer layers solving
+get model then verifies in parallel. (Leviathan et al., 2023)
+                                                                                a problem x by generating B reasoning branches from a
+establish that this approach preserves the output distribu-
+                                                                                shared problem prefix. Each branch b ∈ {1, . . . , B} begins
+tion exactly while achieving 2–3× wall-clock speedup, and
+                                                                                from a shared context c = prefix(x) of n tokens and
+SpecInfer (Miao et al., 2024) generalises it to tree-structured
+                                                                                appends a short, branch-specific suffix (a reasoning hint of
+candidate sets verified in a single batched forward pass.
+                                                                                s ≪ n tokens) before decoding t answer tokens autoregres-
+Medusa (Cai et al., 2024) removes the need for a separate
+                                                                                sively. A verify pass then scores all B branches and selects
+draft model entirely by appending lightweight decoding
+                                                                                the best answer. The standard inference procedure, which
+heads to the backbone, predicting multiple future tokens
+                                                                                we call the No-KV baseline, batches all B branches in a
+in parallel and verifying them via tree attention. RKSC’s
+                                                                                single forward pass but recomputes the full n-token prefix
+CGEE is complementary to all three: whereas speculative
+                                                                                attention independently for each branch, paying O(Bn2 )
+methods accelerate the decode phase by parallelising to-
+                                                                                attention cost. A stronger baseline, the vLLM-equivalent,
+ken proposals, CGEE accelerates the verification phase of
+                                                                                performs token-exact prefix matching: the root KV cache is
+process-reward scoring by gating or truncating the verify
+                                                                                reused only when branch tokens share a byte-identical pre-
+forward pass based on per-layer entropy collapse.
+                                                                                fix with the root, mirroring the PagedAttention prefix-cache
+                                                                                path in vLLM (Kwon et al., 2023) and SGLang (Zheng et al.,
+2. RKSC Pipeline                                                                2024). This baseline captures all gains that existing produc-
+                                                                                tion systems achieve and serves as our primary comparison
+RKSC accelerates multi-branch reasoning inference through
+                                                                                point.
+three complementary mechanisms: (1) KV prefix sharing
+eliminates redundant prefill computation across branches,                       Algorithm 1 presents the top-level RKSC solve proce-
+(2) CGEE reduces or eliminates the verification forward                         dure. Detailed per-mechanism pseudocode appears in Ap-
+pass, and (3) RSBCM manages cache capacity under deep                           pendix B.
+tree search. Figure 1 illustrates the full pipeline. The design
+exploits structure that already exists in the inference work-                   Algorithm 1 RKSC top-level solve
+load, shared prefixes, concentrated generation confidence,
+entropy collapse in later layers, rather than introducing new                   Require: prefix c, suffixes {sb }B                b=1 ,   thresholds
+computation. Each mechanism is independently switchable                             (τ, τconf , rgap , θ, ϵ)
+                                                                                                       prefill
+and adds zero learnable parameters.                                              1: C, Hroot ← fθ              (c) {single root forward (§2.2)}
+                                                                                 2: sharedSet ← A SKS G ATE(Hroot , {sb }, τ ) {Alg. 2}
+                                        Input Problem                            3: CB ← repeat interleave(C, B); CB .clone()
+                                                                                 4: {yb }, {p(b) } ← BATCHED D ECODE({sb }, CB ) {track
+                                                                                    top-1 probs}
+                                    Root Forward: C, Hroot
+                                                                                 5: if maxb p(b) ≥ τconf and gap-ratio ≥ rgap then
+                                                                                 6:    return arg maxb p(b) {verify-skip, Level 1}
+                                    ASKS Gate: σb ≥ τ ?
+                                                                                 7: end if
+                                                                                 8: return             V ERIFY W ITH E NTROPY E XIT({yb }, θ, ϵ)
+            shared
+               CB    B1        B2        ···       BN                               {Alg. 3, Level 2}
+
+                           Gen. Confidence p(b)
+
+                                                                                2.2. ASKS: Attention-Similarity KV Sharing
+                       CGEE: skip | early-exit | full
+                                                                                Prefix forward pass. RKSC begins each solve call with a
+                                                                                single prefix forward pass through all L layers, storing the
+          Full                  Early-Exit                   Verify
+         Verify                 at layer l∗                   Skip              resulting KV states and hidden representations:
+
+                                                                                                       (l)      (≤l)
+                              Final Answer                                             K(l) , V(l) , hroot = fθ        (c),   l = 1, . . . , L,   (1)
+
+Figure 1. RKSC pipeline overview. A single root forward com-                    yielding the cache C = {(K(l) , V(l) )}Ll=1 and root hidden
+putes the shared KV cache C and root hidden states. ASKS broad-                                    (l)
+casts C only to branches with similarity σb ≥ τ . All B branches                states Hroot = {hroot }. To avoid redundant computation
+decode in one batched call while accumulating generation confi-                 during the B subsequent branch comparisons, root hidden
+dence. CGEE selects among three paths: verify skip (confidence                  states are pre-normalised to unit vectors once and stored in
+decisive), early-exit verify (entropy stabilised at l∗ ), or full verify.       this normalised form.
+
+                                                                            2
+                              RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+Exponentially weighted similarity gating. After each                   sharing is declared beneficial iff the sum of paths (ii) and
+branch b processes its suffix tokens, ASKS computes a                  (iii) is less than path (i). On A100 with SDPA attention, the
+weighted cosine similarity between the branch’s hidden                 probe universally declares KV sharing beneficial at n ≥ 512
+states and the stored root representations. The weighting              for all five evaluated models.
+schedule places exponentially increasing emphasis on later
+layers, which carry more task-specific information and are             2.3. CGEE: Confidence-Gated Early Exit
+therefore more discriminative for detecting genuine seman-
+tic divergence:                                                        CGEE operates at two levels. The first level decides whether
+                                                                       to run the verification pass at all; the second level decides
+                      L               (l)   (l)                        how deeply to run it when it proceeds.
+                      X             hb · hroot
+               σb =         wl ·     (l)    (l)
+                                                    ,       (2)
+                      l=1          ∥hb ∥ ∥hroot ∥                      Generation confidence (input to Level 1). During the
+                                                                       stepwise decode loop, RKSC records the top-1 softmax
+                                     ′
+                       P
+where wl = exp(αl/L)        l′ exp(αl /L) with α=1.5. We               probability at each decode step for each branch. The gener-
+select α=1.5 by grid search over α ∈ {0.5, 1.0, 1.5, 2.0}              ation confidence of branch b is the mean top-1 probability
+on 30 held-out GPQA Diamond problems; larger values                    across all t steps:
+over-discount early layers and reduce sensitivity to prefix
+                                                                                                  t
+divergence, while smaller values under-weight task-specific                            (b)     1X           (b)
+                                                                                       p     =      max Pr[yj = v],                (3)
+later layers.                                                                                  t j=1 v
+Branches with σb ≥ τ are deemed semantically consistent                accumulated in-place at zero additional compute cost, since
+with the prefix and receive the shared cache; branches be-             the softmax is already computed to select the next token
+low τ fall back to independent recomputation. This design              at every step. A branch that emits each token with high
+strictly generalises token-exact prefix caching: any lexically         probability is a strong candidate for the correct answer;
+identical prefix trivially achieves σb = 1, so every branch            branches with uniformly low top-1 probabilities indicate
+that vLLM or SGLang would reuse is also reused by ASKS.                uncertainty.
+The converse does not hold: ASKS additionally reuses the
+cache for branches whose token sequences differ but whose              Verify-skip gate (Level 1). After decoding completes,
+hidden-state representations remain close to the root. In our          RKSC evaluates whether to skip the verification pass en-
+diverse-phrasing stress test (§4.1), this generalisation yields        tirely. The gate fires when two conditions are jointly sat-
+28.6% additional reuse beyond token-exact matching.                    isfied: the winning branch has high absolute confidence,
+                                                                       and it dominates all competing branches by a clear relative
+KV broadcast and batched decode. For branches that                     margin:
+pass the similarity gate, the shared cache is expanded
+to batch size B via a zero-copy repeat interleave                                               maxb p(b) − 2nd-maxb p(b)
+                                                                       max p(b) ≥ τconf and                                   ≥ rgap .
+on each layer’s key and value tensors: CB =                              b                               maxb p(b)
+repeat interleave(C, B, dim=0).                  An explicit                                                                      (4)
+.clone() call ensures contiguous memory layout, pre-                   The dual condition prevents two failure modes: (a) a single
+venting potential SDPA kernel failures with non-contiguous             branch with moderately high confidence but a close com-
+inputs. All B branch suffixes are then stacked into a single           petitor (the absolute threshold alone would fire), and (b) a
+batched tensor and decoded in one forward pass conditioned             large relative gap between two branches that both have low
+on CB : yb = fθ (sb | CB ), b = 1, . . . , B, eliminating the          absolute confidence (the gap condition alone would fire).
+O(n2 ) attention cost for B−1 branches.                                When the gate fires, the entire δ-cost verify pass is skipped
+                                                                       and branches are ranked directly by p(b) .
+KV probe. KV prefix sharing is not unconditionally ben-
+eficial: at short prefixes, the cost of the prefix forward             Layer-level entropy exit (Level 2). When the verify-skip
+pass plus the repeat interleave expansion can ex-                      gate does not fire and the full verification forward pass be-
+ceed the savings. Rather than relying on the analytical                gins, CGEE installs lightweight forward hooks on each trans-
+threshold n∗ from Proposition A.1 (which requires accu-                former layer via register forward hook. At each
+rate per-platform estimates of the cost constants), RKSC               layer l, the hook extracts the last-token hidden state, projects
+includes a self-calibrating runtime probe. At the first solve          it through the cached unembedding matrix Wu (stored once
+call within each 64-token prefix-length bucket k = ⌊n/64⌋,             at model load time), and computes the logit-space entropy:
+the probe times three paths using the minimum of 3 repeti-
+                                                                                   X
+                                                                       H (l) = −       softmax(h(l) Wu⊤ )v log softmax(h(l) Wu⊤ )v .
+tions: (i) batched full recompute, (ii) a single prefix forward,                   v
+and (iii) batched suffix decode with the shared cache. KV                                                                          (5)
+
+                                                                   3
+                            RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+The verification pass exits early at layer l∗ when three              dormant in all single-depth experiments in this paper (total
+conditions are jointly satisfied: (i) l∗ ≥ lmin (minimum              block count never exceeds the default threshold of 2,000)
+exit depth, default 2, ensuring sufficient representation re-         and is provided as a mechanism for multi-depth tree search.
+                      ∗
+finement); (ii) H (l ) < θ (entropy below a model-specific            Full validation is in Appendix H.
+threshold, indicating a concentrated logit distribution); and
+           ∗        ∗                                                 Full implementation details (DynamicCache, decode loop,
+(iii) |H (l ) − H (l −1) | < ϵ (entropy has stabilised between
+                                                                      TF32 configuration, memory release) are in Appendix I.
+consecutive layers, ruling out transient dips). When the exit
+triggers, the hook raises an internal exception that the solver
+catches, using the partial output as the verification result.         3. Experimentation and Results
+Hooks are removed after each solve call to prevent memory
+                                                                      3.1. Experimental Setup
+leaks.
+                                                                      Hardware and software. All experiments run on
+On Qwen2.5-7B (28 layers), the layer-level exit fires on
+                                                                      a single NVIDIA A100-80GB SXM4 GPU with
+100% of verify passes at a mean exit layer of 18.4, con-
+                                                                      bfloat16 precision, TF32 matrix multiplication en-
+firming that the model reaches a stable logit distribution
+                                                                      abled, and the SDPA attention backend. The soft-
+approximately 34% before the final layer. This validates
+                                                                      ware stack consists of PyTorch 2.3.1, Transform-
+the core premise of Level 2: the unembedding projection at
+                                                                      ers 4.44.0, and CUDA 12.1. Random seeds are fixed
+intermediate layers contains sufficient information to deter-
+                                                                      across all experiments (torch.manual seed(42),
+mine the verification outcome, and the remaining 34% of
+                                                                      numpy.random.seed(42),
+layers are computationally wasteful for this purpose.
+                                                                      torch.cuda.manual seed all(42)).
+
+Calibration. The thresholds τconf , rgap , and θ are cali-
+brated per model on 30 held-out GPQA Diamond problems                 Models. We evaluate five publicly available GQA models
+(non-overlapping with evaluation). τconf is set to the 75th           spanning 7B–10B parameters and three distinct GQA com-
+percentile of the observed maxb p(b) distribution; rgap to            pression ratios: Qwen2.5-7B-Instruct (Team, 2024a; Yang
+the 25th percentile of the observed relative gap; and θ to            et al., 2024) (28 layers, 28 query heads, 4 KV heads; 7:1
+the median of per-layer entropy values at the first stabilisa-        ratio), Mistral-7B-Instruct-v0.3 (Jiang et al., 2023) (32L,
+tion point. This yields conservative gates that fire only on          32Q, 8KV; 4:1), Falcon3-7B-Instruct (Team, 2024b) (28L,
+clear-cut cases.                                                      12Q, 4KV; 3:1), Falcon3-10B-Instruct (Team, 2024b) (40L,
+                                                                      12Q, 4KV; 3:1), and Llama-3-8B-Instruct (AI@Meta,
+2.4. RSBCM: Reasoning-Selective Block Cache                           2024) (32L, 32Q, 8KV; 4:1). This selection covers three
+     Manager                                                          training lineages (Qwen, Mistral/Meta, TII), two vocabulary
+                                                                      sizes (32K and 128K+), and a range of head configurations,
+To prevent the shared KV cache from growing unbound-                  ensuring that observed gains are not artifacts of a single
+edly under deep tree search, RKSC includes RSBCM.                     architecture.
+Each cached block receives an importance score ω =
+branch score/(depth + 1), which prioritises blocks from
+high-scoring branches at shallower depths. When the num-
+                                                                      Baselines. We compare against two baselines. The No-
+ber of allocated blocks exceeds a configurable capacity (de-
+                                                                      KV baseline batches all B branches in a single forward
+fault 2,000 blocks), the manager evicts blocks in ascending
+                                                                      pass but recomputes the shared prefix independently for
+ω order. The depth denominator ensures that blocks deep
+                                                                      each branch, representing a well-engineered system without
+in the search tree, which are less likely to be revisited, are
+                                                                      prefix caching. The vLLM-equivalent baseline implements
+evicted first, while the branch-score numerator preserves
+                                                                      token-exact prefix matching: it reuses the shared KV cache
+blocks associated with higher-confidence reasoning trajec-
+                                                                      only for branches whose token sequences are byte-identical
+tories.
+                                                                      to the root prefix, mirroring the PagedAttention prefix-cache
+In a stress test with max blocks=4 < B=8 (chosen to                   path in vLLM (Kwon et al., 2023) and SGLang (Zheng et al.,
+force evictions within a single solve call), RSBCM fires              2024). In our identical-prefix experimental regime (where
+exactly B − 4 = 4 evictions per problem (80 total across              all branches share the same padded prefix), every branch is
+20 problems, matching the expected count exactly). The                byte-identical to the root, so the vLLM-equivalent reuses the
+overhead is +1.5 ms/problem (95% CI [−6, +9] ms); the                 cache unconditionally, the same behaviour as setting τ =0
+wide interval with N =20 means the overhead is consistent             in the ASKS gate. Outside this regime (the diverse-phrasing
+with zero but not provably so, the correct interpretation is          ablation in §4.1), vLLM-equivalent achieves 0% reuse by
+that it is small relative to the speedups achieved. Answer            construction. Both baselines are measured through the same
+agreement is 100% across all 20 problems. RSBCM is                    solver code path as RKSC to ensure timing fairness.
+
+                                                                  4
+                            RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+Calibration and evaluation sets. The 30 GPQA Diamond                  with a bootstrap 95% CI of [1.339, 1.347] and a coefficient
+problems used for per-model calibration (thresholds τconf ,           of variation of 1%, confirming high measurement reliability.
+rgap , θ) are drawn from a held-out split disjoint from all           This saving is almost entirely attributable to prefix attention:
+evaluation sets, including the 30 problems in Table 1.                at n=1,024, the batched prefill of B=8 branches dominates
+                                                                      decode cost, and RKSC replaces B−1 of those prefills with
+Branching and padding. All experiments use B=8                        a single suffix forward conditioned on the shared cache.
+branches with eight fixed reasoning-hint suffixes cycled
+                                                                      The combined RKSC condition (KV+CGEE) achieves
+across branches. Problems are padded to approximately
+                                                                      1.622× ([1.486, 1.803]), saving 750 ms per problem. The
+1,024 tokens using a neutral filler string prepended itera-
+                                                                      elevated variance (CV=28%) is expected and reflects the
+tively, placing all experiments in the KV-beneficial regime
+                                                                      binary nature of the CGEE skip decision, which produces a
+(n/n∗ ≈ 11, Proposition A.1).
+                                                                      bimodal latency distribution: problems on which the gate
+                                                                      fires land on the fast skip-path, while the rest match the
+Datasets. We evaluate on four benchmarks spanning a                   KV-only condition. This bimodality inflates the standard
+difficulty gradient: GPQA Diamond (Rein et al., 2023)                 deviation relative to the mean and does not indicate measure-
+(graduate-level science), MMLU-STEM (Hendrycks et al.,                ment instability, the KV-sharing component, which accounts
+2021b;a) (university-level STEM), ARC-Challenge (Clark                for the majority of the speedup, has CV=1%. At t=32 de-
+et al., 2018) (medium science multiple-choice), and                   code steps on GPQA Diamond (the hardest dataset), the
+GSM8K (Cobbe et al., 2021) (elementary mathematics).                  verify-skip gate fires infrequently, so CGEE’s marginal con-
+Table 1 uses N =30 GPQA problems with t=32 decode                     tribution is modest in this decomposition. The full CGEE
+steps; the extended evaluation (Table 2) uses N =50 per               contribution is visible in the extended evaluation at t=8
+dataset with t=8.                                                     (§3.3), where verify cost constitutes a larger fraction of total
+                                                                      latency.
+Timing protocol. Each condition is timed over Nruns = 2–
+3 repeats per problem; the reported latency is the mean
+                                                                      Operating-regime disclosure. The extended evaluation
+across repeats and problems. Two warmup solves per condi-
+                                                                      uses t=8 decode steps, which is representative of the first
+tion are executed and discarded to stabilise the CUDA alloca-
+                                                                      branching phase in tree search and is a favourable operating
+tor before timing begins, reducing the coefficient of variation
+                                                                      point for RKSC because a short decode keeps the verify-pass
+from ∼30% to ∼10%. torch.cuda.synchronize()
+                                                                      cost proportionally large. The throughput decomposition
+is called before every wall-clock measurement.
+                                                                      at t=32 (Table 1) and the verify-only isolation below pro-
+                                                                      vide complementary views at longer decode horizons where
+Compute budget. All experiments together consume ap-                  CGEE’s contribution is naturally smaller.
+proximately 42 A100-GPU-hours: 3 hours for calibration (5
+models × 30 held-out problems × 3 conditions), 24 hours
+                                                                      CGEE verify-only isolation. To measure the layer-level
+for the extended evaluation (Table 2), 9 hours for ablations
+                                                                      entropy exit in isolation, we time the verification pass alone
+(§4), and 6 hours for the throughput decomposition at t=32
+                                                                      in a decode-dominated regime (t=128, N =15). Full-depth
+(Table 1) and the verify-isolation study. Model weights are
+                                                                      verification takes 315.3 ± 8.2 ms; CGEE-accelerated verifi-
+cached locally; no training occurs.
+                                                                      cation takes 250.7±11.8 ms, yielding a verify-pass speedup
+                                                                      of 1.258× (bootstrap 95% CI [1.225, 1.293], p<0.0001).
+3.2. Throughput Decomposition                                         The layer-level entropy exit fires on 100% of branches at a
+Table 1 isolates the contribution of each RKSC component              mean exit layer of 18.4 out of 28, confirming that the model
+on GPQA Diamond using Qwen2.5-7B-Instruct with t=32                   reaches a stable logit distribution well before the final layer
+decode steps. This longer decode regime makes the de-                 on verification inputs. This validates the core premise of
+code term Btγ non-negligible relative to the prefill term,            Level 2: the unembedding projection at intermediate layers
+providing a conservative estimate of gains.                           contains sufficient information to determine the verification
+                                                                      outcome.
+Table 1. Latency decomposition on GPQA Diamond (N =30,
+B=8, prefix ≈1,024 tok, t=32).                                        3.3. Multi-Model, Multi-Dataset Evaluation
+                                                                      Table 2 reports the full extended evaluation. At t=8 de-
+ Condition               Latency (ms)    Speedup    % Saved
+                                                                      code steps (representative of the first branching phase in
+ No-KV (ref)              1,956 ± 10      1.000×           ,          tree search, where decode cost is small relative to prefill),
+ KV only                   1,457 ± 8      1.343×      25.5%
+ RKSC (KV+CGEE)          1,206 ± 339     1.622×       38.3%           RKSC achieves a mean speedup of 3.008× across all 20
+                                                                      model–dataset pairs, with a peak of 3.990× (Llama-3-8B
+KV prefix sharing alone saves 500 ms per problem (25.5%)              on MMLU-STEM).
+
+                                                                  5
+                            RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+Table 2. Extended evaluation (B=8, prefix ≈1,024 tok, t=8, N =50 per dataset, 1,000 total problems). vLLM↑: vLLM-equiv vs No-KV.
+RKSC↑: KV+CGEE vs No-KV. CGEE skip: verify-skip gate fire rate.
+
+
+                                               NoKV     vLLM RKSC
+                      Model          Dataset    (ms)     (ms) (ms)          vLLM↑     RKSC↑     CGEE skip
+                                     GPQA       1,159      653        598     1.78×     1.94× 3%
+                      Qwen2.5-7B     GSM8K      1,163      652        515     1.78×     2.26× 32%
+                      Instruct       ARC-C      1,163      651        391     1.79×     2.97× 71%
+                                     MMLU       1,160      649        371     1.79×     3.13× 70%
+                                     GPQA       1,257      690        590     1.82×     2.13× 23%
+                      Mistral-7B     GSM8K      1,262      689        581     1.83×     2.17× 30%
+                      Instruct       ARC-C      1,263      691        482     1.83×     2.62× 60%
+                                     MMLU       1,260      692        534     1.82×     2.36× 47%
+                                     GPQA       1,158      637        360     1.82×     3.21× 54%
+                      Falcon3-7B     GSM8K      1,170      650        376     1.80×     3.11× 50%
+                      Instruct       ARC-C      1,173      651        347     1.80×     3.38× 66%
+                                     MMLU       1,175      651        395     1.80×     2.98× 39%
+                                  GPQA          1,629      895        450     1.82×     3.63× 72%
+                      Falcon3-10B GSM8K         1,634      898        473     1.82×     3.46× 57%
+                      Instruct    ARC-C         1,628      897        418     1.82×     3.89× 77%
+                                  MMLU          1,634      898        467     1.82×     3.50× 66%
+                                     GPQA       1,280      708        509     1.81×     2.51× 57%
+                      Llama-3-8B     GSM8K      1,283      710        464     1.81×     2.76× 65%
+                      Instruct       ARC-C      1,282      712        401     1.80×     3.20× 74%
+                                     MMLU       1,284      710        322     1.81×     3.99× 92%
+                      Overall                   1,301      719        452   1.808×    3.008× 55%
+
+
+Architecture generalization. The vLLM-equivalent gain                (60–92%, where shorter problems allow the model to con-
+spans 1.78×–1.83× across all 20 model–dataset pairs                  centrate confidence rapidly). This difficulty-adaptive be-
+(mean 1.808×, std 0.02), confirming the prediction of                haviour follows directly from the dual condition in Eq. (4):
+Eq. (8): since SKV depends on n and B but not on model               harder problems produce smaller inter-branch gaps and
+family or task, fixing the prefix length and branching fac-          lower absolute confidence, so both conditions are less likely
+tor produces near-identical gains regardless of architecture.        to be satisfied simultaneously.
+This near-constant behaviour persists despite substantial
+architectural variation, five models spanning three GQA
+compression ratios (3:1, 4:1, 7:1), two vocabulary sizes,            Effect of model scale. Falcon3-10B achieves the high-
+and three independent training lineages. The tight cluster-          est mean RKSC speedup (3.619×), compared to 2.574×–
+ing (±0.02×) confirms that RKSC’s KV throughput benefit              3.171× for the 7B–8B models. The absolute latency saved
+transfers uniformly across model families without requiring          also scales: 1,179 ms per problem for Falcon3-10B ver-
+a high-compression GQA architecture.                                 sus 692–799 ms for smaller models. This scaling follows
+                                                                     from the latency model (Eq. (6)): larger models have higher
+At the n=1,024 operating point, all branches achieve σb ≥            per-layer costs, so a fixed number of layers avoided by
+0.95 for all models, yielding 100% KV reuse. In this                 prefix sharing and early exit represents a proportionally
+identical-prefix regime, ASKS and the vLLM-equivalent                larger saving. Llama-3-8B achieves the highest single-cell
+produce identical KV gains by construction; the genuine              result (3.990× on MMLU-STEM with a 92% skip rate),
+ASKS novelty over token-exact caching is isolated in §4.1.           demonstrating that models excluded from calibration benefit
+                                                                     substantially from RKSC.
+
+Effect of task difficulty on CGEE. CGEE multiplies
+the KV-only speedup from 1.81× to 3.008× on average, a               RKSC vs vLLM-equivalent. The marginal speedup of
+1.66× marginal improvement attributable entirely to the              RKSC over vLLM-equivalent prefix caching averages
+dual-level exit mechanism. The verify-skip rate ρ̂ tracks            +61.2% across all 20 model–dataset pairs. In the identical-
+difficulty monotonically across the four datasets: lowest            prefix regime, this gain is attributable entirely to CGEE’s
+on GPQA Diamond (mean ∼42% across models, where                      dual-level exit, since ASKS and vLLM-equivalent yield
+graduate-level reasoning produces high inter-branch uncer-           identical KV gains when all branches share the same token
+tainty), and highest on ARC-Challenge and MMLU-STEM                  prefix. The genuine ASKS novelty is isolated in §4.1.
+
+                                                                 6
+                             RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+3.4. Accuracy Analysis                                                phrasings (n ≈ 512), ASKS achieves a 1.131× speedup
+                                                                      over the No-KV baseline (bootstrap 95% CI [1.066, 1.174],
+Table 3. CGEE accuracy impact across all 20 model–dataset pairs       p=0.0007), while token-exact caching provides no benefit.
+(1,616 total verify calls).                                           This result demonstrates that ASKS offers a strict superset
+                                                                      of the functionality provided by existing prefix-caching sys-
+               Metric                    Value                        tems, with measurable throughput gains in the regime where
+               Total verify calls        1,616                        those systems fail.
+               CGEE-induced errors           6
+               Error rate               0.37%                         4.2. Prefix-Length Sensitivity
+               Mean ∆ accuracy          −0.2%
+               Mean verify-skip rate      55%                         To characterise the operating envelope of KV sharing, we
+                                                                      sweep the prefix length over n ∈ {128, 256, 512, 1024}
+Across 1,616 verify calls spanning all five models and four           tokens with B=8 and N =20 problems (Qwen2.5-7B).
+datasets, CGEE introduced only 6 errors (0.37%), with a               At n=128, the speedup is 0.993× ([0.909, 1.103]), con-
+mean accuracy delta of −0.2% relative to full-depth verifica-         firming no net benefit at short prefixes where the
+tion (Table 3). Three model–dataset pairs account for all six         repeat interleave overhead approaches the saved
+errors: Mistral-7B on ARC-Challenge (3 errors, −4.0%                  prefill cost. At n=256 the result is similarly break-even
+∆accuracy), Falcon3-10B on ARC-Challenge (2 errors,                   (0.999×, [0.951, 1.061]). At n=512, KV sharing is clearly
+−2.0%), and Llama-3-8B on GSM8K (1 error, −2.0%).                     beneficial (1.127×, [1.081, 1.224]), and at n=1,024 the
+The remaining 17 model–dataset pairs exhibit zero CGEE-               speedup reaches 1.452× ([1.301, 1.681]).
+induced errors.
+                                                                      The empirical transition from break-even to beneficial be-
+The error concentration in multiple-choice benchmarks                 tween n=256 and n=512 is higher than the analytical
+(ARC-C) is consistent with the structure of the CGEE gate:            threshold n∗ ≈ 90 from Proposition A.1. This gap re-
+on multiple-choice items, generation confidence reflects              flects constant-factor SDPA kernel overhead that the linear
+the model’s fluency in producing the answer letter, which             latency model does not capture: the actual prefix forward
+occasionally diverges from the correctness signal that full-          pass includes fixed-cost setup steps (kernel launch, memory
+depth verification captures. On free-form generation tasks            allocation) that are non-negligible at short prefix lengths but
+(GPQA, GSM8K), where generation confidence more di-                   amortise at n ≥ 512. The KV probe (§2.2) handles this
+rectly reflects understanding, the error rate is lower. These         discrepancy correctly by measuring both paths at runtime
+results confirm that the dual condition in Eq. (4), requiring         rather than relying on the analytical threshold.
+both high absolute confidence and a clear relative margin, is
+an effective safeguard against false positives.
+                                                                      4.3. ASKS Threshold Insensitivity
+
+4. Analysis and Ablations                                             In the identical-prefix regime, all branches achieve σb ≥
+                                                                      0.95 for all five models, so the ASKS gate is non-binding
+4.1. ASKS Novelty Over vLLM Prefix Caching                            regardless of threshold τ . To confirm this, we sweep τ ∈
+                                                                      {0.70, 0.82, 0.90, 0.95} at n ≈ 512 with N =20 problems:
+The experiments in §3.3 use an identical-prefix regime
+                                                                      all four settings produce speedups of ∼1.16× (p < 10−25 ),
+where both ASKS and vLLM-equivalent caching achieve
+                                                                      confirming that the gate decision is τ -insensitive when the
+100% KV reuse and identical speedups. To isolate the contri-
+                                                                      prefix is long relative to the branch suffix. This robustness
+bution of semantic similarity gating, we construct a diverse-
+                                                                      is practically important: practitioners need not tune τ for
+phrasing regime where branch-level token sequences differ
+                                                                      their specific workload when operating at n ≥ 512.
+from the first token.
+We design eight phrasing templates at four semantic-                  4.4. CGEE Skip Rate vs Task Difficulty
+divergence levels (identical, minor rewording, structural
+reframing, and very different academic register) and evalu-           The CGEE verify-skip rate tracks task difficulty monotoni-
+ate N =15 problems on Qwen2.5-7B. Token-exact caching                 cally across the four benchmarks (averaged across all five
+achieves 0% reuse on all non-identical phrasings by con-              models): GPQA Diamond 42%, GSM8K 47%, MMLU-
+struction, since branches diverge at token position 1. ASKS           STEM 63%, ARC-Challenge 70%. This ordering matches
+achieves 28.6% additional reuse at τ =0.82, correctly iden-           the expected difficulty gradient and follows directly from the
+tifying branches whose hidden-state representations remain            gate design: on hard problems, the model distributes proba-
+semantically consistent despite surface-level lexical diver-          bility mass more uniformly across branches, causing both
+gence.                                                                conditions in Eq. (4) to fail more often. On easy problems,
+                                                                      one branch dominates early in the decode sequence, both
+The wall-clock implication is significant: on padded diverse
+
+                                                                  7
+                            RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+conditions are satisfied, and the gate fires. CGEE therefore          a single solve-call owner of the cache. In a multi-tenant
+provides its largest speedup contribution precisely on the            inference server, concurrent solves would require a tenant-
+tasks where verification is least necessary, a self-correcting        aware importance score; this is supported by the current
+property that limits accuracy risk.                                   design but not empirically validated here.
+
+5. Limitations                                                        6. Conclusion
+Sample size. Our evaluation uses N =50 problems per                   We presented RKSC, a training-free inference acceleration
+dataset, producing wide 95% confidence intervals on CGEE              framework for multi-branch LLM reasoning that addresses
+skip rates (±10–18%). A sample of N ≥ 200 would reduce                two structural redundancies in current inference pipelines.
+the CI to ±5%. Importantly, the KV sharing gains (which               ASKS broadcasts a single shared prefix KV cache to all
+account for the majority of the speedup) have CV<2% and               semantically consistent branches via exponentially weighted
+are not affected by this limitation.                                  cosine similarity, generalising token-exact prefix caching to
+                                                                      the semantic regime and demonstrating 28.6% additional
+Model scale. We evaluate 7B–10B models on a single A100
+                                                                      KV reuse on lexically diverse branches. CGEE reduces
+GPU. Models at 14B+ and multi-GPU tensor-parallel config-
+                                                                      verification cost through a dual-level exit: a verify-skip gate
+urations introduce communication overhead that may alter
+                                                                      that bypasses the entire verification pass when generation
+the relative contribution of prefix sharing versus verification
+                                                                      confidence is decisive, and a layer-level entropy exit that
+cost. The latency model (Eq. (6)) predicts larger models
+                                                                      terminates the verification forward pass at an intermediate
+should benefit more, and the Falcon3-10B results (3.62×
+                                                                      transformer layer when per-layer logit entropy stabilises.
+mean vs 2.57–3.17× for 7B models) provide early evidence
+                                                                      Together, these mechanisms achieve a mean speedup of
+for this trend.
+                                                                      3.008× (peak 3.990×) across five model families and four
+Domain coverage. Our benchmarks cover science and                     benchmarks, with a CGEE-induced error rate of 0.37%.
+mathematics. The CGEE entropy threshold θ is calibrated               The KV sharing component is architecture-agnostic (std
+on GPQA Diamond and may not transfer to domains with                  0.02× across five models), while the CGEE component is
+substantially different entropy profiles. Per-dataset θ cali-         difficulty-adaptive (skip rates from 42% on graduate-level
+bration via a small held-out sweep (5–10 problems) restores           science to 92% on university STEM). RKSC requires no
+gate activity, at the cost of one additional calibration step.        fine-tuning, no architecture modifications, and no custom
+                                                                      CUDA kernels.
+CGEE error rate. While low (0.37%, 6/1,616), CGEE is
+not error-free. All six errors occur in the verify-skip gate
+(Level 1); the layer-level entropy exit (Level 2) preserves           Impact Statement
+the full verification outcome by construction. Applications
+                                                                      This paper advances the efficiency of large language model
+requiring zero verification errors should disable Level 1 and
+                                                                      inference for multi-step reasoning tasks. By reducing re-
+retain only Level 2, accepting a smaller speedup contribu-
+                                                                      dundant computation in multi-branch reasoning pipelines,
+tion.
+                                                                      RKSC lowers the energy cost of inference-time scaling
+Scaling of ASKS broadcast. The repeat interleave                      and makes state-of-the-art reasoning more accessible on
+expansion is O(BLdk ) in memory where dk is the per-head              constrained hardware. We are not aware of societal con-
+KV dimension; for very large B (≥ 64) on long prefixes,               sequences specific to this work beyond those general to
+this expansion can itself become non-negligible on memory-            advancing the field of Machine Learning and Large Lan-
+bound workloads. A zero-copy view-based implementation                guage Models (LLMs).
+(rather than the safer .clone()) would remove this cost
+at the expense of additional care around SDPA kernel input            References
+contiguity.
+                                                                      AI@Meta.  Llama 3 model card. 2024. URL
+Hook-based exit is architecture-coupled. CGEE’s Level 2                 https://github.com/meta-llama/llama3/
+exit depends on register forward hook semantics                         blob/main/MODEL_CARD.md.
+and the existence of a distinct unembedding matrix acces-
+sible at model-load time. Models with tied input/output
+embeddings or non-standard layer modules may require mi-              An Yang, A. L., Yang, B., Zhang, B., Hui, B., Zheng, B.,
+nor adapter code. We verified compatibility with all five              Yu, B., Gao, C., Huang, C., Lv, C., Zheng, C., Liu, D.,
+evaluated models; extending to MoE or fused-layer archi-                Zhou, F., Huang, F., Hu, F., Ge, H., Wei, H., Lin, H.,
+tectures is future work.                                               Tang, J., Yang, J., Tu, J., Zhang, J., Yang, J., Yang, J.,
+                                                                        Zhou, J., Zhou, J., Lin, J., Dang, K., Bao, K., Yang, K.,
+Concurrent solves. RSBCM’s eviction policy assumes                     Yu, L., Deng, L., Li, M., Xue, M., Li, M., Zhang, P.,
+
+                                                                  8
+                            RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+  Wang, P., Zhu, Q., Men, R., Gao, R., Liu, S., Luo, S.,              Hendrycks, D., Burns, C., Basart, S., Zou, A., Mazeika, M.,
+  Li, T., Tang, T., Yin, W., Ren, X., Wang, X., Zhang, X.,              Song, D., and Steinhardt, J. Measuring massive multitask
+  Ren, X., Fan, Y., Su, Y., Zhang, Y., Zhang, Y., Wan,                  language understanding. Proceedings of the International
+  Y., Liu, Y., Wang, Z., Cui, Z., Zhang, Z., Zhou, Z., and              Conference on Learning Representations (ICLR), 2021b.
+  Qiu, Z. Qwen3 technical report, 2025. URL https:
+  //arxiv.org/abs/2505.09388.                                         Jiang, A. Q., Sablayrolles, A., Mensch, A., Bamford, C.,
+                                                                         Chaplot, D. S., de las Casas, D., Bressand, F., Lengyel,
+Cai, T., Li, Y., Geng, Z., Peng, H., Lee, J. D., Chen, D.,               G., Lample, G., Saulnier, L., Lavaud, L. R., Lachaux, M.-
+  and Dao, T. Medusa: Simple llm inference acceleration                  A., Stock, P., Scao, T. L., Lavril, T., Wang, T., Lacroix,
+  framework with multiple decoding heads, 2024. URL                      T., and Sayed, W. E. Mistral 7b, 2023. URL https:
+  https://arxiv.org/abs/2401.10774.                                      //arxiv.org/abs/2310.06825.
+
+Chen, K., Tan, X., Yu, M., and Xu, H. Memshare: Memory                Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+  efficient inference for large reasoning models through               C. H., Gonzalez, J. E., Zhang, H., and Stoica, I. Ef-
+  kv cache reuse, 2025a. URL https://arxiv.org/                        ficient memory management for large language model
+  abs/2507.21433.                                                      serving with pagedattention, 2023. URL https://
+                                                                       arxiv.org/abs/2309.06180.
+Chen, X., Xu, J., Liang, T., He, Z., Pang, J., Yu, D., Song,
+  L., Liu, Q., Zhou, M., Zhang, Z., Wang, R., Tu, Z., Mi,             Leviathan, Y., Kalman, M., and Matias, Y. Fast inference
+  H., and Yu, D. Do not think that much for 2+3=? on                    from transformers via speculative decoding, 2023. URL
+  the overthinking of o1-like llms, 2025b. URL https:                   https://arxiv.org/abs/2211.17192.
+  //arxiv.org/abs/2412.21187.
+                                                                      Lightman, H., Kosaraju, V., Burda, Y., Edwards, H., Baker,
+Clark, P., Cowhey, I., Etzioni, O., Khot, T., Sabharwal, A.,            B., Lee, T., Leike, J., Schulman, J., Sutskever, I., and
+  Schoenick, C., and Tafjord, O. Think you have solved                  Cobbe, K. Let’s verify step by step, 2023. URL https:
+  question answering? try arc, the ai2 reasoning challenge.             //arxiv.org/abs/2305.20050.
+  arXiv:1803.05457v1, 2018.
+                                                                      Miao, X., Oliaro, G., Zhang, Z., Cheng, X., Wang, Z.,
+Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,              Zhang, Z., Wong, R. Y. Y., Zhu, A., Yang, L., Shi,
+  Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,            X., Shi, C., Chen, Z., Arfeen, D., Abhyankar, R., and
+  R., Hesse, C., and Schulman, J. Training verifiers to solve          Jia, Z. Specinfer: Accelerating large language model
+  math word problems. arXiv preprint arXiv:2110.14168,                 serving with tree-based speculative inference and ver-
+  2021.                                                                ification. In Proceedings of the 29th ACM Interna-
+                                                                       tional Conference on Architectural Support for Pro-
+Elhoushi, M., Shrivastava, A., Liskovich, D., Hosmer, B.,              gramming Languages and Operating Systems, Volume
+  Wasti, B., Lai, L., Mahmoud, A., Acun, B., Agarwal,                  3, ASPLOS ’24, pp. 932–949. ACM, April 2024. doi:
+  S., Roman, A., Aly, A., Chen, B., and Wu, C.-J. Layer-               10.1145/3620666.3651335. URL http://dx.doi.
+  skip: Enabling early exit inference and self-speculative             org/10.1145/3620666.3651335.
+  decoding. In Proceedings of the 62nd Annual Meeting
+  of the Association for Computational Linguistics (Vol-              Rein, D., Hou, B. L., Stickland, A. C., Petty, J., Pang, R. Y.,
+  ume 1: Long Papers), pp. 12622–12642. Association                     Dirani, J., Michael, J., and Bowman, S. R. Gpqa: A
+  for Computational Linguistics, 2024. doi: 10.18653/v1/                graduate-level google-proof q&a benchmark, 2023. URL
+  2024.acl-long.681. URL http://dx.doi.org/10.                          https://arxiv.org/abs/2311.12022.
+  18653/v1/2024.acl-long.681.
+                                                                      Schuster, T., Fisch, A., Gupta, J., Dehghani, M., Bahri, D.,
+Guo, D. et al. Deepseek-r1 incentivizes reasoning in llms               Tran, V. Q., Tay, Y., and Metzler, D. Confident adap-
+  through reinforcement learning. Nature, 645(8081):                    tive language modeling, 2022. URL https://arxiv.
+  633–638, September 2025. ISSN 1476-4687. doi:                         org/abs/2207.07061.
+ 10.1038/s41586-025-09422-z. URL http://dx.doi.
+  org/10.1038/s41586-025-09422-z.                                     Team, Q. Qwen2.5: A party of foundation models, Septem-
+                                                                        ber 2024a. URL https://qwenlm.github.io/
+Hendrycks, D., Burns, C., Basart, S., Critch, A., Li, J., Song,         blog/qwen2.5/.
+  D., and Steinhardt, J. Aligning ai with shared human
+  values. Proceedings of the International Conference on              Team, T. The falcon 3 family of open models, December
+  Learning Representations (ICLR), 2021a.                               2024b.
+
+                                                                  9
+                            RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones,
+  L., Gomez, A. N., Kaiser, L., and Polosukhin, I. Attention
+  is all you need, 2023. URL https://arxiv.org/
+  abs/1706.03762.
+Wang, X., Wei, J., Schuurmans, D., Le, Q., Chi, E., Narang,
+ S., Chowdhery, A., and Zhou, D. Self-consistency im-
+ proves chain of thought reasoning in language mod-
+ els, 2023. URL https://arxiv.org/abs/2203.
+ 11171.
+Xin, J., Tang, R., Lee, J., Yu, Y., and Lin, J. Deebert: Dy-
+  namic early exiting for accelerating bert inference, 2020.
+  URL https://arxiv.org/abs/2004.12993.
+
+Yang, A., Yang, B., Hui, B., Zheng, B., Yu, B., Zhou, C.,
+  Li, C., Li, C., Liu, D., Huang, F., Dong, G., Wei, H., Lin,
+  H., Tang, J., Wang, J., Yang, J., Tu, J., Zhang, J., Ma, J.,
+  Xu, J., Zhou, J., Bai, J., He, J., Lin, J., Dang, K., Lu, K.,
+  Chen, K., Yang, K., Li, M., Xue, M., Ni, N., Zhang, P.,
+  Wang, P., Peng, R., Men, R., Gao, R., Lin, R., Wang, S.,
+  Bai, S., Tan, S., Zhu, T., Li, T., Liu, T., Ge, W., Deng,
+  X., Zhou, X., Ren, X., Zhang, X., Wei, X., Ren, X., Fan,
+  Y., Yao, Y., Zhang, Y., Wan, Y., Chu, Y., Liu, Y., Cui, Z.,
+  Zhang, Z., and Fan, Z. Qwen2 technical report. arXiv
+  preprint arXiv:2407.10671, 2024.
+
+Yang, C., Si, Q., Duan, Y., Zhu, Z., Zhu, C., Li, Q., Chen,
+  M., Lin, Z., and Wang, W. Dynamic early exit in rea-
+  soning models, 2025. URL https://arxiv.org/
+  abs/2504.15895.
+Yao, S., Yu, D., Zhao, J., Shafran, I., Griffiths, T. L., Cao,
+  Y., and Narasimhan, K. Tree of thoughts: Deliberate
+  problem solving with large language models, 2023. URL
+  https://arxiv.org/abs/2305.10601.
+Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H.,
+  Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., Bar-
+  rett, C., and Sheng, Y. Sglang: Efficient execution
+  of structured language model programs, 2024. URL
+  https://arxiv.org/abs/2312.07104.
+
+
+
+
+                                                                  10
+                           RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+The appendix is organised as follows. Appendix A contains the full theoretical analysis: the latency model, KV sharing
+speedup and threshold proposition, the combined RKSC speedup corollary, and the dual-level CGEE derivation. Appendix B
+gives detailed pseudocode for the three mechanisms referenced in §2. Appendix C collects all hyperparameters and the full
+prefix-length sensitivity sweep. Appendix D provides per-model accuracy breakdowns complementing Table 3. Appendix E
+lists the per-model cost constants used in the latency model. Appendix F shows qualitative examples of CGEE firing and
+deferring. Appendix G analyses per-layer entropy dynamics underlying Level-2 exit. Appendix H documents the RSBCM
+deep-tree validation experiment. Appendix I gives implementation details. Appendix J provides a full reproducibility
+checklist.
+
+A. Theoretical Analysis
+We characterise the latency savings of RKSC analytically, derive the conditions under which each mechanism is beneficial,
+and show that the combined speedup decomposes into factors operating on disjoint cost terms. The main-text discussion of
+results in §3.3 and the prefix-length ablation in §4.2 refer to Proposition A.1 and Eq. (8) from this appendix.
+
+A.1. Latency Model
+Consider generating B independent reasoning branches from a shared problem prefix of n tokens, each producing t decode
+tokens. We decompose wall-clock latency into four additive terms:
+
+                                             αn2 +
+                                         L = |{z}          B βn                      δ ,
+                                                                          + B t γ + |{z}                                (6)
+                                                           | {z }           | {z }
+                                              prefill   branch overhead     decode   verify
+
+where α is the per-token-squared self-attention cost (dominant for long prefixes due to the quadratic attention mechanism),
+β is the per-token feed-forward cost, γ is the per-step autoregressive decode cost, and δ is the full-depth verification
+forward-pass cost. The No-KV baseline pays the full prefill cost for each of the B branches: Lref = Bαn2 + Btγ + δ. This
+model is additive in the four cost terms, enabling clean decomposition of savings.
+
+A.2. KV Prefix Sharing Speedup
+RKSC computes the prefix KV cache once (cost αn2 ) and broadcasts it to all B branches, so each branch pays only the
+suffix attention cost βs for a short suffix of s ≪ n tokens:
+
+                                            LKV = αn2 + B βs + B t γ + δ.                                               (7)
+
+The KV speedup relative to the No-KV reference is:
+
+                                                          Bαn2 + Btγ + δ
+                                             SKV =                          .                                           (8)
+                                                        αn2 + Bβs + Btγ + δ
+                                                                      2
+Proposition A.1 (KV
+                 ∗
+                   psharing threshold). SKV > 1 if and only if (B−1)αn > Bβs, i.e., the shared prefix exceeds the
+critical length n = Bβs/(B−1)α.
+
+Proof. Expanding SKV > 1 gives Lref > LKV . Substituting
+                                                   p Eqs. (7) and the No-KV reference, the Btγ and δ terms cancel,
+leaving (B−1)αn2 > Bβs. Solving for n yields n > Bβs/(B−1)α = n∗ .
+
+Equation (8) has two important structural properties. First, SKV depends on n, B, s, and the cost ratios α/β and α/γ, but
+not on model family, GQA compression ratio, or task. This predicts that fixing n and B produces near-identical KV gains
+regardless of architecture, a prediction verified empirically in §3.3, where the vLLM-equivalent gain varies by only ±0.03×
+across five heterogeneous model families. Second, SKV increases monotonically in n and B but decreases in t: longer
+decode sequences dilute the KV-dominated prefill fraction. On A100 with SDPA, empirical timing on Qwen2.5-7B gives
+n∗ ≈ 90 tokens, placing all experiments at n=1,024 in the beneficial regime (n/n∗ ≈ 11).
+
+Worked numerical example. The per-token self-attention cost α and per-token feed-forward cost β can be fit by
+microbenchmarking the prefill path at varying n and recovering the quadratic and linear coefficients. Plugging empirical
+values into Proposition A.1 with B=8 and s=16 yields n∗ ≈ 90 tokens once kernel-launch overhead is folded in. The
+
+                                                                11
+                            RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+empirical break-even (§4.2) is higher (n between 256 and 512) because fixed SDPA setup costs dominate the linear model
+at short prefixes, precisely why RKSC uses a runtime probe (§2.2) rather than the analytical threshold alone. Fitted cost
+constants per model appear in Appendix E.
+
+A.3. Dual-Level CGEE Speedup
+CGEE saves latency through two independent channels. The verify-skip gate (Level 1) saves the full δ on a fraction ρ of
+problems. The layer-level entropy exit (Level 2) saves a fraction (1 − l∗ /L) of δ on a fraction ϕ of the remaining (1 − ρ)
+problems where entropy stabilises before the final layer. The combined expected latency with both CGEE levels active is:
+
+                                      E[LCGEE ] = LKV − ρ δ − (1−ρ) ϕ δ (1 − l∗ /L),                                       (9)
+
+and the full RKSC speedup relative to the No-KV baseline is:
+
+                                   Lref                  Bαn2 + Btγ + δ
+                       SRKSC =             =                                              .                               (10)
+                                 E[LCGEE ]   αn + Bβs + Btγ + δ − ρδ − (1−ρ)ϕδ(1 − l∗ /L)
+                                               2
+
+
+Corollary A.2 (Combined RKSC speedup). Let ρ denote the fraction of problems on which the verify-skip gate fires, and let
+the layer-level entropy exit fire at layer l∗ on a fraction ϕ of the remaining (1−ρ) problems. Then SRKSC is given by Eq. (10),
+and SRKSC ≥ SKV with equality iff ρ = ϕ = 0.
+
+
+Proof. Substitute Eq. (9) into SRKSC = Lref /E[LCGEE ] to obtain Eq. (10). Both subtractive terms in the denominator are
+non-negative, so E[LCGEE ] ≤ LKV , giving SRKSC ≥ SKV . Equality holds iff ρδ + (1−ρ)ϕδ(1 − l∗ /L) = 0, i.e. iff ρ = ϕ = 0
+(since δ > 0 and l∗ < L).
+
+A.4. Structural Interpretation of the Speedup Decomposition
+Equation (10) decomposes the total latency savings into three mutually disjoint cost terms:
+
+  • The KV-sharing term (B−1)αn2 − Bβs, which removes B−1 of the B prefill costs at the expense of a suffix attention
+    cost. This term is active on every solve call when σb ≥ τ .
+
+  • The verify-skip term ρδ, which removes the entire verify pass on a ρ-fraction of problems. This term is active only on
+    problems where generation confidence is decisive.
+
+  • The layer-exit term (1−ρ)ϕδ(1 − l∗ /L), which removes a (1 − l∗ /L)-fraction of the verify pass on the remaining
+    problems. This term is active whenever verify-skip does not fire but layer-level entropy stabilises.
+
+Because the three savings act on disjoint cost terms (αn2 , δ in full, and δ in part), they compose additively in the speedup
+ratio rather than trading off. This is the structural reason that combining the three mechanisms produces the observed 1.66×
+multiplicative improvement over vLLM-equivalent caching.
+
+A.5. Skip-Rate Adaptivity
+The skip rate ρ is an emergent property of the model–task interaction. On hard problems, maxb p(b) is low, inter-branch
+gaps are small, and ρ is correspondingly low. On easier tasks, the model rapidly concentrates confidence on one branch,
+producing large gaps and high ρ. This difficulty-adaptive behaviour means CGEE applies aggressive savings when the
+model is most confident, and defers to full verification when uncertainty warrants it, matching the qualitative ordering of
+task difficulty reported in §4.4.
+
+B. Algorithmic Details
+This appendix provides detailed pseudocode for the three RKSC mechanisms. Algorithm 2 details the ASKS similarity gate;
+Algorithm 3 details the CGEE layer-level entropy exit; Algorithm 4 details RSBCM eviction.
+
+                                                             12
+                           RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+Algorithm 2 A SKS G ATE: similarity-gated KV reuse
+                                         (l)
+Require: root hidden states Hroot = {hroot }L     (pre-normalised), branch suffixes {sb }B
+                                                                                         b=1 , threshold τ , exponent αw
+                                             Pl=1
+                                               L              ′
+ 1: compute weights wl ← exp(αw l/L)/ l′ =1 exp(αw l /L) for l = 1, . . . , L
+ 2: sharedSet ← ∅
+ 3: for b = 1, . . . , B do
+          (l)
+ 4:   {hb } ← fθsuffix (sb ) {per-layer hidden states for this suffix}
+              PL            (l)   (l)    (l)
+ 5:   σb ← l=1 wl · ⟨hb /∥hb ∥, hroot ⟩
+ 6:   if σb ≥ τ then
+ 7:      sharedSet.add(b)
+ 8:   end if
+ 9: end for
+10: return sharedSet
+
+
+Algorithm 3 V ERIFY W ITH E NTROPY E XIT: layer-level entropy-stabilisation exit
+Require: candidate tokens {yb }, unembedding Wu , thresholds θ, ϵ, lmin
+ 1: install forward hooks on each transformer layer (via register forward hook)
+ 2: Hprev ← +∞
+ 3: for l = 1, . . . , L do
+ 4:    compute layer output h(l) (forward pass up to layer l)
+               (l)
+ 5:    z ← hlast-token · Wu⊤ {unembedding projection}
+ 6:    p ← softmax(z)
+       H (l) ← − v pv log pv
+                    P
+ 7:
+ 8:    if l ≥ lmin and H (l) < θ and |H (l) − Hprev | < ϵ then
+ 9:       raise EarlyExitSignal(p) {caught by solver; hooks removed in finally block}
+10:    end if
+11:    Hprev ← H (l)
+12: end for
+13: remove hooks; return softmax(h(L) Wu⊤ ) {full-depth result if no early exit}
+
+
+
+C. Hyperparameter Settings and Sensitivity
+C.1. Complete Hyperparameter Table
+Table 4 collects every hyperparameter used in RKSC, split into fixed-across-models settings (top block) and per-model
+calibrated settings (bottom block). Calibrated thresholds are obtained on 30 held-out GPQA Diamond problems disjoint
+from the evaluation set.
+The τconf and rgap values are shared across all models because they are set to percentiles of each model’s own confidence
+distribution, making them self-normalising. The θ values differ because Mistral-7B’s logit distributions are substantially
+sharper (lower entropy) than the other models.
+
+C.2. Prefix-Length Sweep
+C.3. ASKS Threshold Sweep
+Table 6 reports the full τ -sweep referenced in §4.3. In the identical-prefix regime, all four settings produce statistically
+indistinguishable speedups at n ≈ 512, confirming that the gate decision is τ -insensitive in this regime.
+
+C.4. CGEE Cross-Dataset Calibration
+The entropy threshold θ is calibrated on GPQA Diamond. Table 7 shows the consequences of using a single GPQA-calibrated
+θ versus per-dataset calibration. Per-dataset θ calibration via a small held-out sweep (5–10 problems) restores gate activity
+on out-of-distribution datasets without loss in accuracy.
+
+                                                             13
+                            RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+Algorithm 4 R SBCM E VICT: attention-weighted depth-priority eviction
+Require: block table B = {(blocki , scorei , depthi )}, capacity Nmax
+ 1: while |B| > Nmax do
+ 2:   ωi ← scorei /(depthi + 1) for all i
+ 3:   i∗ ← arg mini ωi
+ 4:   evict block i∗ from cache
+ 5:   B ← B \ {(blocki∗ , scorei∗ , depthi∗ )}
+ 6: end while
+
+
+This cross-domain behaviour is documented as a limitation in §5. The main-paper results use per-dataset θ throughout; the
+GPQA-calibrated value is the default for deployment without a calibration sweep.
+
+D. Per-Model Accuracy Analysis
+Table 8 decomposes the aggregate accuracy impact (Table 3) across the 20 model–dataset pairs. Six errors concentrate in
+three pairs; the remaining 17 pairs exhibit zero CGEE-induced errors relative to full-depth verification.
+
+D.1. Failure Case Analysis
+Examining the six CGEE-induced errors reveals a consistent pattern: in each case, one branch emits the answer letter with
+high absolute probability while simultaneously carrying a subtle formatting deviation (e.g., a trailing period, different case,
+or embedded justification) that full-depth verification penalises but generation confidence does not. On ARC-Challenge, this
+manifests as the model fluently emitting, say, “C.” with p > 0.9 while full-depth verification prefers the branch that emitted
+“C” without punctuation because the verifier has learned the benchmark’s exact-match convention.
+This is not a failure of the entropy signal itself but of the verify-skip gate’s reliance on generation confidence as a proxy for
+correctness on multiple-choice tasks. On free-form tasks (GSM8K, GPQA), where the answer letter is embedded in longer
+reasoning and generation confidence more directly reflects understanding, the error rate drops to 0−1 per 50 problems. The
+dual condition in Eq. (4), requiring both high absolute confidence and a clear relative margin, prevents the naive failure mode
+of a single low-confidence branch firing the skip, but does not guard against correlated fluency-vs-correctness divergence on
+format-sensitive tasks. Users running on such benchmarks should either raise τconf or disable Level 1 and rely on Level 2
+alone.
+
+E. Empirical Cost Constants
+Table 9 reports the KV probe measurements for all five models, obtained by running the self-calibrating runtime probe
+(§2.2) at n≈1,024 tokens, B=8. The probe times three paths, batched full recompute, single root forward, and batched
+suffix decode with shared cache, and confirms that KV sharing is beneficial for all models at this prefix length.
+All five models achieve B ∗ ≤ 1.7, confirming KV sharing is beneficial for any B ≥ 2. At the experimental setting of B=8,
+the net saving per solve call ranges from 445 ms (Falcon3-7B) to 627 ms (Falcon3-10B), consistent with the latency model
+prediction that larger models benefit more (Eq. (8)). The near-identical B ∗ values (1.6–1.7) across architectures spanning
+three training lineages, two vocabulary sizes, and 7B–10B parameters confirms the architecture-invariance claim in §3.3: the
+break-even condition (B−1)αn2 > Bβs (Proposition A.1) depends on the cost ratio α/β, which is approximately constant
+across GQA model families at fixed hardware.
+
+F. Qualitative Examples
+We present two contrasting qualitative examples to illustrate when CGEE fires and when it defers.
+
+Example 1: CGEE-skip fires (ARC-Challenge, Qwen2.5-7B).
+
+     Problem: Which of the following is the primary greenhouse gas released by livestock digestion? (A) Carbon
+     dioxide (B) Methane (C) Water vapour (D) Nitrous oxide
+
+                                                               14
+                             RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+       Table 4. Complete RKSC hyperparameter settings. Values marked calibrated are fit per model on 30 held-out problems.
+
+     Hyperparameter                     Symbol     Value           Role
+     Fixed (shared across all models)
+     Branching factor                   B          8               number of parallel reasoning branches
+     Suffix length                      s          16 tokens       per-branch reasoning hint length
+     Decode steps (main eval)           t          8               Table 2
+     Decode steps (throughput table)    t          32              Table 1
+     Decode steps (verify isolation)    t          128             §3.2
+     ASKS exponent                      αw         1.5             grid-searched on {0.5, 1.0, 1.5, 2.0}
+     ASKS similarity threshold          τ          0.82            validated insensitive (§4.3)
+     Min exit layer (CGEE)              lmin       2               representation-refinement guard
+     Entropy stabilisation tolerance    ϵ          3.0 (nats)      rules out transient entropy dips
+     RSBCM default capacity             Nmax       2,000 blocks    overridden to 4 in RSBCM stress test
+     Decode-level CGEE threshold        θdec       0.72            early termination in decode loop
+     Decode-level CGEE gap              rdec       0.10            decode-loop gap condition
+     KV probe bucket width              ,          64 tokens       prefix-length probe granularity
+     KV probe repetitions               rprobe     3               min of 3 timings per path
+     Warmup solves                      Nwarmup    2               per condition
+     Timing repetitions                 Nruns      2–3             per problem, per condition
+     Calibrated per model (75th pct of max p / 25th pct of gap on 30 held-out GPQA problems, disjoint from all evaluation sets)
+     τconf (all models)                 τconf      0.70            Level-1 absolute confidence threshold
+     rgap (all models)                  rgap       0.06            Level-1 relative gap threshold
+     θ (Qwen2.5-7B)                     θ          8.0             Level-2 entropy threshold (nats)
+     θ (Mistral-7B)                     θ          0.50            Level-2 entropy threshold (nats)
+     θ (Falcon3-7B)                     θ          8.0             Level-2 entropy threshold (nats)
+     θ (Falcon3-10B)                    θ          8.0             Level-2 entropy threshold (nats)
+     θ (Llama-3-8B)                     θ          8.0             Level-2 entropy threshold (nats)
+     ASKS τ (Qwen2.5-7B)                τ          0.82            ASKS similarity gate threshold
+     ASKS τ (Mistral-7B)                τ          0.80            ASKS similarity gate threshold
+     ASKS τ (Falcon3-7B)                τ          0.80            ASKS similarity gate threshold
+     ASKS τ (Falcon3-10B)               τ          0.80            ASKS similarity gate threshold
+     ASKS τ (Llama-3-8B)                τ          0.82            ASKS similarity gate threshold (default)
+
+                             Table 5. End-to-end speedup vs prefix length (Qwen2.5-7B, N =20, B=8).
+
+                                        Prefix n   Speedup             95% CI   CV     Reuse
+                                          128       0.993×     [0.909, 1.103]   5%     100%
+                                          256       0.999×     [0.951, 1.061]   2%     100%
+                                          512       1.127×     [1.081, 1.224]   1%     100%
+                                         1024       1.452×     [1.301, 1.681]   0%     100%
+
+
+
+All 8 branches converge on “(B) Methane” within 3 decode steps. Top-1 probabilities: maxb p(b) = 0.94; 2nd-max = 0.22;
+gap ratio = 0.77. Both conditions of Eq. (4) fire and the verify pass is skipped entirely. Full-depth verify, run separately,
+confirms branch 3 is the correct answer, agreeing with the skipped decision. Latency: 321 ms (skip) vs 512 ms (full verify),
+a 1.59× reduction on this single problem.
+
+Example 2: CGEE-skip defers (GPQA Diamond, Qwen2.5-7B).
+
+     Problem: A particle of mass m is placed in a 3D isotropic harmonic oscillator potential with frequency ω. What is
+     the degeneracy of the first excited state?
+
+Branches split: 4 emit “3”, 3 emit “6”, 1 emits “2”. maxb p(b) = 0.61; 2nd-max = 0.54; gap ratio = 0.11 < rgap . The
+relative-gap condition fails, so the gate defers to full verification. Level 2 (layer-level entropy exit) fires at layer 19 out of 28,
+saving ≈ 32% of the verify cost. Full verify selects the “3” branches (correct: the first excited state has degeneracy 3 for the
+3D isotropic oscillator). Latency: 641 ms (Level-2 exit) vs 892 ms (full verify), a 1.39× reduction. This example illustrates
+the difficulty-adaptive behaviour quantified in §4.4.
+
+                                                                  15
+                              RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+Table 6. ASKS threshold sweep at n ≈ 512, N =20 problems on Qwen2.5-7B. Speedups are indistinguishable at all four settings,
+confirming τ -insensitivity in the identical-prefix regime.
+
+                                        τ     Speedup vs No-KV       95% CI               Reuse rate
+                                      0.70                1.162×     [1.155, 1.170]       100%
+                                      0.82                1.163×     [1.154, 1.171]       100%
+                                      0.90                1.163×     [1.154, 1.171]       100%
+                                      0.95                1.158×     [1.150, 1.167]       100%
+
+
+
+
+Table 7. CGEE Level-2 exit activity: GPQA-calibrated θ vs per-dataset-calibrated θ (Qwen2.5-7B). The GPQA-calibrated θ=8.0 does
+not activate on out-of-distribution datasets with lower entropy profiles; per-dataset calibration (5–10 problems) restores full activity.
+
+           Dataset                     Exit rate (GPQA-θ)     Exit rate (per-dataset-θ)     Note
+           GPQA Diamond (calib.)                     100%                        100%       calibration target
+           GSM8K                                       0%                        100%       lower entropy; needs θGSM < 8.0
+           ARC-Challenge                               0%                        100%       lower entropy; needs θARC < 8.0
+           MMLU-STEM                                   0%                        100%       lower entropy; needs θMMLU < 8.0
+
+
+
+
+These examples are illustrative and the specific latencies quoted are from individual runs rather than averages; aggregate
+figures appear in Table 2.
+
+G. Per-Layer Entropy Dynamics
+Table 10 shows the typical per-layer entropy trajectory during a verification forward pass on Qwen2.5-7B (28 layers). The
+trajectory confirms the premise of Level 2: entropy decays approximately monotonically through the network, with a rapid
+drop in the middle layers followed by a plateau that begins around layer 17–19 and persists to the final layer.
+The stabilisation condition |H (l) − H (l−1) | < ϵ = 3.0 is first satisfied at layer l∗ = 19 on average, matching the reported
+mean exit layer of 18.4 in the main text. Between layer 19 and layer 28, entropy changes by less than 0.04 nats, well below
+any decision-changing threshold for the argmax over the vocabulary on this task, confirming that the remaining 34% of
+layers do not alter the verification outcome and can safely be skipped. The values in Table 10 are representative means from
+profiling runs on GPQA Diamond hold-out problems; exact per-problem curves are available in the released code.
+
+H. RSBCM Deep-Tree Validation
+To validate RSBCM in the regime where evictions actually fire, we run a stress-test configuration with capacity Nmax = 4
+and branching B = 8 on 20 GPQA Diamond problems, forcing exactly B − Nmax = 4 evictions per solve call. Table 11
+reports the results.
+The eviction count matches the expected value exactly, confirming that the importance score ω = score/(depth + 1)
+correctly identifies and retires the lowest-value blocks. Overhead is statistically indistinguishable from zero, and no answer
+regressions were observed. RSBCM is therefore dormant in the default single-depth experiments reported in the main paper
+(where B < Nmax = 2000 always holds), but available as a safety mechanism for deep tree search.
+
+I. Implementation Details
+I.1. Stepwise Batched Decode
+RKSC replaces generate() with a direct model() loop: (1) suffix prefill conditioned on CB ; (2) token-by-token decode
+with pre-allocated attention masks sliced per step; (3) early termination on EOS or decode-level CGEE gate (θdec =0.72,
+rdec =0.10). Eliminating GenerationMixin scaffolding removes logit processors, stopping criteria, and beam tracking
+that are not needed in this pipeline, saving approximately 8−12% of end-to-end decode time measured on Qwen2.5-7B.
+
+                                                                   16
+                             RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+Table 8. Per-model, per-dataset CGEE accuracy impact. Errors: number of problems where CGEE’s answer diverges from full-depth
+verify. ∆Acc: CGEE accuracy minus full-verify accuracy (N =50 per cell).
+
+                                Model           Dataset      Errors                ∆Acc      Skip rate
+                                                GPQA             0                 0.0%           3%
+                                                GSM8K            0                 0.0%          32%
+                                Qwen2.5-7B
+                                                ARC-C            0                 0.0%          71%
+                                                MMLU             0                 0.0%          70%
+                                                GPQA             0              0.0%             23%
+                                                GSM8K            0              0.0%             30%
+                                Mistral-7B
+                                                ARC-C            3             −4.0%             60%
+                                                MMLU             0              0.0%             47%
+                                                GPQA             0                 0.0%          54%
+                                                GSM8K            0                 0.0%          50%
+                                Falcon3-7B
+                                                ARC-C            0                 0.0%          66%
+                                                MMLU             0                 0.0%          39%
+                                                GPQA             0              0.0%             72%
+                                                GSM8K            0              0.0%             57%
+                                Falcon3-10B
+                                                ARC-C            2             −2.0%             77%
+                                                MMLU             0              0.0%             66%
+                                                GPQA             0              0.0%             57%
+                                                GSM8K            1             −2.0%             65%
+                                Llama-3-8B
+                                                ARC-C            0              0.0%             74%
+                                                MMLU             0              0.0%             92%
+                                Total           ,                6     −0.2% (mean)       55% (mean)
+
+
+
+
+Table 9. KV probe measurements on A100-80GB with SDPA, B=8, n≈1,024 tokens. batch full: batched prefill with no sharing (ms).
+prefix fwd: single root forward pass (ms). sfx+KV: batched suffix decode conditioned on shared cache (ms). net: latency saved per solve
+call (ms). B ∗ : break-even branching factor; KV sharing is beneficial for all B > B ∗ .
+
+               Model           batch full    prefix fwd     sfx+KV     net saved                                   B∗
+               Qwen2.5-7B           586.8            88.1     43.1        455.7                                    1.6
+               Mistral-7B           629.4            89.9     58.8        480.7                                    1.7
+               Falcon3-7B           567.4            73.5     48.7        445.2                                    1.6
+               Falcon3-10B          798.7           103.4     68.8        626.5                                    1.6
+               Llama-3-8B           606.4            88.9     58.1        459.4                                    1.7
+               Verify isolation (Qwen2.5-7B, t=128): full 315.3±8.2 ms; CGEE 250.7±11.8 ms (1.258×, p<0.0001)
+
+
+
+
+I.2. CGEE Layer Hooks
+Hooks are installed via register forward hook on each transformer layer module. Each hook extracts the last-
+token hidden state, projects it through the cached unembedding matrix Wu , computes softmax entropy, and raises an
+ EarlyExitSignal exception when exit conditions are met. The solver catches this exception in a try/finally
+block that guarantees hook removal even if an exit fires, preventing a memory leak that would otherwise persist across solve
+calls. On Qwen2.5-7B, the per-layer hook overhead is ≈ 40 µs, which is recovered many times over whenever an exit fires
+before the final layer.
+
+I.3. KV Cache Expansion
+The prefix cache is expanded via .repeat interleave(B, dim=0) with .clone() for contiguous memory. Direct
+views (without .clone()) exposed an SDPA kernel bug on non-contiguous inputs in our PyTorch 2.3.1 build; the explicit
+clone resolves this at the cost of one additional tensor allocation per solve call, which is negligible at n = 1024 but grows
+with B · L · dk .
+
+                                                                  17
+                            RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+Table 10. Typical per-layer entropy trajectory on Qwen2.5-7B verify pass (means over 30 held-out GPQA problems). Layer denotes the
+transformer layer index (1–28); Entropy is H (l) from Eq. (5).
+
+                                            Layer    Entropy H (l)   |H (l) − H (l−1) |
+                                                1             9.82                  ,
+                                                4             7.41               0.81
+                                                8             5.12               0.62
+                                               12             3.08               0.45
+                                               16             1.62               0.23
+                                               18             1.14               0.07
+                                               19             1.08              0.006
+                                               20             1.06              0.002
+                                               24             1.04              0.001
+                                               28             1.04              0.000
+
+                         Table 11. RSBCM stress test on Qwen2.5-7B (N =20 problems, B=8, Nmax =4).
+
+          Metric                                                                                                    Value
+          Expected evictions                                                                     20 × (B − Nmax ) = 80
+          Observed evictions                                                                                            80
+          Overhead per problem                                                                                   +1.5 ms
+          95% CI on overhead                                                                                  [−6, +9] ms
+          Interpretation                              overhead small relative to savings; N =20 too small to bound to zero
+          Answer agreement vs no-eviction baseline                                                           100% (20/20)
+          Wall-clock cost of 80 evictions                                                                      30 ms total
+
+
+I.4. Memory Release
+unload model() explicitly pops arch[’ unembed weight’] before deleting the model, preventing a ∼1.8 GB
+reference leak for 9B models, then runs 3 GC passes and torch.cuda.empty cache(). Without this explicit pop,
+PyTorch’s reference counting retains the unembedding matrix via the cached reference in the CGEE hook infrastructure,
+causing accumulating leaks across sequential solves.
+
+I.5. TF32 and bfloat16 Configuration
+All     experiments       use     bfloat16      model     weights    with     TF32-enabled        matrix    multiplica-
+tion        (torch.backends.cuda.matmul.allow tf32 = True)                          and          SDPA         attention
+(scaled dot product attention). TF32 provides approximately 5% additional throughput at negligible
+precision loss; disabling it produces identical answers but ≈ 5% higher latency across all conditions uniformly (so the
+reported ratios are TF32-independent).
+
+J. Reproducibility Checklist
+Hardware and software.
+
+   • Single NVIDIA A100-80GB SXM4 GPU, PCIe 4.0.
+
+   • PyTorch 2.3.1, Transformers 4.44.0, CUDA 12.1, SDPA attention backend, bfloat16 + TF32.
+
+   • Ubuntu 22.04, Python 3.10.
+
+Determinism.
+
+   • Seeds: torch.manual seed(42), numpy.random.seed(42), torch.cuda.manual seed all(42),
+     random.seed(42) at the start of every condition.
+
+   • torch.backends.cudnn.deterministic = True and torch.backends.cudnn.benchmark =
+
+                                                               18
+                          RKSC: Reasoning-Aware KV Cache Sharing and Confident Early Exit
+
+    False for the warmup phase; benchmark re-enabled for timing measurements to allow kernel autotuning (iden-
+    tical kernel across all conditions ensures timing fairness).
+
+Timing.
+
+  • Nruns = 2–3 per problem, Nwarmup = 2 per condition, torch.cuda.synchronize() before each measurement.
+
+  • Warmup discarded; reported latency is mean over the Nruns measurements and problems.
+  • Bootstrap 95% confidence intervals via Bboot = 10,000 resamples of the problem-level latencies.
+
+Data.
+
+  • Datasets: GPQA Diamond (rein2023), GSM8K (cobbe2021), ARC-Challenge (allenai:arc), MMLU-STEM (hendryck-
+    stest2021) via HuggingFace Datasets.
+  • Evaluation sets: first N =50 problems per dataset (main eval), first N =30 for throughput decomposition, N =15 for
+    verify isolation, N =20 for prefix-length sweep. Fixed indices used across conditions to ensure paired comparisons.
+  • Held-out calibration set: 30 GPQA Diamond problems disjoint from evaluation.
+
+  • Padding: neutral filler string prepended iteratively to ≈1,024 tokens; hard cap at max seq len − 256 tokens to reserve
+    decode headroom.
+
+Models.
+
+  • All     models     loaded    with      AutoModelForCausalLM.from pretrained(...,
+    torch dtype=torch.bfloat16, attn implementation="sdpa").
+  • Checkpoints: Qwen2.5-7B-Instruct, Mistral-7B-Instruct-v0.3, Falcon3-7B-Instruct, Falcon3-10B-Instruct, Meta-Llama-
+    3-8B-Instruct (HuggingFace hub).
+
+  • Chat templates: each model’s native apply chat template used verbatim.
+
+Branching.
+
+  • B = 8 branches throughout; 8 fixed reasoning-hint suffixes cycled across branches (suffixes listed verbatim in released
+    code).
+
+Code and artefacts.
+
+  • Code release: https://github.com/AnirudhSekar/RKSC.
+  • Released artefacts include: the RKSC solver, calibration scripts, all timing harnesses, bootstrap analysis scripts, and
+    per-problem latency logs.
+
+Expected compute. Reproducing the full set of main-paper results requires approximately 42 A100-GPU-hours (itemised
+in §3.1).
+
+
+
+
+                                                           19
+

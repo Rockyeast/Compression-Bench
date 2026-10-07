@@ -1,0 +1,444 @@
+                                                   Fast NF4 Dequantization Kernels for Large
+                                                          Language Model Inference
+                                                         Xiangbo Qi                               Chaoyi Jiang                          Murali Annavaram
+                                              University of Southern California          University of Southern California        University of Southern California
+                                                    Los Angeles, USA                           Los Angeles, USA                         Los Angeles, USA
+                                                        qim@usc.edu                             chaoyij@usc.edu                         annavara@usc.edu
+
+
+
+                                           Abstract—Large language models (LLMs) have grown be-             LLMs requires millions of dequantization operations, with
+                                        yond the memory capacity of single GPU devices, necessitating       the overhead accumulating across hundreds of transformer
+arXiv:2604.02556v1 [cs.LG] 2 Apr 2026
+
+
+
+
+                                        quantization techniques for practical deployment. While NF4 (4-     layers. Our profiling in Table I shows that the Qwen3-32B
+                                        bit NormalFloat) quantization enables 4× memory reduction,
+                                        inference on current NVIDIA GPUs (e.g., Ampere A100) requires       dequantization process accounts for roughly 30–40% of the
+                                        expensive dequantization back to FP16 format, creating a critical   end-to-end latency, clearly identifying dequantization as the
+                                        performance bottleneck. This paper presents a lightweight shared    dominant bottleneck.
+                                        memory optimization that addresses this gap through principled         Our work addresses this gap through a principled opti-
+                                        memory hierarchy exploitation while maintaining full ecosystem      mization of the dequantization bottleneck using lightweight
+                                        compatibility. We compare our technique against the open-source
+                                        BitsAndBytes implementation, achieving 2.0–2.2× kernel speedup      shared memory techniques. Unlike existing approaches that
+                                        across three models (Gemma 27B, Qwen3 32B, and Llama3.3             require complex kernel fusion or offline preprocessing [9],
+                                        70B) and up to 1.54× end-to-end improvement by leveraging           [10], our method achieves considerable performance gains
+                                        the 12–15× latency advantage of shared memory over global           through focused optimization of memory access patterns while
+                                        memory access. Our optimization reduces instruction counts          maintaining full compatibility with the HuggingFace Trans-
+                                        through simplified indexing logic while using only 64 bytes of
+                                        shared memory per thread block, demonstrating that lightweight      formers [7] and BitsAndBytes ecosystem [5]. The simplicity
+                                        optimizations can deliver substantial performance gains with        of our approach enables immediate deployment in production
+                                        minimal engineering effort. This work provides a plug-and-play      systems and research environments without disrupting exist-
+                                        solution for the HuggingFace ecosystem that democratizes access     ing workflows or requiring model conversion. Experimental
+                                        to advanced models on existing GPU infrastructure.                  results show significant improvements in inference latency and
+                                           Index Terms—Machine learning systems, large language mod-
+                                        els, quantization, graphics processing units                        throughput. In summary, our contributions are as follows:
+                                                                                                               • We identify and characterize the dequantization bottle-
+
+                                                              I. I NTRODUCTION                                   neck in current NF4 implementations through systematic
+                                                                                                                 profiling, revealing that memory access patterns rather
+                                           Large language models (LLMs) such as GPT-5 [1], Llama                 than computational complexity dominate performance.
+                                        4 [2], Claude 4 [3], and Qwen3 [4] have demonstrated remark-           • We design and implement a lightweight shared memory
+                                        able capabilities across diverse domains, driving widespread             optimization that leverages the 12–15× latency advantage
+                                        adoption in production applications. These applications span             of on-chip memory over global memory on Ampere
+                                        code generation [18], [19], question answering [20], [22], and           architecture.
+                                        conversational AI systems [21]. The exponential growth from            • Our approach transforms redundant per-thread global-
+                                        GPT-3’s 175B parameters [23] to current models exceeding                 memory accesses into efficient per-block loading, reduc-
+                                        400B parameters [2] has created a deployment challenge                   ing LUT global-memory traffic by 64× per thread block.
+                                        where models exceed single GPU memory capacity, neces-                 • We provide comprehensive experimental evaluation
+                                        sitating sophisticated quantization techniques [5].                      across three models and diverse batch sizes, demon-
+                                           NF4 (4-bit NormalFloat) quantization [5] has emerged                  strating 2.0–2.2× kernel speedup and up to 1.54× end-
+                                        alongside other methods such as GPTQ [16] and AWQ [17] as                to-end improvement across model sizes from 27B to
+                                        the dominant approach for memory-efficient fine-tuning and               70B parameters. The optimization reduces dequantization
+                                        inference, reducing model footprint by 4× while maintain-                instruction count by 71% through simplified indexing
+                                        ing accuracy within 0.1% of full precision on downstream                 logic that eliminates warp divergence.
+                                        tasks. However, the current NVIDIA Ampere architecture
+                                        lacks native 4-bit compute support, requiring dequantization                             II. BACKGROUND
+                                        from NF4 to FP16 format for every matrix multiplication
+                                        during inference. This creates a fundamental performance            A. Large Language Model Inference
+                                        bottleneck that becomes increasingly severe as model sizes             Modern transformer-based language models consist of
+                                        grow and throughput demands increase. Each layer in modern          stacked decoder layers, with architectures ranging from 28
+               Quantized Weights             LUT Decoding                    Scaled with                Dequantized
+                  (4-bit NF4)                     .                         Scaling Factors            Weights (FP16)
+
+
+
+
+                   1                                      2
+                                                                                                         Tensor Core
+                                                                                                           MatMul
+                                                                                                           (FP16)
+                                                                        Register
+                                                                    Shared Memory
+
+                        4-Level Tree Decoding                 Global Memory LUT
+
+Fig. 1: Baseline NF4 dequantization showing bottlenecks (1) 4-level tree decoding with branching overhead and warp divergence
+(2) Global memory code access at 290 clock cycles per operation
+
+
+layers in smaller models to 64 layers in Qwen3-32B [4]. Each            Beyond inference optimization, NF4 has become essential
+layer contains self-attention and feed-forward network sublay-       for QLoRA (Quantized Low-Rank Adaptation), which enables
+ers, involving matrix multiplications between input activations      fine-tuning of 65B+ parameter models on single consumer
+and learned weight matrices. For a model with P parameters,          GPUs [5]. QLoRA combines NF4 quantization of base model
+the computational cost of a forward pass is approximately            weights with training low-rank adapter matrices in higher
+2P FLOPs per token during autoregressive inference [6].              precision, reducing fine-tuning memory requirements from
+During autoregressive inference, the model processes tokens          over 780GB to under 48GB for a 65B model. The base
+sequentially, with each layer’s output serving as input to the       weights remain in 4-bit NF4 format during both forward
+next layer.                                                          and backward passes, with gradients computed only for the
+   For an NF4 quantized model, the weight matrices in each           small adapter matrices. This makes NF4 not just an inference
+layer require dequantization from 4-bit to FP16 format before        optimization but a foundational technology for democratized
+computation on current GPU hardware. Each transformer                model customization [13].
+layer contains multiple weight matrices: query, key, value,
+and output projections for attention, plus gate, up, and down                                 III. M OTIVATION
+projections for the feed-forward network. Processing input
+tokens through many layers (e.g., Qwen3-32B’s 64 layers)             A. The Quantization-Compute Gap
+requires dequantizing hundreds of weight matrices, with each            The fundamental challenge stems from a critical architec-
+matrix containing millions of parameters. Dequantization cost        tural mismatch where memory capacity constraints demand
+scales with model depth and the number of weight matrices            4-bit quantization, but compute units require 16-bit inputs. To
+per layer, but remains approximately constant per forward pass       run Qwen3-32B on an A100 GPU, the model requires 64GB in
+regardless of batch size, since only the fixed weight matrices—      FP16 format but only 16GB when quantized to NF4, making
+not the batch-dependent activations—require dequantization.          quantization essential for single-GPU deployment. However,
+                                                                     the A100’s Tensor Cores only support FP16/BF16 operations,
+B. NF4 Quantization Fundamentals                                     necessitating dequantization for every matrix multiplication.
+                                                                        This creates a bottleneck where dequantization overhead
+   NF4 quantization addresses the memory challenge through           dominates inference time. Table I shows baseline overhead
+a mathematically principled approach that aligns with the            percentage (OH%) and kernel latency (KL) for Qwen3-32B
+empirical distribution of neural network weights [5]. Unlike         across batch sizes on the GSM8K dataset.
+uniform quantization schemes that distribute levels evenly
+across the value range, NF4 concentrates precision around zero                           Batch Size
+                                                                                                      GSM8K Dataset
+where most weights cluster. The scheme uses 16 carefully                                              OH%   KL(ms)
+                                                                                              2        39.8  12983
+chosen quantization levels following quantile values of a                                     4        39.3  13031
+theoretical normal distribution, normalized to fit the range [-1,                             8        37.4  13021
+1]. NF4 uses a block size of 64 elements per scaling factor,                                  16       34.7  13046
+                                                                                              32       29.5  13041
+balancing quantization granularity with metadata overhead.                                    64       21.4  13027
+This information-theoretic approach minimizes quantization
+error for normally distributed weights while enabling efficient      TABLE I: Baseline dequantization overhead (OH%) and kernel
+4-bit storage.                                                       latency (KL) for Qwen3-32B.
+   Dequantization overhead remains consistently high at 21-         to simple shifts and masks. Third, we must maintain token-
+40% of total inference time across batch sizes (2-64), with         exact compatibility with the baseline implementation to en-
+the baseline’s reliance on global memory lookups resulting in       sure correctness. These objectives must be achieved within
+approximately 13,000ms of consistent overhead. This validates       the constraints of preserving ecosystem compatibility with
+shared memory optimization as our target.                           BitsAndBytes and HuggingFace Transformers, requiring zero
+                                                                    offline preprocessing or model conversion, and maintaining the
+B. Memory Access Pattern Analysis                                   modular kernel interface that enables composition with other
+   The inefficiency of current dequantization implementations       optimizations.
+stems from suboptimal memory access patterns that fail to
+exploit GPU memory hierarchy. The baseline kernel loads the         B. Shared Memory Loading Strategy
+16-element NF4 dequantization codes from global memory
+repeatedly for each thread’s dequantization operations, result-        The core insight of our optimization is that the 16-element
+ing in redundant transfers of identical data. Global memory         NF4 code table, requiring only 64 bytes in FP32 format, fits
+access on Ampere architecture [8] incurs 290 clock cycles,          comfortably in shared memory and can be reused across all
+compared to 23 cycles for shared-memory reads and 19 cycles         threads in a block. We implement a single-thread loading
+for writes [12], creating a severe bottleneck for the billions of   strategy in which a single thread loads the lookup table into
+lookup operations required during inference.                        shared memory at kernel launch, followed by a synchroniza-
+   The scattered access pattern and lack of data reuse at           tion barrier that ensures all threads see the complete table
+the thread block level mean the GPU’s substantial compute           before proceeding with dequantization.
+capabilities remain underutilized while waiting for memory             This approach transforms the memory access pattern from
+operations to complete. Our kernel-level profiling confirms this    one lookup-table load per thread (repeated across many de-
+memory-bound behavior, with dequantization kernels consum-          quantization operations) to a single load per thread block.
+ing 21–40% of end-to-end latency despite the relatively simple      For the kernel configuration with TILE SIZE=512, this rep-
+computational operations involved [14].                             resents a significant reduction in global memory traffic for
+                                                                    lookup table access. With 64 threads per block processing 8
+C. Profiling Analysis and Bottleneck Identification                 elements each (NUM PER TH=8), each block handles 512
+   For the Qwen3-32B batch-size-8 configuration in Table I,         weight elements in total. The shared memory’s single-cycle
+PyTorch Profiler reveals the severity of the dequantization bot-    broadcast capability allows multiple threads to read the same
+tleneck in production workloads [14]. Within quantized matrix       table entry simultaneously without bank conflicts, maximizing
+multiplication, dequantization kernels account for 72.4% of the     throughput. Figure 2 illustrates this memory hierarchy opti-
+time, with the remainder split between the underlying matmul        mization where the quantized weights and scales reside in
+computation and activation memory transfers. Note that this         global memory while the shared NF4 LUT in on-chip shared
+72.4% figure is scoped to quantized matmul (not end-to-end          memory serves all lookups within the thread block, eliminating
+latency), and end-to-end latency also includes attention, KV-       repeated global memory accesses that dominated the baseline
+cache updates, sampling, and framework overhead, which is           implementation.
+why Table I reports 21–40% dequantization overhead at the
+end-to-end level.                                                      Quantized Weights        Shared NF4 LUT                        Scales
+   The baseline kernel’s 4-level tree structure for NF4 dequan-
+                                                                                     …                                                         …
+tization requires multiple conditional branches and compar-
+isons for each weight element, creating both computational                                               2
+overhead and warp divergence. Figure 1 illustrates these
+bottlenecks: the tree-based decoding with branching overhead
+causes warp divergence as threads take different conditional                        1                           1. Extract NF4 Code
+paths, and global memory code access incurs 290 clock cycles
+per operation on Ampere architecture. This memory-bound                                                      2. Look Up NF4 Distribution
+
+behavior persists across all batch sizes, though the relative
+impact varies with workload characteristics.                                                         3        3. Scale and Dequantize
+
+
+        IV. P ROBLEM F ORMULATION AND D ESIGN                                            Registers
+                                                                                  Shared Memory
+A. Optimization Objectives and Constraints
+                                                                                  Global Memory                   Dequantized Weights
+   Our design targets three primary objectives while respecting
+                                                                                                                                 …
+critical constraints. First, we aim to minimize global memory
+accesses for lookup table operations by exploiting data reuse
+opportunities within thread blocks. Second, we seek to re-          Fig. 2: Memory-level architecture with shared NF4 LUT
+duce instruction count through simplified indexing logic that       serving all lookups within the thread block.
+eliminates complex branching and reduces bit manipulation
+C. Memory Loading vs. Hardcoded Literals                              The baseline implementation uses a 4-level binary tree with
+                                                                   conditional branches, requiring up to 7 instructions per lookup
+   We load the lookup table from constant memory into shared
+                                                                   with potential warp divergence. Our optimized version reduces
+memory rather than hardcoding literals in the kernel. Hardcod-
+                                                                   this to 2 instructions: bit extraction and direct shared memory
+ing embeds float immediates into PTX instructions, increasing
+                                                                   access. This transformation eliminates all branching in the
+kernel code size and instruction cache pressure on the per-
+                                                                   critical dequantization loop, ensuring all threads in a warp
+SM instruction cache (128 KB on Ampere [8]). Loading from
+                                                                   execute identically.
+global memory leverages the dedicated 64 KB constant cache
+per SM, which provides broadcast capability where a single         F. Thread-Level Architecture
+memory read can serve all 32 threads in a warp simultaneously
+when they access the same address. This results in a more             The thread-level implementation employs a single-thread
+compact kernel binary with fewer instructions, improving in-       loading strategy where thread 0 loads the 16-element NF4
+struction fetch efficiency and reducing stalls in high-occupancy   lookup table (64 bytes) into shared memory while other
+scenarios. The constant memory declaration ensures robust          threads wait at a synchronization barrier. This design was
+performance across varying workload characteristics while          chosen over cooperative loading using many threads because
+minimizing register pressure.                                      the small data size makes the overhead of thread coordination
+                                                                   and potential bank conflicts outweigh parallelism benefits. The
+D. Simplified Index Computation                                    64-byte sequential copy latency is negligible compared to
+                                                                   the thousands of subsequent shared memory accesses during
+   Beyond memory optimization, we redesign the index com-          dequantization.
+putation logic to minimize instruction overhead. The baseline         The kernel is configured with 64 threads per block, pro-
+implementation employs a binary tree traversal for index           cessing 8 elements per thread (NUM PER TH=8), yielding
+calculation, requiring multiple conditional branches and arith-    a tile size of 512 elements. This configuration achieves good
+metic operations. Our approach leverages the regular structure     occupancy (2-3 blocks per SM on Ampere) without excessive
+of NF4 quantization to implement direct indexing through bit       register pressure. The 8 elements per thread provides sufficient
+manipulation. This eliminates branch divergence within warps       work granularity to amortize instruction overhead while main-
+and reduces the indexing operation from 7 instructions to 2        taining manageable register usage. The resulting 512-element
+instructions per weight. The simplified logic also improves        tile size aligns well with typical weight matrix dimensions and
+instruction-level parallelism by removing data dependencies        cache line sizes.
+between successive index computations.                                During dequantization, all 64 threads simultaneously access
+                                                                   the shared NF4 lookup table. Shared memory on Ampere
+E. Algorithm Design
+                                                                   supports broadcast reads—when multiple threads in a warp
+   Algorithm 1 presents the pseudocode for our optimized           access the same address, the value is broadcast to all requesting
+NF4 dequantization kernel. The key innovation lies in the          threads in a single operation. This eliminates bank conflicts
+single-thread loading of the NF4 lookup table into shared          and provides 15× latency advantage (19 cycles for shared
+memory (lines 4-8), followed by direct indexed access during       memory versus 290 cycles for global memory). The access pat-
+dequantization (lines 13-14) rather than tree-based branching      tern exhibits excellent temporal locality as threads repeatedly
+used in the baseline implementation.                               access the lookup table across 512 dequantization operations
+                                                                   per thread block (64 threads × 8 elements), justifying the
+Algorithm 1 Optimized NF4 Dequantization Kernel                    initial loading overhead.
+ 1: Require:
+ 2:      • Quantized NF4 weights A, scaling factors absmax               Thread Block (Partial View)                            Thread Block (Partial View)
+ 3:      • Allocated shared memory smem nf 4[16]
+                                                                                                                                   T4      T5      T6      …
+ 4: if threadIdx.x = 0 then                                          1                                                   2
+ 5:     for i = 0 to 15 do                                                    T0                                                   T0      T1      T2      T3
+ 6:        smem nf 4[i] ← nf 4 data[i] from constant mem
+                                                                         Thread 0 Loads
+ 7:     end for
+ 8: end if                                                                                   LUT[0] : -1.0
+                                                                                            LUT[1] : -0.69…
+                                                                                            LUT[2] : -0.52…
+ 9:   syncthreads()
+                                                                                                  …                                     SMEM_NF4 Table
+10: for j = 0 to Nbytes − 1 in parallel do                                                   LUT[15] : 1.0
+
+11:     qval ← Anf4 [j]                                                     Shared Memory
+                                                                                                                                 All Threads Use Shared Memory to
+                                                                                                                                  Directly Lookup Quantized Value
+12:    scale ← absmax[blockIdx]
+13:    out[2j] ← smem nf 4[qval ≫ 4] × scale                                                                  __syncthreads()
+
+14:    out[2j + 1] ← smem nf 4[qval & 0x0F ] × scale               Fig. 3: Thread-level architecture with single-thread loading of
+15: end for
+                                                                   LUT into shared memory.
+16: Ensure: Dequantized FP16 weights out
+                    V. I MPLEMENTATION                                 Our measurement protocol implements controls for accu-
+                                                                    rate and reproducible results. Each experiment begins with a
+A. Kernel Architecture
+                                                                    warmup phase of one inference pass to stabilize GPU clocks
+   Our         optimized        kernel       modifies        the    and populate caches. For optimized-kernel analysis, we run
+kDequantizeBlockwise function in BitsAndBytes,                      three profiling-enabled passes, reporting mean latency. We
+instantiated with template parameters for FP16 output,              lock the GPU to its maximum clock (1410 MHz) using nvidia-
+512-element tile size, 64 threads per thread block, 8 elements      smi, eliminating frequency scaling variance. The PyTorch
+per thread, and NF4 data type. The implementation maintains         Profiler provides microsecond-resolution timing via NVIDIA’s
+full API compatibility with HuggingFace Transformers.               CUPTI interface, including kernel launch overhead and mem-
+   The kernel declares the NF4 lookup table in constant             ory transfers to reflect realistic end-to-end performance [14].
+memory, enabling hardware-accelerated broadcast reads from             We evaluate performance across batch sizes 2, 4, 8, 16, 32,
+the 64 KB constant cache per SM. Thread 0 copies the                and 64 using input prompts from the GSM8K dataset [15] for
+table to shared memory, followed by __syncthreads() for             all three models, comparing baseline dequantization against
+visibility. The dequantization loop extracts 4-bit indices using    our shared memory optimized version. Each batch size is
+bitwise operations (shift right by 4 for high nibble, AND with      tested with multiple prompt lengths to ensure robustness across
+0x0F for low nibble) and performs shared memory lookups.            different workload characteristics.
+The baseline implementation uses a 4-level conditional tree
+requiring multiple branch instructions per weight; our bit          B. End-to-End Performance Results
+manipulation compiles to 2 instructions with no branches,              Our evaluation demonstrates consistent performance im-
+eliminating warp divergence.                                        provements across all three models and tested batch sizes
+   Global memory accesses use CUB library primitives for            (Figure 4). The end-to-end speedup varies significantly by
+coalesced transfers. Edge cases are handled via predicated          model size, with larger models demonstrating greater benefits:
+execution when weight matrix size is not divisible by 512.          Llama3.3 70B achieves 1.52× average speedup across all
+The modified kernel integrates directly into BitsAndBytes and       batch sizes, Qwen3 32B achieves 1.18× average, and Gemma
+is accessed through the standard quantized linear layer API.        27B achieves 1.10× average. This pattern occurs because
+                                                                    larger models spend a higher proportion of total inference time
+B. Instruction-Level Optimizations                                  in dequantization operations, increasing the impact of our 2.0-
+   Our optimization eliminates the baseline kernel’s branching      2.2× kernel-level improvements.
+tree traversal for index computation. The baseline implementa-         Figure 4 (top row) shows end-to-end latency across the
+tion requires multiple conditional branches to traverse a 4-level   three models. Llama3.3 70B demonstrates the most dramatic
+decision tree for each weight element, causing warp divergence      improvements, achieving 1.54× speedup at batch 2 (39.96s to
+when threads process different indices. Our approach uses           26s) and maintaining 1.44× speedup even at batch 64. Qwen3
+direct bit manipulation with AND and shift operations to            32B shows strong mid-range performance with peak gains of
+extract the 4-bit index, reducing the indexing operation from 7     1.29× at batch 32, while Gemma 27B exhibits increasing
+instructions with branches to 2 instructions without branches.      benefits at larger batch sizes, reaching 1.32× at batch 64
+   This elimination of branch divergence is particularly impor-     (23.13s to 17.49s).
+tant as all threads within a warp now execute the same direct          The varying end-to-end impact across batch sizes re-
+indexing instruction rather than potentially taking different       flects how dequantization’s proportion of total inference time
+branches in the tree traversal. This maintains the GPU’s SIMT       changes with workload characteristics. Qwen3 32B profiling
+execution model efficiently and prevents the serialization that     (Table I) shows dequantization consumes 30-40% of total
+occurs when threads within a warp follow different control          inference time across batch sizes. At smaller batch sizes, mem-
+flow paths.                                                         ory bandwidth underutilization for matrix operations allows
+                                                                    dequantization to dominate, enabling our kernel optimization
+                      VI. E XPERIMENTS                              to deliver greater end-to-end improvements. At larger batch
+                                                                    sizes, improved matrix multiplication parallelization reduces
+A. Experimental Setup                                               dequantization’s relative contribution, though it remains a
+  We conducted comprehensive testing on the USC CARC                significant bottleneck. Our consistent 2.0-2.2× kernel speedup
+system using a single NVIDIA A100-80GB GPU paired with              thus translates to end-to-end improvements ranging from
+AMD EPYC 7513 CPU (32 cores) and 64GB RAM. The                      1.07× to 1.54× depending on model architecture and batch
+software environment consists of CUDA 12.6, PyTorch 2.1,            configuration.
+and BitsAndBytes 0.47.0 with fixed random seeds ensuring               Figure 4 (bottom row) shows throughput improvements in
+reproducibility [11]. We evaluate our optimization on three         tokens per second. The optimized implementation delivers
+models: Gemma 27B, Qwen3 32B, and Llama3.3 70B, with                consistent gains across all models and batch sizes. Llama3.3
+token-by-token accuracy verification confirming bit-exact out-      70B shows the strongest throughput improvements with 1.54×
+puts between baseline and optimized implementations for all         at batch 2, leveraging its greater dequantization overhead to
+models.                                                             achieve substantial acceleration. Qwen3 32B achieves 1.30×
+                                        Gemma 27B                              Qwen3 32B                                   Llama3.3 70B
+    E2E Latency (s)       30                                                                               50
+                                    Baseline    Optimized        30
+                          25                                                                               40
+                                                                 25
+                          20
+                                                                 20                                        30
+                          15
+                                                                 15                                        20
+                          10                                     10
+                           5                                      5                                        10
+                           0                                      0                                         0
+                                2   4     8    16     32    64         2   4     8     16   32    64              2    4      8     16    32   64
+                                        Batch size                             Batch size                                   Batch size
+  Throughput (tokens/s)
+
+
+
+
+                                                                 700
+                          600                                    600                                       300
+                          500                                    500                                       250
+                          400                                    400                                       200
+                          300                                    300                                       150
+                          200                                    200                                       100
+                          100                                    100                                        50
+                            0                                      0                                         0
+                                2   4      8   16     32    64         2   4     8     16   32    64              2     4      8    16    32   64
+                                         Batch size                            Batch size                                    Batch size
+Fig. 4: End-to-end latency (top row) and throughput (bottom row) comparison across three models showing consistent
+improvements with our optimized NF4 dequantization kernel.
+
+                                                                                                  Batch    Gemma      Qwen3        Llama3.3
+improvement at batch 32 (283 to 368 tokens/s), while Gemma
+                                                                                                   Size      27B       32B           70B
+27B demonstrates increasing gains with batch size, reaching                                          2      2.10×     2.20×         2.04×
+1.25× at batch 64 (506 to 633 tokens/s). These throughput im-                                        4      2.10×     2.19×         2.04×
+provements directly translate to production benefits, enabling                                       8      2.11×     2.19×         2.04×
+higher system capacity and improved cost-effectiveness for                                          16      2.10×     2.19×         2.03×
+deployed LLM inference systems.                                                                     32      2.11×     2.19×         2.05×
+                                                                                                    64      2.08×     2.15×         2.03×
+   This analysis demonstrates that dequantization remains a                                      Average    2.10×     2.19×         2.04×
+significant bottleneck across all practical batch sizes and
+model scales, validating our optimization target. The con-                           TABLE II: Kernel-level dequantization speedup across models
+sistent kernel-level speedup translates to varying end-to-end                        and batch sizes, demonstrating consistent 2.0–2.2× improve-
+improvements based on model architecture and workload                                ments.
+characteristics, with larger models showing greater benefits
+due to their higher proportion of time spent in dequantization
+operations.                                                                          branches, while shared memory access eliminates repeated
+                                                                                     global memory loads for the lookup table. Warp execution
+C. Kernel-Level Performance Analysis                                                 efficiency improves significantly due to the elimination of
+                                                                                     branch divergence, as all threads now execute the same direct
+   The dequantization kernel demonstrates improvements                               indexing instruction rather than potentially taking different
+across all configurations. Table II presents the kernel-level                        branches in the tree traversal.
+speedup across all three models and batch sizes for the NF4                             The consistent improvements across different batch sizes
+dequantization kernel. The optimization achieves consistent                          indicate that the optimization scales effectively with varying
+2.0–2.2× speedup across all models. This consistency across                          workload characteristics, making it suitable for diverse deploy-
+different model sizes validates that our optimization targets                        ment scenarios from research experimentation to production
+fundamental memory access bottlenecks rather than model-                             inference systems.
+specific characteristics.
+   The consistency of the speedup across both models and                                                   VII. C ONCLUSION
+batch sizes confirms that our optimization targets fundamen-                            We present an optimized NF4 dequantization kernel achiev-
+tal memory access bottlenecks rather than model-specific or                          ing 2.0–2.2× kernel speedup and up to 1.54× end-to-end
+batch-specific effects. The slight variations between mod-                           improvement through principled GPU memory hierarchy ex-
+els (2.04–2.19×) reflect differences in overall memory ac-                           ploitation. By loading the 16-element NF4 lookup table into
+cess patterns and compute intensity, but all three models                            shared memory and simplifying index computation through
+benefit substantially from the shared memory optimization.                           direct bit manipulation, our lightweight approach requires
+The simplified indexing logic reduces the index computation                          only 64 bytes of shared memory per thread block while
+from 7 instructions with branches to 2 instructions without                          delivering consistent performance gains across models ranging
+from 27B to 70B parameters. The optimization maintains full
+compatibility with the HuggingFace ecosystem and requires
+no offline pre-processing or model conversion, enabling im-
+mediate deployment in production systems.
+                               R EFERENCES
+ [1] OpenAI, “Introducing GPT-5,” OpenAI Blog, Aug. 2025. [Online].
+     Available: https://openai.com/index/introducing-gpt-5/
+ [2] Meta AI, “The Llama 4 herd: The beginning of a new era of natively
+     multimodal AI innovation,” Meta AI Blog, Apr. 2025. [Online]. Avail-
+     able: https://ai.meta.com/blog/llama-4-multimodal-intelligence/
+ [3] Anthropic, “Claude 4 System Card,” Anthropic, Tech. Rep., May 2025.
+ [4] A. Yang et al., “Qwen3 Technical Report,” arXiv preprint
+     arXiv:2505.09388, 2025.
+ [5] T. Dettmers, A. Pagnoni, A. Holtzman, and L. Zettlemoyer, “QLoRA:
+     Efficient fine-tuning of quantized LLMs,” in Proc. Adv. Neural Inf.
+     Process. Syst., vol. 36, 2023, pp. 10088–10115.
+ [6] J. Kaplan et al., “Scaling laws for neural language models,” arXiv
+     preprint arXiv:2001.08361, 2020.
+ [7] T. Wolf et al., “Transformers: State-of-the-art natural language process-
+     ing,” in Proc. Conf. Empirical Methods Natural Lang. Process.: Syst.
+     Demonstrations, 2020, pp. 38–45.
+ [8] NVIDIA Corporation, “NVIDIA A100 Tensor Core GPU architecture,”
+     White Paper, 2020.
+ [9] G. Park et al., “LUT-GEMM: Quantized matrix multiplication based on
+     LUTs for efficient inference in large-scale generative language models,”
+     in Proc. Int. Conf. Learn. Representations (ICLR), 2024.
+[10] H. Guo, W. Brandon, R. Cholakov, J. Ragan-Kelley, E. P. Xing, and Y.
+     Kim, “Fast matrix multiplications for lookup table-quantized LLMs,” in
+     Findings of EMNLP, 2024.
+[11] NVIDIA Corporation, “CUDA C++ programming guide,” NVIDIA De-
+     veloper Documentation, 2024. [Online]. Available: https://docs.nvidia.
+     com/cuda/
+[12] H. Abdelkhalik, Y. Arafa, N. Santhi, and A.-H. A. Badawy, “Demysti-
+     fying the Nvidia Ampere architecture through microbenchmarking and
+     instruction-level analysis,” in Proc. IEEE High Performance Extreme
+     Computing Conf. (HPEC), 2022, pp. 1–8.
+[13] E. J. Hu et al., “LoRA: Low-rank adaptation of large language models,”
+     arXiv preprint arXiv:2106.09685, 2021.
+[14] PyTorch Team, “PyTorch Profiler documentation,” PyTorch Documen-
+     tation, 2025. [Online]. Available: https://pytorch.org/docs/stable/profiler.
+     html
+[15] K. Cobbe et al., “Training verifiers to solve math word problems,” arXiv
+     preprint arXiv:2110.14168, 2021.
+[16] E. Frantar, S. Ashkboos, T. Hoefler, and D. Alistarh, “GPTQ: Accurate
+     post-training quantization for generative pre-trained transformers,” arXiv
+     preprint arXiv:2210.17323, 2022.
+[17] J. Lin et al., “AWQ: Activation-aware weight quantization for LLM
+     compression and acceleration,” arXiv preprint arXiv:2306.00978, 2023.
+[18] M. Chen et al., “Evaluating large language models trained on code,”
+     arXiv preprint arXiv:2107.03374, 2021.
+[19] Y. Li et al., “Competition-level code generation with AlphaCode,”
+     Science, vol. 378, no. 6624, pp. 1092–1097, 2022.
+[20] R. Nakano et al., “WebGPT: Browser-assisted question-answering with
+     human feedback,” arXiv preprint arXiv:2112.09332, 2021.
+[21] R. Thoppilan et al., “LaMDA: Language models for dialog applications,”
+     arXiv preprint arXiv:2201.08239, 2022.
+[22] L. Ouyang et al., “Training language models to follow instructions with
+     human feedback,” in Proc. Adv. Neural Inf. Process. Syst., vol. 35, 2022,
+     pp. 27730–27744.
+[23] T. Brown et al., “Language models are few-shot learners,” in Proc. Adv.
+     Neural Inf. Process. Syst., vol. 33, 2020, pp. 1877–1901.
+

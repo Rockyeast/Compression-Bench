@@ -1,0 +1,1883 @@
+                                         From Tensor Buffer to Distributed Memory Hierarchy: A
+                                         Survey of KV Cache Management for LLM Serving
+                                         JIE LI, Texas Tech University, USA
+                                         TONGYANG WANG, Texas Tech University, USA
+                                         YONG CHEN, Texas Tech University, USA
+                                         The key-value (KV) cache has become a first-order memory object in LLM serving rather than a temporary
+                                         per-request tensor. This survey classifies more than thirty KV-management systems and frameworks using four
+arXiv:2607.02574v1 [cs.DC] 30 Jun 2026
+
+
+
+
+                                         axes: locality, lifetime, ownership, and substrate. The axes reveal five architectural archetypes—local-paged,
+                                         disaggregated-pipeline, shared-store, memory-pool, and hybrid-tier. Once workload and hardware are fixed,
+                                         ownership accounts for much of the remaining design variance among distributed systems. The survey also
+                                         audits current evaluations and identifies seven missing KV-specific measurements, linking them to open
+                                         problems in fault tolerance, isolation, tiered eviction, speculative decoding, MoE serving, and shared-cache
+                                         semantics.
+                                         CCS Concepts: • Computer systems organization → Distributed architectures; Cloud computing; •
+                                         Computing methodologies → Artificial intelligence.
+                                         Additional Key Words and Phrases: KV cache, LLM serving, distributed systems, inference optimization,
+                                         memory hierarchy
+
+                                         1   Introduction
+                                         The key-value (KV) cache is a major dynamic memory consumer in autoregressive LLM inference [9,
+                                         48, 64], particularly for long-context and high-concurrency serving. For a decoder-only model with
+                                         𝐿 layers, 𝐻 kv KV attention heads, head dimension 𝐷, sequence length 𝑆, and 𝑏 bytes per KV element,
+                                         the aggregate per-request KV cache footprint is 2 × 𝐿 × 𝐻 kv × 𝐷 × 𝑆 × 𝑏 bytes, before accounting
+                                         for tensor-parallel sharding, allocator fragmentation, metadata, or paging overheads. The factor of
+                                         two accounts for separately stored keys and values. For a Llama-3.1-70B-style model with 𝐿 = 80,
+                                         𝐻 kv = 8, 𝐷 = 128, and a 128K-token context, this corresponds to roughly 40 GiB per request in
+                                         BF16/FP16. At 32K context, each request still requires about 10 GiB, so one hundred concurrent
+                                         requests approach 1 TiB of aggregate KV state. As workloads shift toward long-context prompting,
+                                         multi-turn interaction, and retrieval-augmented generation (RAG), the KV cache has become a
+                                         first-order serving bottleneck rather than a small temporary buffer confined to the producing GPU.
+                                             This survey argues that the community is in the middle of an architectural shift. The KV cache
+                                         was once a local tensor freed at request completion. Modern systems increasingly treat it as an
+                                         explicit scheduling and memory-management object. Some systems remain local but virtualize,
+                                         schedule, evict, or compress KV to raise effective capacity. Others move KV across workers, requests,
+                                         memory tiers, or pooled-memory substrates, making it a distributed memory tier with explicit
+                                         placement, lifetime, ownership, and substrate policies. These mechanisms are related responses to
+                                         four questions: where the cache lives, how long it survives, who owns it, and what carries or exposes
+                                         it. The survey’s organizing contribution is to show that the classified systems, frameworks, and
+                                         KV-reduction techniques—roughly three dozen entries enumerated in Tables 8 and 9—concentrate
+                                         around five recurring archetypes when sorted by their answers.
+                                         This research is supported in part by the National Science Foundation under grant OAC-2404438, and CNS-1939140 (A U.S.
+                                         National Science Foundation Industry-University Cooperative Research Center on Cloud and Autonomic Computing).
+                                         Authors’ Contact Information: Jie Li, jie.li@ttu.edu, Texas Tech University, Department of Computer Science, Lubbock,
+                                         Texas, USA; Tongyang Wang, tongyang.wang@ttu.edu, Texas Tech University, Department of Computer Science, Lubbock,
+                                         Texas, USA; Yong Chen, yong.chen@ttu.edu, Texas Tech University, Department of Computer Science, Lubbock, Texas,
+                                         USA.
+2                                                                   Jie Li, Tongyang Wang, and Yong Chen
+
+
+1.1   Why the Local KV Abstraction Is No Longer Sufficient
+Three workload trends push KV state across boundaries that a per-GPU abstraction cannot cross.
+Context windows have grown from 1K–2K tokens in early GPT-style models to 4K in Llama 2 [123],
+128K in Llama 3.1 [40], and longer in recent commercial systems; because KV memory scales
+linearly, a model needing 1.25 GiB of KV at 4K reaches 40 GiB at 128K and exceeds 300 GiB per
+request at 1M context. Chat and retrieval-augmented generation reuse long system prompts and
+retrieved contexts across requests, so a strictly per-request KV model recomputes the same prefix on
+every turn. Agentic workflows [128] branch over intermediate states and resume earlier reasoning
+contexts, so KV state benefits from persisting beyond a single linear decode stream. KV state
+increasingly crosses at least one boundary [57]—between GPUs, between nodes, between memory
+tiers, or between requests/sessions—and a serving system has to define the semantics and cost of
+each crossing.
+
+1.2   Six Design Responses
+Six lines of work emerged or accelerated during 2023–2025 in response to this redefinition: local KV
+virtualization and phase-aware scheduling, KV reduction by eviction or compression, prefill/decode
+disaggregation, cross-request prefix and context reuse, KV offload tiering, and pooled-memory
+substrates. We summarize each line and its anchor systems in detail in §2.5 rather than introducing
+the same enumeration twice. The six lines share four design decisions: where the cache lives, how
+long it must survive, who owns it, and what substrate carries or exposes it. Section 3 develops these
+decisions into a taxonomy.
+
+1.3   Thesis
+Recent LLM serving systems no longer treat the KV cache only as an opaque per-request buffer. Local
+systems make KV explicit through paging, virtual memory, scheduling, eviction, and compression;
+distributed systems further expose KV through placement, ownership, lifetime, and substrate
+choices. These mechanisms form a small number of recurring architectures. End-to-end serving
+metrics were not built to show which architectural choice paid off; closing that gap takes a taxonomy,
+an archetype map, and a measurement-gap audit.
+
+1.4   Contributions
+The survey contributes a four-axis taxonomy of KV-cache management (locality, lifetime, owner-
+ship, substrate), with movement model, granularity, and scheduling objective treated as derived
+properties; an argument that the classified systems concentrate around five recurring architectural
+envelopes (Local-paged, Disagg-pipeline, Shared-store, Memory-pool, Hybrid-tier), with within-
+archetype variance and boundary systems documented explicitly; a system-level classification
+distinguishing anchor systems, framework modes, and boundary cases; and a measurement-gap
+audit linking each open design question to the specific measurements needed to answer it.
+
+1.5   Survey Scope and Methodology
+The survey is selective but systematic. A system, framework, or technique is included when
+it materially changes at least one KV-management semantic—placement, lifetime, ownership,
+substrate, scheduling, reuse, or footprint—and is excluded when its main contribution is model-
+weight quantization, training-time KV behavior, generic scheduling without KV awareness, pure
+benchmark reporting, or attention approximation without a managed KV object. PagedAttention-
+style allocation, continuous batching, and KV compression are included when they define the
+baseline used by later distributed systems. Speculative decoding [11, 68, 89] is included because
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving                                   3
+
+
+                             Prefill Phase                             Decode Phase
+
+
+          T1     T2     T3      …      Ts         Ts+1    Ts+2          Ts+3          Ts+4   …   Ts+t           Prompt Tokens
+
+
+                                                                                                              Generated Tokens
+
+                 TransformerLayer
+                Transformer  Layer               Logits                  TransformerLayer
+                                                                        Transformer  Layer
+               Transformer Layer                                       Transformer Layer
+                                                                                                               Write KV Cache
+
+
+                                                                                                              Read accumulated
+                                                                                                                 KV Cache
+               K1, V1         K2, V2   …     Ks, Vs       Ks+1, Vs+1           Ks+2, Vs+2    …           Increasing arrow thickness
+                                                                                                             indicates higher KV
+                               Prompt KV                               Generated KV                     bandwidth/capacity pressure
+
+
+
+
+Fig. 1. Prefill materializes key and value vectors for prompt tokens; decode then advances one token per step
+through a shared Transformer stack, autoregressively feeding each newly emitted token back as the query
+for the next step. Each decode step reads the entire accumulated KV cache (prompt + previously generated
+entries) and appends one new 𝐾𝑡 , 𝑉𝑡 pair; the cumulative KV-read traffic over 𝑇 decode steps therefore scales
+as 𝑂 (𝑇 𝑆 + 𝑇 2 ) (annotated in the figure), making decode increasingly sensitive to KV bandwidth and capacity
+as sequence length and concurrency grow.
+
+
+draft-token validation creates non-linear KV trajectories; MoE serving is included where expert-
+parallel placement or traffic constrains KV locality; multi-tenant isolation and fault tolerance are in
+scope because shared-store, offload, and hybrid-tier systems rely on remote or reusable KV state
+without specifying isolation or recovery semantics.
+   Candidate papers were drawn from arXiv, USENIX venues, MLSys, ASPLOS/ISCA/MICRO/HPCA,
+SOSP, SIGCOMM, SIGMETRICS, ACM DL, IEEE Xplore, Google Scholar, Semantic Scholar, and
+NeurIPS/ICML/ICLR systems tracks, with searches closed in May 2026 and keyword groups covering
+distributed KV serving, prefill/decode disaggregation, KV offload and tiering, CXL memory for LLM
+inference, prefix reuse, quantization, and continuous batching; snowballing from vLLM, DistServe,
+and Mooncake captured adjacent work. The classified population is summarized in Tables 8 and 9,
+with adjacent work discussed in related work rather than classified. We use anchor system for a
+system whose contribution defines an archetype; anchors are bolded in the system tables. Because
+the population mixes peer-reviewed systems, preprints, vendor reports, and production frameworks,
+the system tables include an evidence-tier column, and the prose hedges quantitative claims drawn
+from non-peer-reviewed sources.
+
+2     Background: KV Lifecycle and Serving Constraints
+KV-cache management is shaped by three constraints: the autoregressive inference procedure that
+creates and consumes KV state, the memory hierarchy that stores or moves it, and the latency
+metrics used to evaluate serving systems. This section reviews the prefill/decode lifecycle (§2.1),
+the resulting memory and bandwidth scaling (§2.2), the block-table abstraction behind modern
+local KV managers (§2.3), the parallelism layouts that restrict KV placement (§2.4), the main design
+responses in recent systems (§2.5), and the metric blind spots that motivate the audit in §5.5 (§2.6).
+
+2.1    Transformer Inference: Prefill and Decode
+Transformer LLMs generate text autoregressively, one token at a time [124]. Serving a request is
+usually decomposed into two phases (Figure 1).
+  Prefill. The model processes the input prompt in one or more forward passes. Under causal
+masking, each prompt token attends only to earlier prompt tokens, and each attention layer writes
+the token’s key and value vectors into the KV cache. In dense attention, the attention work for a
+4                                                                      Jie Li, Tongyang Wang, and Yong Chen
+
+
+prompt of length 𝑆 is quadratic in 𝑆, although optimized kernels and distributed attention reduce
+constants and improve hardware utilization [23, 24, 79, 122]. Prefill is therefore usually compute- and
+throughput-oriented: its efficiency depends on matrix-multiplication utilization, attention-kernel
+efficiency, batch size, prompt length, and the parallelism layout.
+   Decode. After the first output token is selected, generation advances one token per step. At
+decode step 𝑡, the new query attends to all cached keys and values from the prompt and the 𝑡
+previous generated tokens, then appends one new key/value entry per layer. Decode has lower
+arithmetic intensity than prefill because it performs small, step-wise computation while repeatedly
+streaming KV state from memory. It is often limited by KV-read bandwidth, KV capacity, scheduling
+overhead, and interconnect latency when KV state is remote or offloaded [78].
+   The two phases therefore prefer different operating points. Prefill benefits from large effective
+batches and high compute throughput; decode benefits from low-latency scheduling, high KV-read
+bandwidth, and enough memory to keep long-lived cache state close to the attention kernels. This
+asymmetry motivates phase-aware scheduling, prefill/decode disaggregation, and KV tiering, but
+the payoff depends on workload mix, interconnect cost, and system scale [64, 100, 145, 146].
+   Capacity is linear; cumulative decode traffic is not. At any instant, the KV capacity required
+for one request is proportional to the number of resident tokens. For a prompt of length 𝑆 and 𝑇
+generated tokens, the final cache contains 𝑆 +𝑇 token positions. Over the request lifetime, however,
+decode repeatedly scans the growing prefix. Across 𝑇 decode steps, the number of cached-token
+positions read is
+                                     𝑇∑︁−1
+                                                           𝑇 (𝑇 − 1)
+                                           (𝑆 + 𝑡) = 𝑇 𝑆 +           ,
+                                      𝑡 =0
+                                                               2
+so cumulative KV-read traffic scales as 𝑂 (𝑇 𝑆 + 𝑇 2 ) under standard dense-attention decode.
+   For example, a 70B grouped-query-attention (GQA) model with roughly 320 KiB of BF16/FP16
+KV state per token uses about 40 GiB of KV for a 128K-token prompt when “K” denotes 1024 tokens.
+If that request generates 32K tokens, dense decode reads on the order of
+                                                                       
+                                                        32K × (32K − 1)
+                           320 KiB × 32K × 128K +                         ,
+                                                               2
+or about 1.4–1.6 PB of cumulative KV traffic, depending on binary versus decimal units and exact
+model configuration. Thus, KV bandwidth demand can be as important as KV capacity.
+
+2.2   KV Memory Footprint: Math, Scaling, and Tier Comparison
+For a decoder-only model with 𝐿 layers, 𝐻 kv KV heads, head dimension 𝐷, resident sequence length
+𝑆, and 𝑏 bytes per KV element, the aggregate per-request KV footprint is
+                                       2 × 𝐿 × 𝐻 kv × 𝐷 × 𝑆 × 𝑏
+bytes. The factor of two accounts for separately stored keys and values. In FP16 or BF16, where
+𝑏 = 2, this simplifies to 4𝐿𝐻 kv 𝐷𝑆 bytes. This is the logical aggregate footprint before tensor-parallel
+sharding, allocator metadata, paging overheads, fragmentation, quantization, compression, or
+recomputation. Figure 2 shows the linear scaling across representative model families.
+   The same scaling applies across concurrent requests: aggregate KV memory grows with the sum
+of resident sequence lengths [8, 15, 96]. A Llama-70B-style GQA model with 𝐿 = 80, 𝐻 kv = 8, and
+𝐷 = 128 needs roughly 40 GiB of aggregate KV state for one 128K-token request in BF16/FP16. At
+32K context, it still needs about 10 GiB per request, so one hundred concurrent requests approach
+1 TiB of aggregate KV state. This is far beyond what a single GPU can store together with model
+weights, activation scratch space, CUDA graphs, temporary buffers, and allocator slack.
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving                                                 5
+
+
+                                            105        7B Dense (L=32, H=32, D=128)
+                                                       70B GQA (L=80, H=8, D=128)
+                                                       175B Dense (L=96, H=96, D=128)
+                                                       70B GQA, 100 concurrent (aggregate)
+                                            104                                                                                     4608 GiB @ 1M
+        KV Cache Size (GiB, binary units)
+
+
+
+
+                                                   1 TiB                                                 576.0 GiB @ 128K
+                                                                                                                                    512 GiB @ 1M
+                                            103                                                                                     320 GiB @ 1M
+                                                                               approach 1 TiB at 32K
+                                                                                  (100x 70B GQA)
+                                                                                                         64.0 GiB @ 128K
+                                            102    H100 (80 GiB)                                         40.0 GiB @ 128K
+                                                   A100 (40 GiB)
+
+
+                                            101
+
+
+
+                                            100
+
+
+
+                                            10−1
+                                                           4K          8K          16K        32K        64K       128K     256K   512K     1M
+                                                                                             Context Length (tokens)
+
+
+
+Fig. 2. KV cache footprint versus context length for representative LLM architectures in FP16/BF16. Solid
+lines show per-request KV state for 7B Dense, 70B GQA, and 175B Dense; the dashed line shows aggregate
+KV state for one hundred concurrent 70B GQA requests, which approaches the 1 TiB dotted reference already
+at 32K context. Dashed red lines mark representative A100 (40 GiB) and H100 (80 GiB) HBM capacities, with
+crosses (×) at each per-request HBM crossing. Sizes are in binary units (GiB); per-request capacity scales
+linearly in 𝑆, while cumulative decode traffic scales as 𝑂 (𝑇 𝑆 + 𝑇 2 ) (Figure 1).
+
+
+   GQA reduces the footprint but does not remove the constraint. Grouped-query attention
+reduces 𝐻 kv below the number of query heads, often to 8 KV heads in 70B-class models [4]. This
+proportionally reduces KV capacity and bandwidth relative to full multi-head attention. Yet long-
+context and high-concurrency workloads can still exhaust HBM, and prefix-caching or multi-turn
+serving may keep useful KV resident beyond one decode stream. Additional techniques such as
+layer-wise sharing, compression, eviction, or selective retention [129, 138] reduce the footprint
+further, but they also add representation, scheduling, and quality-control obligations.
+   Table 1 summarizes the placement choices available to a KV manager. The tiers differ not only
+in capacity, bandwidth, and latency but also in access semantics: HBM is directly consumed by
+attention kernels, peer GPU memory requires topology-aware communication, host DRAM and
+SSD usually require staging, RDMA exposes remote memory through network operations, and CXL
+changes the load/store substrate while preserving contention, coherence, NUMA, and placement
+costs. These differences become the substrate dimension of the taxonomy in §3.
+
+2.3   PagedAttention, Block Tables, and Continuous Batching
+Before vLLM’s PagedAttention, many serving systems allocated KV caches as contiguous tensors
+sized per sequence or for conservative maximum lengths [97, 141]. Variable prompt and output
+lengths made this wasteful: memory reserved for unused future tokens could not be easily reused
+by other requests. PagedAttention introduced a block-based abstraction that later KV systems
+inherit [64].
+   PagedAttention allocates KV memory in fixed-size blocks, often covering a small number of
+tokens, and maps logical token positions to physical blocks through a per-sequence block table [64].
+Blocks can be allocated as a sequence grows and returned to a pool when no request, branch,
+or cached prefix needs them. This reduces external fragmentation and makes local KV memory
+schedulable.
+6                                                                       Jie Li, Tongyang Wang, and Yong Chen
+
+
+Table 1. Memory tiers and interconnect paths available for KV placement or movement. Values are represen-
+tative; actual bandwidth and latency depend on device generation, topology, NUMA placement, software
+path, and access granularity. GPU HBM latencies are effective under kernel execution, not raw DRAM-array
+latencies. NVLink/NVSwitch path costs in the sub-𝜇s range apply to intra-node peer access; cross-GPU access
+through NVSwitch on H100-class systems is typically several hundred ns and hop-dependent. CXL latencies
+near the lower bound assume local-controller access; rack-scale CXL access in TraCT-style deployments is
+closer to several hundred ns. GPU access to host DRAM over PCIe incurs DMA setup cost in addition to
+transfer time.
+
+
+Tier / path            Capacity        Bandwidth              Latency                    Access model
+GPU HBM [19–21]        40–             1–5 TB/s               Hundreds of ns effective Directly
+                       192 GB/GPU                             latency; access-pattern  consumed by
+                                                              and kernel dependent     GPU kernels
+Peer GPU memory        Node-scale Hundreds of GB/s per Sub-𝜇s to few-𝜇s path   GPU peer access,
+over                   GPU memory GPU; TB/s aggregate cost; topology dependent collectives, or
+NVLink/NVSwitch                                                                explicit transfer
+RDMA-accessible        Cluster-scale   Tens to hundreds of    Few-𝜇s to tens of 𝜇s;   One-sided or
+remote GPU or host                     GB/s per endpoint      software-path dependent two-sided
+memory                                                                                network transfer
+Host DRAM              Hundreds of     Tens to hundreds of    ∼100 ns CPU-local;         CPU load/store;
+                       GB to           GB/s from CPU;         higher from GPU due to     GPU DMA,
+                       TB/node         lower effective GPU    PCIe, DMA, paging, or      unified memory,
+                                       bandwidth over PCIe    software overheads         or explicit copy
+CXL-attached           Device/rack-    Tens to hundreds of    Hundreds of ns to few      Load/store with
+memory [18]            scale           GB/s                   𝜇s; fabric dependent       fabric, NUMA,
+                                                                                         and coherence
+                                                                                         constraints
+SSD/NVMe               TB–PB           GB/s-scale             Tens to hundreds of 𝜇s     Block I/O, file,
+                                                              or higher                  object, or explicit
+                                                                                         staging interface
+
+
+   Block indirection also enables sharing. In vLLM’s original use case, parallel sampling and beam-
+search-style decoding can share prompt KV across continuations. In cross-request prefix caching,
+requests with identical prefixes can point to the same physical KV blocks and avoid redundant
+prefill work, subject to reference counting and copy-on-write or append-only semantics when
+sequences diverge.
+   SGLang’s RadixAttention makes prefix identity explicit by storing reusable KV objects in a radix
+tree [145]. A new request reuses KV along the longest matching prefix and computes only the
+unmatched suffix. This shifts KV management from anonymous tensor allocation to named, shared
+cache objects, introducing obligations around naming, reference counts, admission, eviction, and
+safe sharing. Those obligations reappear in the ownership axis of §3.
+   Continuous batching is the corresponding scheduling mechanism [64, 141]. Instead of waiting
+for all requests in a static batch to finish, the scheduler changes the active batch at decode-iteration
+granularity. This improves utilization but means requests with different prompt lengths, output
+lengths, priorities, and lifetimes share the same KV block pool. A block cannot be reclaimed while
+any active decode step, branch, or shared-prefix descendant depends on it. The interaction between
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving   7
+
+
+continuous batching and distributed KV management is especially important for prefill/decode
+handoff, eviction safety, prefix-cache admission, and cache-aware routing.
+
+2.4   Parallelism Strategies and KV Placement Constraints
+KV placement is constrained by the model’s parallelism layout. A system cannot freely choose
+single-GPU locality if attention is sharded across a tensor-parallel group, and it cannot freely
+centralize ownership if data-parallel replicas independently admit and schedule requests.
+   Tensor parallelism (TP) shards attention and feed-forward computations across GPUs; in common
+head-parallel implementations the KV cache is sharded by head across the TP group, and node-level
+TP over NVLink/NVSwitch is the typical layout because cross-node TP is collective-heavy [91, 103].
+Pipeline parallelism (PP) partitions layers into stages, so KV is layer-local to the stage that owns
+the corresponding attention layers [91]. Data parallelism (DP) gives each replica an independent
+KV pool; without an external prefix cache or cache-aware router, repeated prefixes are recomputed
+across replicas [102]. Expert parallelism (EP) shards feed-forward experts; in standard Transformer
+MoE designs KV still follows the attention-layer layout [33, 55], but expert all-to-all traffic contends
+with KV transfer for interconnect bandwidth, so EP affects KV management indirectly. Context-
+and sequence-parallel variants shard different dimensions and produce different KV-placement
+constraints.
+   Production systems often compose these strategies—TP within a node, PP or DP across nodes,
+EP for MoE—and long-context systems such as LoongServe and Infinite-LLM use sequence- or
+attention-oriented parallelism to reduce KV migration under variable context lengths [74, 132].
+The taxonomy in §3 records KV choices alongside these parallelism assumptions, since the two are
+interact.
+
+2.5   Six Design Responses
+Recent systems respond to KV pressure through six recurring mechanisms. Two remain mostly
+within a local serving instance; the other four move KV management across boundaries.
+   P1, local KV virtualization and phase-aware scheduling, includes vLLM’s PagedAttention [64],
+vAttention’s demand-backed virtual memory [98], Orca’s iteration-level scheduling [141], and
+SARATHI, Sarathi-Serve, DeepSpeed-FastGen, and TensorRT-LLM-style engines that mix prefills
+and decodes through chunking, split-fuse scheduling, in-flight batching, or paged KV pools [2, 3, 49].
+The obligation is allocator–scheduler consistency.
+   P2, KV reduction by eviction, sparsification, quantization, or compression, includes eviction and
+sparsification methods that retain selected tokens or allocate different budgets across layers and
+positions [6, 10, 12, 85, 135], quantization and compression methods that reduce bytes per re-
+tained element or compress semantically grouped context [50, 60, 80, 86], and transfer-oriented
+compression such as CacheGen [83]. The obligation is fidelity in generation quality and kernel
+compatibility.
+   P3, prefill/decode disaggregation, places prefill and decode on separate workers connected by
+GPU peer links, RDMA, PCIe, CXL, or other substrates. DistServe, Splitwise, and KVDirect differ
+in placement and transfer-control choices [14, 95, 146], and Trinity extends placement to include
+vector search alongside prefill and decode [84]. The obligation is KV handoff with controlled
+transfer, synchronization, admission, and ownership semantics.
+   P4, cross-request prefix and context reuse, makes repeated system prompts, templates, few-shot
+examples, and RAG contexts cacheable. SGLang uses a radix tree, CacheBlend fuses cached knowl-
+edge for RAG [139], LMCache adds content-based naming and storage abstractions [81], Preble
+uses prefix-aware scheduling [115], and MemServe combines context caching with disaggregated
+inference and an elastic memory pool [51]. The obligation is safe identity and isolation: the system
+8                                                                     Jie Li, Tongyang Wang, and Yong Chen
+
+
+must decide when two requests may share or reuse KV [39, 59] and prevent incorrect reuse across
+tenants, templates, model versions, adapters, or security domains.
+   P5, KV offload and tiering, moves KV to host DRAM, SSD, remote memory, or storage when
+HBM is scarce. FlexGen is a historical precursor for offloading inference state across GPU, CPU,
+and disk [112]; Mooncake combines a disaggregated pipeline with a KVCache-centric store over
+CPU, DRAM, and SSD [100]; ShadowKV keeps long-context KV in cheaper tiers while retrieving
+portions needed for sparse attention [117]; LMCache and SGLang HiCache-style modes belong
+here when KV persists across tiers. The obligation is migration control under deadline.
+   P6, memory pooling and disaggregated memory substrates [70, 108, 119], exposes capacity across
+workers through CXL-attached memory, RDMA-accessible pools, or specialized memory ser-
+vices. TraCT uses CXL shared memory as both a KV-transfer path and a rack-wide prefix-aware
+cache [140]; Beluga explores CXL-based KV-cache memory architecture [137]; CXL-SpecKV adds
+FPGA-side speculative prefetching over a CXL-disaggregated KV cache [77]. Pooling does not
+remove access cost: ownership, synchronization, consistency, contention, and failure handling
+remain runtime responsibilities.
+   Mooncake combines disaggregation, reuse, and tiering; SGLang combines virtualization and
+reuse and can extend toward tiering; CacheGen combines compression with transfer-oriented use
+cases; CXL-SpecKV combines reduction with pooled-memory substrates. Across combinations the
+same questions recur, which Section 3 turns into the four taxonomy axes.
+
+2.6    Serving Metrics and Their Blind Spots
+LLM serving papers commonly report latency and throughput metrics, but these rarely identify
+which KV-management mechanism caused an improvement. TTFT (time to first token) aggregates
+queueing, prefill, KV allocation, prefix-cache lookup, KV transfer when disaggregated, and decode-
+worker readiness, and does not reveal which component changed. TPOT (time per output token), and
+related inter-token-latency metrics, conflate local HBM bandwidth, remote-KV fetches, CPU/SSD
+prefetch misses, synchronization, scheduler delay, and offload recovery. Throughput alone ignores
+latency. Goodput—throughput of requests satisfying latency SLOs such as TTFT < 𝑡 1 and TPOT <
+𝑡 2 —joins the two, but it is highly workload- and SLO-dependent, and a goodput gain can come
+from admission control, larger batches, faster prefill, higher prefix-cache hit rate, faster KV transfer,
+fewer offload misses, or better decode scheduling. SLO attainment summarizes the fraction of
+requests meeting their targets but hides distributional behavior, and P50, P95, and P99 may be
+dominated by different sources of delay. Section 5.5 identifies the additional measurements needed
+to make those mechanisms visible.
+
+3     Four-Axis Taxonomy
+Four design choices recur across the systems surveyed: locality (where a consumer obtains a
+KV block), lifetime (how long the system attempts to keep the block useful), ownership (which
+component allocates, names, evicts, and resolves contention for the block), and substrate (which
+data-movement or memory-access mechanism carries or exposes the bits). These are the four axes
+of the taxonomy.
+   The taxonomy operates at the granularity of a KV block when a system exposes block-based
+KV management—the PagedAttention allocation unit, often 16–32 tokens [64]—and otherwise at
+the smallest KV unit the system places, transfers, names, or evicts. A system’s design is described
+by an (𝐴, 𝐵, 𝐶, 𝐷) tuple, with the understanding that a system may occupy multiple positions on
+an axis (for example, A1 direct handoff for newly produced KV and A2 shared-store lookup for
+reusable prefixes).
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving       9
+
+
+                                       Table 2. Axis A: locality levels.
+
+
+Level Name                  Description
+A0     Local-only           KV is consumed on the GPU or worker that produced it or currently owns it.
+A1     Direct remote        KV is transferred directly from a producer or owner to a consumer, typically
+                            along one logical producer–consumer path.
+A2     Shared store         KV resides in a shared namespace or distributed store from which eligible
+                            workers can fetch blocks.
+A3     Shared memory        KV is accessed through a load/store-addressable memory region shared across
+                            workers; coherence, consistency, and synchronization are supplied by the fabric,
+                            software, or both.
+
+
+   Classification rule. We classify the dominant KV-management contribution of each system,
+framework mode, or technique. The procedure is operational: identify the KV object the system
+manages; determine whether the main contribution changes placement, lifetime, ownership, sub-
+strate, representation, or scheduling dependency; assign the primary tuple from that contribution;
+then add secondary labels only when the paper or implementation exposes a distinct mode, compo-
+nent, or boundary mechanism with different axis values. A system is marked as boundary when it
+changes KV movement or representation without defining a full ownership and lifetime contract.
+Thus, SGLang appears as local-paged in its core radix-tree serving mode and shared-store-adjacent
+in hierarchical-cache modes; CacheGen is boundary because it changes the representation and
+transfer path without defining a persistent shared namespace; and Mooncake is hybrid-tier because
+the full system composes disaggregation, shared storage, and tiering rather than belonging to only
+one archetype.
+
+3.1   Axis A: Locality
+Locality describes where the consumer of a KV block obtains it. Table 2 defines the four locality
+levels.
+   Of the four axes, locality has the most direct effect on data-access latency and bandwidth pressure.
+A0 keeps remote data movement off the KV critical path. A1 adds a direct producer-to-consumer
+transfer. A2 adds lookup and store-access overhead, and A3 exposes a shared-memory access path
+whose behavior depends on the fabric, the placement policy, and the synchronization discipline.
+Aggregate capacity usually grows as a design moves from local-only KV toward shared-store or
+shared-memory designs, though the exact ordering depends on the deployment: a large A2 store
+can expose more aggregate capacity than a local design, while an A3 design is bounded by the size
+and topology of its shared pool.
+   Locality does not map one-to-one onto hardware. A1 is commonly built on RDMA or GPU-aware
+communication, but TCP or host-mediated copies serve less latency-sensitive paths equally well. A3
+today is associated with CXL-like fabrics, yet the level is defined by shared load/store-addressability,
+so a future non-CXL fabric with the same access model would also qualify as A3.
+
+3.2   Axis B: Lifetime
+Lifetime describes the semantic scope over which a system attempts to keep a KV block useful. Table 3
+separates reuse scope from retention strength: B0-B2 give the intended reuse scope, and B3 and B4
+are modifiers for whether retention is opportunistic or recoverable.
+   Lifetime governs how long KV state stays resident, so it drives aggregate memory pressure more
+than any other axis. A B0 system allocates KV for the active request and releases it at completion.
+10                                                                       Jie Li, Tongyang Wang, and Yong Chen
+
+
+                                     Table 3. Axis B: lifetime levels.
+
+
+Level Name                 Description
+B0    Per-request         KV is needed only for the active request and can be discarded when the request
+                          finishes.
+B1    Per-session         Reusable KV is retained across multiple turns of one user session or conversation.
+B2    Cross-session       Reusable KV is retained across requests, sessions, users, or workloads that share
+                          prefixes or retrieved context.
+B3    Opportunistic       KV is retained while capacity and policy allow, without a hard reuse guarantee;
+                          this modifier can coexist with B0–B2.
+B4    Durable/recoverable KV is backed by a documented recovery contract and can survive relevant node
+                          or process failures; this modifier can coexist with B0–B2.
+
+
+
+
+B1 retains reusable KV across the turns of one session, raising residency but avoiding repeated
+within-session prefill. B2 retains KV across sessions or users, amortizing prefill for shared prefixes
+and RAG contexts. B3 marks opportunistic retention: blocks are kept while capacity allows and
+dropped under pressure. Because B3 is a policy rather than a scope, it composes with B0–B2; an
+entry like B2+B3 means cross-session reuse held opportunistically.
+   No system in our population occupies B1 as a primary label. Two mechanisms are sometimes
+mistaken for it, but do not meet the definition. StreamingLLM-style attention sinks bound the KV
+footprint inside a single decode stream by keeping a few initial tokens plus a sliding window and
+discarding the middle, which is request-scoped footprint reduction (B0). SGLang’s local RadixAt-
+tention retains finished-request KV in an LRU radix tree for prefix-keyed reuse across requests,
+which is B2 under opportunistic retention (B3). Deployed chat services do hold per-session KV
+across turns, but none in our population formalizes a per-session contract—a retention budget,
+cross-session eviction priority, and session isolation—separate from these two mechanisms. We
+keep B1 in the axis as a real design point and record its absence as DG7 ( §6). B4 is likewise empty:
+no surveyed system provides a documented, recoverable KV-state contract across node or store
+failure, a gap §6 takes up.
+
+3.3   Axis C: Ownership
+Ownership describes who allocates, evicts, names, and arbitrates access to a KV block. Table 4 lists
+the ownership levels. Hardware does not settle this question — the same substrate can be governed
+by any of several control planes—which is why ownership is where engineering trade-offs surface
+most clearly. C0 keeps control local to each worker, minimizing control-plane overhead at the cost
+of cross-worker optimization. C1 puts one logical component in charge: global policy becomes
+simple, but the component is a scalability and availability concern unless it is replicated or sharded.
+C2 distributes decisions across workers or cache nodes through a directory, hash mapping, lease,
+or peer-to-peer protocol, removing the single bottleneck while adding coordination complexity. C3
+leaves ownership to software conventions over shared memory, which simplifies the data path but
+makes allocation, write discipline, and failure behavior harder to verify under concurrency.
+   The practical consequence is that two systems matched on locality, lifetime, and substrate can
+still part ways on who controls placement and eviction—and that choice, more than the others, sets
+their scalability and fault-tolerance profiles.
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving             11
+
+
+                                      Table 4. Axis C: ownership levels.
+
+
+Level Name                  Description
+C0      Per-worker          Each worker manages its own KV blocks, with no global authority for placement
+                            or eviction.
+C1      Coordinator         A centralized control component decides KV placement, admission, eviction, or
+                            routing.
+C2      Distributed         Workers or cache nodes cooperate through a distributed directory, hash mapping,
+                            lease protocol, or peer-to-peer control protocol.
+C3      Shared memory       KV resides in a shared memory region, while software conventions define
+                            allocation, ownership, and write discipline.
+
+
+                                   Table 5. Axis D: substrate comparison.
+
+
+Level     Name                        Access Model                           Typical Role
+D-local   GPU HBM/local memory Direct access by local GPU kernels            Baseline residence for active KV
+D0        NVLink/NVSwitch           GPU–GPU copy, peer access, or            Intra-node or tightly coupled
+                                    collective communication within          multi-GPU KV movement
+                                    an NVLink/NVSwitch domain
+D1        RDMA/GPUDirect            One-sided or two-sided network           Low-latency cross-node KV
+          RDMA over IB or RoCE transfer, often GPU-aware                     transfer
+D2        Transfer libraries or     Software abstraction over RDMA,          Portable KV-transfer layer rather
+          abstraction layers, e.g., TCP, shared memory, GPU-copy             than a separate physical substrate
+          NIXL or UCX               paths, or storage backends
+D3        CXL-like shared memory Load/store access to memory                 Shared-memory KV pool or
+                                    attached through a coherent,             memory expansion
+                                    partially coherent, or
+                                    software-managed fabric
+D4        Host DRAM over PCIe       Pinned-memory access,                    KV offload or staging tier
+                                    CPU-mediated staging, or DMA
+                                    copy between GPU and host
+                                    memory
+D5        Local/remote SSD or       Block, file, object, or storage-fabric   Capacity tier for cold or reusable
+          storage system            I/O                                      KV state
+D6        SmartNIC/DPU/FPGA         Programmable data movement,              Offloaded transfer, indexing,
+                                    near-data processing, or                 compression, prefetching, or
+                                    in-network/data-path processing          scheduling support
+
+
+
+3.4     Axis D: Substrate
+Substrate describes how the bits move or are accessed. A system can use multiple substrates si-
+multaneously. Table 5 compares the substrate labels used in the system tables. We use D-local
+for ordinary GPU HBM/local device memory and reserve D0–D6 for non-local transfer paths,
+pooled-memory paths, lower-bandwidth capacity tiers, or programmable data-path components
+that become explicit design choices.
+  Substrate is the axis most tightly bound to hardware availability. RDMA and GPUDirect RDMA
+dominate low-latency cross-node KV movement in disaggregated systems, and CXL-like fabrics are
+12                                                                  Jie Li, Tongyang Wang, and Yong Chen
+
+
+the natural fit for load/store-addressable shared memory. Transfer libraries such as NIXL and UCX
+sit above one or more of these substrates rather than constituting substrates of their own—vLLM,
+for instance, describes its NIXL connector as an asynchronous KV-transfer path for disaggregated
+prefilling [22], and Mooncake’s transfer engine moves KV and pools it across tiers, with performance
+set by the underlying transport [100]. We group SmartNICs, DPUs, and FPGAs under D6 because
+all three expose programmable data-path or near-data compute to KV management, where their
+differences in bandwidth, programmability, or control-plane assumptions matter. Table 1 gives
+representative capacity, bandwidth, and latency ranges for the major tiers, and these constraints
+feed directly into the archetype concentration in §4.
+
+3.5   Derived Properties
+The four axes also determine several design properties that are often used as classifiers in prior
+work. We treat these properties as derived rather than independent because their values follow
+from combinations of locality, lifetime, ownership, and substrate.
+   The movement model follows from locality and substrate: A1+D1 naturally maps to RDMA push
+or pull, A2 to lookup plus remote fetch, and A3+D3 to shared-memory access. Granularity follows
+mainly from lifetime and ownership: B0+C0 systems can use request-local tensors or page blocks,
+while B2+C2 systems need reusable names for prefixes, blocks, or segments. The scheduling objective
+follows from the full tuple: C1 disaggregated pipelines optimize global placement and goodput, C2
+shared-store designs balance cache-hit rate against lookup and transfer cost, and C0 local-paged
+designs focus on batching, admission, and local memory pressure.
+
+3.6   Why These Four Axes
+The four axes satisfy an orthogonality test: a system can change one axis while leaving the
+others largely unchanged. DistServe and KVDirect illustrate the point: both address disaggregated
+inference and KV transfer over RDMA-like substrates, but they differ in how much control is
+centralized versus embedded in a distributed communication protocol [14, 146]. Two axis values—
+A3 (shared-memory locality) and C3 (shared-memory ownership discipline)—are usually induced
+when D3 (CXL-like shared memory) is the substrate. We retain them as separate axis values rather
+than folding them into D3 because they encode different consequences: A3 describes the data
+path that a consumer follows to reach a KV block, C3 describes the software discipline used
+to allocate and arbitrate that block, and D3 describes the fabric that carries it. A future system
+could plausibly expose A3+C2 (shared memory with directory-managed ownership) or A2+C3
+(object-store interface over shared memory), and treating the three properties separately keeps the
+taxonomy expressive enough to record such designs.
+   A fifth candidate axis—granularity (token, block, layer, tensor, or prefix)—is excluded because it
+is largely induced by lifetime and ownership. Similarly, consistency model is excluded because most
+surveyed systems do not state an explicit KV consistency contract. Prior work on attention approx-
+imation, long-context attention, and efficient inference [27, 42, 56, 109] is related to reducing KV
+pressure or attention cost, but orthogonal to the placement semantics considered here. Consistency
+may become a useful axis once systems document contracts for concurrent access, reuse, failure,
+and recovery.
+
+3.7 Comparison with Alternative Taxonomies
+Prior surveys typically organize this literature by optimization level, mechanism, or workload. Level
+taxonomies separate token-level, model-level, and system-level techniques but cannot distinguish
+system-level designs that differ in control-plane ownership. Mechanism taxonomies classify by
+substrate (RDMA, CXL, SSD, GPU-interconnect) cleanly but conflate systems whose lifetime and
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving   13
+
+
+ownership differ; a substrate-only view makes LMCache-like shared caches and Mooncake-like
+KV-cache stores look closer than their control planes are. Workload taxonomies explain why a
+deployment cares about TTFT, TPOT, throughput, or reuse without identifying the architectural de-
+cision that produced the result. The four-axis tuple treats locality, lifetime, ownership, and substrate
+as separable, leaving sparse, linear, and long-context attention [7, 63, 127, 142] as complementary
+KV-workload techniques rather than primary classifiers.
+
+3.8     Worked Example: Classifying a System on the Four Axes
+The classification procedure is most easily seen on a concrete system. Infinite-LLM [74] is a recent
+distributed serving system for ultra-long contexts; it splits attention across workers using a context-
+parallel scheme and routes KV through a cluster-level memory pool rather than keeping it on the
+producing worker. Applying the procedure in §3 step by step:
+      (1) Identify the KV object. The managed unit is the per-worker KV slice produced during
+          distributed attention.
+      (2) Determine the dominant contribution. Infinite-LLM’s primary contribution is making KV
+          addressable across the cluster so that long contexts spill out of a single worker; the change
+          is to locality and ownership rather than to substrate or lifetime semantics.
+      (3) Assign the primary tuple. Locality is A2 (shared store across workers, exposed as a logical
+          KV pool rather than as a single shared-memory region), lifetime is B0 (request-scoped,
+          because the long-context KV is consumed only by the originating request), ownership is C2
+          (distributed across the worker pool through a directory and routing protocol), and substrate
+          is the underlying network plus host or device memory tiers, recorded as D-local+D1.
+      (4) Add secondary labels only when warranted. Infinite-LLM does not expose a separate cross-
+          session reuse mode, so no secondary B label is added.
+      (5) Mark boundary status. The system is close to the shared-store envelope in (A, C) and to
+          the disaggregated-pipeline envelope in (B, D); we therefore record it as a boundary case
+          adjacent to shared-store and discuss it in §4 together with the boundary table.
+   The same procedure applies to other systems and is the basis for the per-system rows in Ta-
+bles 8 and 9.
+
+4     System Archetypes
+The taxonomy in §3 supplies the axes; this section uses them to make the concentration claim.
+The systems in Tables 8 and 9 concentrate around five recurring envelopes rather than spreading
+uniformly across the four-axis design space. The claim is empirical and qualitative: the archetypes
+are envelopes induced by repeated axis signatures across the classified systems, not a statistical
+clustering result. An anchor system is a system whose contribution makes an archetype recognizable;
+a boundary system spans archetypes or contributes a mechanism reused by several archetypes.
+The archetype names are architectural, not mechanism level: Local-paged covers paging, virtual-
+memory, scheduling, eviction, and compression alike, because all of them keep ownership local while
+changing the local KV cost model. Two things follow. Mechanism diversity within an archetype
+is common, and §4.4 quantifies it. And the Hybrid-tier envelope is wider than the rest, since its
+members compose two or more mechanisms by design; §4.2 tightens that definition.
+
+4.1     Why the Population Concentrates: Parallel Emergence
+The classified systems span several years and design-response families, yet their design points
+cluster more tightly than that diversity suggests. Hardware narrows practical choices—RDMA
+or GPU-aware networking dominates explicit cross-node KV movement, and CXL-like fabrics
+14                                                                                                                               Jie Li, Tongyang Wang, and Yong Chen
+
+
+                                                                               B4 empty
+                               B4
+                           durable
+                                                                            SGLang HiCache
+                                                                            Hybrid-tier
+                                                                         (A0/A1/A2 × B0/B2[+B3])              Shared-store
+                                B2                                         Mooncake; ShadowKV                                                              Gap (§4.6)
+                            cross-       Local-paged                                                            (A2, B2[+B3])
+                                                                                                               LMCache; Preble
+                                                                                                                                                       (A3, B2[+B3], D3)
+                           session        (A0, B0 B2[+B3])                           Mooncake store              CacheBlend
+                                                                                                                                                        CXL prefix cache
+        Axis B: lifetime
+
+
+
+
+                                B1                                         B1 empty (DG7)
+                           session
+                                                                                                      CacheGen transfer
+                                                               B0 hook
+
+
+                                         vLLM; Sarathi-Serve             Disagg-pipeline                                                              (A3, B0/B2[+B3])
+                                                                                                                                                        TraCT; Beluga
+                               B0           SGLang (core)                                                                                                CXL-SpecKV
+                           request       H2O; StreamingLLM
+                                            KIVI; KVQuant                        (A1, B0)                KVDirect ownership shift
+                                                                           DistServe; Splitwise                 (C1 C2)                             Memory-pool
+
+                                                                                                                                    B3 (retention modifier) omitted from axis; see Table 2
+                                                A0                                A1                                 A2                                      A3
+                                               local                             direct                            shared                                  shared
+                                                                                remote                              store                                  memory
+                                                                                           Axis A: locality
+
+
+Fig. 3. Archetype map in the (𝐴, 𝐵) projection. Colored regions give a visual map of the five archetype
+envelopes from Table 6: Local-paged spans B0–B2 (per the table signature B0–B2[+B3]); Disagg-pipeline sits
+at B0; Shared-store at B2; Memory-pool at A3 spanning B0–B2; Hybrid-tier composes A0/A1/A2 with B0/B2,
+rendered as a dashed envelope sitting above the empty B1 band with a thin “B0 hook” line dropping into the
+request-scoped region (so the box is not visually anchored on B1). B3 is a retention modifier and is omitted
+from the vertical axis; Table 6 records where it applies. The B1 (per-session) and B4 (durable) rows are marked
+empty per §3. Dashed arrows mark labeled boundary/compositional paths (SGLang HiCache, Mooncake
+store, CacheGen transfer, KVDirect ownership shift). The (A3, B2[+B3], D3) CXL prefix-cache gap from §4.7 is
+marked inside the Memory-pool envelope.
+
+
+dominate load/store-addressable memory pools. Workload structure creates prefix and segment
+reuse from chat sessions, system prompts, and RAG pipelines, and makes prefill-to-decode handoff
+one-directional, large, and latency-critical. Serving-stack compatibility favors PagedAttention-style
+block granularity because block tables already support allocation, eviction, transfer, and reuse.
+Systems with different stated goals therefore converge on similar primitives because they face the
+same KV movement, naming, and scheduling constraints.
+
+4.2   The Five Archetypes
+
+                             Table 6. The five archetypes with their (𝐴, 𝐵, 𝐶, 𝐷) signatures and anchor systems.
+
+Archetype                              Signature                                                                                                        Anchors
+Local-paged                            (A0, B0–B2[+B3], C0, D-local[+D0])                                                                               vLLM, Sarathi-Serve
+Disagg-pipeline                        (A1, B0, C1/C2, D-local+D1)                                                                                      DistServe, Splitwise
+Shared-store                           (A2, B2[+B3], C1/C2, D-local+[D1/D4/D5])                                                                         LMCache, Preble
+Memory-pool                            (A3, B0/B2[+B3], C3, D-local+D3[+D6])                                                                            TraCT
+Hybrid-tier                            (A0/A1/A2, B0/B2[+B3], C0/C1, D-local+[D1/D4/D5])                                                                Mooncake, ShadowKV
+
+
+  The signatures in Table 6 are envelopes rather than exact tuples for every member; §5.1 gives
+the per-system assignments. Figure 3 is intentionally less precise than the table: it visualizes where
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving    15
+
+
+the archetype envelopes sit in the (𝐴, 𝐵) projection, highlights the empty B4 region, and marks
+boundary or compositional paths among the regions.
+   Archetype 1: Local-paged. KV is managed within a single GPU, node, or local serving in-
+stance using block-table allocation, virtual memory, local scheduling, or local footprint reduction.
+There is no cross-node KV-store substrate and no distributed KV ownership in the dominant
+contribution. The anchors are vLLM [64] (PagedAttention and continuous batching) and Sarathi-
+Serve [2] (chunked prefill and stall-free scheduling). Orca, SARATHI [3], DeepSpeed-FastGen [49],
+TensorRT-LLM-style engines, and vAttention [98] keep KV local while changing batching, preemp-
+tion, virtual-memory backing, or prefill chunking; framework engines may also use intra-node
+GPU interconnects for broader model execution without becoming shared KV stores. H2O, Scis-
+sorhands, StreamingLLM, SnapKV, PyramidKV, KIVI, KVQuant, and ChunkKV reduce the local
+footprint through eviction, sparsification, quantization, or compression [6, 10, 12, 50, 80, 85, 86, 135].
+SGLang [145] is local-paged in its core serving mode, where prefix reuse remains within the serving
+instance, while FlexGen [112] is a local-control offload precursor whose GPU/CPU/disk tiering we
+group with Hybrid-tier in the timeline (Figure 4). The persistence of this archetype shows that many
+deployments still benefit most from improving the local allocator, scheduler, or representation.
+   Archetype 2: Disaggregated-pipeline. KV crosses from specialized prefill workers to de-
+code workers and normally remains request-scoped. DistServe [146] and Splitwise [95] are the
+anchors; adjacent systems include P/D-Serve [57], KVDirect [14] when its main role is transfer
+protocol design, LoongServe when elastic sequence parallelism reduces KV migration under long
+contexts [132], and hardware specialization such as SPAD [144]. This is the simplest distributed
+archetype because it introduces one primary locality crossing while avoiding a persistent global
+KV namespace.
+   The key engineering tension in this archetype is the granularity of the KV handoff. A system can
+transfer KV only after prefill completes, or it can pipeline KV movement as earlier layers or chunks
+become available. Pipelined handoff can reduce decode-worker idle time, but it increases message
+count, synchronization, and metadata-path overhead. Existing disaggregated-serving papers usually
+report end-to-end latency, goodput, or SLO attainment, but they rarely isolate the metadata and
+message-granularity costs of the handoff; this is a concrete instance of the metadata-gap audit
+in §5.5.
+   Archetype 3: Shared-store. KV resides in a global or semi-global namespace and can be reused
+across requests. LMCache [81] and Preble [115] are the anchors. The key distinction within the
+archetype is ownership: some designs use a centralized coordinator, scheduler, or cache server, while
+others distribute lookup, placement, or transfer responsibilities. Adjacent systems include SGLang
+HiCache, CacheBlend [139], MemServe, and CacheGen [51, 83] when their mechanisms support
+transfer or reuse but do not by themselves constitute a long-lived shared KV store. CacheBlend
+is shared-store-adjacent because it makes cached non-prefix RAG KV usable through selective
+recomputation rather than by defining a standalone store. Shared-store systems are diverse because
+they must name, locate, evict, and define safe reuse semantics for KV objects that outlive any single
+request.
+   Shared-store systems face a fundamental tension between cache hit rate and metadata overhead.
+Longer retention increases the probability that an incoming request can reuse a stored prefix
+or segment, but it also increases lookup cost, metadata memory, block-location tracking, and
+eviction complexity. Few shared-store papers report the metadata-to-data memory ratio for realistic
+workloads; this is MG2 in §5.5. The tension becomes acute at scale: a store with 100 TB of KV state
+and 1 TB of metadata is qualitatively different from a store with 1 TB of KV and 10 GB of metadata,
+and published evaluations rarely span this range.
+16                                                                  Jie Li, Tongyang Wang, and Yong Chen
+
+
+   Archetype 4: Memory-pool. KV is placed in a physically shared memory pool, typically
+CXL-attached memory, and workers access it through load/store, DMA, or memory-mapped
+operations. TraCT [140] is the anchor; Beluga [137], CXL-SpecKV [77], and the elastic memory-
+pool component of MemServe [51] are adjacent memory-pool designs. This archetype is small
+because CXL deployment is still limited, but it is architecturally distinct: the cost model shifts
+from explicit network transfer and object lookup to shared-memory placement, access latency,
+bandwidth contention, and software-managed coordination.
+   The key open question for this archetype is whether shared-memory coordination can be
+maintained at CXL scale without assuming transparent hardware coherence across the entire pool.
+A practical CXL KV system must still define ownership, allocation, invalidation, and reclamation
+semantics. TraCT-style designs show that rack-scale shared-memory KV paths are plausible, but
+no published system has yet established the scalability limits of software-managed consistency and
+allocation for cluster-scale KV pools.
+   Archetype 5: Hybrid-tier. A hybrid-tier system composes two or more of the previous archetypes’
+mechanisms under an integrated control plane that arbitrates among them. Mooncake [100], the
+canonical anchor, combines prefill/decode disaggregation, shared KV storage, and tiering across
+GPU, CPU, and storage media under a centralized control plane. We therefore restrict the hybrid-tier
+label to systems whose distinguishing contribution is the integration logic itself rather than the
+underlying components.
+   ShadowKV [117] sits at the edge of this definition: it combines local-control offload tiering
+with sparse retrieval, but its dominant path remains local-control offload rather than Mooncake-
+style distributed ownership. We record ShadowKV under hybrid-tier because it integrates two
+mechanisms (offload tiering and sparse retrieval) under a unified runtime, while noting in Table 9
+that its (A0, B0, C0) tuple is closer to Local-paged augmentation than to Mooncake-shaped designs;
+readers who prefer a narrower hybrid-tier definition can read ShadowKV as a Local-paged boundary
+system without changing the rest of the analysis. FlexGen [112] is treated as a local-control tiering
+precursor in Table 8 rather than as a hybrid-tier system, because its placement search across GPU,
+CPU, and disk was designed for offline batched generation rather than for the multi-mechanism
+integration that defines the archetype. Trinity [84] is related when vector-search disaggregation
+is coupled to prefill/decode placement, but its primary contribution is not a general multi-tier
+KV-cache manager; we therefore mark it as a boundary case (see §4.5). Hybrid-tier systems expose
+control-plane interactions—coordinator contention, cross-tier eviction ordering, multi-lifetime
+management, and interactions between handoff and reuse—that single-response systems can avoid.
+   The defining characteristic of hybrid-tier systems is integration: they occupy multiple values on
+one or more axes simultaneously and arbitrate among them with explicit policy. Recording that
+range is more informative than forcing a single-tuple classification, and it suggests that as the field
+matures, the taxonomy may need an explicitly compositional extension (see §4.6).
+
+4.3   A Brief Timeline of System Evolution
+The chronology helps explain why the five archetypes emerged in parallel rather than as a simple
+replacement sequence. Figure 4 therefore groups systems by their archetype role, not by the six
+background responses: KV reduction appears inside Local-paged because it keeps ownership local,
+and offload or tiering appears in Hybrid-tier when it is composed with disaggregation, reuse, or
+multi-tier placement. FlexGen is the one precursor we plot in Hybrid-tier rather than Local-paged:
+although its ownership is local (A0, C0), its defining contribution is GPU/CPU/disk tiered placement,
+which anticipates the hybrid-tier cost model more directly than the local allocator and scheduler
+work; Table 8 still records its primary role as a local-control offload precursor.
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving                                                                                     17
+
+                         Core          Boundary           Same system            Local-paged             Disagg-pipeline     Shared-store            Memory-pool              Hybrid-tier
+
+                                                                                 StreamingLLM              vAttention
+                                                                              SARATHI           KIVI
+                                                                       H2O               SGLang               PyramidKV
+   Local-paged            Orca                                     Scissorhands       Prompt DeepSpeed-
+                                                                                              Cache     SnapKV                           ChunkKV                         ForkKV
+                                                                       TensorRT-LLM          FastGen
+                                                                               vLLM                Sarathi-Serve
+                                                                                    KVQuant
+                                                                                             Splitwise
+Disagg-pipeline                                                                   CacheGen                        Mooncake          KVDirect                        Trinity
+                                                                                              DistServe
+
+                                                                                                             MemServe
+                                                                                        SGLang           CacheBlend
+  Shared-store                                                                    CacheGen             Preble                                                            ForkKV
+                                                                                          Infinite-LLM      Mooncake
+                                                                                                                    LMCache
+
+                                                                                                                                                               CXL-SpecKV
+  Memory-pool                                                                                                     MemServe                                       Beluga
+                                                                                                                                                                     TraCT
+
+
+                                                                                                                             ShadowKV
+    Hybrid-tier                                          FlexGen                                                  Mooncake
+                                                                                                                                                   Year-only dates are plotted at July 1.
+                   Jun           Sep    Dec        Mar        Jun          Sep      Dec         Mar         Jun       Sep    Dec         Mar         Jun       Sep        Dec         Mar
+                  2022          2022    2022      2023       2023         2023      2023       2024        2024      2024    2024       2025        2025      2025        2025       2026
+
+
+Fig. 4. Timeline of LLM serving and KV-cache system designs. Systems are positioned by release date
+and grouped by the five archetypes used in this survey: local-paged, disaggregated-pipeline, shared-store,
+memory-pool, and hybrid-tier. Filled circles indicate primary archetype assignments; hollow diamonds indicate
+boundary or secondary assignments (per §4.2 and §4.5). FlexGen and ShadowKV are drawn as boundary
+diamonds in Hybrid-tier to match their treatment in the text as precursor and edge-of-definition cases
+respectively; Mooncake is the sole filled hybrid-tier anchor. Boundary systems Prompt Cache, Infinite-LLM,
+MemServe, and ForkKV are plotted on their respective archetype rows; systems classified under more than
+one archetype are linked by thin vertical connectors.
+
+
+
+   Local serving mechanisms—iteration-level scheduling, PagedAttention-style block manage-
+ment, chunked prefill, KV eviction, and quantization—were established early and remain active
+because they improve the local allocator, scheduler, or representation. Disaggregated-pipeline
+and shared-store systems became prominent in 2024 as prefill/decode interference and repeated-
+context workloads made one-worker KV ownership less attractive. Memory-pool systems appear
+later, consistent with the slower availability of CXL-class substrates. Hybrid-tier systems compose
+multiple archetypes rather than replacing earlier ones and therefore expose interactions among
+handoff timing, reuse lifetime, tiered placement, and ownership. The publication cycle still creates
+a comparison gap: these systems are evaluated on different models, context distributions, hardware
+generations, batching policies, and SLOs, so chronology alone cannot rank them.
+
+4.4 Within-Archetype Variance
+Table 7 reports how many distinct values each archetype takes on each axis. Few values mean the
+members truly converge; many values mean the archetype spans diverse design points.
+  The strongest convergence appears on locality and ownership. Local-paged has a large population
+and its low A/C variance reflects genuine convergence around per-worker control; memory-pool
+has similarly stable A/C values but its small population may be a sample-size artifact. Variance is
+highest in hybrid-tier, which is consistent with the archetype’s definition. Shared-store is the telling
+case: its ownership splits between coordinator designs (C1) and distributed lookup-or-transfer
+protocols (C2), a choice driven by engineering preference rather than by the substrate.
+18                                                                     Jie Li, Tongyang Wang, and Yong Chen
+
+
+Table 7. Within-archetype variance per axis. Counts are approximate distinct values because boundary
+systems may occupy multiple values.
+
+                              Archetype         A    B    C   D values
+                              Local-paged       1   2–3   1      1–2
+                              Disagg-pipeline   1    1    2       2
+                              Shared-store      1    2    2      3–4
+                              Memory-pool       1   2–3   1      2–3
+                              Hybrid-tier       3    3    2      3–4
+
+
+4.5   Boundary Systems
+Several systems sit between archetypes. SGLang is local-paged in its default radix-tree mode and
+shared-store-adjacent with HiCache enabled, because KV is then stored outside the immediate
+GPU-resident block table. CacheGen compresses KV for network transfer rather than defining a
+persistent shared namespace, so it is closest to disaggregated-pipeline at request scope (B0) and
+shared-store-adjacent when the compressed representation supports remote reuse. KVDirect
+preserves the disaggregated-pipeline locality and lifetime but uses peer-to-peer ownership (C2)
+instead of a coordinator (C1), which is architecturally significant but does not warrant a separate
+archetype. Mooncake’s store layer resembles Shared-store, but the complete system composes
+disaggregation, shared storage, and tiered placement under a larger control plane and is classified as
+hybrid-tier; the store layer is used as shared-store evidence only when discussing that component.
+   Trinity [84] shares the (A1, B0, C1, D-local+D1) signature of DistServe and Splitwise; its boundary
+label records the contribution type—coupling vector-search retrieval to the PD pipeline—rather than
+an axis-tuple difference. Infinite-LLM [74] is shared-store-adjacent with the (A2, B0, C2) signature
+derived in §3.8; the request-scoped lifetime distinguishes it from cross-session shared stores. Prompt
+Cache [39] is local-paged-adjacent with (A0, B2+B3, C0): its reuse unit is a structured prompt
+schema rather than a token prefix, which stresses the B2 lifetime definition without changing
+locality or ownership. ForkKV [128] supplies forking semantics for KV reuse across reasoning
+branches, with (A0/A2, B0/B2+B3, C0/C2) values that depend on configuration; it is boundary to
+both Local-paged and Shared-store.
+
+4.6 Threats to Validity
+The analysis is empirical rather than exhaustive. The five envelopes describe the classified systems;
+they are not a proof that no sixth can exist. Because substrate choices constrain locality and
+ownership, some of the apparent convergence reflects today’s hardware. Hybrid-tier systems are
+better represented as axis ranges than as single tuples, so the within-archetype variance in Table 7
+is a lower bound on diversity. The memory-pool envelope rests on a small, recent population,
+so its low locality and ownership variance may be a sample-size artifact that later CXL systems
+will widen, and future speculative-decoding-aware or MoE-aware KV managers may motivate a
+compositional extension of the taxonomy.
+
+4.7   Cross-Archetype Comparison: What the Archetypes Reveal
+Among the distributed archetypes, hardware shapes locality and workload shapes lifetime, leaving
+ownership as the axis on which otherwise-matched systems most often disagree. DistServe and
+KVDirect share locality, lifetime, and substrate (A1, B0, D-local+D1) but differ on ownership:
+DistServe uses a centralized goodput-optimized scheduler (C1), while KVDirect embeds a peer-to-
+peer transfer protocol (C2). Mooncake and LMCache share locality and reuse scope (A2, B2+B3)
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving   19
+
+
+but differ on ownership: Mooncake routes through a centralized Conductor (C1), while LMCache
+uses content-derived chunk keys over centralized or distributed backends (C1/C2). The choice
+among coordinator, distributed-protocol, and shared-memory ownership carries scalability and
+fault-tolerance consequences that end-to-end latency hides. Ownership is not universally dominant;
+it is simply where the distributed systems in this population diverge most.
+    Substrate choices, by contrast, are converging in practice: most surveyed systems use GPU
+HBM for active KV, RDMA-capable networking for cross-node movement, host DRAM for offload,
+and increasingly CXL for pooled designs. For emerging memory-pool systems, the classification
+indicates architectural role rather than validated comparative performance, and future systems
+may differentiate less on the substrate itself and more on the ownership and lifetime policies built
+over it.
+    The empty B4 region is an important absence: no surveyed system provides durable KV state
+with an explicit recovery model for node or store failure. This is distinct from semantic response
+caching or retrieval caching [104]; durable KV would require preserving, validating, and recovering
+model-specific KV tensors or blocks. The absence becomes costlier as KV state grows to tens
+or hundreds of gigabytes per active workload, because a lost store mid-decode forces re-prefill,
+slow-path fallback, or request abort.
+    A less visible second gap sits at (𝐴3, 𝐵2 + 𝐵3, 𝐶2/𝐶3, 𝐷3): a CXL-backed prefix cache with cross-
+session reuse, opportunistic retention, and explicit ownership semantics. The constituent pieces
+already exist—CXL shared KV paths in memory-pool systems, distributed prefix directories in
+shared-store systems—but the combination has not been demonstrated as a documented serving
+architecture. §6 turns both this absence and the B4 gap into concrete open questions.
+
+5     Analysis of LLM Serving Systems
+Section 4 named five archetypes; this section provides the underlying evidence. We classify the
+surveyed systems on the four axes (Tables 8 and 9), compare six representative anchors on recurring
+mechanisms (Table 10), and audit which evaluations report which KV-specific measurements
+(Table 11). The audit yields seven measurement gaps that motivate the agenda in §6. The tables
+mix peer-reviewed systems, preprints, and production frameworks; the classification records
+architectural semantics, not a normalized performance ranking.
+
+5.1 System Classification
+Tables 8 and 9 together classify 35 entries spanning 33 distinct systems and framework modes (18
+entries in Table 8, 17 in Table 9); SGLang and Mooncake each appear in two modes, which is why
+entries exceed systems. Local-paged is the largest archetype because compression, eviction, virtual
+memory, and scheduling work can be evaluated on a single serving instance against a mature
+PagedAttention-style baseline. Disagg-pipeline and shared-store differ primarily in lifetime: the
+former transfers request-scoped KV; the latter retains it across requests under opportunistic eviction.
+Hybrid-tier and boundary entries expose composition—Mooncake combines disaggregation, shared
+storage, and tiering; ShadowKV combines tiering with sparse retrieval; Trinity [84] couples vector-
+search placement to the PD pipeline without making reusable KV state its central managed object.
+The evidence-tier column reminds the reader that several headline systems are arXiv or framework
+sources; their performance numbers should be read as author-reported until reproduced.
+
+5.2    Mechanism-Level Comparison
+Table 10 compares six representative anchor systems across the mechanisms introduced in §2.5.
+Two mechanisms recur across archetypes: many anchors use PagedAttention-style block allocation
+or an equivalent block layout, and representative systems that cross a network commonly use
+20                                                                                               Jie Li, Tongyang Wang, and Yong Chen
+
+
+Table 8. System classification — local and framework-centered systems. A=locality, B=lifetime, C=ownership,
+and Substrate=D-level memory or transfer path; anchor systems are in bold. The Tier column records evidence
+type: P=peer-reviewed venue, A=arXiv preprint, V=vendor or industry technical report, W=workshop venue,
+F=open-source framework.
+
+System                  Role                        A         B         C    Tier    Substrate          Primary KV Contribution
+vLLM                    Local-paged                 A0    B0/B2+B3     C0      P     D-local            PagedAttention block-level alloca-
+                                                                                                        tion; continuous batching and block
+                                                                                                        reuse
+SGLang (local)          Local-paged                 A0      B2+B3      C0      P     D-local            RadixAttention prefix sharing;
+                                                                                                        instance-local opportunistic reuse
+Sarathi-Serve           Local-paged                 A0        B0       C0      A     D-local            Chunked prefill; stall-free schedul-
+                                                                                                        ing
+Orca                    Local-paged                 A0        B0       C0      P     D-local            Iteration-level scheduling; preemp-
+                                                                                                        tive batching
+SARATHI                 Local-paged                 A0        B0       C0      A     D-local            Chunked prefill; piggybacking de-
+                                                                                                        codes with prefills
+H2O                     Local-paged                 A0        B0       C0      P     D-local            Heavy-hitter KV eviction; attention-
+                                                                                                        score-based retention within a re-
+                                                                                                        quest
+Scissorhands            Local-paged                 A0        B0       C0      P     D-local            KV persistence hypothesis; fixed-
+                                                                                                        budget retention within a request
+StreamingLLM            Local-paged                 A0        B0       C0      P     D-local            Attention sinks; streaming-session
+                                                                                                        retention with limited window
+SnapKV                  Local-paged                 A0        B0       C0      P     D-local            Prompt-aware KV compression be-
+                                                                                                        fore generation
+PyramidKV               Local-paged                 A0        B0       C0      P     D-local            Layer-wise asymmetric KV budget
+                                                                                                        allocation
+KIVI                    Local-paged                 A0        B0       C0      P     D-local            2-bit asymmetric KV quantization
+KVQuant                 Local-paged                 A0        B0       C0      P     D-local            Non-uniform KV quantization; 1M
+                                                                                                        context on single GPU
+ChunkKV                 Local-paged                 A0        B0       C0      A     D-local            Semantic-chunk-based KV com-
+                                                                                                        pression
+DeepSpeed-FastGen       Local-paged                 A0        B0       C0      V     D-local            SplitFuse; fused prefill-decode
+                                                                                                        chunk scheduling
+Prompt Cache            Local-paged boundary        A0      B2+B3      C0      P     D-local            Schema-aware prompt KV caching
+                                                                                                        at semantic-template granularity
+FlexGen [112]           Local-offload precursor     A0        B0       C0      P     D-local,D4,D5      Single-GPU offload of inference
+                                                                                                        state across GPU, CPU, and disk
+TensorRT-LLM            Framework                   A0    B0/B2+B3     C0      F     D-local,D0         Production paged KV cache, in-
+                                                                                                        flight batching, and optional KV
+                                                                                                        reuse/offload support
+vAttention              Framework                   A0        B0       C0      A     D-local            Virtual memory for KV; CUDA vir-
+                                                                                                        tual address management
+ Role records the dominant role in this survey. D-local denotes ordinary GPU HBM/local device memory.
+
+
+
+
+RDMA-capable push, pull, or fetch paths. CacheGen can use TCP as a non-anchor boundary
+mechanism, but the high-performance distributed anchors are designed around lower-latency
+transfer or shared-memory substrates.
+   The remaining mechanisms vary, and the variance tracks the taxonomy. Naming tracks owner-
+ship: vLLM uses request-local tables, Mooncake delegates naming and placement to its centralized
+Conductor, and LMCache uses content-derived keys. Readiness signaling tracks lifetime: B0 systems
+can use request-scoped completion because KV does not outlive the request, while B2+B3 systems
+need object-, block-, or tier-granularity readiness signals to support overlap and opportunistic
+retention. Eviction policies are usually described functionally but rarely measured as a control-plane
+cost; no representative anchor characterizes reuse-distance distributions, which is the strongest
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving                               21
+
+
+Table 9. System classification—distributed, pooled, and hybrid systems. A=locality, B=lifetime, C=ownership,
+and D=memory or transfer substrate. Anchor systems are shown in bold. The Tier column records evidence
+type: P=peer-reviewed, A=arXiv, V=vendor, W=workshop, F=framework.
+
+System              Role                 A    B        C       Tier Substrate          Primary KV Contribution
+
+DistServe           Disagg. pipeline     A1   B0       C1       P   D-local, D1        PD disaggregation with goodput-optimized
+                                                                                       scheduling
+Splitwise           Disagg. pipeline     A1   B0       C1       P   D-local, D1        Phase-aware allocation with separate
+                                                                                       prefill/decode clusters
+KVDirect            Disagg. pipeline     A1   B0       C2       A   D-local, D1        Distributed KV transfer protocol and
+                                                                                       peer-to-peer handoff
+
+LMCache             Shared store         A2   B2+B3    C1/C2    A   D-local, D4, D5    Distributed KV object store for cross-instance
+                                                                                       prefix reuse
+Preble              Shared store         A2   B2+B3    C1       A   D-local, D1        Global scheduler with prefix-aware KV
+                                                                                       placement
+SGLang HiCache      Shared-store adj.    A2   B2+B3    C1/C2    F   D4, D5             Hierarchical prefix cache beyond one serving
+                                                                                       instance
+CacheBlend [139] Shared-store adj.       A2   B2+B3    C1/C2    P   D-local, D4, D5    Cached knowledge fusion for reusable RAG
+                                                                                       context
+Infinite-LLM [74]   Shared-store adj.    A2   B0       C2       A   D-local, D1        Cluster-level KV pool for long-context
+                                                                                       distributed attention
+CacheGen            Boundary            A1/A2 B0/B2    C0/C1    P   D1, D4, D5         KV compression and streaming for transfer or
+                                                                                       context loading
+Mooncake store      Shared-store         A2   B2+B3    C1       A   D-local, D1, D4,   KVCache-centric disaggregation with a tiered
+                    comp.                                           D5                 KV store
+
+TraCT               Memory pool          A3   B0+B2+B3 C3       A   D-local, D3        Rack-scale CXL shared-memory KV with
+                                                                                       load/store access
+Beluga [137]        Memory pool          A3   B0/B2+B3 C3       A   D-local, D3        CXL memory pooling with a KV-aware
+                                                                                       architecture
+CXL-SpecKV [77] Memory pool              A3   B0+B3    C3      W    D3, D6             CXL-disaggregated speculative KV cache with
+                                                                                       FPGA-side support
+
+Mooncake            Hybrid tier         A1+A2 B0+B2+B3 C1       A   D-local, D1, D4,   PD disaggregation, distributed KV storage, and
+                                                                    D5                 tiering
+ShadowKV            Hybrid tier          A0   B0       C0       A   D-local, D4        Local-control KV offload with sparse retrieval
+                    (boundary)                                                         and reconstruction
+Trinity             Boundary             A1   B0       C1       A   D-local, D1        Vector-search disaggregation coupled to PD
+                                                                                       placement
+ForkKV              Boundary            A0/A2 B0/B2+B3 C0/C2    A   D-local, D1        Forking semantics for branching/agentic KV
+                                                                                       reuse
+
+Notes: Role records the dominant role in this survey. D1=RDMA/GPUDirect RDMA; D3=CXL-like shared memory; D4=host DRAM;
+D5=SSD/storage; D6=SmartNIC/DPU/FPGA.
+
+
+
+
+single piece of evidence for MG4 in §6. Multi-tenant isolation and fault tolerance are absent or only
+partially addressed across the representative anchors, which is why they reappear as DG2 and DG1.
+   A pattern not visible in the archetype table is that completion signaling changes as soon as
+KV crosses a locality or lifetime boundary: local systems use per-request synchronization, disagg-
+pipeline systems need handoff completion, shared-store and hybrid-tier systems need block- or
+tier-granularity readiness signals, and memory-pool systems inherit coherence or allocator-level
+synchronization. Completion signaling is therefore a convergent control-plane primitive even
+when data-plane substrates differ, which is why the most reusable primitives across archetypes are
+naming, readiness, eviction, and completion rather than the data path itself.
+
+5.3       Cross-Cutting Observations from System Classification
+Compression and eviction systems cluster on the local-control side, while distributed systems
+cluster around placement, movement, and ownership: KIVI, KVQuant, ChunkKV, H2O, Scissorhands,
+22                                                                                    Jie Li, Tongyang Wang, and Yong Chen
+
+
+Table 10. Mechanism comparison across representative anchor systems. Entries summarize the dominant
+mechanism reported or implied by each anchor; “—” means that the mechanism is absent or not specified as
+a KV-management feature.
+
+Mechanism            vLLM              DistServe         LMCache           Mooncake          TraCT            ShadowKV
+
+Block allocation     PagedAttention    PagedAttention-   PagedAttention-   PagedAttention-   CXL-aware        Offload-aware
+                                       like              like              like              layout           layout
+Naming / prefix ID   Block table       Request/job ID    Content-derived   Conductor-        Pool metadata    Request/context
+                                                         keys              managed                            ID
+Transfer/access      Local HBM         RDMA push/pull    Remote fetch      RDMA push/pull    CXL load/store   CPU offload and
+                                                                                                              reconstruction
+Readiness signal     Local scheduler    Handoff          Object/block      Block/tier        Allocator        Prefetch
+                                        completion       readiness         readiness         metadata         readiness
+Eviction             Local block policy Request          Store policy      Tier-aware policy Pool allocator   Sparse retrieval
+                                        completion                                                            policy
+Multi-tenant         —                  —                Namespace         —                 —                —
+isolation
+Fault tolerance      —                 —                 —                 —                 —                —
+
+
+
+
+StreamingLLM, SnapKV, PyramidKV, GEAR [60], DynamicMemCompress [92], and ZipCache [47]
+optimize representation; distributed systems decide which device, worker, or tier holds each
+block. Systems such as CacheGen and CXL-SpecKV combine the two, but one side is usually the
+primary contribution. Locality and lifetime are correlated but not identical: A0 systems mostly
+use request-scoped KV, while A2 and A3 designs more often appear with cross-request reuse (B2)
+or opportunistic retention (B3) because moving KV across a boundary must buy reuse, capacity,
+or transfer overlap. Substrate diversity increases with archetype complexity—local HBM in Local-
+paged, RDMA in Disagg-pipeline, host memory or storage in Shared-store, CXL in Memory-
+pool, and several substrates composed in Hybrid-tier—which is why ownership becomes more
+important in later archetypes: each additional substrate requires explicit scheduling, coordination,
+or consistency machinery. Publication maturity does not map cleanly onto this progression, so all
+five archetypes remain active rather than forming a replacement sequence.
+
+5.4     A Testable Prediction from the Taxonomy
+A taxonomy is most useful when it yields a prediction whose failure would force a revision. Ours
+suggests one. Among the distributed archetypes (Disagg-pipeline, Shared-store, and the distributed
+components of Hybrid-tier), at equivalent throughput and matched workload, systems with cen-
+tralized ownership (C1) should show lower tail-latency variance than systems with distributed
+ownership (C2), because C1 removes distributed-coordination stalls from the critical path while
+paying a fixed scheduling cost. Concretely: a 99th-percentile TTFT decomposition for a C1 system
+should be dominated by queueing and prefill compute, while a comparable decomposition for a C2
+system should additionally show contributions from directory lookup, distributed-lock contention,
+and consensus-style synchronization. DistServe versus KVDirect is the natural test pair because
+they hold 𝐴, 𝐵, and 𝐷 fixed and differ on 𝐶 alone; Mooncake versus LMCache provides a second
+test pair in the shared-store envelope. We cannot fully evaluate this prediction with currently
+reported data—the tail decomposition is exactly MG6, the gap surfaced by the audit—which itself
+reinforces the case for the measurement program. If a future study found indistinguishable tail
+decompositions for C1 and C2 systems on matched workloads, the taxonomy would have to demote
+ownership or add a confounding axis. The prediction is offered as a falsifiable consequence, not an
+asserted result.
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving             23
+
+
+Table 11. Measurement-gap audit. A metric is counted as “reported” (✓) only when the paper presents it in a
+form that supports cross-system comparison or root-cause attribution; “partial” means some systems report
+it under restrictive conditions (microbenchmark only, single substrate only, or single workload); ✗ means no
+surveyed system in the archetype reports it; N/A means the metric does not apply to the archetype’s locality
+and lifetime pattern.
+
+Metric                           Local-paged   Disagg-pipeline    Shared-store   Memory-pool      Hybrid-tier
+TTFT / TPOT                         partial           ✓              partial         partial            ✓
+Throughput / Goodput                  ✓               ✓              partial         partial            ✓
+MG1: Remote KV access patterns       N/A              ✗                ✗               ✗                ✗
+Transfer/access latency              N/A            partial          partial         partial          partial
+Cache hit rate                       N/A             N/A               ✓               ✗                ✓
+MG2: Metadata path costs              ✗               ✗                ✗               ✗                ✗
+MG3: Completion overhead              ✗               ✗                ✗               ✗                ✗
+MG4: Lifetime / reuse distance        ✗               ✗                ✗               ✗                ✗
+MG5: Prefetchability slack            ✗               ✗                ✗               ✗                ✗
+MG6: P99 tail attribution             ✗             partial            ✗             partial          partial
+MG7: Public trace availability        ✗             partial          partial           ✗              partial
+
+
+
+5.5   Measurement-Gap Audit
+Most systems report at least one end-to-end metric—throughput, TTFT, TPOT, goodput, or tail
+latency—but the exact metric set differs by archetype and workload. In Table 11, a metric is counted
+as reported only when the paper gives it in a form that can support cross-system comparison or
+root-cause attribution, not merely when the term appears in an evaluation section. Table 11 shows
+that seven KV-specific measurements are rarely reported in such a form. We audit them in turn.
+   The missing data-path measurements are MG1 and MG5. Systems that move KV rarely report
+the event distribution underneath their end-to-end numbers: bytes moved per token, remote
+blocks touched per token, operation sizes, or critical-path stalls (MG1). Transfer or access latency
+sometimes appears for a single microbenchmark, but not in a form that can explain P99 TTFT or
+TPOT. Prefetchability slack (MG5) is missing entirely, even though layer order and token order
+make many KV accesses predictable.
+   The missing metadata-path measurements are MG2, MG3, and MG4. Block lookup, prefix match-
+ing, ownership tracking, reference counting, eviction decisions, location directories, and completion
+notifications consume CPU cycles and memory bandwidth, but no system measures their cost
+(MG2, MG3). Reuse-distance and block-lifetime distributions are also absent (MG4), which leaves
+eviction policies tuned by intuition rather than workload evidence.
+   Why the metadata gap matters: a back-of-the-envelope. Consider a shared-store with a
+radix-tree prefix index holding 𝑁 active prefixes. Each lookup performs 𝑂 (log 𝑁 ) pointer chases,
+each chase missing the last-level cache at roughly 100 ns. For 𝑁 = 104 prefixes a lookup costs
+≈ 1.3 𝜇s; under a request rate of 105 req/s the lookup path alone consumes about 130 ms of
+one core every second, before reference counting, copy-on-write tracking, eviction decisions, or
+replication metadata. Layer-granularity completion signaling in pipelined disaggregation adds a
+synchronization term that scales with the layer count 𝐿, while request-granularity completion has a
+single synchronization point but pins the consumer for the full transfer; the variance contributed by
+the two strategies is empirically different but unreported. These numbers show the metadata-path
+gap is substantive, not cosmetic: without it, a shared-store that scales to tens of thousands of
+prefixes looks identical to one that does not.
+   MG6 is a cross-cutting attribution gap: decomposing P99 TTFT or TPOT into queueing, compute,
+transfer, metadata, and synchronization components requires both data-path and metadata-path
+24                                                                  Jie Li, Tongyang Wang, and Yong Chen
+
+
+visibility, which is why it is reported only partially and only for some distributed archetypes. MG7,
+the public-trace gap, has narrowed but not closed: Splitwise released the Azure LLM Inference
+traces (with request arrivals, prompt and output lengths, and timing fields), and Mooncake released
+a production KV-aware trace; both are now widely reused. Neither, however, exposes per-block
+KV access events, prefix-sharing identities, session boundaries, or transfer-event timings at the
+granularity needed to attribute P99 tail latency to a specific KV mechanism. Most other surveyed
+systems still evaluate on synthetic workloads or private traces with unknown prefix-sharing
+structure. A useful next-generation public trace would include request arrivals, prompt and output
+lengths, prefix-sharing structure, session structure, KV block accesses, and transfer events. Current
+evaluations are sufficient to show that a system improves over its own baseline but insufficient
+to explain why or whether the same mechanism would win under a different workload, SLO, or
+hardware substrate.
+
+5.6    Implications for Cross-Archetype Comparison
+Cross-archetype comparison is currently method-bound: a disaggregated-pipeline paper reporting
+“2× goodput” and a shared-store paper reporting “5× throughput” rarely share a workload, an
+SLO, or a hardware family, so comparisons between them are necessarily qualitative without a
+common trace and KV-bytes-moved counters. Individual evaluations are consistent with each
+system’s stated goal; the shortfall is community-level. Speculative decoding, MoE, multi-tenant
+isolation, and fault tolerance remain weakly covered by the anchor systems: vLLM partially engages
+speculative decoding and LMCache exposes namespace mechanisms for isolation, but no anchor
+provides a full KV-management treatment of these cases, which motivates DG2, DG4, and DG5
+in §6. For practitioners, Local-paged is the natural baseline when KV does not cross workers;
+Disagg-pipeline targets phase interference; Shared-store requires enough prefix or context reuse to
+justify lookup and transfer overhead; Memory-pool is most relevant when CXL-like fabrics are
+available; Hybrid-tier matches production stacks but is hardest to evaluate because several control
+planes interact.
+
+6     Research Agenda
+The audit in §5.5 surfaced what current evaluations omit. The agenda pairs seven design gaps
+(DG1–DG7) with seven measurement gaps (MG1–MG7); each design question depends on a spe-
+cific subset of missing counters, traces, or decompositions, so measurement is a precondition for
+architecture rather than an afterthought. The gaps are KV-specific—block lifetime, prefix reuse dis-
+tance, transferred-KV completion, remote KV access distributions, and metadata operations such as
+block lookup, reference counting, and location directories—rather than generic distributed-systems
+concerns.
+
+6.1 Design Gaps
+DG1—Fault tolerance of distributed KV state. When a distributed-KV store fails mid-decode,
+should the system re-prefill from the original prompt, recover from another tier or replica, or fail
+the request? This is distinct from semantic response caching: the object to recover is model-specific
+KV tensor state whose validity depends on model version, tokenization, position encoding, adapters,
+and attention layout. The options have very different latency and cost profiles, but no surveyed
+system publishes a KV recovery model. MG3 and MG4 are prerequisites: completion semantics
+identify which blocks became visible to consumers, while lifetime distributions identify how long
+recoverable state must survive.
+   DG2—Multi-tenant isolation. A shared prefix cache can leak information because a hit is
+observably faster than a miss and may reveal that a prior tenant used the same prefix. The open
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving   25
+
+
+question is what a timing-channel-aware prefix cache should guarantee, and what latency benefit
+remains after defenses such as namespace isolation, admission rules, padding, or noise. MG6 and
+MG7 are prerequisites because the defense cost depends on tail-latency attribution and multi-tenant
+reuse structure.
+   DG3—Eviction across replicated tiers. A KV block can be live in HBM, host DRAM, and
+a remote store simultaneously. Existing tier-aware systems often approximate this with per-tier
+heuristics. A principled policy would price each tier’s fetch latency against the probability of
+near-future reuse, which requires per-block reuse-distance and lifetime traces. MG4 and MG5 are
+therefore prerequisites.
+   DG4—Speculative decoding × KV cache. Speculative decoding creates tentative KV columns
+that may be accepted or rolled back. Existing distributed-KV systems mostly assume linear append,
+so they do not specify whether branch KV should be transferred, shared, or discarded before
+verification. RDMA-based transfer and CXL-style shared memory have different rollback costs;
+MG1 and MG3 are needed to model the resulting trade-off.
+   DG5—MoE × KV cache. In standard Transformer MoE models, attention KV follows the
+attention-layer layout rather than expert identity, but expert all-to-all traffic still competes with
+KV transfer and prefetch traffic. The missing design question is whether expert routing and KV
+placement should be co-scheduled or merely share a congestion-aware runtime. MG1 and MG2 are
+prerequisites because the answer depends on joint data-path and metadata-path traffic.
+   DG6—Ownership semantics for shared prefix caches. Shared prefix caches rely on reference
+counting, copy-on-write, and location directories, but rarely state a consistency contract. If one
+request holds prefix 𝑃 while another extends or evicts it, the system should define what each
+consumer can observe. MG2 is prerequisite because the cost of stronger semantics depends on
+which metadata operations are frequent, synchronized, or on the critical path.
+   DG7—Per-session KV management. The B1 lifetime level (§3) is currently unoccupied by
+published systems: deployed chat services retain per-session KV state across conversational turns,
+but no surveyed system formalizes a per-session retention contract distinct from streaming-window
+mechanisms or instance-local opportunistic reuse. The open question is what a published per-
+session KV architecture would specify—retention budgets per session, eviction priorities across
+active sessions, migration semantics when a session moves between workers, and isolation between
+sessions of different tenants. MG4 (reuse-distance distributions) and MG7 (session-aware public
+traces) are prerequisites because a session-aware policy needs evidence about inter-turn arrival
+gaps and reuse patterns.
+
+
+6.2   Measurement Gaps
+MG1—Remote KV access-pattern characterization. Systems report TTFT and TPOT but not
+the remote-memory event distribution: operation sizes, remote blocks per token, remote bytes
+per token, and critical-path remote stalls. These counters are what shared-store and hybrid-tier
+systems actually wait on.
+   MG2—Metadata path costs. Systems should report how much time and CPU/memory band-
+width are spent on block lookup, prefix lookup, ownership tracking, refcounting, eviction decisions,
+location directories, and completion notifications. Without this breakdown, DG5 and DG6 cannot
+distinguish data-path bottlenecks from control-plane bottlenecks.
+   MG3—Completion and synchronization overhead. Distributed KV systems need to know
+when a block, layer, or request is safe to consume. The missing measurement is the latency cost
+and correctness trade-off of each completion granularity, especially under asynchronous transfer.
+26                                                                     Jie Li, Tongyang Wang, and Yong Chen
+
+
+   MG4—Reuse-distance and lifetime distributions. This measurement records how long KV
+blocks live and how far apart their reuses are. Aggregate hit rate does not reveal whether a block
+should be replicated, offloaded, or evicted.
+   MG5—Prefetchability slack. Transformer inference exposes future layer and token access
+order, but systems do not report how much time exists between a predictable need and the deadline
+for that block. This quantity determines whether tiered KV policies can rely on prefetch.
+   MG6—Tail-latency attribution. This measurement decomposes P99 TTFT or TPOT into queu-
+ing, compute, transfer, metadata, and synchronization components. Without attribution, optimiza-
+tion efforts may target the wrong bottleneck; DG2 also needs it because timing channels are visible
+at the tail, not just in the mean.
+   MG7—Public traces. A KV-aware trace should include request arrivals, prompt/output lengths,
+prefix-sharing structure, session structure, KV block accesses, and transfer events. Mooncake’s
+production trace is a notable exception; most systems still rely on synthetic or private workloads.
+
+6.3    Pairings
+Table 12 pairs each design gap with the specific measurements needed to address it. The pairing is the
+argument that follow-up measurement work is well-motivated: without MG4 (lifetime distributions),
+fault-tolerance mechanisms (DG1) cannot be designed against a known state-retention target.
+
+Table 12. Pairing design gaps with required measurements. DG denotes an open design gap; MG denotes a
+missing measurement needed to evaluate or design that mechanism.
+
+Design gap                      Required measurement
+DG1: Fault tolerance            MG3 (completion semantics) + MG4 (lifetime distributions)
+DG2: Multi-tenant isolation     MG6 (tail-latency attribution) + MG7 (multi-tenant traces)
+DG3: Replicated-tier eviction   MG4 (reuse distance) + MG5 (prefetchability)
+DG4: Speculative × KV           MG1 (access patterns) + MG3 (completion)
+DG5: MoE × KV                   MG1 (access patterns under expert routing) + MG2 (metadata path under EP)
+DG6: Ownership semantics        MG2 (metadata path)
+DG7: Per-session KV manage-     MG4 (reuse distance) + MG7 (session-aware traces)
+ment
+
+
+   The precondition is short. Closing MG3 (completion semantics) and MG4 (reuse-distance dis-
+tributions) unblocks fault tolerance (DG1), and MG4 is additionally an input to DG3 and DG7. A
+single public production trace annotated with reuse distance and tail latency supplies inputs that
+several questions share, because MG4, MG6, and MG7 can be derived from the same trace. We
+therefore prioritize completion semantics, reuse-distance distributions, and public KV-aware traces,
+in that order.
+
+7     Related Work
+No prior survey covers the four-axis vocabulary or the archetype analysis presented in §3–§4, but
+several existing surveys cover overlapping ground. We position each by the design question its
+taxonomy answers and the design question it cannot.
+
+7.1    KV Cache Surveys
+Miao et al. [88] survey generative LLM serving broadly: batching, scheduling, parallelism, memory
+management, and deployment stacks. Their taxonomy explains how serving systems improve
+throughput and latency, but it does not distinguish two KV-specific designs with the same serving
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving   27
+
+
+goal and different ownership semantics, such as Mooncake’s Conductor-managed placement and
+LMCache’s content-addressed chunk lookup. Our axes make that distinction explicit. Their survey
+covers a wider range of infrastructure than this paper but treats each area as a separate category
+rather than as a set of interacting design decisions. Our survey is narrower—KV-cache management
+rather than the whole serving stack—but deeper on the interactions between locality, lifetime,
+ownership, and substrate.
+   Li et al. [71] organize KV-cache management vertically: token-level selection and dropping,
+model-level quantization and low-rank decomposition, and system-level hardware-aware design.
+Their taxonomy captures compression mechanisms in detail, yet DistServe and KVDirect land in
+the same system-level bucket despite making opposite ownership choices. Our four axes cut across
+their levels and recover the distinction theirs collapses. Li et al. also provide the most comprehensive
+coverage of KV compression techniques (12+ papers), which complements our survey: we treat
+compression as a data-path optimization and focus on the control plane.
+   Liu et al. [82] review KV-cache compression for inference efficiency, including selective-token
+strategies, quantization, and attention compression. Their compression coverage is complementary
+to Li et al.’s management-oriented view. We classify representative KV compression and eviction
+systems because they change the capacity and movement cost model, but we do not attempt to
+re-survey the algorithmic details of every compression method.
+
+7.2   LLM Inference Efficiency Surveys
+Tay et al. [122] survey efficient Transformer architectures including sparse and linearized attention.
+Useful as it is for model-level efficiency, the taxonomy has no vocabulary for whether a KV block is
+local, remote, shared, or durable—the very thing that defines control-plane systems like LMCache
+and Mooncake.
+   Adjacent literatures shape the design space without joining the classified population: general
+LLM serving systems studying placement, multiplexing, migration, and admission [5, 32, 73, 113,
+114, 116, 133, 143]; long-context, sequence-modeling, and KV-reduction techniques that change
+the amount or pattern of KV state to manage [1, 16, 17, 28, 29, 34, 36, 41, 42, 45, 47, 54, 67, 76, 90,
+92, 105, 118, 120, 121, 130, 136]; and speculative decoding, MoE, memory disaggregation, retrieval,
+and vector search, which provide boundary conditions through non-linear lifetimes, shared-fabric
+contention, remote-memory substrates, or reusable external context [30, 31, 37, 38, 43, 44, 46, 52,
+53, 58, 61, 62, 65, 66, 69, 72, 87, 93, 94, 99, 101, 106, 107, 110, 111, 125, 131].
+
+7.3   Memory Disaggregation and CXL Surveys
+Wang et al. [126] survey memory disaggregation for data centers, covering RDMA-based and CXL-
+based approaches across the hardware, architecture, and software-system layers. Their taxonomy
+answers a substrate question: how memory is exposed across machines. KV caching adds workload
+structure that generic disaggregation taxonomies do not model: read-heavy decode, predictable
+layer order, block tables, and prefix identity. Their survey is essential reading for understanding
+the hardware evolution that enables the hybrid-tier and memory-pool archetypes, but it does not
+address the workload-specific policies (prefix naming, eviction, completion signaling) that are the
+focus of our analysis.
+   Chen et al. [13] survey CXL-based computing systems from single-machine memory expansion
+to distributed shared memory. Their CXL focus explains why memory pooling is becoming feasible,
+but a CXL pool used as raw shared memory and a CXL-backed prefix cache with distributed
+ownership read the same in their framing. That difference is Axis C. Their survey supplies the
+hardware background; our ownership axis supplies the software vocabulary CXL builders need to
+describe what they have built on top of it.
+28                                                                                  Jie Li, Tongyang Wang, and Yong Chen
+
+
+7.4     What This Survey Adds
+No prior survey takes locality, lifetime, ownership, and substrate as primary axes: Miao et al.
+organize by serving stack, Liu et al. by compression technique, Li et al. by KV-management level,
+Wang et al. by memory-disaggregation layer, Tay et al. by efficient-attention architecture, and Chen
+et al. by CXL substrate. Each orientation is internally consistent, yet none separates Mooncake
+from LMCache—two shared-store designs that differ in how they name, place, and locate reusable
+KV. The four-axis tuple surfaces that distinction; the measurement-gap audit and paired agenda
+then identify which evaluations omit which inputs and which omissions block which next steps.
+   The scope boundary also differs: speculative decoding and MoE serving appear at the subset that
+touches KV management; KV-specific compression and eviction appear when they change serving
+memory behavior; model-weight compression [25, 26, 35, 75, 134] and attention-algorithm work
+without KV pressure are excluded. No prior survey provides a measurement-gap audit of the kind
+in Table 11; the closest precedent is the evaluation-methodology discussion in Miao et al., which
+identifies serving metrics without enumerating what they fail to capture for distributed KV state.
+
+8     Conclusion
+Recent KV-cache systems are not a scatter of unrelated point solutions. Local virtualization and
+scheduling, KV reduction, disaggregation, prefix reuse, offload tiering, and memory pooling answer
+the same four questions: where the KV cache lives, how long it survives, who owns it, and what
+substrate carries or exposes it. The taxonomy made those questions explicit; the archetype map and
+the system tables supplied the evidence. The classified systems fall into five envelopes. Convergence
+is tightest in Local-paged; Shared-store is the most revealing, since ownership there separates
+coordinator-managed stores from content-addressed designs like LMCache’s chunk keys.
+   Ownership carries the most engineering leverage among the distributed archetypes. Hardware
+fixes locality, deployment scale fixes substrate, and workload fixes lifetime; what remains for
+otherwise-similar systems to disagree on is ownership—Mooncake routes through a centralized
+Conductor, while LMCache uses content-derived chunk keys and can run over centralized or
+distributed backends, and the two pay different scalability and fault-tolerance prices for how they
+name, locate, and place reusable KV. End-to-end metrics do not expose this: a goodput improvement
+reports better performance on one workload and SLO without identifying whether the gain came
+from scheduling, KV transfer, prefix hits, prefetching, or lower metadata cost. Recent hybrid
+systems—Mooncake, ShadowKV, Trinity, and ForkKV [128]—compose multiple mechanisms under
+one control plane, a sign that the field is moving from point solutions toward integrated stacks. We
+note this as an observed trend and stop short of forecasting where it lands.
+   Closing the measurement gaps is the precondition for making the five archetypes useful as a guide
+for evaluating future systems and not only as a retrospective map. Until the community collects
+and publishes completion semantics (MG3), reuse-distance distributions (MG4), and KV-aware
+public traces (MG7), cross-archetype comparison will remain qualitative.
+
+References
+    [1] Adnan, M., Arunkumar, A., Jain, G., Nair, P. J., Soloveychik, I., and Kamath, P. Keyformer: Kv cache reduction
+        through key tokens selection for efficient generative inference. Proceedings of Machine Learning and Systems (2024).
+    [2] Agrawal, A., Kedia, N., Panwar, A., Mohan, J., Kwatra, N., Gulavani, B. S., Tumanov, A., and Ramjee, R. Taming
+        throughput-latency tradeoff in llm inference with sarathi-serve. In USENIX Symposium on Operating Systems Design
+        and Implementation (2024).
+    [3] Agrawal, A., Panwar, A., Mohan, J., Kwatra, N., Gulavani, B. S., and Ramjee, R. Sarathi: Efficient llm inference
+        by piggybacking decodes with chunked prefills. arXiv preprint arXiv:2308.16369 (2023).
+    [4] Ainslie, J., Lee-Thorp, J., De Jong, M., Zemlyanskiy, Y., Lebrón, F., and Sanghai, S. Gqa: Training generalized
+        multi-query transformer models from multi-head checkpoints. In Proceedings of the 2023 Conference on Empirical
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving                           29
+
+
+      Methods in Natural Language Processing (2023), pp. 4895–4901.
+  [5] Aminabadi, R. Y., Rajbhandari, S., Awan, A. A., Li, C., Li, D., Zheng, E., Ruwase, O., Smith, S., Zhang, M., Rasley,
+      J., et al. Deepspeed-inference: enabling efficient inference of transformer models at unprecedented scale. In SC22:
+      International Conference for High Performance Computing, Networking, Storage and Analysis (2022), IEEE, pp. 1–15.
+  [6] Barrett, C., Cai, R., Chen, B., Chen, T., Ré, C., Sheng, Y., Song, Z., Tian, Y., "atlas" Wang, Z., Zhang, Z., Zheng,
+      L., and Zhou, T. H2o: Heavy-hitter oracle for efficient generative inference of large language models. Advances in
+      Neural Information Processing Systems 36 (2023), 34661–34710.
+  [7] Beltagy, I., Peters, M. E., and Cohan, A. Longformer: The long-document transformer. arXiv preprint
+      arXiv:2004.05150 (2020).
+  [8] Brandon, W., Nrusimha, A., Qian, K., Ankner, Z., Jin, T., Song, Z., and Ragan-Kelley, J. Striped attention: Faster
+      ring attention for causal transformers. arXiv preprint arXiv:2311.09431 (2023).
+  [9] Brown, T. B., Mann, B., Ryder, N., Subbiah, M., Kaplan, J., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G.,
+      Askell, A., Agarwal, S., Herbert-Voss, A., Krueger, G., Henighan, T., Child, R., Ramesh, A., Ziegler, D. M., Wu, J.,
+      Winter, C., Hesse, C., Chen, M., Sigler, E. J., Litwin, M., Gray, S., Chess, B., Clark, J., Berner, C., McCandlish, S.,
+      Radford, A., Sutskever, I., and Amodei, D. Language models are few-shot learners. Advances in neural information
+      processing systems 33 (2020), 1877–1901.
+ [10] Cai, T., Chen, D., Huang, Y., Lewis, P., Li, Y., Locatelli, A., Venkitesh, B., Yang, B., and Ye, H. Snapkv: Llm
+      knows what you are looking for before generation. Advances in Neural Information Processing Systems 37 (2024),
+      22947–22970.
+ [11] Cai, T., Li, Y., Geng, Z., Peng, H., Lee, J. D., Chen, D., and Dao, T. Medusa: Simple llm inference acceleration
+      framework with multiple decoding heads. arXiv preprint arXiv:2401.10774 (2024).
+ [12] Cai, Z., Zhang, Y., Gao, B., Liu, Y., Li, Y., Liu, T., Lu, K., Xiong, W., Dong, Y., Hu, J., and Xiao, W. Pyramidkv:
+      Dynamic kv cache compression based on pyramidal information funneling. arXiv preprint arXiv:2406.02069 (2024).
+ [13] Chen, C., Zhao, X., Cheng, G., Xu, Y., Deng, S., and Yin, J. Next-gen computing systems with compute express link:
+      a comprehensive survey. arXiv preprint arXiv:2412.20249 (2024).
+ [14] Chen, S., Jiang, R., Yu, D., Xu, J., Chao, M., Meng, F., Jiang, C., Xu, W., and Liu, H. Kvdirect: Distributed disaggregated
+      llm inference. arXiv preprint arXiv:2501.14743 (2024).
+ [15] Chen, S., Wong, S., Chen, L., and Tian, Y. Extending context window of large language models via positional
+      interpolation. arXiv preprint arXiv:2306.15595 (2023).
+ [16] Chen, Y., Qian, S., Tang, H., Lai, X., Liu, Z., Han, S., and Jia, J. Longlora: Efficient fine-tuning of long-context large
+      language models. In International Conference on Learning Representations (2024), vol. 2024, pp. 8220–8238.
+ [17] Child, R., Gray, S., Radford, A., and Sutskever, I. Generating long sequences with sparse transformers. arXiv
+      preprint arXiv:1904.10509 (2019).
+ [18] Consortium, C. Compute express link (cxl) specification 3.0. Technical specification, Revision 3.0, Version 1.0 (2022).
+ [19] Corporation, A. Amd instinct mi300 series architecture. Technical whitepaper (2023).
+ [20] Corporation, N. Nvidia h100 tensor core gpu architecture. Technical whitepaper (2022).
+ [21] Corporation, N. Nvidia grace hopper superchip architecture. Technical whitepaper (2023).
+ [22] Corporation, N. Nvidia inference xfer library (nixl) and dynamo framework. GitHub repository (2025).
+ [23] Dao, T. Flashattention-2: Faster attention with better parallelism and work partitioning. In International Conference
+      on Learning Representations (2024), vol. 2024, pp. 35549–35562.
+ [24] Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and Ré, C. Flashattention: Fast and memory-efficient exact attention with
+      io-awareness. Advances in neural information processing systems 35 (2022), 16344–16359.
+ [25] Dettmers, T., Lewis, M., Belkada, Y., and Zettlemoyer, L. Gpt3.int8(): 8-bit matrix multiplication for transformers
+      at scale. Advances in neural information processing systems (2022).
+ [26] Dettmers, T., Svirschevski, R., Egiazarian, V., Kuznedelev, D., Frantar, E., Ashkboos, S., Borzunov, A., Hoefler,
+      T., and Alistarh, D. Spqr: A sparse-quantized representation for near-lossless llm weight compression. arXiv
+      preprint arXiv:2306.03078 (2023).
+ [27] Ding, J., Ma, S., Dong, L., Zhang, X., Huang, S., Wang, W., Zheng, N., and Wei, F. Longnet: Scaling transformers
+      to 1,000,000,000 tokens. arXiv preprint arXiv:2307.02486 (2023).
+ [28] Ding, Y., Zhang, L. L., Zhang, C., Xu, Y., Shang, N., Xu, J., Yang, F., and Yang, M. Longrope: Extending llm context
+      window beyond 2 million tokens. arXiv preprint arXiv:2402.13753 (2024).
+ [29] Dong, H., Yang, X., Zhang, Z., Wang, Z., Chi, Y., and Chen, B. Get more with less: Synthesizing recurrence with kv
+      cache compression for efficient llm inference. arXiv preprint arXiv:2402.09398 (2024).
+ [30] Dragojević, A., Narayanan, D., Hodson, O., and Castro, M. Farm: fast remote memory. Networked Systems Design
+      and Implementation (2014), 401–414.
+ [31] Du, N., Huang, Y., Dai, A. M., Tong, S., Lepikhin, D., Xu, Y., Krikun, M., Zhou, Y., Yu, A. W., Firat, O., Zoph, B.,
+      Fedus, L., Bosma, M., Zhou, Z., Wang, T., Wang, Y. E., Webster, K., Pellat, M., Robinson, K., Meier-Hellstern,
+30                                                                                  Jie Li, Tongyang Wang, and Yong Chen
+
+
+     K., Duke, T., Dixon, L., Zhang, K., Le, Q. V., Wu, Y., Chen, Z., and Cui, C. Glam: Efficient scaling of language models
+     with mixture-of-experts. In International conference on machine learning (2022), PMLR, pp. 5547–5569.
+[32] Duan, J., Lu, R., Duanmu, H., Li, X., Zhang, X., Lin, D., Stoica, I., and Zhang, H. Muxserve: flexible spatial-temporal
+     multiplexing for multiple llm serving. arXiv preprint arXiv:2404.02015 (2024).
+[33] Fedus, W., Zoph, B., and Shazeer, N. Switch transformers: Scaling to trillion parameter models with simple and
+     efficient sparsity. Journal of Machine Learning Research 23, 120 (2022), 1–39.
+[34] Feng, Y., Lv, J., Cao, Y., Xie, X., and Zhou, S. K. Ada-kv: Optimizing kv cache eviction by adaptive budget allocation
+     for efficient llm inference. Advances in Neural Information Processing Systems (2024).
+[35] Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D. Gptq: Accurate post-training quantization for generative
+     pre-trained transformers. arXiv preprint arXiv:2210.17323 (2022).
+[36] Fu, D. Y., Dao, T., Saab, K. K., Thomas, A. W., Rudra, A., and Ré, C. Hungry hungry hippos: Towards language
+     modeling with state space models. arXiv preprint arXiv:2212.14052 (2022).
+[37] Fu, Y., Bailis, P., Stoica, I., and Zhang, H. Break the sequential dependency of llm inference using lookahead
+     decoding. arXiv preprint arXiv:2402.02057 (2024).
+[38] Gale, T., Narayanan, D., Young, C., and Zaharia, M. Megablocks: Efficient sparse training with mixture-of-experts.
+     Proceedings of Machine Learning and Systems (2022).
+[39] Gim, I., Chen, G., seob Lee, S., Sarda, N. L., Khandelwal, A., and Zhong, L. Prompt cache: Modular attention
+     reuse for low-latency inference. Proceedings of Machine Learning and Systems 6 (2024), 325–338.
+[40] Grattafiori, A., Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle, A., Letman, A., Mathur, A., Schelten,
+     A., Vaughan, A., et al. The llama 3 herd of models. arXiv preprint arXiv:2407.21783 (2024).
+[41] Gu, A., and Dao, T. Mamba: Linear-time sequence modeling with selective state spaces. arXiv preprint arXiv:2312.00752
+     (2023).
+[42] Gu, A., Goel, K., and Ré, C. Efficiently modeling long sequences with structured state spaces. arXiv preprint
+     arXiv:2111.00396 (2021).
+[43] Gu, J., Lee, Y., Zhang, Y., Chowdhury, M., and Shin, K. G. Efficient memory disaggregation with infiniswap.
+     Networked Systems Design and Implementation (2017), 649–667.
+[44] Guu, K., Lee, K., Tung, Z., Pasupat, P., and Chang, M. Retrieval augmented language model pre-training. In
+     International conference on machine learning (2020), PMLR, pp. 3929–3938.
+[45] Han, C., Wang, Q., Xiong, W., Chen, Y., Ji, H., and Wang, S. Lm-infinite: Simple on-the-fly length generalization for
+     large language models. arXiv preprint arXiv:2308.16137 (2023).
+[46] He, J., Qiu, J., Zeng, A., Yang, Z., Zhai, J., and Tang, J. Fastmoe: A fast mixture-of-expert training system. arXiv
+     preprint arXiv:2103.13262 (2021).
+[47] He, Y., Zhang, L., Wu, W., Liu, J., Zhou, H., and Zhuang, B. Zipcache: Accurate and efficient kv cache quantization
+     with salient token identification. Advances in Neural Information Processing Systems 37 (2024), 68287–68307.
+[48] Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E., Cai, T., Rutherford, E., Casas, D., Hendricks, L. A.,
+     Welbl, J., Clark, A., et al. Training compute-optimal large language models. arXiv preprint arXiv:2203.15556 10
+     (2022).
+[49] Holmes, C., Tanaka, M., Wyatt, M. B., Awan, A. A., Rasley, J., Rajbhandari, S., Aminabadi, R. Y., Qin, H.,
+     Bakhtiari, A., Kurilenko, L. V., and He, Y. Deepspeed-fastgen: High-throughput text generation for llms via mii
+     and deepspeed-inference. arXiv preprint arXiv:2401.08671 (2024).
+[50] Hooper, C., Kim, S., Mohammadzadeh, H., Mahoney, M. W., Shao, Y. S., Keutzer, K., and Gholami, A. Kvquant:
+     Towards 10 million context length llm inference with kv cache quantization. Advances in Neural Information Processing
+     Systems 37 (2024), 1270–1303.
+[51] Hu, C., Huang, H., Hu, J., Xu, J., Chen, X., Xie, T., Wang, C., Wang, S., Bao, Y., Sun, N., et al. Memserve: Context
+     caching for disaggregated llm serving with elastic memory pool. arXiv preprint arXiv:2406.17565 (2024).
+[52] Hwang, C. H., Cui, W., Xiong, Y., Yang, Z., Liu, Z., Hu, H., Wang, Z., Salas, R., Jose, J., Ram, P., Chau, J., Cheng, P.,
+     Yang, F., Yang, M., and Xiong, Y. Tutel: Adaptive mixture-of-experts at scale. Proceedings of Machine Learning and
+     Systems 5 (2023), 269–287.
+[53] Izacard, G., Lewis, P., Lomeli, M., Hosseini, L., Petroni, F., Schick, T., Dwivedi-Yu, J., Joulin, A., Riedel, S., and
+     Grave, E. Atlas: Few-shot learning with retrieval augmented language models. Journal of Machine Learning Research
+     24, 251 (2023), 1–43.
+[54] Jacobs, S. A., Tanaka, M., Zhang, C., Zhang, M., Song, S. L., Rajbhandari, S., and He, Y. Deepspeed ulysses: System
+     optimizations for enabling training of extreme long sequence transformer models. arXiv preprint arXiv:2309.14509
+     (2023).
+[55] Jiang, A. Q., Sablayrolles, A., Roux, A., Mensch, A., Savary, B., Bamford, C., Chaplot, D. S., Casas, D. d. l.,
+     Hanna, E. B., Bressand, F., et al. Mixtral of experts. arXiv preprint arXiv:2401.04088 (2024).
+[56] Jiang, H., Li, Y., Zhang, C., Wu, Q., Luo, X., Ahn, S., Han, Z., Abdi, A. H., Li, D., Lin, C.-Y., et al. Minference 1.0:
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving                       31
+
+
+      Accelerating pre-filling for long-context llms via dynamic sparse attention. Advances in Neural Information Processing
+      Systems 37 (2024), 52481–52515.
+ [57] Jin, Y., Wang, T., Lin, H., Song, M., Li, P., Ma, Y., Shan, Y., Yuan, Z., Li, C., Sun, Y., et al. P/d-serve: Serving
+      disaggregated large language model at scale. arXiv preprint arXiv:2408.08147 (2024).
+ [58] Johnson, J., Douze, M., and Jeǵou, H. Billion-scale similarity search with gpus. IEEE Transactions on Big Data 7, 3
+      (2019), 535–547.
+ [59] Juravsky, J., Brown, B., Ehrlich, R., Fu, D. Y., Ré, C., and Mirhoseini, A. Hydragen: High-throughput llm inference
+      with shared prefixes. arXiv preprint arXiv:2402.05099 (2024).
+ [60] Kang, H., Zhang, Q., Kundu, S., Jeong, G., Liu, Z., Krishna, T., and Zhao, T. Gear: An efficient kv cache compression
+      recipe for near-lossless generative inference of llm. arXiv preprint arXiv:2403.05527 (2024).
+ [61] Karpukhin, V., Oguz, B., Min, S., Lewis, P., Wu, L., Edunov, S., Chen, D., and Yih, W.-t. Dense passage retrieval
+      for open-domain question answering. In Proceedings of the 2020 conference on empirical methods in natural language
+      processing (EMNLP) (2020), pp. 6769–6781.
+ [62] Khattab, O., and Zaharia, M. Colbert: Efficient and effective passage search via contextualized late interaction
+      over bert. In Proceedings of the 43rd International ACM SIGIR conference on research and development in Information
+      Retrieval (2020), pp. 39–48.
+ [63] Kitaev, N., Kaiser, Ł., and Levskaya, A. Reformer: The efficient transformer. arXiv preprint arXiv:2001.04451 (2020).
+ [64] Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+      memory management for large language model serving with pagedattention. In Proceedings of the 29th symposium
+      on operating systems principles (2023), pp. 611–626.
+ [65] Lee, K., Chang, M.-W., and Toutanova, K. Latent retrieval for weakly supervised open domain question answering.
+      In Proceedings of the 57th annual meeting of the association for computational linguistics (2019), pp. 6086–6096.
+ [66] Lepikhin, D., Lee, H., Xu, Y., Chen, D., Firat, O., Huang, Y., Krikun, M., Shazeer, N., and Chen, Z. Gshard: Scaling
+      giant models with conditional computation and automatic sharding. arXiv preprint arXiv:2006.16668 (2020).
+ [67] Lesens, D., Rakhshan, B. T., and Rabusseau, G. Kq-svd: Compressing the kv cache with provable guarantees on
+      attention fidelity. arXiv preprint arXiv:2512.05916 (2025).
+ [68] Leviathan, Y., Kalman, M., and Matias, Y. Fast inference from transformers via speculative decoding. In
+      International Conference on Machine Learning (2023), PMLR, pp. 19274–19286.
+ [69] Lewis, P., Perez, E., Piktus, A., Petroni, F., Karpukhin, V., Goyal, N., Küttler, H., Lewis, M., tau Yih, W.,
+      Rocktäschel, T., Riedel, S., and Kiela, D. Retrieval-augmented generation for knowledge-intensive nlp tasks. UCL
+      Discovery (University College London) 33 (2020), 9459–9474.
+ [70] Li, H., Berger, D. S., Hsu, L., Ernst, D., Zardoshti, P., Novakovic, S., Shah, M., Rajadnya, S., Lee, S., Agarwal, I.,
+      et al. Pond: Cxl-based memory pooling systems for cloud platforms. In Proceedings of the 28th ACM International
+      Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2 (2023), pp. 574–587.
+ [71] Li, H., Li, Y., Tian, A., Tang, T., Xu, Z., Chen, X., Hu, N., Dong, W., Li, Q., and Chen, L. A survey on large language
+      model acceleration based on kv cache management. arXiv preprint arXiv:2412.19442 (2024).
+ [72] Li, Y., Wei, F., Zhang, C., and Zhang, H. Eagle: Speculative sampling requires rethinking feature uncertainty. arXiv
+      preprint arXiv:2401.15077 (2024).
+ [73] Li, Z., Zheng, L., Zhong, Y., Liu, V., Sheng, Y., Jin, X., Huang, Y., Chen, Z., Zhang, H., Gonzalez, J. E., et al.
+      {AlpaServe}: Statistical multiplexing with model parallelism for deep learning serving. In 17th USENIX Symposium
+      on Operating Systems Design and Implementation (OSDI 23) (2023), pp. 663–679.
+ [74] Lin, B., Zhang, C., Peng, T., Zhao, H., Xiao, W., Sun, M., Liu, A., Zhang, Z., Li, L., Qiu, X., et al. Infinite-llm:
+      Efficient llm service for long context with distattention and distributed kvcache. arXiv preprint arXiv:2401.02669
+      (2024).
+ [75] Lin, J., Tang, J., Tang, H., Shang, Y., Chen, W.-M., Wang, W.-C., Xiao, G., Dang, X., Gan, C., and Han, S. Awq:
+      Activation-aware weight quantization for llm compression and acceleration. Proceedings of machine learning and
+      systems 6 (2024), 87–100.
+ [76] Liu, A., Liu, J., Pan, Z., He, Y., Haffari, G., and Zhuang, B. Minicache: Kv cache compression in depth dimension
+      for large language models. Advances in Neural Information Processing Systems 37 (2024), 139997–140031.
+ [77] Liu, D., and Yu, Y. Cxl-speckv: A disaggregated fpga speculative kv-cache for datacenter llm serving. In Proceedings
+      of the 2026 ACM/SIGDA International Symposium on Field Programmable Gate Arrays (2026), pp. 56–66.
+ [78] Liu, H., and Abbeel, P. Blockwise parallel transformers for large context models. Advances in neural information
+      processing systems 36 (2023), 8828–8844.
+ [79] Liu, H., Zaharia, M., and Abbeel, P. Ringattention with blockwise transformers for near-infinite context. In
+      International Conference on Learning Representations (2024), vol. 2024, pp. 3992–4008.
+ [80] Liu, X., Tang, Z., Dong, P., Li, Z., Li, B., Hu, X., and Chu, X. Chunkkv: Semantic-preserving kv cache compression
+      for efficient long-context llm inference. Advances in Neural Information Processing Systems 38 (2026), 28728–28778.
+32                                                                                     Jie Li, Tongyang Wang, and Yong Chen
+
+
+ [81] Liu, Y., Cheng, Y., Yao, J., An, Y., Chen, X., Feng, S., Huang, Y., Shen, S. S. P., Zhang, R., Du, K., and Jiang, J.
+      Lmcache: An efficient kv cache layer for enterprise-scale llm inference. arXiv preprint arXiv:2510.09665 (2025).
+ [82] Liu, Y., Fu, J., Liu, S., Zou, Y., Zhang, S., and Zhou, J. Kv cache compression for inference efficiency in llms: A review.
+      In Proceedings of the 4th International Conference on Artificial Intelligence and Intelligent Information Processing (2025),
+      pp. 207–212.
+ [83] Liu, Y., Li, H., Cheng, Y., Ray, S., Huang, Y., Zhang, Q., Du, K., Yao, J., Lu, S., Ananthanarayanan, G., Maire, M.,
+      Hoffmann, H., Holtzman, A., and Jiang, J. Cachegen: Kv cache compression and streaming for fast large language
+      model serving. In Proceedings of the ACM SIGCOMM 2024 Conference (2024), pp. 38–56.
+ [84] Liu, Y., and Qian, C. Trinity: Disaggregating vector search from prefill-decode disaggregation in llm serving. arXiv
+      preprint arXiv:2512.02281 (2025).
+ [85] Liu, Z., Desai, A., Liao, F., Wang, W., Xie, V., Xu, Z., Kyrillidis, A., and Shrivastava, A. Scissorhands: Exploiting
+      the persistence of importance hypothesis for llm kv cache compression at test time. Advances in Neural Information
+      Processing Systems (2023).
+ [86] Liu, Z., Yuan, J., Jin, H., Zhong, S., Xu, Z., Braverman, V., Chen, B., and Hu, X. Kivi: A tuning-free asymmetric 2bit
+      quantization for kv cache. arXiv preprint arXiv:2402.02750 (2024).
+ [87] Malkov, Y. A., and Yashunin, D. A. Efficient and robust approximate nearest neighbor search using hierarchical
+      navigable small world graphs. IEEE Transactions on Pattern Analysis and Machine Intelligence 42, 4 (2018), 824–836.
+ [88] Miao, X., Oliaro, G., Zhang, Z., Cheng, X., Jin, H., Chen, T., and Jia, Z. Towards efficient generative large language
+      model serving: A survey from algorithms to systems. ACM Computing Surveys 58, 1 (2025), 1–37.
+ [89] Miao, X., Oliaro, G., Zhang, Z., Cheng, X., Wang, Z., Zhang, Z., Wong, R. Y. Y., Zhu, A., Yang, L., Shi, X.,
+      et al. Specinfer: Accelerating large language model serving with tree-based speculative inference and verification.
+      In Proceedings of the 29th ACM International Conference on Architectural Support for Programming Languages and
+      Operating Systems, Volume 3 (2024), pp. 932–949.
+ [90] Mohtashami, A., and Jaggi, M. Landmark attention: Random-access infinite context length for transformers. arXiv
+      preprint arXiv:2305.16300 (2023).
+ [91] Narayanan, D., Shoeybi, M., Casper, J., LeGresley, P., Patwary, M., Korthikanti, V., Vainbrand, D., Kashinkunti,
+      P., Bernauer, J., Catanzaro, B., et al. Efficient large-scale language model training on gpu clusters using megatron-
+      lm. In Proceedings of the international conference for high performance computing, networking, storage and analysis
+      (2021), pp. 1–15.
+ [92] Nawrot, P., Łańcucki, A., Chochowski, M., Tarjan, D., and Ponti, E. M. Dynamic memory compression:
+      Retrofitting llms for accelerated inference. arXiv preprint arXiv:2403.09636 (2024).
+ [93] Ou, J., Chen, Y., et al. Lossless acceleration of large language model via adaptive n-gram parallel decoding. In
+      Proceedings of the 2024 Conference of the North American Chapter of the Association for Computational Linguistics:
+      Human Language Technologies (Volume 6: Industry Track) (2024), pp. 10–22.
+ [94] Ousterhout, J., Agrawal, P., Erickson, D., Kozyrakis, C., Leverich, J., Mazieres, D., Mitra, S., Narayanan, A.,
+      Parulkar, G., Rosenblum, M., Rumble, S. M., Stratmann, E., and Stutsman, R. The case for ramclouds: Scalable
+      high-performance storage entirely in dram. ACM SIGOPS Operating Systems Review 43, 4 (2010), 92–105.
+ [95] Patel, P., Choukse, E., Zhang, C., Shah, A., Goiri, Í., Maleki, S., and Bianchini, R. Splitwise: Efficient generative
+      llm inference using phase splitting. In 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture
+      (ISCA) (2024), IEEE, pp. 118–132.
+ [96] Peng, B., Quesnelle, J., Fan, H., and Shippole, E. Yarn: Efficient context window extension of large language models.
+      In International Conference on Learning Representations (2024), vol. 2024, pp. 31932–31951.
+ [97] Pope, R., Douglas, S., Chowdhery, A., Devlin, J., Bradbury, J., Heek, J., Xiao, K., Agrawal, S., and Dean, J.
+      Efficiently scaling transformer inference. Proceedings of machine learning and systems 5 (2023), 606–624.
+ [98] Prabhu, R., Nayak, A., Mohan, J., Ramjee, R., and Panwar, A. vattention: Dynamic memory management for
+      serving llms without pagedattention. In Proceedings of the 30th ACM International Conference on Architectural Support
+      for Programming Languages and Operating Systems, Volume 1 (2025), pp. 1133–1150.
+ [99] Puri, A., Jose, J., Venkatesh, T., and Narayanan, V. Dracksim: Simulator for rack-scale memory disaggregation.
+      arXiv preprint arXiv:2305.09977 (2023).
+[100] Qin, R., Li, Z., He, W., Cui, J., Tang, H., Ren, F., Ma, T., Cai, S., Zhang, Y., Zhang, M., et al. Mooncake: A
+      kvcache-centric disaggregated architecture for llm serving. ACM Transactions on Storage (2024).
+[101] Rajbhandari, S., Li, C., Yao, Z., Zhang, M., Aminabadi, R. Y., Awan, A. A., Rasley, J., and He, Y. Deepspeed-moe:
+      Advancing mixture-of-experts inference and training to power next-generation ai scale. In International conference
+      on machine learning (2022), PMLR, pp. 18332–18346.
+[102] Rajbhandari, S., Rasley, J., Ruwase, O., and He, Y. Zero: Memory optimizations toward training trillion parameter
+      models. In SC20: international conference for high performance computing, networking, storage and analysis (2020),
+      IEEE, pp. 1–16.
+From Tensor Buffer to Distributed Memory Hierarchy: A Survey of KV Cache Management for LLM Serving                       33
+
+
+[103] Rasley, J., Rajbhandari, S., Ruwase, O., and He, Y. Deepspeed: System optimizations enable training deep learning
+      models with over 100 billion parameters. Proceedings of the 26th ACM SIGKDD International Conference on Knowledge
+      Discovery and Data Mining (2020), 3505–3506.
+[104] Regmi, S., and Pun, C. P. Gpt semantic cache: Reducing llm costs and latency via semantic embedding caching. arXiv
+      preprint arXiv:2411.05276 (2024).
+[105] Ribar, L., Chelombiev, I., Hudlass-Galley, L., Blake, C., Luschi, C., and Orr, D. Sparq attention: Bandwidth-
+      efficient llm inference. arXiv preprint arXiv:2312.04985 (2023).
+[106] Ruan, Z., Schwarzkopf, M., Aguilera, M. K., and Belay, A. {AIFM}:{High-performance},{application-integrated}
+      far memory. In 14th USENIX Symposium on Operating Systems Design and Implementation (OSDI 20) (2020), pp. 315–332.
+[107] Shan, Y., Huang, Y., Chen, Y., and Zhang, Y. {LegoOS}: A disseminated, distributed {OS} for hardware resource
+      disaggregation. In 13th USENIX Symposium on Operating Systems Design and Implementation (OSDI 18) (2018),
+      pp. 69–87.
+[108] Sharma, D. D., Blankenship, R., and Berger, D. S. An introduction to the compute express link (cxl) interconnect.
+      ACM Computing Surveys 56, 11 (2024), 1–37.
+[109] Shazeer, N. Fast transformer decoding: One write-head is all you need. arXiv preprint arXiv:1911.02150 (2019).
+[110] Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le, Q. V., Hinton, G. E., and Dean, J. Outrageously large
+      neural networks: The sparsely-gated mixture-of-experts layer. arXiv preprint arXiv:1701.06538 (2017).
+[111] Shen, L., Wu, Z., Gong, W., Hao, H., Bai, Y., Wu, H., Wu, X., Bian, J., Xiong, H., Yu, D., and Ma, Y. Se-moe: A
+      scalable and efficient mixture-of-experts distributed training and inference system. arXiv preprint arXiv:2205.10034
+      (2022).
+[112] Sheng, Y., Zheng, L., Yuan, B., Li, Z., Ryabinin, M., Chen, B., Liang, P., Ré, C., Stoica, I., and Zhang, C. Flexgen:
+      High-throughput generative inference of large language models with a single gpu. In International Conference on
+      Machine Learning (2023), PMLR, pp. 31094–31116.
+[113] Shi, X., Cai, C., Du, J., and Jia, Z. Nexus: Proactive intra-gpu disaggregation of prefill and decode in llm serving.
+      arXiv preprint arXiv:2507.06608 (2025).
+[114] Song, Y., Mi, Z., Xie, H., and Chen, H. Powerinfer: Fast large language model serving with a consumer-grade gpu.
+      In Proceedings of the ACM SIGOPS 30th Symposium on Operating Systems Principles (2024), pp. 590–606.
+[115] Srivatsa, V., He, Z., Abhyankar, R., Li, D., and Zhang, Y. Preble: Efficient distributed prompt scheduling for llm
+      serving. In International conference on learning representations (2025), vol. 2025, pp. 37057–37082.
+[116] Sun, B., Huang, Z., Zhao, H., Xiao, W., Zhang, X., Li, Y., and Lin, W. Llumnix: Dynamic scheduling for large
+      language model serving. In 18th USENIX symposium on operating systems design and implementation (OSDI 24) (2024),
+      pp. 173–191.
+[117] Sun, H., Chang, L.-W., Bao, W., Zheng, S., Zheng, N., Liu, X., Dong, H., Chi, Y., and Chen, B. Shadowkv: Kv cache
+      in shadows for high-throughput long-context llm inference. arXiv preprint arXiv:2410.21465 (2024).
+[118] Sun, Y., Dong, L., Huang, S., Ma, S., Xia, Y., Xue, J., Wang, J., and Wei, F. Retentive network: A successor to
+      transformer for large language models. arXiv preprint arXiv:2307.08621 (2023).
+[119] Sun, Y., Yuan, Y., Yu, Z., Kuper, R., Song, C., Huang, J., Ji, H., Agarwal, S., Lou, J., Jeong, I., et al. Demystifying
+      cxl memory with genuine cxl-ready systems and devices. In Proceedings of the 56th Annual IEEE/ACM International
+      Symposium on Microarchitecture (2023), pp. 105–121.
+[120] Tang, H., Lin, Y., Lin, J., Han, Q., Ke, D., Hong, S., Yao, Y., and Wang, G. Razorattention: Efficient kv cache
+      compression through retrieval heads. In International Conference on Learning Representations (2025), vol. 2025,
+      pp. 16632–16646.
+[121] Tang, J., Zhao, Y., Zhu, K., Xiao, G., Kasikci, B., and Han, S. Quest: Query-aware sparsity for efficient long-context
+      llm inference. arXiv preprint arXiv:2406.10774 (2024).
+[122] Tay, Y., Dehghani, M., Bahri, D., and Metzler, D. Efficient transformers: A survey. ACM Computing Surveys 55, 6
+      (2022), 1–28.
+[123] Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi, A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P.,
+      Bhosale, S., et al. Llama 2: Open foundation and fine-tuned chat models. arXiv preprint arXiv:2307.09288 (2023).
+[124] Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I.
+      Attention is all you need. Advances in neural information processing systems 30 (2017).
+[125] Wang, C., Ma, H., Liu, S., Li, Y., Ruan, Z., Nguyen, K., Bond, M. D., Netravali, R., Kim, M., and Xu, G. H.
+      Semeru: a {Memory-Disaggregated} managed runtime. In 14th USENIX Symposium on Operating Systems Design and
+      Implementation (OSDI 20) (2020), pp. 261–280.
+[126] Wang, J., Li, C., Wang, T., Guo, J., Yang, H., Zhuansun, Y., and Guo, M. Survey of disaggregated memory: Cross-layer
+      technique insights for next-generation datacenters. ACM Computing Surveys 58, 12 (2026), 1–38.
+[127] Wang, S., Li, B. Z., Khabsa, M., Fang, H., and Ma, H. Linformer: Self-attention with linear complexity. arXiv preprint
+      arXiv:2006.04768 (2020).
+34                                                                                  Jie Li, Tongyang Wang, and Yong Chen
+
+
+[128] Wang, S., Ren, R., and Gui, L. Forkkv: Scaling multi-lora agent serving via copy-on-write disaggregated kv cache.
+      arXiv preprint arXiv:2604.06370 (2026).
+[129] Wang, Z., Cui, B., and Gan, S. Squeezeattention: 2d management of kv-cache in llm inference via layer-wise optimal
+      budget. In International Conference on Learning Representations (2025), vol. 2025, pp. 23593–23606.
+[130] Wang, Z., Jin, B., Yu, Z., and Zhang, M. Model tells you where to merge: Adaptive kv cache merging for llms on
+      long-context tasks. arXiv preprint arXiv:2407.08454 (2024).
+[131] Weiner, J., Agarwal, N., Schatzberg, D., Yang, L., Wang, H., Sanouillet, B., Sharma, B., Heo, T., Jain, M.,
+      Tang, C., et al. Tmo: Transparent memory offloading in datacenters. In Proceedings of the 27th ACM International
+      Conference on Architectural Support for Programming Languages and Operating Systems (2022), pp. 609–621.
+[132] Wu, B., Liu, S., Zhong, Y., Sun, P., Liu, X., and Jin, X. Loongserve: Efficiently serving long-context large language
+      models with elastic sequence parallelism. In Proceedings of the ACM SIGOPS 30th Symposium on Operating Systems
+      Principles (2024), pp. 640–654.
+[133] Wu, B., Zhong, Y., Zhang, Z., Liu, S., Liu, F., Sun, Y., Huang, G., Liu, X., and Jin, X. Fast distributed inference
+      serving for large language models. arXiv preprint arXiv:2305.05920 (2023).
+[134] Xiao, G., Lin, J., Seznec, M., Wu, H., Demouth, J., and Han, S. Smoothquant: Accurate and efficient post-training
+      quantization for large language models. In International conference on machine learning (2023), PMLR, pp. 38087–38099.
+[135] Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Efficient streaming language models with attention sinks. In
+      International Conference on Learning Representations (2024), vol. 2024, pp. 21875–21895.
+[136] Yang, D., Han, X., Gao, Y., Hu, Y., Zhang, S., and Zhao, H. Pyramidinfer: Pyramid kv cache compression for high-
+      throughput llm inference. In Findings of the Association for Computational Linguistics: ACL 2024 (2024), pp. 3258–3270.
+[137] Yang, X., Hu, Q., Li, J., Li, F., Zhu, Y., Zhou, Y., Lin, Q., Dai, J., Kong, Y., Zhang, J., et al. Beluga: A cxl-based
+      memory architecture for scalable and efficient llm kvcache management. Proceedings of the ACM on Management of
+      Data 4, 1 (SIGMOD (2026), 1–29.
+[138] Yang, Y., Cao, Z., Chen, Q., Qin, L., Yang, D., Zhao, H., and Chen, Z. Kvsharer: Efficient inference via layer-wise
+      dissimilar kv cache sharing. arXiv preprint arXiv:2410.18517 (2024).
+[139] Yao, J., Li, H., Liu, Y., Ray, S., Cheng, Y., Zhang, Q., Du, K., Lu, S., and Jiang, J. Cacheblend: Fast large language
+      model serving for rag with cached knowledge fusion. In Proceedings of the twentieth European conference on computer
+      systems (2025), pp. 94–109.
+[140] Yoon, D., Min, Y., Kim, H., Noh, S. H., and Kim, J. Tract: Disaggregated llm serving with cxl shared memory kv
+      cache at rack-scale. arXiv preprint arXiv:2512.18194 (2025).
+[141] Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-G. Orca: A distributed serving system for transformer-based
+      generative models. 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22) (2022),
+      521–538.
+[142] Zaheer, M., Guruganesh, G., Dubey, K. A., Ainslie, J., Alberti, C., Ontanon, S., Pham, P., Ravula, A., Wang, Q.,
+      Yang, L., et al. Big bird: Transformers for longer sequences. Advances in neural information processing systems 33
+      (2020), 17283–17297.
+[143] Zhang, C., Du, K., Liu, S., Kwon, W., Mo, X., Wang, Y., Liu, X., You, K., Li, Z., Long, M., et al. Jenga: Effective
+      memory management for serving llm with heterogeneity. In Proceedings of the ACM SIGOPS 31st Symposium on
+      Operating Systems Principles (2025), pp. 446–461.
+[144] Zhang, H., Patel, P., Ning, A., and Wentzlaff, D. Spad: Specialized prefill and decode hardware for disaggregated
+      llm inference. arXiv preprint arXiv:2510.08544 (2025).
+[145] Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H., Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., et al.
+      Sglang: Efficient execution of structured language model programs. Advances in neural information processing systems
+      37 (2024), 62557–62583.
+[146] Zhong, Y., Liu, S., Chen, J., Hu, J., Zhu, Y., Liu, X., Jin, X., and Zhang, H. {DistServe}: Disaggregating prefill and
+      decoding for goodput-optimized large language model serving. In 18th USENIX Symposium on Operating Systems
+      Design and Implementation (OSDI 24) (2024), pp. 193–210.
+

@@ -1,0 +1,398 @@
+                                                      QIGen: Generating Efficient Kernels for Quantized Inference
+                                                                     on Large Language Models
+
+
+                                                               Tommaso Pegolotti 1 Elias Frantar 2 Dan Alistarh 3 Markus Püschel 1
+
+
+                                                                Abstract                                et al., 2022; Dettmers & Zettlemoyer, 2022; Frantar et al.,
+                                                                                                        2022; Park et al., 2022; Xiao et al., 2022; Yao et al., 2022),
+                                             We present ongoing work on a new automatic
+                                                                                                        which work by reducing the bitwidth of data types used
+arXiv:2307.03738v1 [cs.LG] 7 Jul 2023
+
+
+
+
+                                             code generation approach for supporting quan-
+                                                                                                        for storing weights, activations, or both, with the goal of
+                                             tized generative inference on LLMs such as
+                                                                                                        minimizing the impact on accuracy.
+                                             LLaMA or OPT on off-the-shelf CPUs. Our
+                                             approach is informed by the target architecture            Focusing specifically on generative inference, where the
+                                             and a performance model, including both hard-              size of the weights is the main bottleneck, the currently best-
+                                             ware characteristics and method-specific accu-             performing method is GPTQ (Frantar et al., 2022), which
+                                             racy constraints. Results on CPU-based infer-              achieves near-lossless quantization to 4-bit weights, and can
+                                             ence for LLaMA models show that our approach               even accurately support 2 and 3-bit weights by reducing the
+                                             can lead to high performance and high accu-                granularity to smaller weight groups, e.g., by jointly quantiz-
+                                             racy, comparing favorably to the best existing             ing blocks of 64 weights using a shared scale and zero-point.
+                                             open-source solution. A preliminary implemen-              Similar grouping techniques can also allow simpler round-
+                                             tation is available at https://github.com/                 to-nearest (RTN) quantization to preserve accuracy using
+                                             IST-DASLab/QIGen.                                          4-bit weights (Dettmers & Zettlemoyer, 2022).
+                                                                                                        Given this algorithmic progress, a remaining key chal-
+                                        1. Introduction                                                 lenge is the efficient system support for these compressed
+                                                                                                        numerical formats, to execute LLMs on user devices ac-
+                                        The impressive performance of generative large language
+                                                                                                        curately and fast. Existing academic proposals such as
+                                        models (LLMs) (Black et al., 2022; Zhang et al., 2022;
+                                                                                                        LLM.int8() (Dettmers et al., 2022), GPTQ (Frantar et al.,
+                                        Touvron et al., 2023) has led to significant interest in ex-
+                                                                                                        2022), and SmoothQuant (Xiao et al., 2022), and open-
+                                        ecuting them on user devices with limited computational
+                                                                                                        sourced solutions such as llama.cpp (Gerganov, 2023), man-
+                                        power. Interestingly, the computational envelope of genera-
+                                                                                                        ually develop custom kernels for their specific target hard-
+                                        tive workloads renders this plausible: when executing the
+                                                                                                        ware, such as GPUs or CPUs. Unfortunately, this approach
+                                        popular one-token-at-a-time generation based on a given
+                                                                                                        can be extremely time-intensive and error-prone, and re-
+                                        cached context, the operational cost of obtaining single out-
+                                                                                                        quires potentially re-writing kernels from scratch to support
+                                        puts is relatively small, as the computation can be mapped
+                                                                                                        new quantization formats and target hardware.
+                                        onto relatively inexpensive matrix-vector products, as op-
+                                        posed to the massive matrix-matrix multiplications that are     In this paper, we present ongoing work on a new automatic
+                                        otherwise common in deep learning.                              code generation approach, called QIGen, for obtaining effi-
+                                                                                                        cient and general kernels for generative LLM inference of
+                                        Thus, the key challenge in personalized generative LLM
+                                                                                                        varying bitwidth. At a high level, our approach provides
+                                        inference becomes memory: well-performing models have
+                                                                                                        customized efficient implementations of the low-level ma-
+                                        extremely large parameter counts, which often exceed the
+                                                                                                        trix operations required to support multiplication operations
+                                        memory capacity of consumer devices, and induce high
+                                                                                                        on quantized variants of LLM weight matrices. Our ap-
+                                        memory transfer costs at runtime, overwhelming bandwidth.
+                                                                                                        proach is based on a performance model which is informed
+                                        To address this issue, a series of quantization-based methods
+                                                                                                        both by hardware characteristics, e.g., cache size, and by
+                                        specialized to LLMs have been recently proposed (Dettmers
+                                                                                                        accuracy constraints pertaining to the quantization methods,
+                                            1
+                                              ETH Zurich 2 IST Austria 3 IST Austria & Neu-             e.g., the use of weight grouping. We present results gen-
+                                        ral Magic.       Correspondence to: Tommaso Pegolotti           erating efficient low-bitwidth kernels for general purpose
+                                        <tommaso.pegolotti@inf.ethz.ch>,     Dan     Alistarh           CPUs supporting the popular AVX2 intrinsics, which we
+                                        <dan.alistarh@ist.ac.at>.                                       interface with Pytorch (Paszke et al., 2019), and showcase
+                                        Accepted to the ICML 2023 FoMo Workshop.                        on the accurate LLaMA family (Touvron et al., 2023).
+                                          Generating Kernels for Quantized LLM Inference
+
+2. Background                                                           load(address)           load from memory address
+Quantization. Quantization is an efficient compression                  store(address,a)        stores a at memory address
+technique for reducing memory utilization by representing               broadcast(a)            fills a register with a
+data using a limited number of values, typically integer                fmadd(a,b,c)            returns a · b + c
+levels. We define a quantization function as a map Q from               reduce add(a)           returns the sum of the elements of a
+real numbers to integers. Formally,                                     srli(a,i)               returns a >> i
+                                                                        and(a,m)                returns a bitwise and m
+                     Q : (R, N) 7→ [0, 2b ),
+                                                                        cvt int float(a)        converts a to float
+where b is the number of bits we want to use to represent
+the new value. Given a vector x ∈ Rn , we define Q(x, b) as            Table 1: List of vector instructions used in the implementa-
+                                                  !                    tion and their semantics.
+                          x − min(x)        b
+      Q(x, b) = rnd                       (2 − 1) ,
+                       max(x) − min(x)
+                                                                       & Zettlemoyer (2022) provided an in-depth overview of
+where max(x) and min(x) is the maximum and minimum                     the accuracy-compression trade-offs underlying these meth-
+value in x, respectively, and rnd rounds to nearest. This              ods, establishing that 4-bit quantization is an optimal point
+equation can be rewritten as xq = rnd((x − z)s(x)), with               for round-to-nearest-based methods, whereas higher com-
+z = min(x) and s(x) = (2b − 1)/(max(x) − min(x)).                      pression can be achieved via data-aware methods such as
+Similarly, the corresponding dequantization function is                GPTQ.
+                                                                       All the above methods focused on GPU inference as their
+                       D(xq ) = s(xq z).
+                                                                       main target scenario. By contrast, there has been much less
+                                                                       focus on CPU-based inference; for this, the open-source
+As example, consider the dot-product between y ∈ Rn and                LLaMA.cpp/GGML project (Gerganov, 2023) can provide
+xq ∈ [0, 2b ). The resulting value is given by                         reasonable generative performance on end devices such
+                                                                       as Intel/AMD/ARM CPUs, showing that running models
+           ⟨y, s(xq − z)⟩ = s(⟨y, xq ⟩ − z⟨y, 1⟩).               (1)
+                                                                       locally in such setups is feasible.
+
+To improve accuracy, we can increase the quantization gran-            Notation. We simplify the names of AVX SIMD vector
+ularity and store more s and z values for each vector. We              instructions for readability in our exposition. The semantics
+denote the resulting partition by groups. To compute the               of the instructions can be seen in Table 1.
+dot-product using these additional values, we only need to
+modify 1. In particular, we rewrite it as                              3. Code Generation
+   P                         P                  P
+   X                         X                  X                      We consider CPU-based generative inference as the motivat-
+     ⟨yi , si (xiq − zi )⟩ =   si ⟨yi , xiq ⟩ −   zi ⟨yi , 1⟩,   (2)   ing setup for our work, although our techniques are general,
+    i                         i                  i
+                                                                       and should be extensible to other settings as well.
+where P is the number of groups.
+                                                                       Data format. Our implementation of linear layers uses
+LLM quantization. There has been significant focus on                  quantized weights obtained via GPTQ, in which the weights
+accurate post-training quantization (PTQ) methods (Nagel               are represented using 32-bit integers to store multiple con-
+et al., 2019) that scale and are accurate for LLMs. Early              secutive values. For instance, with 4-bit quantization, a
+work (Yao et al., 2022; Dettmers et al., 2022; Park et al.,            single “unit” can represent 8 values, and with 2-bit quantiza-
+2022) used direct rounding to the nearest quantization                 tion, it can represent 16 values. Some bit granularities may
+level (RTN), reducing group size to obtain higher accu-                require specialized implementations. For example, if we
+racy at the cost of more space. LLM.int8() (Dettmers                   use 3-bit, we store 32 values in three consecutive integers.
+et al., 2022) quantized activations as well, isolating “outlier
+                                                                       We quantize the weight matrices in a column-wise manner.
+features” for which higher bit-width is used. These ap-
+                                                                       For 4-bit quantization, each entry (i, j) in the quantized
+proaches induce quantization errors of 5–10% in perplexity
+                                                                       matrix contains the values at indices (8i : 8i + 7, j) of the
+increase for OPT (Zhang et al., 2022) or LLaMA (Touvron
+                                                                       uncompressed matrix. For each column j, we also store
+et al., 2023) models, relative to the uncompressed baseline.
+                                                                       one scale sj and one zj value. Additionally, we can also
+GPTQ (Frantar et al., 2022) proposed a higher-accuracy
+                                                                       quantize the zj value. The changes in the matrices after
+approach (e.g., 3–5% perplexity increase at 4-bit), via an
+                                                                       quantization are illustrated in Figure 1.
+approximate solver minimizing the layer-wise squared er-
+ror between the quantized and original layers. Dettmers                The total memory used to store a weight matrix of size
+                                       Generating Kernels for Quantized LLM Inference
+
+
+
+
+Figure 1: Reduction in matrix size due to quantization.           Figure 2: Visual representation of data used in the Micro-
+Given a weight matrix W of size n × m, we obtain a com-           GEMV step. To store xµ , Wµ , and yµ we need mu , mu tu
+pressed matrix Wq of size n/(32/b)×m and two one dimen-           and tu registers, respectively. In each step of the algorithm
+sional vectors z and s of size m. We quantize the elements        we multiply one element of xµ by a register containing 8
+column-wise as shown by the colors. For example, 8 values         values of Wµ , to obtain 8 values of yµ . Considering the grey
+in the red rectangle become 1 value in the red square.            cells, we have yµ,3 = yµ,3 + xµ,1 · Wµ,1,17:24 .
+
+
+                                                                  Mini-GEMV. To improve performance, we exploit that
+N × M is thus bN M + 32M + bM instead of 32N M . The              weight matrices in a neural network are set at compile time.
+32M is for the sj stored in single-precision floating point.      By considering the size of the weight matrices and the cache
+We obtain a significant reduction in memory usage by a            size of the CPU, we can store the matrices in sequential
+factor of ≈ 32/b.                                                 blocks using the Z-curve order (Valsalam & Skjellum, 2002).
+Computation. LLMs typically comprise a series of linear           This approach improves spatial locality, and thus cache
+layers, where the input is a vector. As a result, matrix-vector   usage, minimizes false sharing when using multiple threads,
+multiplications (GEMV) form the core of our computations.         and minimizes TLB misses.
+In Algorithm 1, we present a straightforward implementa-          We utilize a model similar to (Yotov et al., 2005) for op-
+tion of a 4-bit qGEMV (quantized general matrix-vector            timizing cache performance by dividing the computation
+multiply) based on the factorization in (1). The approach         into Mini-GEMVs. Specifically, we partition the input and
+involves computing the dot-products using integer represen-       output vectors and the weight matrix into blocks of sizes
+tations and scaling and transposing the result once after the     mb × 1 and mb × btb /32, respectively. The term btb /32
+final reduction. To extract eight rows from the quantized         accounts for packing multiple values into a single 32-bit
+weight matrix, considering 4-bit quantization, we utilize the     integer. For temporal locality, we set the block dimensions
+auxiliary function unpack as presented in Algorithm 2.            such that
+                                                                                  32mb + bmb tb + 32tb ≤ γ,                (3)
+Algorithm 1 4-bit qGEMV routine.
+                n
+                                                                  where γ represents the size in bits of the L1 data cache.
+ 1: In: W ∈ N b ×m , s ∈ Rm , z ∈ Rm , x ∈ Rn , x̂ ∈ R
+ 2: Out: y = xW                                                   Micro-GEMV. In the next step aim for an efficient in-
+ 3: for j = 0 : m do                                              nermost loop of the computation. In particular, we use
+ 4: acc ← broadcast(0)                                            different instructions based on the specification of the tar-
+ 5: for i = 0 : 8 : n do                                          geted CPU. The specification may include the available in-
+ 6:      w ← load(&W [i/8][j])
+ 7:      l0:8 ← unpack(w)                                         structions (such as AVX2, AVX512, or AMX), the number
+ 8:      for ii = 0 : 8 do                                        of floating-point ports, and the number of available FMA
+ 9:         xii ← broadcast(x[i + ii])                            (fused multiply-add) ports. By tailoring the instructions
+10:         acc ← fmadd(xii , lii , acc)                          to the specific CPU, we can maximize register usage and
+11:      end for                                                  instruction-level parallelism, leading to improved perfor-
+12:    end for
+13:    w[j] ← s[j] ∗ (reduce add(acc) − z[j] ∗ x̂)                mance during computation.
+14: end for                                                       In addition, we divide the Mini-GEMVs further into Micro-
+                                                                  GEMVs operating on an mu -sized part xµ of x, tu -sized
+                                                                  part yµ of y and thus an mu × tu block Wµ of W as shown
+Algorithm 2 AVX2 4-bit Unpack Routine.                            in Fig. 2. xµ and Wµ need to load different values, while
+ 1: In: v                                                         yµ remains in registers. We show a sketch of the modified
+ 2: Out: l0 to l7                                                 innermost loop in Algorithm 3. We set
+ 3: mask ← broadcast(15)
+ 4: for i = 0 : 8 do                                                                mu + mu tu + tu ≤ η,                      (4)
+ 5:   si ← srli(v, i ∗ 4)
+ 6:   ai ← and(si , mask)                                         where η is the number of vector registers, to reduce the
+ 7:   li ← cvt int float(ai )                                     number of register spills. For example, AVX/AVX2 have
+ 8: end for
+                                                                  η = 16.
+                                          Generating Kernels for Quantized LLM Inference
+
+Finally, we include mu and tu in (3) to simplify genera-             method (Frantar et al., 2022), whereas llama.cpp uses
+tion and reduce cleanup code. The final model equation is            pre-generated models using their custom q4 0 quantization
+therefore                                                            format. For performance measurements we use an
+                                                                     AMD EPYC 7742 64-Core processor running 64 threads.
+                         32mb + bmb tb + 32tb ≤ γ,                   We compile our code using gcc 9.4.0 with -O3,
+                                                              (5)
+            tb   mod tu = 0,      mb    mod mu = 0.                  -mavx, -mavx2, -mfma, -march=native,
+                                                                     -ffast-math, -ftree-vectorize flags, and we
+We find mu and tu through empirical search. With these               parallelize using OpenMP 4.5. We compile llama.cpp
+fixed, we maximize the left-hand side of the inequality to           using OpenBLAS.
+maximize cache utilization.
+                                                                     Accuracy. We begin by examining the accuracy (perplex-
+Algorithm 3 AVX2 4-bit µqGEMV Routine.                               ity) of our generated models on the wikitext2 dataset,
+ 1: y1 ← load(&y[j])
+                                                                     which is standard in this setting (Frantar et al., 2022; Yao
+ 2: . . . // Load the values of y in tu registers, and use them as   et al., 2022). Moreover, Dettmers and Zettlemoyer have
+    vector accumulators.                                             shown that perplexity is closely correlated with average per-
+ 3: ytu ← loadu(&y[j + tu ])                                         formance across zero-shot tasks (Dettmers & Zettlemoyer,
+ 4: for i = 0 : mu : m do                                            2022). The results for running GPTQ with standard parame-
+ 5: w1,1 ← load(&W [i/8][j])
+ 6:      . . . // Load the values of W in tu mu registers.
+                                                                     ters across the LLaMA model family are shown in Table 2.
+ 7: wtu ,mu ← load(&W [(i + mu )/8][j + tu ])
+ 8: x1 ← broadcast(&x[i])                                                           llama-7b (5.68)      llama-13b (5.09)     llama-30b (4.10)
+ 9:      . . . // Load the values of x in mu registers.              Group size   4bit   3bit    2bit   4bit   3bit    2bit   4bit   3bit    2bit
+10:      xmu ← broadcast(&x[i + mu ])                                      128    5.81   6.43   23.58   5.19   5.51   15.88   4.21   4.63   11.13
+11:      . . . // Compute                                                   64    5.79   6.23   14.15   5.18   5.49   11.13   4.19   4.55    9.10
+                                                                            32    5.77   6.11   10.24   5.15   5.40    8.37   4.18   4.47    7.22
+12: end for                                                                 16    5.76   5.99    8.30   5.13   5.31    7.11   4.16   4.39    6.19
+13: store(&y[j], y1 )
+14: . . . // Store back tu registers.
+15: store(&y[j + tu ], ytu )                                         Table 2: Perplexity values evaluated on the wikitext2
+                                                                     dataset. The perplexity of the floating point model is given
+                                                                     in brackets next to their name.
+Finally, we present an overview of the code generation meta-
+algorithm below.                                                     We observe that 4bit quantization generally preserves ac-
+                                                                     curacy, across all models within a few relative percentage
+Algorithm 4 QIGen Generation Overview.                               points, and that results improve when decreasing group size.
+ 1: Fetch γ and η                                                    (The only exception is LLaMA-7b group size 32, for which
+ 2: Find mu and tu by optimizing (4) via search.                     we believe some additional hyper-parameter tuning may be
+ 3: Find mb and tb by maximising the left-hand side of (5) using
+    integer-programming.                                             beneficial.) As also noted in the original paper, the relative
+ 4: Generate the Micro-GEMV kernels for the CPU.                     accuracy drop decreases with model size, to the point where
+                                                                     small group sizes are nearly lossless on the larger models.
+                                                                     Throughput performance. Next, we compare the perfor-
+4. Evaluation                                                        mance of our generated kernels to those of llama.cpp. For a
+We assess the effectiveness and precision of our imple-              fair comparison, we consider models quantized to a 4bit for-
+mentation by comparing it with the Python bindings for               mat. For llama.cpp, we specifically executed their q4 0
+llama.cpp (Gerganov, 2023)1 , and by presenting the per-             quantization format, which yields the best performance
+plexity values on the standard wikitext2 dataset (Merity             among all their supported formats. (According to their
+et al., 2016). For this preliminary version, we have executed        documentation, this would correspond to a group size of 32
+our generator on the AVX2 instruction set. However, the              using our implementation.)
+instructions that we use have equivalents on all SIMD vector         We generate different variants for our kernels, varying the
+architectures.                                                       grouping between 32 and 128 elements, as well as using full
+Goals and setup. We compare our approach to llama.cpp,               columns, trading off accuracy for space. For full columns,
+both in terms of inference throughput (tokens generated              we can use Equation (1) to reduce the number of floating
+/ second) as well as in terms of accuracy of the resulting           point operations and loads in the innermost loop. On the
+models, measured in terms of perplexity (PPL). We                    other hand, for grouped models, we need to use Equation (2).
+use models generated using the GPTQ quantization                     Note that, while Equation (1) requires storing the values of
+                                                                     y only once, Equation (2) requires n/g additional stores,
+   1
+       https://github.com/abetlen/llama-cpp-python                   where n is the number of rows and g is the group size.
+                                                            Generating Kernels for Quantized LLM Inference
+
+
+           Performance vs Perplexity of 3bit Models                                             Performance vs Perplexity of 4bit Models
+           [token/s]                                                                            [token/s]
+    10             16g                                                                     10         16g
+                   32g                   Llama-13b                                                    32g              Llama-13b
+                   64g                                                                                64g
+       8           128g                                                                     8         128g
+
+       6                                                                                    6
+                  Llama-30b                                                                        Llama-30b
+       4                                                                                    4
+
+       2                                                                Llama-7b            2                                                Llama-7b
+
+       0                                                                                    0
+        4.0               4.5           5.0              5.5          6.0            6.5     4.0             4.5        5.0           5.5      6.0      6.5
+                                              Perplexity                                                                      Perplexity
+                                                 (a)                                                                           (b)
+
+Figure 3: Changes in performance and perplexity between different group sizes used. In 3(a) and in 3(b) we give the
+measurements for our 3bit and 4bit implementations respectively. Overall we do not notice major performance difference
+between 3bit and 4bit kernels.
+
+
+       Performance of 4bit Models                                                                                  Version      Group Size     Memory (MiB)
+       [token/s]
+                              10.20
+                                                                                                LlaMA 7b             FP32                -            26555
+  10                                                                   llama.cpp q4_0                                3 Bit            128              8072
+                           9.26                                        16g                                           4 Bit            128              8814
+                       8.70                                            32g
+   8               7.69                                                64g                   LlaMA 13b               FP32                -            50712
+                                                          7.04         128g
+                                                      6.41                                                           3 Bit            128             14333
+   6          6.02                                5.85                 Full                                          4 Bit            128             16483
+           4.76                               4.78
+                                                                                             LlaMA 30b               FP32                -           125614
+   4                                      3.60                                    3.79                               3 Bit            128             31173
+                                                                              2.94
+                                      2.63
+                                                                          2.16
+                                                                                                                     4 Bit            128             37176
+   2                                                             1.45 1.29
+                                                                     1.10
+                                                                                           Table 3: Comparison of memory usage in MiB used to
+   0
+                  Llama-7b                 Llama-13b                  Llama-30b            generate a 128 token sentence.
+                                          Model Size
+
+Figure 4: Performance comparison in token/seconds of                                       performance between the two implementations is similar.
+our different implementations, grouped and non grouped,
+vs. llama.cpp q4 0 quantization method. We notice perfor-                                  Memory consumption. Finally, we report in Table 3 the
+mance benefits arising from bigger groups.                                                 total memory in MiB used to generate a 128 token long
+                                                                                           sentence using floating point weights and our 3bit and 4bit
+                                                                                           quantized kernels with a group size of 128. The results
+                                                                                           were obtained for LlaMA models with 7, 13, and 30 billion
+The results are shown in Fig. 4. We observe that our kernels
+                                                                                           parameters. The 3bit kernels showed a reduction of up to
+outperform llama.cpp in terms of throughput, by up to 2.6×
+                                                                                           4x, while the 4bit kernels showed a reduction of up to 3.3x
+when using full columns on the 13 billion parameter model,
+                                                                                           times compared to the floating point implementations.
+and by approximately 2× when using group implementa-
+tions. However, we observed a lower performance than
+llama.cpp for the 30b case for group sizes 16 and 32. We                                   5. Discussion
+believe that this is due to the assumptions we introduce to
+                                                                                           We provided evidence that an automatic code generation
+solve (5), and should be improvable by further examination.
+                                                                                           approach can yield strong results for quantized inference
+We investigate the full accuracy/performance trade-off in                                  over large language models. Our results show that one can
+Fig. 3, where we show the relationship between the perfor-                                 obtain state-of-the-art CPU inference performance using
+mance in tokens/seconds and the perplexity of our 3bit and                                 our methods, with minimal accuracy loss when compared
+4bit models in Fig. 3(a) and Fig. 3(b) respectively. We found                              to the uncompressed baseline. Our results can be extended
+that for smaller group sizes, performance decreased while                                  along several directions: improving practical performance
+accuracy increased. It is important to note that overall, the                              of existing kernels through fine-tuning, as well as targeting
+                                      Generating Kernels for Quantized LLM Inference
+
+different CPU architectures and accelerator hardware.              Concurrency and Computation: Practice and Experience,
+                                                                   14:805–839, 08 2002. doi: 10.1002/cpe.630.
+References                                                       Xiao, G., Lin, J., Seznec, M., Demouth, J., and Han,
+Black, S., Biderman, S., Hallahan, E., Anthony, Q., Gao,           S. Smoothquant: Accurate and efficient post-training
+  L., Golding, L., He, H., Leahy, C., McDonell, K., Phang,         quantization for large language models. arXiv preprint
+  J., et al. Gpt-neox-20b: An open-source autoregressive           arXiv:2211.10438, 2022.
+  language model. arXiv preprint arXiv:2204.06745, 2022.
+                                                                 Yao, Z., Aminabadi, R. Y., Zhang, M., Wu, X., Li, C., and
+Dettmers, T. and Zettlemoyer, L. The case for 4-bit pre-           He, Y. Zeroquant: Efficient and affordable post-training
+  cision: k-bit inference scaling laws. arXiv preprint             quantization for large-scale transformers. arXiv preprint
+  arXiv:2212.09720, 2022.                                          arXiv:2206.01861, 2022.
+
+Dettmers, T., Lewis, M., Belkada, Y., and Zettlemoyer, L.        Yotov, K., Li, X., Ren, G., Garzaran, M., Padua, D., Pin-
+  LLM.int8(): 8-bit matrix multiplication for transformers         gali, K., and Stodghill, P. A comparison of empirical and
+  at scale. Advances in Neural Information Processing              model-driven optimization. Proceedings of the IEEE, 93
+  Systems 35: Annual Conference on Neural Information              (2), 2005. special issue on ”Program Generation, Opti-
+  Processing Systems 2022, NeurIPS 2022, 2022.                     mization, and Adaptation”.
+
+Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D. Gptq:   Zhang, S., Roller, S., Goyal, N., Artetxe, M., Chen, M.,
+  Accurate post-training quantization for generative pre-          Chen, S., Dewan, C., Diab, M., Li, X., Lin, X. V., et al.
+  trained transformers. arXiv preprint arXiv:2210.17323,           OPT: Open pre-trained transformer language models.
+  2022.                                                            arXiv preprint arXiv:2205.01068, 2022.
+
+Gerganov, G. llama.cpp: Low-Latency Audio Stream-
+  ing Library for C++.   https://github.com/
+  ggerganov/llama.cpp, 2023. Accessed: May 30,
+  2023.
+Merity, S., Xiong, C., Bradbury, J., and Socher, R.
+ Pointer sentinel mixture models.     arXiv preprint
+ arXiv:1609.07843, 2016.
+Nagel, M., Baalen, M. v., Blankevoort, T., and Welling,
+  M. Data-free quantization through weight equalization
+  and bias correction. In Proceedings of the IEEE/CVF
+  International Conference on Computer Vision, pp. 1325–
+ 1334, 2019.
+Park, G., Park, B., Kwon, S. J., Kim, B., Lee, Y., and Lee,
+  D. nuQmm: Quantized matmul for efficient inference of
+  large-scale generative language models. arXiv preprint
+  arXiv:2206.09557, 2022.
+Paszke, A., Gross, S., Massa, F., Lerer, A., Bradbury, J.,
+  Chanan, G., Killeen, T., Lin, Z., Gimelshein, N., Antiga,
+  L., et al. Pytorch: An imperative style, high-performance
+  deep learning library. In Conference on Neural Informa-
+  tion Processing Systems (NeurIPS), 2019.
+Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,
+  M.-A., Lacroix, T., Rozière, B., Goyal, N., Hambro, E.,
+  Azhar, F., et al. Llama: Open and efficient foundation lan-
+  guage models. arXiv preprint arXiv:2302.13971, 2023.
+Valsalam, V. and Skjellum, A. A framework for high-
+  performance matrix multiplication based on hierarchical
+  abstractions, algorithms and optimized low-level kernels.
+

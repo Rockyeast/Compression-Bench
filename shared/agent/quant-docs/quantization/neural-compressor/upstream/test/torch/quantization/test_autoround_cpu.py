@@ -1,0 +1,791 @@
+import copy
+import os
+import shutil
+from functools import lru_cache
+
+import pytest
+import torch
+import transformers
+from packaging.version import Version
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from neural_compressor.torch.quantization import (
+    AutoRoundConfig,
+    convert,
+    get_default_AutoRound_config,
+    prepare,
+    quantize,
+)
+from neural_compressor.torch.quantization.quantize import (
+    _AutoRoundModelReference,
+    _is_autoround_string_model_reference,
+)
+from neural_compressor.torch.utils import logger
+
+torch.backends.__allow_nonbracketed_mutation_flag = True
+
+try:
+    import auto_round
+
+    auto_round_installed = True
+except ImportError:
+    auto_round_installed = False
+
+if auto_round_installed:
+    from neural_compressor.torch.algorithms.autoround.autoround import (
+        AutoRoundQuantizer,
+        _build_autoround_init_kwargs,
+    )
+
+try:
+    import compressed_tensors
+
+    ct_installed = True
+except ImportError:
+    ct_installed = False
+
+
+tagert_modules = ["QuantLinear", "QuantLinearGPTQ", "QuantLinearAWQ", "WQLinear_GEMM", 'AwqTorchQuantLinear']
+
+
+@torch.no_grad()
+def run_fn(model, dataloader):
+    for data in dataloader:
+        if isinstance(data, tuple) or isinstance(data, list):
+            model(*data)
+        elif isinstance(data, dict):
+            model(**data)
+        else:
+            model(data)
+
+
+@pytest.mark.skipif(not auto_round_installed, reason="auto_round module is not installed")
+def test_build_autoround_init_kwargs_uses_new_algorithm_config():
+    """Map INC configuration to AutoRound's algorithm-config API when available."""
+    try:
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+    except ImportError:
+        pytest.skip("Installed AutoRound uses the legacy flat parameter API")
+
+    config = AutoRoundConfig(
+        dtype="int4",
+        use_sym=False,
+        act_dtype="int8",
+        iters=1,
+        sampler="rand",
+        truncation=True,
+    )
+    init_kwargs = _build_autoround_init_kwargs(config, keys_to_pop=[])
+
+    assert isinstance(init_kwargs["alg_configs"], SignRoundConfig)
+    assert init_kwargs["alg_configs"].data_type == "int4"
+    assert init_kwargs["alg_configs"].sym is False
+    assert init_kwargs["alg_configs"].act_data_type == "int8"
+    assert init_kwargs["alg_configs"].iters == 1
+    assert "iters" not in init_kwargs
+    assert "non_tunable_params" not in init_kwargs
+    assert "sampler" not in init_kwargs
+    assert "truncation" not in init_kwargs
+
+
+@pytest.mark.skipif(not auto_round_installed, reason="auto_round module is not installed")
+def test_build_autoround_init_kwargs_handles_entry_renamed_params():
+    """Move parameters renamed by the INC algorithm entry into alg_configs."""
+    try:
+        from auto_round.algorithms.quantization.sign_round.config import SignRoundConfig
+    except ImportError:
+        pytest.skip("Installed AutoRound uses the legacy flat parameter API")
+
+    quantizer = AutoRoundQuantizer(
+        bits=4,
+        data_type="int",
+        sym=False,
+        act_data_type="int",
+        act_bits=8,
+        iters=0,
+    )
+    init_kwargs = _build_autoround_init_kwargs(quantizer, keys_to_pop=[])
+
+    assert isinstance(init_kwargs["alg_configs"], SignRoundConfig)
+    assert init_kwargs["alg_configs"].bits == 4
+    assert init_kwargs["alg_configs"].data_type == "int"
+    assert init_kwargs["alg_configs"].sym is False
+    assert init_kwargs["alg_configs"].act_data_type == "int"
+    assert "bits" not in init_kwargs
+    assert "data_type" not in init_kwargs
+    assert "sym" not in init_kwargs
+    assert "act_data_type" not in init_kwargs
+
+
+@pytest.mark.skipif(not auto_round_installed, reason="auto_round module is not installed")
+class TestAutoRoundCPU:
+    @classmethod
+    def setup_class(self):
+        self.opt_model = transformers.AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+        ).to("cpu")
+        self.inp = torch.ones([1, 10], dtype=torch.long, device="cpu")
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained("facebook/opt-125m", trust_remote_code=True)
+        from neural_compressor.torch.algorithms.autoround import get_dataloader
+
+        self.dataloader = get_dataloader(
+            self.tokenizer, 32, dataset_name="NeelNanda/pile-10k", seed=42, bs=8, nsamples=10
+        )
+
+    @classmethod
+    def teardown_class(self):
+        shutil.rmtree("saved_results", ignore_errors=True)
+        shutil.rmtree("tmp_auto_round", ignore_errors=True)
+
+    def setup_method(self, method):
+        logger.info(f"Running TestAutoRound test: {method.__name__}")
+
+    def test_quant_lm_head(self):
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            # "trl-internal-testing/tiny-Phi3ForCausalLM",
+            "optimum-intel-internal-testing/tiny-random-Phi3ForCausalLM"
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            "optimum-intel-internal-testing/tiny-random-Phi3ForCausalLM", trust_remote_code=True
+        )
+
+        quant_config = AutoRoundConfig(
+            tokenizer=tokenizer,
+            nsamples=32,
+            seqlen=10,
+            iters=1,
+            amp=False,
+            scale_dtype="fp32",
+            quant_lm_head=True,
+            group_size=32,
+        )
+        logger.info(f"Test AutoRound with config {quant_config}")
+        text = "Replace me by any text you'd like."
+        encoded_input = tokenizer(text, return_tensors="pt")
+        model = prepare(model=model, quant_config=quant_config)
+        q_model = convert(model)
+        output = tokenizer.decode(q_model.generate(**encoded_input, max_new_tokens=10)[0])
+        print(output)
+        assert output is not None
+        assert q_model.lm_head.__class__.__name__ in tagert_modules, "packing model failed."
+
+    def test_int4_dtype(self):
+        fp32_model = copy.deepcopy(self.opt_model)
+        quant_config = AutoRoundConfig(dtype="int4", nsamples=32, seqlen=10, iters=1, amp=False, scale_dtype="fp32")
+        logger.info(f"Test AutoRound with config {quant_config}")
+
+        # prepare + convert API
+        model = prepare(model=fp32_model, quant_config=quant_config)
+
+        run_fn(model, self.dataloader)
+        q_model = convert(model)
+        _ = q_model(self.inp)  # inference
+        assert (
+            q_model.model.decoder.layers[0].self_attn.k_proj.__class__.__name__ in tagert_modules
+        ), "packing model failed."
+
+    def test_autoround_with_quantize_API(self):
+        fp32_model = copy.deepcopy(self.opt_model)
+
+        quant_config = AutoRoundConfig(scheme="W4A16", seqlen=10, iters=1, use_sym=False, amp=False, scale_dtype="fp32")
+        logger.info(f"Test AutoRound with config {quant_config}")
+
+        # quantize API
+        q_model = quantize(
+            model=fp32_model,
+            quant_config=quant_config,
+            run_fn=run_fn,
+            run_args=(self.dataloader,),
+        )
+        _ = q_model(self.inp)  # inference
+        assert (
+            q_model.model.decoder.layers[0].self_attn.k_proj.__class__.__name__ in tagert_modules
+        ), "packing model failed."
+
+    def test_conv1d(self):
+        model = AutoModelForCausalLM.from_pretrained("MBZUAI/LaMini-GPT-124M", device_map="cpu", trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained("MBZUAI/LaMini-GPT-124M", trust_remote_code=True)
+        text = "Replace me by any text you'd like."
+        encoded_input = tokenizer(text, return_tensors="pt")
+        quant_config = AutoRoundConfig(
+            nsamples=32,
+            seqlen=10,
+            iters=0,
+            amp=False,
+            tokenizer=tokenizer,
+            export_format="auto_round",
+            device_map="cpu",
+        )
+        model = prepare(model=model, quant_config=quant_config)
+        q_model = convert(model)
+        output = tokenizer.decode(q_model.generate(**encoded_input, max_new_tokens=10)[0])
+        print(output)
+        assert output is not None
+        assert not isinstance(
+            q_model.transformer.h[0].attn.c_attn, transformers.pytorch_utils.Conv1D
+        ), "loading compressed model failed."
+
+    def test_utils(self):
+        from neural_compressor.torch.utils.utility import (
+            detect_device,
+            get_layer_names_in_block,
+            get_multimodal_block_names,
+        )
+
+        fp32_model = copy.deepcopy(self.opt_model)
+        to_quant_block_names = get_multimodal_block_names(fp32_model, quant_vision=True)
+        quant_config = AutoRoundConfig(
+            nsamples=32,
+            seqlen=10,
+            iters=10,
+            amp=False,
+            scale_dtype="fp16",
+            to_quant_block_names=to_quant_block_names,
+            device_map="cpu",
+        )
+        logger.info(f"Test AutoRound with config {quant_config}")
+        device = "cpu"
+        layers_list = get_layer_names_in_block(fp32_model, to_quant_block_names=to_quant_block_names)
+        layers_list = get_layer_names_in_block(fp32_model)
+        fp32_model.to(device)
+        # quantizer execute
+        model = prepare(model=fp32_model, quant_config=quant_config)
+        run_fn(model, self.dataloader)
+        q_model = convert(model)
+        _ = q_model(self.inp)  # inference
+        assert (
+            q_model.model.decoder.layers[0].self_attn.k_proj.__class__.__name__ in tagert_modules
+        ), "packing model failed."
+
+    @pytest.mark.skipif(Version(auto_round.__version__) <= Version("0.5.1"), reason="visual layer_name not processed.")
+    def test_mllm(self):
+        input = torch.randn(1, 32)
+        from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
+
+        from neural_compressor.torch.algorithms.autoround import get_mllm_dataloader
+
+        model_name = "Qwen/Qwen2-VL-2B-Instruct"
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        model = Qwen2VLForConditionalGeneration.from_pretrained(model_name, trust_remote_code=True, device_map="cpu")
+        dataloader, template, truncation, batch_size, seqlen, nsamples = get_mllm_dataloader(
+            template=None,
+            model=model,
+            tokenizer=tokenizer,
+            processor=processor,
+            image_processor=None,
+            dataset="NeelNanda/pile-10k",
+            extra_data_dir=None,
+            seqlen=32,
+            batch_size=1,
+            split=None,
+            apply_template=None,
+            truncation=False,
+            seed=42,
+            nsamples=1,
+            quant_nontext_module=True,
+        )
+        quant_config = AutoRoundConfig(
+            bits=4,
+            group_size=128,
+            nsamples=1,
+            batch_size=4,
+            iters=1,
+            seqlen=seqlen,
+            quant_nontext_module=True,
+            truncation=truncation,
+            gradient_accumulate_steps=1,
+            device_map="cpu",
+            tokenizer=tokenizer,
+            processor=processor,
+        )
+
+        model = prepare(model=model, quant_config=quant_config)
+        run_fn(model, dataloader)
+        q_model = convert(model)
+        assert (
+            q_model.model.language_model.layers[0].mlp.up_proj.__class__.__name__ in tagert_modules
+        ), "model quantization failed."
+
+    def test_set_local(self, tmp_path):
+        fp32_model = AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            device_map="cpu",
+        )
+        inp = torch.ones([1, 10], dtype=torch.long, device="cpu")
+        output_dir = tmp_path
+        tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m", trust_remote_code=True)
+        quant_config = AutoRoundConfig(
+            tokenizer=tokenizer,
+            output_dir=output_dir,
+            dtype="int4",
+            nsamples=32,
+            seqlen=10,
+            iters=0,
+            amp=False,
+            scale_dtype="fp32",
+            export_format="auto_round",
+            device_map="cpu",
+        )
+        logger.info(f"Test AutoRound with config {quant_config}")
+        quant_config.set_local("self_attn", AutoRoundConfig(bits=16, data_type="float", act_bits=16))
+        # quant_config.layer_config = {"self_attn": {"bits": 16, "data_type": "float", "act_bits": 16}}
+
+        # prepare + convert API
+        model = prepare(model=fp32_model, quant_config=quant_config)
+        q_model = convert(model)
+
+        # Autoround applied subfolder for formats during saving, such as, './saved_inc/opt-125m-w4g128'.
+        output_dir = q_model.name_or_path
+        model = AutoModelForCausalLM.from_pretrained(
+            output_dir,
+            torch_dtype="auto",
+            device_map="cpu",
+        )
+        out = model(self.inp)[0]
+        assert isinstance(q_model.model.decoder.layers[0].self_attn.v_proj, torch.nn.Linear), "set_local failed."
+
+        # AutoRound API
+        fp32_model = transformers.AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            device_map="cpu",
+        )
+        inp = torch.ones([1, 10], dtype=torch.long, device="cpu")
+        tokenizer = transformers.AutoTokenizer.from_pretrained("facebook/opt-125m", trust_remote_code=True)
+        from auto_round import AutoRound
+
+        # layer_config = {"self.attn": {"data_type": "fp16"}}
+        layer_config = {"self_attn": {"bits": 16, "data_type": "float", "act_bits": 16}}
+        ar = AutoRound(
+            tokenizer=tokenizer,
+            model=fp32_model,
+            layer_config=layer_config,
+            data_type="int4",
+            nsamples=32,
+            seqlen=10,
+            iters=0,
+            amp=False,
+            scale_dtype="fp32",
+            export_format="auto_round",
+            device_map="cpu",
+        )
+        quantized_model_path = tmp_path / "saved_ar"
+
+        # Autoround applied subfolder for formats during saving, such as, './saved_inc/opt-125m-w4g128'.
+        _, quantized_model_path = ar.quantize_and_save(
+            output_dir=quantized_model_path, inplace=True, format="auto_round"
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            quantized_model_path,
+            torch_dtype="auto",
+            device_map="cpu",
+        )
+        out_ar = model(inp)[0]
+        assert torch.all(out_ar.eq(out))
+        shutil.rmtree(quantized_model_path, ignore_errors=True)
+
+    @pytest.mark.skipif(not ct_installed, reason="The compressed-tensors module is not installed.")
+    @pytest.mark.parametrize(
+        "scheme", ["W4A16", "W2A16", "W3A16", "W8A16", "MXFP4", "MXFP8", "NVFP4", "FPW8A16", "FP8_STATIC"]
+    )
+    def test_scheme(self, scheme, tmp_path):
+        # INC API
+        fp32_model = AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            device_map="cpu",
+        )
+        inp = torch.ones([1, 10], dtype=torch.long, device="cpu")
+        tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m", trust_remote_code=True)
+
+        output_dir = tmp_path
+        quant_config = AutoRoundConfig(
+            tokenizer=tokenizer,
+            nsamples=32,
+            seqlen=10,
+            iters=1,
+            amp=False,
+            scale_dtype="fp16",
+            scheme=scheme,
+            export_format="auto_round",
+            output_dir=output_dir,  # default is "tmp_auto_round"
+            device_map="cpu",
+        )
+
+        # quantizer execute
+        model = prepare(model=fp32_model, quant_config=quant_config)
+        inc_model = convert(model)
+        # Autoround applied subfolder for formats during saving, such as, './saved_inc/opt-125m-w4g128'.
+        output_dir = inc_model.name_or_path
+        if scheme in ["FPW8A16"]:  # FP8_STATIC loading not supported yet
+            return
+        inc_model = AutoModelForCausalLM.from_pretrained(
+            output_dir,
+            torch_dtype="auto",
+            device_map="cpu",
+        )
+        out = inc_model(inp)[0]
+
+        # AutoRound API
+        fp32_model = transformers.AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            device_map="cpu",
+        )
+        inp = torch.ones([1, 10], dtype=torch.long, device="cpu")
+        tokenizer = transformers.AutoTokenizer.from_pretrained("facebook/opt-125m", trust_remote_code=True)
+        from auto_round import AutoRound
+
+        ar = AutoRound(
+            model=fp32_model,
+            tokenizer=tokenizer,
+            nsamples=32,
+            seqlen=10,
+            iters=1,
+            amp=False,
+            scale_dtype="fp16",
+            scheme=scheme,
+            device_map="cpu",
+        )
+        quantized_model_path = tmp_path / "saved_ar"
+
+        # Autoround applied subfolder for formats during saving, such as, './saved_inc/opt-125m-w4g128'.
+        _, quantized_model_path = ar.quantize_and_save(
+            output_dir=quantized_model_path, inplace=True, format="auto_round"
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            quantized_model_path,
+            torch_dtype="auto",
+            device_map="cpu",
+        )
+        tokenizer = AutoTokenizer.from_pretrained(quantized_model_path)
+        out_ar = model(inp)[0]
+        assert torch.all(out_ar.eq(out))
+        shutil.rmtree(quantized_model_path, ignore_errors=True)
+
+    @pytest.mark.skipif(not ct_installed, reason="The compressed-tensors module is not installed.")
+    @pytest.mark.skipif(Version(auto_round.__version__) < Version("0.9.0"), reason="target bits is not supported.")
+    def test_target_bits(self, tmp_path):
+        fp32_model = AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            device_map="cpu",
+        )
+        tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m", trust_remote_code=True)
+
+        output_dir = tmp_path
+        quant_config = AutoRoundConfig(
+            tokenizer=tokenizer,
+            nsamples=32,
+            seqlen=10,
+            iters=1,
+            target_bits=5,
+            options=("MXFP4", "MXFP8"),
+            enable_torch_compile=True,
+            low_gpu_mem_usage=True,
+            export_format="auto_round",
+            device_map="cpu",
+        )
+        # quantizer execute
+        model = prepare(model=fp32_model, quant_config=quant_config)
+        model = convert(model)
+        # mxfp4/8 model inference relies on autoround extension for vLLM.
+        target_modules = ["MXFP4QuantLinear", "MXFP8QuantLinear"]
+        assert (
+            model.model.decoder.layers[0].self_attn.k_proj.__class__.__name__ in target_modules
+            and model.model.decoder.layers[1].fc1.__class__.__name__ in target_modules
+        ), "model is not quantized correctly, please check."
+
+    @pytest.mark.skipif(not ct_installed, reason="The compressed-tensors module is not installed.")
+    @pytest.mark.skipif(Version(auto_round.__version__) < Version("0.9.0"), reason="target bits is not supported.")
+    def test_target_bits_autotune(self):
+        from neural_compressor.torch.quantization import TuningConfig, autotune
+
+        baseline = 1
+        eval_result = [0.9, 0.8, 0.99]
+        acc_list = [baseline] + eval_result
+
+        def eval_acc_fn(model) -> float:
+            acc = acc_list.pop(0)
+            return acc
+
+        fp32_model = AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            device_map="cpu",
+        )
+        tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m", trust_remote_code=True)
+        # AutoRound API
+        custom_tune_config = TuningConfig(
+            config_set=[
+                AutoRoundConfig(
+                    tokenizer=tokenizer,
+                    target_bits=[5, 6, 7],
+                    options=("MXFP4", "MXFP8"),
+                    enable_torch_compile=True,
+                    low_gpu_mem_usage=True,
+                    export_format="auto_round",
+                    iters=0,
+                    device_map="cpu",
+                )
+            ]
+        )
+        best_model = autotune(model=fp32_model, tune_config=custom_tune_config, eval_fn=eval_acc_fn)
+        # mxfp4/8 model inference relies on autoround extension for vLLM.
+        target_modules = ["MXFP4QuantLinear", "MXFP8QuantLinear"]
+        assert (
+            best_model.model.decoder.layers[0].self_attn.k_proj.__class__.__name__ in target_modules
+            and best_model.model.decoder.layers[1].fc1.__class__.__name__ in target_modules
+        ), "model is not quantized correctly, please check."
+
+    def test_static_attention_dtype(self, tmp_path):
+        fp32_model = AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            device_map="cpu",
+        )
+        tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m", trust_remote_code=True)
+
+        output_dir = tmp_path
+        quant_config = AutoRoundConfig(
+            tokenizer=tokenizer,
+            iters=0,
+            nsamples=2,
+            seqlen=2,
+            scheme="FP8_STATIC",
+            static_attention_dtype="fp8",
+            output_dir=output_dir,
+            export_format="auto_round",
+            device_map="cpu",
+        )
+        # quantizer execute
+        model = prepare(model=fp32_model, quant_config=quant_config)
+        model = convert(model)
+        output_dir = model.name_or_path
+
+        from safetensors import safe_open
+
+        f = safe_open(os.path.join(output_dir, "model.safetensors"), framework="pt")
+        assert "model.decoder.layers.8.self_attn.k_proj.input_scale" in f.keys()
+        assert "model.decoder.layers.8.self_attn.k_proj.weight_scale" in f.keys()
+        assert f.get_tensor("model.decoder.layers.5.self_attn.v_proj.input_scale").shape == torch.Size([1])
+        assert f.get_tensor("model.decoder.layers.5.self_attn.v_proj.weight").dtype == torch.float8_e4m3fn
+        check_attrs = ["k_scale", "v_scale", "q_scale"]
+
+        for attr in check_attrs:
+            weight_name = f"model.decoder.layers.8.self_attn.{attr}"
+            assert weight_name in f.keys()
+            assert f.get_tensor(weight_name).shape == torch.Size([1])
+            assert f.get_tensor(weight_name).dtype == torch.float32
+
+    @pytest.mark.parametrize("static_kv_dtype", [None, "fp8", "float16"])
+    def test_static_afp8_export(self, static_kv_dtype, tmp_path):
+        fp32_model = AutoModelForCausalLM.from_pretrained(
+            "facebook/opt-125m",
+            device_map="cpu",
+        )
+        tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m", trust_remote_code=True)
+
+        output_dir = tmp_path
+        quant_config = AutoRoundConfig(
+            tokenizer=tokenizer,
+            bits=8,
+            group_size=-1,
+            iters=0,
+            act_bits=8,
+            nsamples=2,
+            seqlen=2,
+            data_type="fp8",
+            act_data_type="fp8",
+            act_dynamic=False,
+            act_group_size=0,
+            static_kv_dtype=static_kv_dtype,
+            export_format="auto_round",
+            output_dir=output_dir,
+            device_map="cpu",
+        )
+
+        # quantizer execute
+        model = prepare(model=fp32_model, quant_config=quant_config)
+        model = convert(model)
+        output_dir = model.name_or_path
+
+        from safetensors import safe_open
+
+        f = safe_open(os.path.join(output_dir, "model.safetensors"), framework="pt")
+        assert "model.decoder.layers.8.self_attn.k_proj.input_scale" in f.keys()
+        assert "model.decoder.layers.8.self_attn.k_proj.weight_scale" in f.keys()
+        assert f.get_tensor("model.decoder.layers.5.self_attn.v_proj.input_scale").shape == torch.Size([1])
+        assert f.get_tensor("model.decoder.layers.5.self_attn.v_proj.weight").dtype == torch.float8_e4m3fn
+        if static_kv_dtype is None:
+            with torch.no_grad():
+                import transformers
+
+                model = transformers.AutoModelForCausalLM.from_pretrained(
+                    output_dir,
+                    torch_dtype="auto",
+                    device_map="cpu",
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True,
+                )
+                model.eval()
+                assert (
+                    model.model.decoder.layers[0].self_attn.k_proj.__class__.__name__
+                    == "WeightFP8ActFP8StaticQuantLinear"
+                ), f"Expected WeightFP8ActFP8StaticQuantLinear, got {model.model.decoder.layers[0].self_attn.k_proj.__class__.__name__}"
+                tokenizer = transformers.AutoTokenizer.from_pretrained(output_dir)
+                prompt = "AI is "
+                encode = tokenizer.encode(prompt, return_tensors="pt")
+                with torch.no_grad():
+                    output_tokens = model.generate(
+                        encode,
+                        max_length=10,
+                    )
+                    output = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+                    print(f"Prompt: {prompt}")
+                    print(f"Output: {output}")
+                    assert output is not None, "Output should not be None"
+
+    @pytest.mark.parametrize(
+        "scheme,  static_kv_dtype, static_attention_dtype",
+        [
+            ("MXFP4", None, "fp8"),
+            ("MXFP4", "fp8", None),
+            ("MXFP8", None, "fp8"),
+            ("MXFP8", "fp8", None),
+            ("NVFP4", None, "fp8"),
+            ("NVFP4", "fp8", None),
+        ],
+    )
+    def test_fp8_kv_attn(self, scheme, static_kv_dtype, static_attention_dtype, tmp_path):
+
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+        from transformers.models.opt.modeling_opt import OPTForCausalLM
+
+        model_name = "facebook/opt-125m"
+        config = AutoConfig.from_pretrained(model_name)
+        config.num_hidden_layers = 1
+        model = OPTForCausalLM(config)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        output_dir = tmp_path
+        quant_config = AutoRoundConfig(
+            tokenizer=tokenizer,
+            scheme=scheme,
+            iters=0,
+            seqlen=2,
+            static_kv_dtype=static_kv_dtype,
+            static_attention_dtype=static_attention_dtype,
+            export_format="auto_round",
+            output_dir=output_dir,
+            reloading=False,
+            device_map="cpu",
+        )
+
+        # quantizer execute
+        model = prepare(model=model, quant_config=quant_config)
+        compressed_model = convert(model)
+
+        attn = compressed_model.model.decoder.layers[0].self_attn
+        q_proj = attn.q_proj
+
+        # weight_scale should exist for all quantized schemes
+        assert hasattr(q_proj, "weight_scale"), f"Missing weight_scale in q_proj for scheme={scheme}"
+        if static_kv_dtype == "fp8":
+            assert (
+                compressed_model.config.quantization_config["static_kv_dtype"] == "fp8"
+            ), f"Invalid static_kv_dtype in config for scheme={scheme}, static_kv_dtype={static_kv_dtype}"
+
+        # Only when static_kv_dtype / static_attention_dtype are fp8 do we expect FP8 KV scales
+        if static_kv_dtype == "fp8" or static_attention_dtype == "fp8":
+            assert attn.k_scale is not None and attn.v_scale is not None, (
+                f"Missing k_scale/v_scale in attention for scheme={scheme}, "
+                f"static_kv_dtype={static_kv_dtype}, static_attention_dtype={static_attention_dtype}"
+            )
+
+        if static_attention_dtype == "fp8":
+            assert (
+                compressed_model.config.quantization_config["static_attention_dtype"] == "fp8"
+            ), f"Invalid static_attention_dtype in config for scheme={scheme}, static_attention_dtype={static_attention_dtype}"
+            assert (
+                getattr(attn, "q_scale", None) is not None
+            ), f"Missing q_scale in attention for scheme={scheme}, static_attention_dtype={static_attention_dtype}"
+
+    def test_is_autoround_string_model_reference(self):
+        """Test detection when AutoRound receives a string model reference."""
+        config = AutoRoundConfig(model_free=True, scheme="MXFP4")
+        model = "/path/to/model"
+        assert _is_autoround_string_model_reference(model, config) is True
+
+    def test_is_autoround_string_model_reference_false_not_string(self):
+        """Test detection returns False when model is not a string."""
+        config = AutoRoundConfig(model_free=True, scheme="MXFP4")
+        model = torch.nn.Linear(10, 10)
+        assert _is_autoround_string_model_reference(model, config) is False
+
+    def test_is_autoround_string_model_reference_with_model_free_false(self):
+        """Test string references are preserved when static quantization disables model-free mode."""
+        config = AutoRoundConfig(model_free=False, scheme="MXFP4", static_kv_dtype="fp8")
+        model = "/path/to/model"
+        assert _is_autoround_string_model_reference(model, config) is True
+
+    def test_autoround_model_reference_creation(self):
+        """Test _AutoRoundModelReference wrapper creation."""
+        model_ref = "/path/to/deepseek-v4"
+        config = AutoRoundConfig(model_free=True, scheme="MXFP4")
+        example_inputs = {"input_ids": torch.ones(1, 10, dtype=torch.long)}
+
+        ref = _AutoRoundModelReference(model_reference=model_ref, quant_config=config, example_inputs=example_inputs)
+
+        assert ref.model_reference == model_ref
+        assert ref.quant_config is config
+        assert ref.example_inputs == example_inputs
+        assert ref.is_prepared is True
+
+    def test_prepare_with_string_model_and_model_free_returns_reference(self):
+        """Test that prepare() returns _AutoRoundModelReference when called with string model and model_free=True."""
+        model = "/path/to/model"
+        config = AutoRoundConfig(
+            model_free=True,
+            scheme="MXFP4",
+            ignore_layers="compressor",
+            output_dir="/tmp/test_output",
+        )
+
+        result = prepare(model, config)
+
+        assert isinstance(result, _AutoRoundModelReference)
+        assert result.model_reference == model
+        assert result.quant_config is config
+
+    def test_prepare_with_string_model_and_static_kv_returns_reference(self):
+        """Test prepare keeps a model path usable when static KV disables model-free mode."""
+        model = "/path/to/model"
+        config = AutoRoundConfig(model_free=False, scheme="MXFP4", static_kv_dtype="fp8")
+
+        result = prepare(model, config)
+
+        assert isinstance(result, _AutoRoundModelReference)
+        assert result.model_reference == model
+        assert result.quant_config is config
+
+    def test_model_free_with_string_model(self):
+        """Test that prepare() preserves all config attributes in _AutoRoundModelReference."""
+        model = "facebook/opt-125m"
+        layer_config = {"fc2": {"bits": 4, "data_type": "mx_fp"}}
+        config = AutoRoundConfig(
+            model_free=True,
+            scheme="MXFP8",
+            ignore_layers="self_attn",
+            layer_config=layer_config,
+            export_format="llm_compressor",
+            output_dir="/tmp/quantized_model",
+        )
+
+        result = prepare(model, config)
+
+        assert isinstance(result, _AutoRoundModelReference)
+        assert result.quant_config.scheme == "MXFP8"
+        assert result.quant_config.ignore_layers == "self_attn"
+        assert result.quant_config.layer_config == layer_config
+        assert result.quant_config.export_format == "llm_compressor"
+
+        result = convert(result)
+        assert not hasattr(result.model.decoder.layers[0].self_attn.k_proj, "quantization_scheme"), "Ignored layers were not preserved during conversion."
+        assert result.model.decoder.layers[0].fc1.quantization_scheme.format.value == 'mxfp8-quantized', "Model conversion did not preserve the quantization scheme format."
+        assert result.model.decoder.layers[0].fc2.quantization_scheme.format.value == 'mxfp4-pack-quantized', "Model conversion did not preserve the quantization scheme format for layer_config."

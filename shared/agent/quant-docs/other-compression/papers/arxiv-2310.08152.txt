@@ -1,0 +1,557 @@
+                                             Context Compression for Auto-regressive Transformers with Sentinel
+                                                                          Tokens
+
+                                                           Siyu Ren        Qi Jia                            Kenny Q. Zhu ∗
+                                                     Shanghai Jiao Tong University, China         University of Texas at Arlington, USA
+                                                      {roy0702, Jia_qi}@sjtu.edu.cn                       kenny.zhu@uta.edu
+
+
+
+                                                                  Abstract                        CUDA kernels are typically required for these mod-
+                                                                                                  els to achieve performance comparable to off-the-
+                                             The quadratic complexity of the attention mod-       shelf LLMs and fulfill real efficiency gains.
+                                             ule makes it gradually become the bulk of com-
+                                                                                                     In this work, we aim to improve the efficiency
+arXiv:2310.08152v2 [cs.CL] 15 Oct 2023
+
+
+
+
+                                             pute in Transformer-based LLMs during gener-
+                                             ation. Moreover, the excessive key-value cache       of existing Transformer-based LLMs without any
+                                             that arises when dealing with long inputs also       architectural changes. Specifically, we focus on
+                                             brings severe issues on memory footprint and         the key-value cache, which accounts for the major-
+                                             inference latency. In this work, we propose          ity of memory footprint and data movement (I/O)
+                                             a plug-and-play approach that is able to in-         cost when dealing with increasingly long input us-
+                                             crementally compress the intermediate activa-        ing LLMs. We propose a plug-and-play approach
+                                             tion of a specified span of tokens into compact
+                                                                                                  to incrementally compress the key-value memory
+                                             ones, thereby reducing both memory and com-
+                                             putational cost when processing subsequent           of a contiguous span of tokens into compact ones.
+                                             context. Experiments on both in-domain lan-          Specifically, we introduce a pair of special sentinel
+                                             guage modeling and zero-shot open-ended doc-         tokens <CL> and <CR> into the vocabulary of
+                                             ument generation demonstrate the advantage           LLMs and use them to mark the boundary of the
+                                             of our approach over sparse attention baselines      span to be compressed. During training, we modify
+                                             in terms of fluency, n-gram matching, and se-        the causal attention mask such that future tokens
+                                             mantic similarity. At last, we comprehensively
+                                                                                                  after <CR> are precluded from attending to tokens
+                                             profile the benefit of context compression on
+                                             improving the system throughout. Code is             between <CL> and <CR>. By continually training
+                                             available at https://github.com/DRSY/KV_             LLMs with the next token prediction objective, the
+                                             Compression.                                         model learns to extract and condense task-relevant
+                                                                                                  information of the bounded span into the ending
+                                         1   Introduction                                         sentinel token. The reduced context length allevi-
+                                                                                                  ates both memory and computational costs when
+                                         The Transformer architecture (Vaswani et al., 2017)      processing subsequent tokens, thereby improving
+                                         has become the underpinning component of mod-            system throughput with larger batch sizes and faster
+                                         ern large language models (LLMs) (Radford et al.,        decoding speed during inference.
+                                         2019; Devlin et al., 2019; Zhang et al., 2022; Tou-
+                                                                                                     We conduct experiments on the WikiText-2 lan-
+                                         vron et al., 2023) in recent years. However, the
+                                                                                                  guage modeling benchmark and show that our
+                                         quadratic computational complexity and memory
+                                                                                                  approach is generalizable to LLMs with various
+                                         footprint of the attention mechanism have largely
+                                                                                                  sizes (from 1.3B to 3B) and position encoding
+                                         limited applying Transformers to increasingly long
+                                                                                                  schemes such as absolute position embedding (De-
+                                         contexts with constrained computing resources.
+                                                                                                  vlin et al., 2019) and rotary position encoding (Su
+                                            To mitigate such issues, prior works (Child et al.,
+                                                                                                  et al., 2021). Compared to sparse attention base-
+                                         2019; Beltagy et al., 2020; Zaheer et al., 2020; Ki-
+                                                                                                  lines, our approach is able to effectively compress
+                                         taev et al., 2020) have explored an assortment of
+                                                                                                  historical key-value cache with significantly re-
+                                         efficient Transformer variants, mostly by replacing
+                                                                                                  duced degradation in perplexity. Moreover, we
+                                         the original quadratic attention operation with var-
+                                                                                                  demonstrate that our approach outperforms sparse
+                                         ious forms of linearized approximation. Though
+                                                                                                  attention in zero-shot open-ended document gener-
+                                         promising, large-scale pre-training and specialized
+                                                                                                  ation across different compression ratios as eval-
+                                             ∗
+                                                 The corresponding author.                        uated by perplexity, ROUGE (Lin, 2004), and
+BERTScore (Zhang et al., 2019). Finally, we em-                         A     cat   <CL> jumps over   <CR>   a   carpet
+                                                                A      carpet
+pirically demonstrate that context compression is
+able to confer considerable improvement in system              cat
+                                                              <CL>
+throughput for text generation.                              jumps
+                                                              over
+2   Background and Related Work                               <CR>
+                                                                a
+In this section, we present necessary background
+                                                             carpet
+knowledge as well as drawing distinctions of our
+approach to existing literatures.                        Figure 1: Modified attention mask for context compres-
+Complexity of Attention Mechanism The self-              sion. Green and grey boxes indicate positions that are
+                                                         allowed and disallowed to be attended to (attention di-
+attention mechanism of LLMs produces a query
+                                                         rection from row → column).
+vector for each token to select and retrieve informa-
+tion from all previously computed key and value
+vectors. Thus, a key-value memory is required at         for a compression scheme with more flexible com-
+runtime to store past information. Given a pre-          pression choices and larger compression ratios.
+trained LLM with M Transformer layers, H atten-
+tion heads, per-head hidden dimension of dhead ,         3      Approach
+batch size b, and current context length L, the
+model stores key and value vectors computed so           In this section, we present a plug-and-play ap-
+far as a tensor of shape (M, 2, b, H, L, dhead ). Dur-   proach to compress the full-length contextual rep-
+ing auto-regressive decoding, the size of key-value      resentations into shorter ones while preserving in-
+cache grows linearly with the context length L,          formation necessary to accomplish the end task.
+leading to significant increase in memory footprint
+and latency.                                             3.1         Context Compression with Sentinel
+                                                                     Tokens
+Efficient Transformers Various efficient vari-
+                                                         To alleviate the computational and memory inten-
+ants of Transformers have been proposed to address
+                                                         sity of key-value memory when processing increas-
+the problematic complexity of attention. Sparse
+                                                         ingly long context, we introduce two sentinel to-
+Transformer (Child et al., 2019) limits the recep-
+                                                         kens <CL> and <CR> into the vocabulary of LLM,
+tive field of each token to a local window. Long-
+                                                         that are placed around a contiguous span of tokens
+former (Beltagy et al., 2020) and BigBird (Zaheer
+                                                         of which the corresponding key-value memory will
+et al., 2020) introduce additional randomly and
+                                                         be compressed.
+globally accessible tokens to compensate for the
+                                                            In order to consolidate information of tokens
+information loss. Linear Transformer (Katharopou-
+                                                         surrounded by <CL> and <CR>, we design a
+los et al., 2020) reformulates the self-attention as a
+                                                         modified causal attention mask to facilitate such
+linear dot-product of kernel feature maps and make
+                                                         behaviour. An illustrative example is shown in
+use of the associativity property of matrix products
+                                                         Figure 1. Specifically, <CL> serves a start-of-
+to reduce the complexity from O(N 2 ) to O(N ).
+                                                         compression symbol and can only attend to it-
+Nevertheless, these approximations were shown
+                                                         self. Normal tokens (tokens except for <CL> and
+to degrade the expressiveness of full-attention and
+                                                         <CR>) have access to all previous <CR> and nor-
+have been upstaged by GPT-like LLMs recently. In
+                                                         mal tokens. This ensures that the contextual repre-
+this work, however, we tackle this problem by com-
+                                                         sentations are built upon both compressed (lossy)
+pressing lengthy input into more compact represen-
+                                                         and complete (lossless) past information. <CR>
+tations, which is orthogonal to on-going efforts to
+                                                         then act as a form of information selection and
+architectural optimization.
+                                                         retrieval from contextual representations of sur-
+Gisting Tokens Mu et al. (2023) explored using           rounded tokens. This modified masking scheme,
+gisting tokens to compress textual prompts during        combined with task-specific fine-tuning of LLM,
+instruction tuning. They showed that verbose task        encourages distilling task-relevant information of
+instructions can be compressed into much shorter         potentially long token sequences into a compact
+ones. However, their approach is only applicable to      representation, thereby reducing the size of key-
+prefix text of around 20 tokens. In contrast, we aim     value memory required for subsequent processing.
+                                                                         Compression Ratio (r)
+        Model             Method
+                                          0.0    0.1      0.2         0.3   0.4    0.5     0.6        0.7       0.8           0.9
+                    Scattered Attention   15.0   18.2   22.6        28.2     35.8   47.2     59.6     81.0     106.4         151.6
+      OPT-1.3B       Local Attention      15.0   15.1   15.2        15.7     16.3   17.2     18.2     19.9     23.0          29.8
+                     KV Compression       15.0   15.0   15.2        15.6     15.9   17.3     17.8     18.0     18.1          18.3
+                    Scattered Attention   13.1   16.2   19.8        25.5     32.4   41.7     56.3     75.7     101.4         142.3
+      OPT-2.7B       Local Attention      13.1   13.1   13.4        13.9     14.4   15.3     16.1     17.5     20.1          26.6
+                     KV Compression       13.1   13.2   13.5        13.7     14.0   15.3     15.8     16.0     16.1          16.3
+                    Scattered Attention   11.2   13.1   16.5        20.7     26.6   34.9     47.2     65.7     91.6          135.9
+    RedPajama-3B     Local Attention      11.2   11.3   11.5        11.8     12.2   12.9     13.6     14.8     17.2           22.9
+                     KV Compression       11.2   11.4   11.5        11.8     11.9   12.3     13.5     13.7     13.8          14.0
+
+     Table 1: Perplexity (the lower the better) of three LLMs on WikiText-2 language modeling benchmark.
+
+
+Input Transformation Given an input x with                                     Method
+                                                                                               Compression Ratio (r)
+L tokens, we define compression ratio r as the                                                 0.7   0.8      0.9
+percentage of the tokens to be enclosed by one or                          Local Attention     23.1     25.2          29.5
+                                                                           KV Compression      21.8     22.0          22.5
+more pairs of <CL> and <CR>, and max compres-
+sion length l as the largest number of tokens to be
+                                                                Table 2: Perplexity (the lower the better) of RedPajama-
+compressed by a single pair of <CL> and <CR>                    3B on WritingPrompts test set.
+tokens. We repeatedly sample span of tokens with
+length conforming to a uniform distribution U (2, l)
+as compression target, until ratio r is reached. But            4     Experiments
+these spans must not overlap. We tie the position
+                                                                We mainly evaluate our approach on language mod-
+encoding of <CL> and <CR> to their previous to-
+                                                                eling task and then explore its zero-shot general-
+ken, such that they don’t occupy valuable positions
+                                                                ization ability on open-ended document generation.
+for LLMs using absolute position embedding.
+                                                                Finally, we quantitatively measure the effect of
+                                                                context compression on system throughput.
+Training We opt for a light-weight procedure for                4.1     Language Modeling
+adapting LLMs to downstream tasks through fine-
+tuning. Specifically, all parameters of the LLM are             Benchmark We mainly conduct experiments on
+frozen except for the embeddings of <CL> and                    the Wikitext-2 (Merity et al., 2016) dataset consist-
+<CR> and LoRA (Hu et al., 2021) modules applied                 ing of Wikipedia articles, which has been widely
+to all attention layers. This not only eases the train-         used for the evaluation of language modeling. We
+ing process of models with billions of parameters               report token-level (excluding <CL> and <CR> for
+but also ensures the inherent language modeling                 KV Compression) average perplexity on the test
+ability and parametric knowledge in feedforward                 set as the evaluation metric. We also report results
+networks are intact (Geva et al., 2021).                        on the WritingPrompts (Fan et al., 2018) dataset to
+                                                                investigate the generality of our method.
+
+                                                                Models To demonstrate the generality of our
+Manipulating Key-Value Memory for Inference-                    approach, dubbed KV Compression, we adopt
+time Compression Given a text piece as prefix,                  OPT-1.3B, OPT-2.7B (Zhang et al., 2022), and
+we apply the same input transformation strategy de-             RedPajama-3B (Computer, 2023) as three LLMs
+fined above to reach a specified compression ratio.             with different sizes and position encoding methods.
+To realize perceivable memory and computation
+reduction, the key-value cache of tokens enclosed               Baselines We compare our approach with two
+by sentinel tokens is freed from GPU in a progres-              sparse attention baselines: (1) Scattered Attention
+sive manner (e.g., using a for-loop over blocks of              which samples positions that permits attention from
+tokens) if the original prefix is too long to fit into          a Bernoulli distribution B(1-r); and (2) Local At-
+GPU. Otherwise we just feed the transformed pre-                tention (Beltagy et al., 2020) which restricts the
+fix through the model and free the key-value cache              attention of token xt to be within (⌊t ∗ r⌋, t). For
+of marked tokens in one go.                                     KV Compression, we set l as 25 throughout the ex-
+          17                                             76.0
+
+
+
+
+                                                                                                                                                   Throughput(# Tokens/Second)
+                                                                                                          52.5                                                                   260
+          16                                             75.5                                             50.0                                                                   240
+                                                         75.0                                             47.5                                                                   220
+
+
+
+
+                                             BERTScore
+          15
+
+
+
+
+                                                                                             Perplexity
+                                                                                                          45.0
+Rouge-L
+
+
+
+                                                                                                                            Local Attention                                      200
+                                                         74.5                                             42.5              KV Compression(ours)
+          14                                                                                                                                                                     180
+                                                         74.0                                             40.0
+                                                                                                                                                                                 160
+          13          Local Attention                    73.5         Local Attention
+                                                                                                          37.5                                                                                           12GB GPU VRAM
+                                                                                                          35.0                                                                   140
+                      KV Compression(ours)               73.0         KV Compression(ours)                                                                                                               24GB GPU VRAM
+                                                                                                          32.5                                                                   120
+               0.0     0.2 0.4 0.6 0.8                          0.0    0.2 0.4 0.6 0.8                           0.0   0.2 0.4 0.6 0.8                                                 0.0   0.2 0.4 0.6 0.8
+                         Compression Ratio                               Compression Ratio                               Compression Ratio                                                     Compression Ratio
+
+ Figure 2: RedPajama-3B on open-ended generation on 200 sampled C4 documents. Generation quality is measured
+ by fluency (perplexity), n-gram matching (ROUGE-L), and semantic similarity (BERTScore). We report system
+ throughput as the number of tokens generated per second with different maximum GPU VRAM.
+
+
+ periments. Our proposed approach, alongside the                                                           open-ended document generation. Given a prefix
+ sparse attention baselines we have selected, shares                                                       text p, nucleus sampling (Holtzman et al., 2019) is
+ a common goal: enhancing the ratio of compu-                                                              used to generate a completion c for it.
+ tation to memory access by curtailing the stored
+ key-value cache. For detailed training setup please                                                       Baselines Because Scattered Attention performs
+ refer to Appendix A.                                                                                      poorly according to Table 1, we only compare KV
+                                                                                                           Compression with Local Attention with compres-
+Results The results on WikiText-2 are shown in                                                             sion ratio r ranging from 0.0 to 0.9 applied to the
+Table 1. As the compression ratio r gets larger,                                                           prefix p using input transformation defined in Sec-
+all three methods result in an increase in perplex-                                                        tion 3 for KV Compression and restricted attention
+ity either due to: (1) important tokens are out-of-                                                        defined in Section 4. For Local Attention to achieve
+scope for attention, or (2) the capacity of single                                                         inference-time compression, it amounts to main-
+<CR> token is insufficient to encapsulate the full                                                         taining a FIFO queue to store the key-value cache:
+information of compressed token span. We observe                                                           as the time step during generation increases, old
+that Local Attention substantially outperforms Scat-                                                       key-value memory in the queue is popped out and
+tered Attention, suggesting the importance of local                                                        newly generated key-value memory is pushed in.
+context for language modeling. KV Compression
+achieves the best perplexity across various com-                                                           Evaluation Metrics We evaluate the quality of
+pression ratios. Notably, at high compression ra-                                                          generated completions from three aspects: (1)
+tios, e.g., r ≥ 0.7, KV Compression incurs signif-                                                         fluency, (2) n-gram matching with ground-truth
+icantly fewer degradation in perplexity compared                                                           continuation, and (3) semantic similarity with
+to Local Attention, demonstrating its advantage                                                            ground-truth continuation. Fluency is evaluated
+in compressing scattered local information mean-                                                           by perplexity computed from Pythia-1B (Biderman
+while keeping coherent global information. In Ta-                                                          et al., 2023) model pre-trained using C4. N-gram
+ble 2, we report the perplexity of RedPajama-3B                                                            matching and semantic similarity are measured by
+on WritingPrompts dataset using Local Attention                                                            ROUGE-L and BERTScore (Zhang et al., 2019) re-
+and the proposed KV Compression, with compres-                                                             spectively. To account for the randomness induced
+sion ratio from {0.7, 0.8, 0.9}. KV Compression                                                            by nucleus sampling, for each prefix, we generate
+achieves consistently lower perplexity compared                                                            8 completions and report the average results.
+to Local Attention, indicating its superiority as a
+domain-generalizable method for context compres-                                                           Results Figure 2 shows that, as r increases, the
+sion.                                                                                                      generated completions of Local Attention tend
+                                                                                                           to diverge from the original topic, leading to de-
+ 4.2                 Zero-shot Open-ended Generation                                                       creased ROUGE-L/BERTScore and increased per-
+ Data We randomly select 200 documents from                                                                plexity. Again, KV Compression excel at pre-
+ C4 (Raffel et al., 2020) validation set for evaluation.                                                   serving relevant information and can still generate
+ We use the leading 128 words as prefixes and treat                                                        decent-quality continuations up to 0.5 compres-
+ the next 64 words as ground-truth references.                                                             sion ratio. Notably, KV Compression can gener-
+                                                                                                           ate fluent text even when the prefix is extremely
+ Models We directly take the RedPajama-3B                                                                  compressed. The reason is that, during training,
+ model trained on Wikitext-2 to perform zero-shot                                                          Local Attention receives rapidly faded information
+from the distant past, making the discourse struc-      put transformation procedure theoretically includes
+ture for subsequent generations incoherent. On the      text spans of all possible linguistic structures, it
+contrary, KV Compression better preserve such in-       may still benefit from an elaborately designed strat-
+formation by consolidating it into sentinel tokens.     egy/algorithm for selecting compression targets in
+                                                        a given context.
+4.3    Throughput Gain from Context
+       Compression
+With KV Compression, the key-value cache corre-
+                                                        References
+sponding to tokens enclosed by sentinel tokens can      Iz Beltagy, Matthew E. Peters, and Arman Cohan. 2020.
+be freed from memory. In this way, it permits a            Longformer: The long-document transformer.
+larger batch size and improves the system through-      Stella Biderman, Hailey Schoelkopf, Quentin Anthony,
+put in return. To quantitatively measure the impact        Herbie Bradley, Kyle O’Brien, Eric Hallahan, Mo-
+of context compression on throughput, we conduct           hammad Aflah Khan, Shivanshu Purohit, USVSN Sai
+                                                           Prashanth, Edward Raff, Aviya Skowron, Lintang
+experiments on open-ended generation by testing            Sutawika, and Oskar van der Wal. 2023. Pythia:
+with different maximum available GPU VRAM.                 A suite for analyzing large language models across
+The full length of the dummy input prefix is set to        training and scaling.
+800 and we use RedPajama-3B with nucleus sam-           Rewon Child, Scott Gray, Alec Radford, and Ilya
+pling to generate a continuation for it. The through-     Sutskever. 2019. Generating long sequences with
+put of the text generation system is defined as the       sparse transformers. CoRR, abs/1904.10509.
+number of tokens generated per second. The re-          Together Computer. 2023. Redpajama: An open source
+sults are shown in the bottom right of Figure 2. We       recipe to reproduce llama training dataset.
+can see that, at extreme compression ratios (e.g.,      Jacob Devlin, Ming-Wei Chang, Kenton Lee, and
+r ≥ 0.8), context compression offers more than             Kristina Toutanova. 2019. BERT: Pre-training of
+1.5x throughout improvement with 12GB GPU                  deep bidirectional transformers for language under-
+VRAM and a slightly smaller 1.3x improvement               standing. In Proceedings of the 2019 Conference of
+                                                           the North American Chapter of the Association for
+with 24GB GPU VRAM. At moderate compres-
+                                                          Computational Linguistics: Human Language Tech-
+sion ratio (e.g., r ≈ 0.5), KV compression is still        nologies, Volume 1 (Long and Short Papers), pages
+able to deliver 1.2x-1.4x throughout improvement          4171–4186, Minneapolis, Minnesota. Association for
+while only suffering from mild quality drop (Sec-          Computational Linguistics.
+tion 4.2). More visualized memory-compression           Angela Fan, Mike Lewis, and Yann Dauphin. 2018.
+ratio correlation is deferred to Appendix D.              Hierarchical neural story generation. In Proceedings
+                                                          of the 56th Annual Meeting of the Association for
+5     Conclusion                                          Computational Linguistics (Volume 1: Long Papers),
+                                                          pages 889–898, Melbourne, Australia. Association
+In this work, we propose a simple yet effective           for Computational Linguistics.
+approach that enables LLMs to summarize the key-        Mor Geva, Roei Schuster, Jonathan Berant, and Omer
+value memory of specified span of tokens. Experi-        Levy. 2021. Transformer feed-forward layers are key-
+ments on language modeling and open-ended gen-           value memories. In Proceedings of the 2021 Confer-
+                                                         ence on Empirical Methods in Natural Language Pro-
+eration demonstrate that our approach substantially
+                                                         cessing, pages 5484–5495, Online and Punta Cana,
+outperforms sparse attention baselines in terms of       Dominican Republic. Association for Computational
+information compression and generation quality.          Linguistics.
+                                                        Ari Holtzman, Jan Buys, Maxwell Forbes, and Yejin
+Limitations                                               Choi. 2019. The curious case of neural text degener-
+                                                          ation. CoRR, abs/1904.09751.
+In the current evaluation setup, we apply the same
+strategy used for training to select spans of tokens    Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan
+to be enclosed by <CL> and <CR> for inference-            Allen-Zhu, Yuanzhi Li, Shean Wang, and Weizhu
+                                                          Chen. 2021. Lora: Low-rank adaptation of large
+time context compression. However, different text
+                                                          language models. CoRR, abs/2106.09685.
+pieces may display different degrees of importance
+for downstream tasks. For instance, a grammatical       Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pap-
+                                                          pas, and François Fleuret. 2020. Transformers are
+and semantic complete noun phrase can be more             rnns: Fast autoregressive transformers with linear
+compressible than an ungrammatical one that con-          attention. In International Conference on Machine
+tains only partial linguistic units. Though our in-       Learning, pages 5156–5165. PMLR.
+Nikita Kitaev, Lukasz Kaiser, and Anselm Levskaya.          Susan Zhang, Stephen Roller, Naman Goyal, Mikel
+  2020. Reformer: The efficient transformer. CoRR,            Artetxe, Moya Chen, Shuohui Chen, Christopher De-
+  abs/2001.04451.                                             wan, Mona Diab, Xian Li, Xi Victoria Lin, Todor Mi-
+                                                              haylov, Myle Ott, Sam Shleifer, Kurt Shuster, Daniel
+Chin-Yew Lin. 2004. ROUGE: A package for auto-                Simig, Punit Singh Koura, Anjali Sridhar, Tianlu
+  matic evaluation of summaries. In Text Summariza-           Wang, and Luke Zettlemoyer. 2022. Opt: Open pre-
+  tion Branches Out, pages 74–81, Barcelona, Spain.           trained transformer language models.
+  Association for Computational Linguistics.
+                                                            Tianyi Zhang, Varsha Kishore, Felix Wu, Kilian Q.
+Ilya Loshchilov and Frank Hutter. 2017.          Fixing       Weinberger, and Yoav Artzi. 2019. Bertscore:
+   weight decay regularization in adam.          CoRR,        Evaluating text generation with BERT. CoRR,
+   abs/1711.05101.                                            abs/1904.09675.
+Stephen Merity, Caiming Xiong, James Bradbury, and
+   Richard Socher. 2016. Pointer sentinel mixture mod-
+   els.
+Jesse Mu, Xiang Lisa Li, and Noah Goodman. 2023.
+   Learning to compress prompts with gist tokens.
+   arXiv preprint arXiv:2304.08467.
+Alec Radford, Jeff Wu, Rewon Child, D. Luan, Dario
+  Amodei, and Ilya Sutskever. 2019. Language models
+  are unsupervised multitask learners.
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine
+  Lee, Sharan Narang, Michael Matena, Yanqi Zhou,
+  Wei Li, and Peter J Liu. 2020. Exploring the limits
+  of transfer learning with a unified text-to-text trans-
+  former. The Journal of Machine Learning Research,
+  21(1):5485–5551.
+Jianlin Su, Yu Lu, Shengfeng Pan, Bo Wen, and Yunfeng
+   Liu. 2021. Roformer: Enhanced transformer with
+   rotary position embedding. CoRR, abs/2104.09864.
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier
+  Martinet, Marie-Anne Lachaux, Timothée Lacroix,
+  Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal
+  Azhar, Aurelien Rodriguez, Armand Joulin, Edouard
+  Grave, and Guillaume Lample. 2023. Llama: Open
+  and efficient foundation language models.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+  Uszkoreit, Llion Jones, Aidan N Gomez, Ł ukasz
+  Kaiser, and Illia Polosukhin. 2017. Attention is all
+  you need. In Advances in Neural Information Pro-
+  cessing Systems, volume 30. Curran Associates, Inc.
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien
+  Chaumond, Clement Delangue, Anthony Moi, Pier-
+  ric Cistac, Tim Rault, Rémi Louf, Morgan Funtowicz,
+  Joe Davison, Sam Shleifer, Patrick von Platen, Clara
+  Ma, Yacine Jernite, Julien Plu, Canwen Xu, Teven Le
+  Scao, Sylvain Gugger, Mariama Drame, Quentin
+  Lhoest, and Alexander M. Rush. 2020. Transform-
+  ers: State-of-the-art natural language processing. In
+  Proceedings of the 2020 Conference on Empirical
+  Methods in Natural Language Processing: System
+  Demonstrations, pages 38–45, Online. Association
+  for Computational Linguistics.
+Manzil Zaheer, Guru Guruganesh, Avinava Dubey,
+ Joshua Ainslie, Chris Alberti, Santiago Ontañón,
+ Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang,
+ and Amr Ahmed. 2020. Big bird: Transformers for
+ longer sequences. CoRR, abs/2007.14062.
+A              Implementation Details                                             of tokens surrounded by sentinel tokens takes a
+                                                                                  specified ratio of the total number of tokens. Here
+Language Modeling For language modeling ex-
+                                                                                  we study the generalization performance of dif-
+periments, we train OPT-1.3B, OPT-2.7B, and
+                                                                                  ferent train-time compression ratios and explore
+RedPajama-3B with the next token prediction ob-
+                                                                                  the best practice. We visualize the perplexity of
+jective. The loss is computed on all tokens except
+                                                                                  RedPajama-3B trained with different compression
+for newly added <CL> and <CR> tokens. For
+                                                                                  ratios at varying test-time compression ratios.
+tokens right before <CL> and <CR>, we adjust
+                                                                                     Figure 3 illustrates the results. We can see that
+their ground-truth label to be tokens right after the
+                                                                                  training with a higher compression ratio always re-
+corresponding <CL> and <CR> tokens.
+                                                                                  sults in better generalization ability across various
+   The trainable parameters for all LLMs include
+                                                                                  test-time compression ratios. The reason is that,
+two token embeddings of <CL> and <CR>, and
+                                                                                  at a small compression ratio, language models can
+LoRA modules applied to all attention layers. The
+                                                                                  sometimes exploit limited local context and can
+rank of weight matrices of LoRA is set to 16.
+                                                                                  still reliably predict the next token. In this case,
+The percentage of trainable parameters takes about
+                                                                                  the sentinel tokens are not guaranteed to acquire
+5% of the total parameters of the LLM. We use
+                                                                                  the desired context compression ability. When the
+AdamW (Loshchilov and Hutter, 2017) optimizer
+                                                                                  majority of context is not allowed to be attended to,
+with a 2e-5 learning rate. The batch size is set to 12
+                                                                                  the sentinel tokens are forced to cultivate enough
+and the maximum sequence length during training
+                                                                                  compression ability in order to minimize the loss
+is set to 256 due to the limited computation bud-
+                                                                                  function.
+get. The implementation is based on Huggingface
+transformers (Wolf et al., 2020) library and all ex-                              C                   Memory Usage with Varied
+periments are conducted using a single RTX 3090                                                       Compression Ratio
+GPU.
+Open-ended Document Generation For open-
+ended document generation, we use nucleus sam-                                                        16
+
+pling with top p=0.9. Due to the randomness in-                                                       14
+duced by sampling, we perform 8 times nucleus
+                                                                                      Peak GPU VRAM
+
+
+
+
+sampling for each compressed prefix and report                                                        12                                                       BS=8, L=256
+                                                                                                                                                               BS=8, L=512
+the average evaluation metrics adopted in the main                                                                                                             BS=8, L=1024
+                                                                                                      10
+paper. This helps reduce variance and ensures a
+more reliable evaluation result.                                                                      8
+
+B              Generalization Ability of KV                                                                0.0   0.1   0.2   0.3   0.4   0.5       0.6   0.7     0.8    0.9
+               Compression                                                                                                     Compression Ratio
+
+                                                                                  Figure 4: Peak cached memory profiled using Pytorch
+                                                                                  when using RedPajama-3B to produce a 100-token con-
+              16.5 Train-time compression ratio                                   tinuation for variable-length prefixes.
+                           0.2
+                           0.3
+              16.0         0.4
+                           0.5                                                       We have shown that context compression con-
+                           0.6
+                           0.7                                                    fers decent improvement in system throughput, es-
+ Perplexity
+
+
+
+
+              15.5
+                           0.8
+                           0.9                                                    pecially for moderate-sized GPUs. Here we re-
+              15.0
+                                                                                  port detailed memory usage assuming a practical
+              14.5                                                                scenario similar to multi-turn dialogue: the prefix
+                                                                                  length (length of historical dialogue) gradually in-
+              14.0
+                     0.2     0.3       0.4        0.5   0.6     0.7   0.8   0.9   creases, and the model is asked to output a response
+                                       Evaluation Compression Ratio
+                                                                                  of roughly 100 tokens. To maximize the through-
+Figure 3: Generalization performance of different train-                          put of dialogue service, we assume the model is
+time compression ratios.                                                          simultaneously generating responses for multiple
+                                                                                  instances, i.e., a batch size larger than one.
+   In our proposed KV Compression, an LLM is                                         The visualized memory usage is shown in Figure
+trained on transformed data in which the percent                                  4. Context compression is able to reduce more than
+                             Local Attention                    76                 Local Attention                                        Local Attention
+          17                 KV Compression(ours)                                  KV Compression(ours)                55                 KV Compression(ours)
+                                                                75
+          16                                                    74
+          15                                                                                                           50
+
+
+
+
+                                                    BERTScore
+
+
+
+
+                                                                                                          Perplexity
+                                                                73
+Rouge-L
+
+
+
+          14                                                    72                                                     45
+          13                                                    71
+                                                                                                                       40
+          12                                                    70
+          11                                                    69                                                     35
+               0.0   0.2 0.4 0.6 0.8                                 0.0   0.2 0.4 0.6 0.8                                  0.0   0.2 0.4 0.6 0.8
+                       Compression Ratio                                     Compression Ratio                                      Compression Ratio
+
+Figure 5: OPT-1B on open-ended generation on 200 sampled C4 documents. Generation quality is measured by
+fluency (perplexity), n-gram matching (ROUGE-L), and semantic similarity (BERTScore).
+
+
+3GB of peak cached GPU memory. In practice,
+this translate to the feasibility of generating more
+tokens for a single instance and enabling more in-
+stances in parallel.
+
+D          Open-ended Generation Results of
+           OPT
+Figure 5 summarizes the results of OPT-1B on
+open-ended document generation. Compared to
+that of Redpajama-3B (Figure 2), the generation
+quality of OPT-1B is substantially lower. Com-
+paring different context compression methods, KV
+Compression performs uniformly better across all
+three evaluation metrics.
+

@@ -1,0 +1,903 @@
+                                               QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+
+                                                                                        Elias Frantar 1 Dan Alistarh 1 2
+
+
+                                                                  Abstract                                 tures, e.g. (Fedus et al., 2022; Artetxe et al., 2022), whose
+                                              Mixture-of-Experts (MoE) architectures offer a               general idea is to replicate certain model components many
+                                              general solution to the high inference costs of              times while routing each input only to a small subset of
+                                                                                                           those replicas. Through expert “specialization” to input
+arXiv:2310.16795v1 [cs.LG] 25 Oct 2023
+
+
+
+
+                                              large language models (LLMs) via sparse routing,
+                                              bringing faster and more accurate models, at the             subsets, MoEs achieve faster inference for the same model
+                                              cost of massive parameter counts. For example,               quality, but with significantly higher memory costs due to
+                                              the SwitchTransformer-c2048 model has 1.6 tril-              components being replicated hundreds or even thousands of
+                                              lion parameters, requiring 3.2TB of accelerator              times, for the largest and best-performing models.
+                                              memory to run efficiently, which makes practi-               For example, the popular SwitchTransformer family (Fe-
+                                              cal deployment challenging and expensive. In                 dus et al., 2022), which we focus on in this study, uses
+                                              this paper, we present a solution to this mem-               between 128 and 2048 experts (layer replicas) to signifi-
+                                              ory problem, in form of a new compression                    cantly outperform standard dense T5 models (Raffel et al.,
+                                              and execution framework called QMoE. Specif-                 2020b) in terms of inference and training costs, at equiv-
+                                              ically, QMoE consists of a scalable algorithm                alent model accuracy. Artetxe et al. (2022) report similar
+                                              which accurately compresses trillion-parameter               improvements, on different tasks, for 512 experts. However,
+                                              MoEs to less than 1 bit per parameter, in a cus-             these results come at the cost of dramatic increases in model
+                                              tom format co-designed with bespoke GPU de-                  size: the largest SwitchTransformer has 1.6 trillion parame-
+                                              coding kernels to facilitate efficient end-to-end            ters, requiring 3.2TB of storage in standard half-precision,
+                                              compressed inference, with minor runtime over-               and correspondingly requires a hundred or more expensive
+                                              heads relative to uncompressed execution. Con-               (GPU or TPU) accelerators for efficient usage. This not only
+                                              cretely, QMoE can compress the 1.6 trillion pa-              makes practical deployment costly and challenging, but also
+                                              rameter SwitchTransformer-c2048 model to less                strongly limits research on such models.
+                                              than 160GB (20x compression, 0.8 bits per pa-
+                                              rameter) at only minor accuracy loss, in less than           Challenges. It is natural to ask whether the truly mas-
+                                              a day on a single GPU. This enables, for the first           sive memory costs of such MoEs can be reduced via stan-
+                                              time, the execution of a trillion-parameter model            dard techniques for model compression, such as quantiza-
+                                              on affordable commodity hardware, like a single              tion (Gholami et al., 2021) or sparsity (Hoefler et al., 2021),
+                                              server with 4x NVIDIA A6000 or 8x NVIDIA                     without significant accuracy loss. Achieving this would
+                                              3090 GPUs, at less than 5% runtime overhead                  require overcoming conceptual and technical barriers:
+                                              relative to ideal uncompressed inference. The
+                                                                                                             1. Conceptually, existing post-training compression meth-
+                                              source code and compressed models are available
+                                                                                                                ods, whose costs would be affordable enough to exe-
+                                              at github.com/IST-DASLab/qmoe.
+                                                                                                                cute on such models, are currently only able to reduce
+                                                                                                                precision to 3 or 4 bits per parameter (Frantar et al.,
+                                                                                                                2022; Dettmers & Zettlemoyer, 2022; Wu et al., 2023)
+                                         1. Introduction
+                                                                                                                or around 50% sparsity (Frantar & Alistarh, 2023),
+                                         Generative large language models (LLMs), e.g. (Radford                 before significant accuracy loss occurs. Yet, making
+                                         et al., 2019; Brown et al., 2020; Touvron et al., 2023a;b),            trillion-parameter MoEs practical would require com-
+                                         have garnered significant industrial and popular attention             pression rates between 10× and 20× relative to 16-bit
+                                         due to their surprising performance across many practical              precision, i.e., on average less than 1 bit per parameter.
+                                         language and reasoning tasks. Yet, a major obstacle to              2. A key practical issue is scaling: applying state-of-the-
+                                         broad deployment is given by their extremely high inference            art compression methods, designed for large dense
+                                         costs. One particularly promising approach for reducing                models, to MoEs that are an order of magnitude larger,
+                                         these costs is the use of Mixture-of-Experts (MoE) architec-           while maintaining affordability, runs into a plethora of
+                                           1                                                                    memory, performance and reliability roadblocks.
+                                             Institute of Science and Technology Austria (ISTA) 2 Neural
+                                         Magic Inc. Corresponding author: elias.frantar@ist.ac.at            3. Actually achieving sub-1-bit compression would re-
+                            QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+     quire a non-trivial custom compression format. Such a       are generally decided by a “router” layer. Probably the most
+     format would also need to come with decoding algo-          common MoE design (Fedus et al., 2022; Artetxe et al.,
+     rithms that are highly-efficient on accelerators such as    2022), which we also focus on in this paper, is to replicate
+     GPUs, in order to run inference on compressed models        the fully-connected module of a Transformer and route to-
+     without major processing slowdowns.                         kens to the replica, referred to as an expert, with the highest
+                                                                 assignment score predicted by a linear routing layer; see
+Contribution. In this paper, we overcome these challenges,       Figure 1 for an illustration. This design enables efficient
+and introduce QMoE, a framework for accurate compres-            training and inference of extremely large models, using 100s
+sion and fast compressed inference of massive MoEs, re-          or even 1000s of experts/, since each token is processed only
+ducing model sizes by 10–20×, to less than 1 bit per pa-         by a small subset of the massive overall network.
+rameter. QMoE is specifically designed to compress and
+                                                                                                        MoE Layer
+subsequently inference with models like the 1.6 trillion
+parameter SwitchTransformer-c2048, using only modest                                                     FC Block 1
+computational resources.                                                              Tokens
+
+Our key technical contributions are a highly scalable com-          Attention Block            Router    FC Block 2
+
+pression algorithm implementation and a customized com-
+pression format designed together with bespoke GPU-                                                      FC Block 3
+
+
+kernels for fast on-the-fly decoding. Further, we show for
+the first time that accurate sub-1-bit compression of tril-
+                                                                 Figure 1. Example of an MoE Transformer block. Each token is
+lion parameter MoEs is feasible and can be achieved via          routed to a different fully-connected (FC) block.
+affordable retraining-free compression techniques.
+Concretely, we reduce the size of SwitchTransformer-c2048,       MoEs have been shown to bring substantial accuracy and
+the largest openly-available model, from 3.2TB in bfloat16       training speed improvements for equivalent inference speed
+to less than 160GB in our customized compressed format,          (Clark et al., 2022; Du et al., 2022; Zoph et al., 2022). How-
+that is, ≈ 0.8 bits per parameter, at only a minor increase in   ever, their current practicality is limited since they are ex-
+loss on pretraining validation and zero-shot data. Using our     tremely large in size and thus require massive amounts of
+QMoE kernels, this compressed model can then be executed         accelerator memory to be executed efficiently.
+fully, without any slow offloading, on commodity hardware
+such as 8× NVIDIA RTX 3090 or 4× NVIDIA A6000                    2.2. Data-dependent Quantization
+GPUs, with < 5% runtime overhead relative to an idealized
+version of uncompressed execution, which would require           The currently most effective strategy for reducing model
+≈ 20× more GPUs.                                                 size and corresponding memory costs is quantization, i.e.,
+                                                                 converting model weights to lower numerical precision. On
+In summary, our work enables, for the first time, the perfor-    large models (Dettmers et al., 2022; Dettmers & Zettle-
+mant execution of massive-scale MoE models on commod-            moyer, 2022), in particular also MoEs (Kim et al., 2022b;
+ity hardware. This is illustrated by the fact that we are able   Yi et al., 2023), just simple rounding can decrease precision
+to efficiently run the trillion-parameter SwitchTransformer-     to 8 or even 4 bits per weight, at minimal accuracy loss
+c2048 model on a single commodity GPU server, with minor         relative to the standard half (16-bit) precision employed
+accuracy loss. This addresses one of the key limitations be-     for these models. However, some MoEs are so large that
+hind MoE architectures, and should improve their practical       reduction rates significantly higher than 4× (accomplished
+adoption as well as facilitate further research on understand-   by 4-bit) would be required to render them practical. Accu-
+ing and improving such models.                                   rately quantizing models to extremely low precision (e.g.,
+                                                                 lower than 3 bits per parameter) typically requires more
+2. Background                                                    sophisticated data-dependent methods (Nagel et al., 2020;
+                                                                 Wang et al., 2020; Hubara et al., 2021).
+2.1. Mixture of Expert Models (MoEs)
+                                                                 Such data-dependent quantization methods use a small set
+The core idea behind Mixture of Expert models (MoEs)             of calibration data, which is passed through the model. As
+is to increase the number of parameters, and thus the net-       this happens, for each linear layer ℓ with weights Wℓ , quan-
+work’s modelling power, while at the same time keeping           tized weights Qℓ are determined one-by-one. Specifically,
+compute costs near-constant, relative to a standard feed-        one approach to do this is by solving a layer-wise quantiza-
+forward architecture. This is typically achieved by creating     tion problem, stated with respect to Wℓ and the observed
+many copies of certain model components, each of which           calibration data inputs Xℓ at the current layer:
+is responsible for processing only a subset of all input to-
+kens. The corresponding input-to-component assignments                                 argminQℓ ||Qℓ Xℓ − Wℓ Xℓ ||.         (1)
+                            QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+Various solvers for Equation (1) have been proposed, with         a large increase in the memory required to apply such tech-
+some optimized, in terms of speed and accuracy, particularly      niques. Not only are the original model weights nearly 10×
+for extremely large models, like GPTQ (Frantar et al., 2022)      larger, but the quantization process itself also needs > 100×
+or ZeroQuant (Yao et al., 2022; Wu et al., 2023). The former      more data. The latter constraint is because accurate data-
+performs quantization using second-order information in the       dependent quantization methods require a sufficient number
+layer-wise Hessian matrix Xℓ Xℓ⊤ , while the latter applies       of input samples for each layer that is being compressed.
+SGD-optimization with straight-through gradient estimation        For very large dense models, a few hundreds of thousands
+(Bengio et al., 2013).                                            of “calibration tokens” typically suffice (Frantar et al., 2022;
+                                                                  Yao et al., 2022). However, in MoEs with thousands of
+Another noteworthy characteristic of many such methods is
+                                                                  layers, a single expert processes only a small subset of all
+that per-layer quantization can be performed sequentially,
+                                                                  inputs, hence we need much more tokens overall to achieve
+using the input from the already partially quantized model
+                                                                  good coverage of all experts. Further, in encoder-decoder
+up to layer ℓ − 1, when quantizing layer ℓ, serving to re-
+                                                                  architecture models, like SwitchTransformers, each token
+duce error accumulation. Concretely, this can be efficiently
+                                                                  is processed only by half of the model, again increasing
+implemented by using Xℓ to find Qℓ before passing on
+                                                                  data requirements. For fast compression, we must maintain
+Xℓ+1 = Qℓ Xℓ to the next layer.
+                                                                  intermediate results for the full calibration dataset, which
+                                                                  requires 100s of GBs of memory for the largest models.
+2.3. MoE Quantization
+                                                                  GPU Utilization. The next significant challenge is that
+There are several aspects which make very-low-bit, e.g.           existing large-scale quantization implementations, in par-
+ternary (3 values) quantization promising for MoE models:         ticular for GPTQ and related methods (Frantar et al., 2022;
+                                                                  Chee et al., 2023), are designed to be fast and memory ef-
+   • In many architectures, almost all parameters are lo-         ficient for the massive individual layers occurring in dense
+     cated in the experts, as they are 1000s of them. This        models. Meanwhile, MoEs typically have smaller layers,
+     means that, for size reduction, it suffices to focus on      but 100× to 1000× more of them. Current implementations
+     compressing just those experts and leave other layers        have poor GPU utilization in this case, and consequently
+     in standard precision. This reduces error accumulation       bad performance. A similar issue occurs if activations and
+     since only a subset of modules involved in a forward         weights have to be transferred between CPU and GPU with
+     pass are actually quantized.                                 high frequency, which may be required to cope with the
+   • Previous work has observed that extremely large dense        massive memory requirements discussed previously.
+     models are more resistant to quantization noise than         Reliability Requirements. Finally, another issue when
+     smaller ones (Frantar et al., 2022; Chee et al., 2023).      compressing models with tens of thousands of layers is that
+     Large MoEs can be much larger than some of these             running into rare edge cases, which may break the process, is
+     massive dense models, and are thus a prime target for        highly likely. This is includes numerical problems like non-
+     accurate quantization.                                       invertible layer-wise Hessians, as well as model-specific
+   • MoE training involves additional stochasticity through       ones, e.g., extreme routing patterns on particular layers.
+     routing instabilities and strategies like token drop-
+     ping (Lepikhin et al., 2020), which may inherently           3.2. System Design & Optimizations
+     encourage high resistance to noise. Finetuning is also
+                                                                  In this section, we describe system-level design and opti-
+     often performed with high dropout (Fedus et al., 2022).
+                                                                  mizations to address the challenges in Section 3.1. This
+                                                                  allows us to apply data-dependent compression to massive
+Our experiments in Section 5.2 confirm that MoEs are in-          MoEs, while preserving the key feature of post-training
+deed highly robust to extreme levels of quantization.             compression techniques: the ability to perform effective
+                                                                  compression using only modest computational resources,
+3. Scaling Data-dependent Quantization to                         e.g., a single NVIDIA A6000 GPU and less than one day of
+   Trillion Parameter MoEs                                        compute. Although we focus on scaling the popular GPTQ
+                                                                  method, most techniques described below will generalize
+3.1. Challenges                                                   to other data-dependent quantization approaches, like Zero-
+                                                                  Quant (Yao et al., 2022), as well.
+While data-dependent quantization techniques have already
+been used to successfully compress large dense models up to
+                                                                  3.2.1. O PTIMIZED ACTIVATION O FFLOADING
+176 billion parameters (Frantar et al., 2022; Wu et al., 2023),
+applying them to sparse mixture-of-expert models another          As discussed in Section 3.1, a key challenge in compressing
+order of magnitude larger brings several new challenges.          MoEs is that we need to maintain massive activation sets.
+Memory Costs. The first major problem we encounter is             Yet, it is possible to carefully orchestrate model execution in
+                                               QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+                                          Token Hidden States
+
+
+                                                                                 Quantized Expert
+                                      1
+
+
+
+
+                 Expert Assignments
+                                      2
+                                      2
+
+                                      2
+                                      1
+                                                                                        Q
+                                      1
+
+                                      2
+
+                                                                                                         GPU
+
+
+Figure 2. Illustration of the offloading execution for the sparse part of a Transformer block. An expert E2 and its corresponding input
+tokens XE are fetched to GPU memory to produce E2′ , which together with the corresponding outputs YE are written back to CPU again.
+
+
+such a way that we only ever need to perform computation                              3.2.2. L IST B UFFER
+on a small subset of the intermediate data. This allows us
+                                                                                      To efficiently support per-sample access for evaluating dense
+to offload main storage from GPU, to much less expensive
+                                                                                      model components, as well as fully-vectorized querying of
+and plentiful CPU memory.
+                                                                                      expert tokens, we store B as a list buffer data structure. This
+Concretely, we maintain a single large buffer B which we                              can be seen as a huge contiguous buffer of all token hidden
+update as follows, for the dense part of a Transformer block:                         states, together with delimiter indices denoting boundaries
+                                                                                      between individual samples. Figure 3 illustrates this storage
+                                                                                      format. This datastructure is crucial for efficiency; naively
+  1. Fetch one “sample” X, containing a few hundreds of
+                                                                                      iterating over samples and fetching relevant tokens via mask-
+     tokens, from CPU to GPU.
+                                                                                      ing is unusably slow for large sample counts.
+  2. Pass it through the corresponding dense layers to obtain
+     the result Y .                                                                   3.2.3. L AZY W EIGHT F ETCHING
+  3. Calculate and store expert assignment for tokens in Y .                          Since the weights of the 1.6 trillion parameter model con-
+                                                                                      sume > 3 TB of storage, they cannot even be stored in
+  4. Send Y back to CPU and overwrite X in B.                                         CPU RAM. Thus, we lazily fetch them directly from disk
+                                                                                      storage as they are required. If we follow the inference
+and respectively for the sparse part, looping over experts:                           procedure outlined in Section 3.2.1, this would be exactly
+                                                                                      once. Afterwards, their memory is released again.
+
+  1. Fetch all individual tokens in B that have been assigned                         3.2.4. E XPERT G ROUPING
+     to expert E, denoted by XE , from CPU to GPU.
+                                                                                      Additionally, in order to avoid GPU underutilization (see
+  2. Use them to produce compressed expert E ′ (for exam-                             Section 3.1), we group multiple experts together and apply
+     ple, with GPTQ).                                                                 a joint batched variant of the GPTQ algorithm. Concretely,
+  3. Run XE through E ′ to get YE ′ .                                                 we extract the inputs XE corresponding to all experts E ∈ E
+                                                                                      in group E (the XE will generally have different sizes) and
+  4. Send YE ′ back to CPU and overwrite XE in B.                                     compute Hessians HE . These matrices, together with the
+                                                                                      weight matrices WE , are then stacked to 3-dimensional ten-
+This process, which is visualized in Figure 2, minimizes                              sors, on which our modified GPTQ algorithm operates, com-
+both memory consumption and transfer cost: we need only                               pressing all experts simultaneously. We can also compute
+                                                                                                    ⊤
+a single copy of B and each token is only read and written                            HE = XE XE       directly with a single matmul as the XE are
+twice per Transformer block.                                                          generally small enough, avoiding the slow per-sample accu-
+                                                                                      mulation employed by prior implementations. Our default
+                                                                                      expert groupsize |E| is 16, which brings a good trade-off
+                                                                                      between GPU memory consumption and utilization.
+                                                                         1   3        Table 1 demonstrates the impact of expert grouping via
+                                                                Bounds
+     Tokens
+
+
+
+
+                                                                         4   7
+                                                                                      GPTQ batching, when compressing a sparse encoder layer
+                                                                                      of switch-base-128 using 10k samples; |E| = 16 yields
+                                                                         8   8        about ≈ 6× speedup over standard per-expert computation.
+
+Figure 3. List buffer example with 3 samples, indicated by hue.
+                             QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+               |E| = 1     |E| = 4     |E| = 16                   ing and true sequential execution (Frantar et al., 2023). How-
+                                                                  ever, as shown in Table 3 for ternary quantization of switch-
+               174.1s       54.4s          28.8s                  base-128, we find the former to be actually harmful and the
+    Table 1. Sparse layer compression time for different |E|.     latter to be more or less quality neutral, for our particular
+                                                                  use-case. We suspect that, in this highly aggressive setting,
+                                                                  quantizing all the most sensitive columns first, leads to large
+3.2.5. ROBUSTNESS M ODIFICATIONS                                  changes of the entire weight matrix, and thus to overfitting.
+To achieve sufficiently high robustness for successfully
+quantizing trillion parameter models with tens of thousands                     GPTQ        act     seq     act + seq
+of layers, we need to employ various numerical and memory                        1.99      2.23     1.99      2.28
+adjustments. The most important are listed below:
+                                                                  Table 3. Activation reordering (act) and sequential execution (seq).
+   • We use 10× higher relative Hessian dampening δ =
+     0.1, avoiding breakdowns with inf-values.
+                                                                  4. Realizing Sub-1-Bit Compression
+   • Very few layer Hessians are not invertible even after
+     high dampening; we skip GPTQ for those and simply            Using our system discussed in Section 3, we can accurately
+     perform vanilla rounding.                                    quantize extremely large SwitchTransformers to very low
+                                                                  bit-widths: 2-bit and even ternary (3 possible values). Yet, in
+   • Sometimes an expert receives a number of tokens that
+                                                                  practice, this falls still short of our compression goal of less
+     is much larger than average, leading to out-of-memory
+                                                                  than 1 bit per parameter. We find that compression rates can
+     situations when these are fetched to GPU. We avoid
+                                                                  be pushed significantly further by taking advantage of the
+     this by capping the maximum number of tokens used
+                                                                  low entropy in the quantized weights. Next, we co-design
+     for compression at 4× the mean and use multiple itera-
+                                                                  an encoding scheme and a CUDA kernel which realize sub-
+     tions for computing and updating YE in such cases.
+                                                                  1-bit per weight compression in practice, at minimal cost in
+                                                                  terms of GPU execution overhead for inference.
+3.3. Accuracy Improvements
+In addition to implementing a highly efficient compression        4.1. Natural Sparsity
+system, we also make new discoveries about applying GPTQ          We pick quantization grids in standard fashion: row-wise
+in our particular context, i.e., for models trained for masked-   around the min and max weights values (Dettmers et al.,
+language-modelling, MoEs and ternary quantization.                2022; Frantar et al., 2022), e.g., for ternary: {wmin , 0, wmax }.
+Premasking Special Tokens. First, we find that results            These rather wide grids combined with the fact that weights
+can be improved if the various special separator tokens           are typically close to normally distributed, naturally lead to
+inserted by the masked-language-modelling task (Raffel            high sparsity after quantization, i.e., a large number of zeros.
+et al., 2020b) are excluded from the calibration data used for    We demonstrate this in Table 4, averaged over all layers. For
+compression. Conretely, in the encoder, we mask out those         ternary weights, the largest model achieves close to 90%
+“mask-tokens” during the Hessian computation. Meanwhile,          natural sparsity; the standard deviation is also quite low, at
+in the decoder, we skip the token directly before such a          < 5%. Seen another way, the quantized weights have low
+special token as this is the one used to predict the latter.      entropy, meaning that, on average, significantly less bits per
+                                                                  weight should be required for lossless storage.
+As shown in Table 2 for switch-base-128 with 10k samples,
+this brings noticeably lower loss at no additional compute
+cost. We think that because those tokens are very common                            model         2-bit    ternary
+during training, the model is so robust in their prediction                        base128        72.2%    85.7%
+that any error compensation on them during quantization is                         large128       73.1%    86.4%
+unnecessary, while worsening correction for other tokens.                            c2048        76.5%    88.6%
+                                                                     Table 4. Natural sparsity for different compressed models.
+                mask     BF16       2bit     tern
+                 no       1.73      1.86    2.16
+                 yes      1.73      1.76    1.99                  4.2. From Sparsity to Entropy
+   Table 2. Impact of special token masking; validation loss.     The direct way of utilizing these high zero proportions
+                                                                  would be in form of a joint sparse & quantized represen-
+Ineffective Heuristics. We also evaluate two more recently        tation (Kurtic et al., 2022; Yu et al., 2023): storing only
+proposed GPTQ enhancement heuristics: activation reorder-         the quantized values of non-zero weights, together with
+                            QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+necessary position metadata. However, as our base quantiza-       4.3. Compression Scheme & Kernel Co-design
+tion levels are already very low, standard sparsity metadata
+                                                                  To achieve our goal, we need to design a compression
+formats (Elsen et al., 2020; Lin et al., 2023) would only
+                                                                  scheme and its GPU decoding kernel jointly, and poten-
+allow limited additional compression. A bitmask indicating
+                                                                  tially trade off compression for faster decoding. We begin
+non-zero locations requires 1 bit per weight, while 10-13
+                                                                  with an overview of the main ideas behind our approach,
+bit (depending on layer size) column indices are even less
+                                                                  followed by an in-depth discussion of key details.
+memory efficient at the sparsity levels we encounter. There-
+fore, we take a different approach: we do not utilize sparsity
+                                                                  4.3.1. OVERVIEW
+directly but rather the low entropy, which is implied by the
+fact that a single value (0) occurs very frequently, using an     Instead of a code with variable length codewords (see Sec-
+appropriate encoding scheme.                                      tion 4.2.1) mapping to fixed length data, we will use a
+                                                                  dictionary-based code with fixed length codewords mapping
+4.2.1. FAST GPU D ECODING C HALLENGES                             to a variable number of symbols. Such LZW-based schemes
+                                                                  (Welch, 1984) are popular for general purpose compression
+In principle, we could group multiple consecutive ternary
+                                                                  like ZIP, as they are particularly effective for text data with
+weights into super-symbols and then apply a code which
+                                                                  long repeated segments. While a dictionary code is not ideal
+assigns variable length codewords to those super-symbols,
+                                                                  in terms of compression rate for the case of almost-random
+based on their probability of occurrence, for example, via a
+                                                                  data in our application, it will be key for fast GPU decoding.
+Huffman approach (Huffman, 1952). If the quantized weight
+values were close to independent, this would achieve strong       First, our kernel design uses one warp, that is 32 consecutive
+compression rates; in fact, for actual independence, they         threads, to handle a row of a weight matrix, each of which is
+would be essentially Shannon-optimal (MacKay, 2003).              encoded independently. This addresses Challenge 4 in Sec-
+                                                                  tion 4.2.1, yielding reasonable GPU utilization for relevant
+At the same time, our primary goal is to use compressed
+                                                                  matrix sizes, with negligible metadata overhead. Further,
+models for fast and space-efficient inference. Thus, it is
+                                                                  we use a fixed-to-variable code with a large dictionary. This
+critical not only that our encoding scheme achieves good
+                                                                  allows us to use a full warp to process one codeword at-a-
+compression, but also that it can be decoded fast on GPU
+                                                                  time, extracting all data, while maintaining good efficiency,
+hardware. This is challenging for a number of reasons:
+                                                                  thus working around Challenges 1 and 2. This way, slow
+Challenge 1: Entropy-based codes generally possess se-            bit and base-3 operations (for ternary) can also be kept at a
+quential decoding dependencies: symbol i can only be de-          minimum, resolving Challenge 3.
+termined if the length, which is variable, of all (i − 1) prior
+symbols is known. Hence, processing consecutive symbols           4.3.2. D ICTIONARY D ESIGN AND I MPLEMENTATION
+simultaneously leads to high synchronization overhead.
+                                                                  In general, assume that the values of a ternary weight matrix
+Challenge 2: Binary words in storage (e.g., INT32 blobs)          (denoted by 0, 1, 2) are distributed close to independently
+may contain different numbers of decoded symbols. Conse-          according to the distribution:
+quently, even if rows/blocks are encoded independently, par-
+allel decoding will happen non-uniformly, while all threads                                                      1 − p0
+                                                                             P (0) = p0 ,    P (1) = P (2) =            ,         (2)
+in a GPU-warp must always execute the same instruction.                                                            2
+This would result in many wasted operations.
+                                                                  where p0 denotes the probability of sampling 0, e.g., 0.885
+Challenge 3: Variable-length low-bit decoding involves a          as per Table 4. Since we plan to use a rather large dictionary,
+large number of binary operations like shifts, which are not      it should be shared between many weight matrices, in or-
+particularly efficient on GPUs.                                   der for the dictionary itself not to cause substantial storage
+Challenge 4: Individual matrices of MoEs are typically not        overheads. We find that such a static dictionary works well
+very large, making it difficult to split them into enough sep-    enough, while simplifying memory efficient compression
+arately decoded segments to achieve good GPU utilization          (see Section 3.2) as we do not have to collect statistics over
+without having to store additional data to break sequential       many yet uncompressed experts.
+dependencies, which would harm compression rates.                 Next, we consider pairs of ternary values t = (t1 , t2 ), whose
+In contrast, uncompressed half-precision matrix-vector prod-      corresponding probability is P (t) = P (t1 )P (t2 ). We gen-
+ucts, which are the primary operation underlying generative       erate the 216 highest probability sequences containing at
+inference, easily achieve close to ideal memory-bandwidth         most 14 such pairs. This dictionary can be generated using a
+utilization and thus present a very strong baseline.              max-priority queue on probability, as shown by Algorithm 1.
+                                                                  To briefly understand the procedure, notice that upon the
+                                                                  first iteration, it will push all individual pairs t = (t1 , t2 ) to
+                                                                  the priority queue, sorting them by decreasing probability,
+                                          QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+Algorithm 1 Generate decoding dictionary sequences.                                             quent elements, and most lookups are for frequently occur-
+  Q ← max priority queue containing (1.0, ())                                                   ring codewords, there are many fast L1-cache hits.
+  while |D| < 216 do                                                                            Validation. To assess the effectiveness of our scheme, we
+    p, s ← pop(Q)                                                                               compute achieved compression rates, both on a real ternary
+    append s to dictionary if 0 < |s| < 28                                                      quantized c2048 model as well as on weight matrices sam-
+    for t ∈ {(t1 , t2 ) | t1 , t2 ∈ {0, 1, 2}} do                                               pled directly from distribution (2), yielding 20.07× and
+       push((p · P (t), cat(s, t)), Q)                                                          21.11×, respectively. This gap of only ≈ 5% suggests that
+    end for                                                                                     our simplifying independence assumption is indeed quite
+  end while                                                                                     close for large models. We also note that our rates are only
+                                                                                                ≈ 20% away from the distribution’s (with p = 0.885) theo-
+                                                                                                retical compression limit of 25.40×, which we consider a
+after which they will be expanded in this order.                                                reasonable trade-off for enabling fast GPU decoding.
+We have exactly 216 codewords as this allows us to store
+                                                                                                4.3.3. GPU K ERNEL
+them in the native UINT16 datatype, avoiding any slow bit-
+extractions at this decoding level. Each of those codewords                                     Having defined the dictionary format, we can now discuss
+maps to two consecutive UINT32 values containing up to 7                                        the design of the actual decoding kernel in detail. We focus
+pairs each, stored using 2 bits per ternary value, followed by                                  on the most important operation for inference, decompres-
+the total number of pairs in the sequence; see also Figure 4.                                   sion fused with a matrix-vector-product. However, our tech-
+This format dictates our maximum chosen pair count of 14.                                       niques can easily be adapted to other use-cases, e.g., pure
+Further, we consider pairs, rather than individual weights, to                                  decompression.
+fit the maximum count into 4 bits. The 2-bit-per-weight for-
+                                                                                                Listing 1 provides CUDA-like pseudocode for our kernel,
+mat is used as there is enough space, while a more compact
+                                                                                                computing the matrix-vector-product of compressed matrix
+ternary encoding would involve slow modulo and division
+                                                                                                w comp (with metadata row off and ter minmax, using
+operations for extraction. We store the pair-count twice so
+                                                                                                dictionary dec) and BF16 vector x, into output buffer y. The
+that each thread can work with only half of the data, stored
+                                                                                                handling of various edge cases and some index calculations
+in a fast INT32 type.
+                                                                                                have been removed for readability. Please see our repository
+  2 bits          4 bits                                                        4 bits
+                                                                                                for the fully functional implementation.
+                                                                                            1   template <int num_warps, int w_width>
+                                                                                            2   __global__ void Sub1MatVec(
+   01       10   00   00   01   00   00   00   01   10   00   00   10    00     1100
+                                                                                            3     int* dec,
+                                                                                            4     ushort* w_comp, int* row_off, __nv_bfloat162* ter_minmax,
+ 1 weight        1 pair                                                       pair count
+                                                                                            5     __nv_bfloat16* x, __nv_bfloat16* y
+                                                                                            6   ) {
+   10       00   01   00   01   00   10   10   00   00   00   00   00    00     1100        7     __shared__ float x_shared[w_width];
+                                                                                            8     for (int i = thread; i < w_width; i += 32 * num_warps)
+                                                                                            9       x_shared[i] = __bfloat162float(x[i]);
+                                                              unfilled                     10
+                                                                                           11       __shared__ float deq[3][32 * num_warps];
+                                                                                           12       deq[0][thread] = 0;
+Figure 4. Data format of a dictionary entry; here of 24 weights.                           13       deq[1][thread] = __bfloat162float(ter_minmax[row].x);
+                                                                                           14       deq[2][thread] = __bfloat162float(ter_minmax[row].y);
+                                                                                           15
+                                                                                           16       __syncthreads();
+Overall, mapping 16-bit codewords to 64-bit data blobs                                     17       __shared__ w_comp_block[32][num_warps];
+                                                                                           18
+strikes a good balance between several goals: (a) Having                                   19       float res = 0;
+codewords map to, on average, more uncompressed values                                     20       int idx = 0;
+                                                                                           21
+than their bitwidth, a necessary condition for achieving < 1-                              22       for (int i = 0; i < row_off[row + 1] - row_off[row]; i += 32) {
+                                                                                           23         w_comp_block[warp][lane] = w_comp[i + lane];
+bit compression. (b) Minimizing the overall storage cost of                                24
+the dictionary to fit into the L2-cache of the GPU, which                                  25
+                                                                                           26
+                                                                                                        if (lane < 28) {
+                                                                                                          for (int j = 0; j < 32; j++) {
+is critical for good decoding performance. (c) Utilizing                                   27               int enc = w_comp_block[warp][j];
+                                                                                           28               int wx14 = dec[2 * enc + (lane / 14)];
+as many threads in a warp as possible for simultaneously                                   29               int ter = (wx14 >> (4 + 2 * (lane % 14))) & 0x3;
+                                                                                           30               float w = deq[ter][thread];
+extracting plain weights from the decoded data; usually,                                   31               res += w * x_shared[idx + lane];
+> 16 will do useful work and only 4 out of 32 threads are                                  32               idx += 2 * (wx14 & 0xf);
+                                                                                           33             }
+never active in this step. (d) Avoiding as many conditionals                               34           }
+                                                                                           35       }
+and extra operations necessary for dealing with non-uniform                                36
+data storage as possible, which slow down parallelization.                                 37
+                                                                                           38
+                                                                                                    for (int i = 16; i > 0; i /= 2)
+                                                                                                      res += __shfl_down_sync(0xffffffff, res, i);
+                                                                                           39       if (lane == 0)
+Finally, we note that while dictionary lookups are in princi-                              40         y[row] += __float2bfloat16(res);
+                                                                                           41   }
+ple random access, keeping it sorted from highest to lowest
+probability ensures very favorable caching behavior. Since                                      Listing 1. Simplified kernel pseudocode for a fused decompress +
+each lookup also automatically prefetches several subse-                                              matrix-vector-product operation.
+                            QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+Parallelization. Overall, each threadblock will handle mul-       of the matrix to compress suffices.
+tiple consecutive rows, each of which is processed by a sin-
+gle warp. We use exactly one thread-block per GPU Stream-         5. Experiments
+ing Multiprocessor (SM) with min(#rows in block, 32)
+warps; if there are more than 32 rows in a block, (some)          5.1. General Setup
+warps sequentially process multiple rows (note that this part
+                                                                  Models. We focus our experiments on the SwitchTrans-
+is omitted in Listing 1 for simplicity). This avoids any bad
+                                                                  former (Fedus et al., 2022) family of models. Our primary
+wave quantization effects. We find this strategy to be an ef-
+                                                                  target is the very largest variant, c2048, with around 1.6
+fective heuristic that yields good performance for all matrix
+                                                                  trillion parameters, but we also consider the comparatively
+shapes we consider.
+                                                                  small base128 (7B params) and large128 (26B params) ver-
+Execution. Our kernel starts by loading the entire input          sions for testing and ablations. We chose the SwitchTrans-
+vector to shared memory (x shared, lines 7-9), using all          former family as it contains the largest publicly-available
+warps in a threadblock. This enables fast element access in       model, which also features a similar or higher number of
+the subsequent per-row product-sum accumulations.                 training tokens to parameters ratio than potential alterna-
+Next, each warp processes its corresponding row by                tives like Artetxe et al. (2022). Further, those models are
+first fetching (up to) 32 codewords into shared memory            also among the most popular massive MoEs, with several
+(w comp block, line 23) using a single coalesced transac-         implementations across frameworks.
+tion. It then loops over those symbols, processing one-at-        Framework. As accessibility is a major goal of our work,
+a-time (lines 26-33). First, using 28 of its 32 threads (line     we build our code-base around the PyTorch-backend of the
+25), it fetches the corresponding decoding data from the          highly popular HuggingFace (Wolf et al., 2019) framework,
+dictionary where the first UINT32 is assigned to threads          rather than on the SwitchTransormer’s original training en-
+0-13 and the second to threads 14-27 (wx14, line 27). Then,       vironment MeshTensorflow (Shazeer et al., 2018) or its
+each thread extracts its corresponding ternary weight (lines      JAX-based successor T5X (Google, 2023). This brings a
+29-30) and adds the corresponding input product into its          number of additional challenges.
+own partial result accumulator (res, line 31). We note that
+                                                                  First, we find that the largest model variants require a hand-
+the input reads from shared memory are contiguous and do
+                                                                  ful of bugfixes, primarily configuration and model setup
+not cause bank conflicts. Afterwards, each thread advances
+                                                                  changes, in order to run properly. We suspect that this is
+the offset index (idx, line 32) into the input vector by the
+                                                                  because their enormous sizes have rendered extensive test-
+total number of weights encoded in the current symbol.
+                                                                  ing very difficult. Second, we observed a major inefficiency
+Finally, after the full row has been scanned, a warp-             in the context of generative inference for models with a
+reduction (lines 37-38) over the partial results of each thread   large number of experts: the HuggingFace implementation
+yields the output (y, lines 39-40).                               will perform several (empty) CUDA calls for potentially
+Ternary decoding. Another relevant detail is that ternary         1000s of experts to which no token is routed, accumulating
+weights are stored as 0, 1, 2 (line 29) but need to be dequan-    large overheads. We modify the implementation (also for
+tized to 0, wmin , wmax for multiplication with inputs. We        baselines) to skip such unnecessary calls, leading to > 10×
+found that the most efficient way of performing this con-         speedup for large models. We apply all changes to the Hug-
+version is via a shared memory lookup table (lines 11-14).        gingFace framework only dynamically at runtime, so that
+Crucially, this table needs to be replicated 32 times across      our code can be run directly with an official installation.
+the column-dimension to avoid very frequent bank conflicts,       HuggingFace prioritizes ease-of-use and flexibility over
+which would otherwise occur every time not all 28 threads         high performance. For that reason, we conduct inference
+dequantize the same value (line 30). Fortunately, there are       measurements not only end-to-end, including all Hugging-
+only 3 input values and so its overall size is tolerable.         Face overheads, but also in isolated fashion, comparing
+Encoding. So far, we have only focused on the decoding            uncompressed and compressed matrix operations directly.
+operation, but we also have to encode matrices with reason-       This is to demonstrate that our GPU kernels would also yield
+able efficiency. In general, this is done by building a trie      low overhead in more optimized inference environments.
+datastructure (of the dictionary discussed in Section 4.3.2)      Datasets. SwitchTransformers have been trained for a
+mapping sequences to codewords. Then, we iterate through          Masked-Language-Modelling (MLM) objective (Raffel
+the input while simulatenously traversing the trie to find        et al., 2020b) on the C4 dataset (Raffel et al., 2020a). Similar
+longest prefix matches, yielding the corresponding code-          to most works in the area of LLM quantization (Yao et al.,
+words. Finally, we densely pack rows of different lengths         2022; Frantar et al., 2022; Dettmers & Zettlemoyer, 2022),
+into a contiguous buffer and record corresponding row off-        we focus on general upstream compression directly on this
+sets. Unlike decoding, encoding is not very latency critical      pretraining task/dataset combination. Consequently, our
+and a straight-forward GPU kernel using one thread per row        evaluation focuses on validation performance for C4/MLM,
+                               QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+where we use the public reproduction of C4 on HuggingFace              zation, 2-bit is achievable at minimal loss (1.7% relative on
+as well as their replication of the original masking proce-            c2048) and ternary at only a small increase (6.7% relative
+dure. Calibration data for compression is taken, in order,             on c2048). This demonstrates not only the effectiveness
+from the first two shards of the training set. For efficiency,         of such advanced quantization methods in this context, but
+we primarily evaluate on 128 samples (corresponding to the             also shows that extremely low-bit compression is indeed
+average loss over > 10K tokens, which is quite stable) from            practical for massive MoEs.
+the first shard of the validation set, but we also perform
+                                                                       Additionally, we conduct evaluations on Arxiv, GitHub,
+some evaluations other datasets.
+                                                                       StackeEchange and Wikipedia data sampled from RedPa-
+Hardware. All compression experiments, including those                 jama (Computer, 2023). Even though only < 0.01% of our
+for the very largest models, can be performed in less than a           C4 calibration data originates from those websites, the com-
+day on a single NVIDIA A6000 with 48GB of GPU memory.                  pressed model still preserves performance almost as well as
+However, efficiently compressing trillion parameter models             on the core of the distribution (see Table 6).
+using a large number of calibration samples requires a few
+100GBs of (CPU) RAM; the original 1.6T model itself also                       bits     arxiv   github     stackexch.     wiki
+occupies > 3 TB disk storage. We highlight that our work is
+performed in a highly constrained environment for models                      BF16      1.31     0.99           1.15      1.20
+of this size, for example, it is already infeasible to load the                2-bit    1.34     1.05           1.17      1.24
+entire (uncompressed) 1.6T model into RAM, let alone into                      tern     1.42     1.13           1.22      1.32
+GPU memory. For inference on compressed models, we
+will also consider running on multiple NVIDIA 3090 GPUs,                    Table 6. Additional evaluations for the c2048 model.
+with 24GB of memory each, in addition to A6000s.
+                                                                       In terms of calibration data, we see that increasing the
+5.2. Compression Results                                               amount of samples generally improves performance slightly,
+                                                                       most noticeably for ternary quantization, but there is also
+Accuracy. We begin by quantizing all SwitchTransformer                 some noise in the process, especially at 2-bit.
+models to 2-bit and ternary precision, and evaluating their
+validation loss. Our default number of calibration samples is          Compression. Next, we investigate the actual compression
+10K for 128 experts and 160K for 2048, but we also consider            rates that are achieved by further compressing ternary mod-
+using 0.5× and 2× as many samples. In addition to using                els using our scheme introduced in Section 4. We consider
+our efficient QMoE framework discussed in Section 3, we                both compression relative to just the MoE modules (the
+also consider a standard round-to-nearest (RTN) baseline               model parts we quantize) as well as to the full model and all
+(Dettmers et al., 2022). We simulate the latter by fixing              its metadata. The compression rates and overall checkpoint
+Hessians to the identity matrix, thus applying precisely the           sizes are listed in Table 7.
+same quantization settings and evaluation protocol. Table 5
+summarizes our results.                                                                                              size [GB]
+                                                                             model      moe-only         full
+                                                                                                                   bf16     ours
+                    base128          large128          c2048                base128      17.06×       11.76×       14.9     1.27
+    method
+                   2bit tern        2bit tern        2bit tern              large128     18.34×       13.32×       52.7     3.96
+     BF16              1.73             1.55             1.18                 c2048      20.07×       19.81×       3142    158.6
+
+     RTN          2.27     4.54    1.96     2.79    1.33     2.15          Table 7. Compression rates and sizes for ternary models.
+
+ QMoE 0.5x        1.78     2.11    1.54     1.70    1.22     1.27
+ QMoE 1.0x        1.76     1.99    1.56     1.69    1.20     1.26      In general, measuring only relative to parts we compress
+ QMoE 2.0x        1.76     1.93    1.57     1.64    1.21     1.26      (moe-only), all sizes achieve > 16× compression rate and
+                                                                       thus < 1 bits per parameter storage. On c2048, even the
+Table 5. Comparing C4 validation losses for 2-bit and ternary (tern)   overall rate, including all uncompressed dense layers, re-
+quantized SwitchTransformers. “QMoE 0.5x” indicates that only          mains at 19.81×, corresponding to 0.807 bits per parameter,
+half of the default number of calibration samples are used.            reducing the checkpoint size from 3142GB to 158.6GB. One
+                                                                       can also observe that compression rates increase with model
+                                                                       size, which is for two reasons: (a) natural sparsity increases
+Perhaps surprisingly, vanilla rounding (RTN) does not lead
+                                                                       while our encoding dictionary is also optimized for c2048
+to a complete model collapse even at ternary precision, em-
+                                                                       (see Section 4), and (b) weight distributions become closer
+phasizing the high robustness of large MoEs to quantization.
+                                                                       to independent for larger layer sizes.
+Nevertheless, the loss increases are quite significant for
+smaller models at 2-bit and far too large to be useful at              Runtime. Finally, we evaluate how long it takes to produce
+ternary precision. In contrast, using data-dependent quanti-           compressed models on a single A6000 GPU, for different
+                                                           QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+                                     Per-layer performance of compressed matrix-vector kernels                                            6         End-to-end performance of compressed models
+                           1.2
+                                                    BF16        RTX3090        A6000                                                               3090-BF16*      3090          A6000-BF16*      A6000
+                                                                                                                                          5
+
+
+
+
+                                                                                                         Seconds to generate 128 tokens
+                           1.0
+   Time relative to BF16
+
+
+
+
+                           0.8                                                                                                            4
+
+                           0.6                                                                                                            3
+
+                           0.4                                                                                                            2
+
+                           0.2                                                                                                            1
+
+                           0.0 768 × 3072   3072 × 768 1024 × 4096 4096 × 1024 2080 × 6144 6144 × 2080
+                                                                                                                                          0
+                                                                                                                                              base128                 large128                    c2048
+
+
+
+Figure 5. (Left) Per-layer compressed kernel performance relative to uncompressed execution. (Right) End-to-end runtimes of compressed
+models and estimates (∗ , would require 65/130 GPUs) for bloat16 baselines. c2048 is run on 4×A6000 and 8×3090 GPUs, respectively.
+
+
+amounts of calibration data. The results are shown in Ta-                                                user application, like (Frantar et al., 2022; Leviathan et al.,
+ble 8. Smaller models can be compressed in less than an                                                  2023; Park et al., 2022), where a single prompt (sampled
+hour and even c2048 in less than a day, confirming the high                                              from C4) should be processed to generate a 128-token re-
+efficiency of QMoE. The runtime increase from large128                                                   sponse. As actually running the bfloat16 version of the
+to c2048 is roughly proportional to the difference in size,                                              c2048 model would require > 65 A6000 and > 130 3090
+despite the latter using 16× more samples. This is because                                               GPUs (versus 4 and 8, respectively, for sub-1-bit com-
+the number of samples per expert stays constant and the                                                  pressed weights) we have to estimate its runtime. We do this
+expert size increases only slightly. Finally, we note that                                               by having all experts in a layer point to the same weight data
+simply (iteratively) loading the original 1.6T model into                                                (completely resolving memory issues), which allows us to
+RAM takes close to 5 hours on our slow disk storage.                                                     collect timings with precisely the same overheads as for our
+                                                                                                         compressed models. However, this is a highly optimistic
+                                                                                                         estimate since real execution would require close to 20×
+                             model           5K/80K          10K/160K           20K/320K
+                                                                                                         more GPUs, with corresponding communication overheads,
+                           base128           8.4min           14.0min             21.6min                and our numbers should thus be viewed only as a lower
+                           large128         22.0min           30.2min             45.2min                bound.
+                             c2048            13.3h            16.0h               20.8h
+                                                                                                         The results, shown in Figure 5 (Right), demonstrate that
+Table 8. Compression runtime for different calibration data size.                                        end-to-end execution of compressed models is only < 5%
+                                                                                                         slower than standard (uncompressed) execution. This slight
+                                                                                                         slow-down despite faster per-layer timings is due to the fact
+5.3. Runtime Results                                                                                     that the encoder may sometimes route multiple tokens to
+Individual Layers. Our kernel performance evaluation                                                     the same expert. Our current implementation naively exe-
+starts with a direct (isolated) comparison of our compressed                                             cutes a separate matrix-vector product for each token, while
+matrix-vector product kernels (see Section 4) against Py-                                                the baseline performs a much more efficient joint matrix
+Torch’s standard (uncompressed) bfloat16 cuBLAS kernels.                                                 multiplication. For applications where this is a significant
+Figure 5 (Left) shows the time taken by our compressed                                                   bottleneck, one could easily introduce an inner loop over to-
+kernels relative to bfloat16, for the matrix shapes found in                                             kens into our kernel (Listing 1, line 30), or fully decompress
+our MoEs, on two different GPUs. While our kernels have                                                  first, followed by a standard matmul, for large token counts.
+to perform a lot less slow (global) memory reads than the
+bfloat16 baseline due to lower storage costs, they need to                                               6. Related Work
+spend much more compute for complex unpacking of the
+heavily-compressed weights. Nevertheless, executing our                                                  Mixture-of-Expert (MoE) Models. Mixture-of-expert
+compressed kernels takes less time than the close to ideal                                               models are a popular research direction aimed at creating
+bfloat16 baseline in all cases, with up to 35% speedup on                                                significantly more efficient large-scale models (Fedus et al.,
+specific matrix shapes. We note that these are very low-                                                 2022; Artetxe et al., 2022; Clark et al., 2022). At the core
+latency operations, with the smallest matrix taking < 0.02                                               of MoEs lie (sparse) routing mechanisms, of which many
+milliseconds and the largest < 0.05.                                                                     variants have been proposed. Those range from static as-
+                                                                                                         signment based on input tokens IDs (Roller et al., 2021),
+End-to-End Execution. Finally, we also benchmark our                                                     over dynamic token-to-expert matching (Zhou et al., 2022),
+kernels end-to-end in HuggingFace on the real weights of                                                 to “soft” routing of linear input combinations (Puigcerver
+our compressed MoE models. We consider an individual
+                            QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+et al., 2023). Since MoEs can feature rather different com-      inference of compressed models.
+putational profiles from standard dense models, there is also
+significant research on optimizing inference and training        7. Discussion and Limitations
+systems (Barham et al., 2022; Gale et al., 2023; Hwang
+et al., 2023). Among the most critical problems in this area     We have presented QMoE, an end-to-end compression and
+are data-exchanges between accelerators during routing and       inference framework for addressing the massive memory
+dealing with uneven compute-loads for different experts.         costs of MoE inference. We showed, for the first time, that
+LLM Quantization. Quantization is a very popular com-            models such as the trillion-parameter SwitchTransformer-
+pression technique, which has seen a vast amount of              c2048 can be accurately compressed to less than 1 bit per
+work (Gholami et al., 2021), especially in the context           parameter, close to 20× compression rate, in a custom for-
+of LLMs. Specifically, the ability to perform accurate           mat that enables the first efficient end-to-end execution of
+weight quantization for billion-parameter models has greatly     such a model on a single commodity GPU server. QMoE is
+boosted their accessibility: it has been shown that extremely    fully open-source and built around the popular HuggingFace
+large dense models can be quantized to 8- or even 4-bit          framework, making deployment and research for massive
+precision at little accuracy loss (Dettmers et al., 2022; Yao    MoEs significantly cheaper and more accessible.
+et al., 2022; Frantar et al., 2022; Dettmers & Zettlemoyer,      Our study is confined to a limited set of models, as only
+2022). Pushing towards even lower bitwidths via more             very few massive and accurate MoEs are available publicy.
+sophisticated compression formats, like multi-level group-       Additionaly, due to their size, most MoEs are trained and de-
+ing coupled with higher-precision outliers (Dettmers et al.,     ployed in different bespoke framework, requiring complex
+2023b), or new quantization techniques, like incoherence         manual integrations to use for further research. Neverthe-
+preprocessing (Chee et al., 2023), is an active area of re-      less, we have covered some of the largest and most accurate
+search. Currently, accurate quantization to 2 or less bits per   available MoEs, specifically SwitchTransformers (Fedus
+parameter appears to be a major barrier for post-training        et al., 2022). A natural extension of our work would be to
+quantization of standard LLMs. By contrast, in this work we      apply our QMoE techniques to other MoE models and vari-
+show that massive MoE models appear to be significantly          ants, such as Artetxe et al. (2022) or the recently-proposed
+more compressible, as we achieve sub-1-bit compression at        SoftMoEs (Puigcerver et al., 2023).
+comparable loss increases to 3-bit or 4-bit quantization of
+standard LLMs with advanced techniques.                          Additionally, we have focused on direct compression of the
+                                                                 pretrained base model. However, it would also be interesting
+MoE Compression. There has also been work on com-                to further finetune a compressed model for specialized down-
+pressing MoE models in particular. Chen et al. (2022) and        stream tasks, similar to QLoRA (Dettmers et al., 2023a).
+Koishekenov et al. (2022) perform compression via spe-           Zoph et al. (2022) report strong results when finetuning
+cialization of MoEs to specific “downstream” finetuning          only non-expert layers, which QMoE leaves uncompressed,
+datasets by pruning components not relevant to the par-          suggesting that this application could be promising. We
+ticular task. In contrast, we focus on general “upstream”        hope to explore this in future work.
+compression of the pretrained model, via extremely low-bit
+quantization. Other works (Kim et al., 2022b; Yi et al., 2023;
+Kim et al., 2023) also perform MoE quantization, but focus       References
+on noticeably higher bit-widths, like 8 or 4 bits per weight.    Artetxe, M., Bhosale, S., Goyal, N., Mihaylov, T., Ott, M.,
+This is accomplished primarily via simple rounding, which,         Shleifer, S., Lin, X. V., Du, J., Iyer, S., Pasunuru, R., et al.
+as shown by our experiments, is not accurate enough for full       Efficient large scale language modeling with mixtures
+2-bit or lower compression. Kim et al. (2022a) achieve 2-bit       of experts. In Empirical Methods in Natural Language
+quantization on a 5 billion parameter MoE, which is con-           Processing (EMNLP), 2022.
+sidered relatively small in this area, by further optimization
+of the model via Quantization-Aware Training (Nagel et al.,      Barham, P., Chowdhery, A., Dean, J., Ghemawat, S., Hand,
+2021). Applying such an approach for trillion-scale models         S., Hurt, D., Isard, M., Lim, H., Pang, R., Roy, S., et al.
+would be extremely resource intensive. They also do not            Pathways: Asynchronous distributed dataflow for ml. In
+provide any mechansims for exploiting low-bit quantization         Conference on Machine Learning and Systems (MLSys),
+and its corresponding natural sparsity in practice, which is       2022.
+challenging and constitutes a key contribution of our work.
+                                                                 Bengio, Y., Léonard, N., and Courville, A. Estimating or
+We are particularly focused on scalabilty and practicalty.         propagating gradients through stochastic neurons for con-
+While existing works study models with at most tens of             ditional computation. arXiv preprint arXiv:1308.3432,
+billions of parameters, we demonstrate the effectiveness           2013.
+and efficiency of our techniques at trillion parameter scale,
+both for the quantization process itself as well as for actual   Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D.,
+                           QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+  Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G.,         Frantar, E. and Alistarh, D. SparseGPT: Massive language
+  Askell, A., et al. Language models are few-shot learners.       models can be accurately pruned in one-shot. In Interna-
+  In Conference on Neural Information Processing Systems          tional Conference on Machine Learning (ICML), 2023.
+  (NeurIPS), 2020.
+                                                                Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh,
+Chee, J., Cai, Y., Kuleshov, V., and De Sa, C. Quip: 2-bit        D. GPTQ: Accurate post-training compression for
+  quantization of large language models with guarantees.          generative pretrained transformers. arXiv preprint
+  arXiv preprint arXiv:2307.13304, 2023.                          arXiv:2210.17323, 2022.
+
+Chen, T., Huang, S., Xie, Y., Jiao, B., Jiang, D., Zhou, H.,    Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D.
+  Li, J., and Wei, F. Task-specific expert pruning for sparse     GPTQ code, 2023. URL https://github.com/
+  mixture-of-experts. arXiv preprint arXiv:2206.00277,            IST-DASLab/gptq.
+  2022.
+                                                                Gale, T., Narayanan, D., Young, C., and Zaharia, M.
+Clark, A., De Las Casas, D., Guy, A., Mensch, A., Paganini,       MegaBlocks: Efficient sparse training with mixture-of-
+  M., Hoffmann, J., Damoc, B., Hechtman, B., Cai, T.,             experts. In Conference on Machine Learning and Systems
+  Borgeaud, S., et al. Unified scaling laws for routed lan-      (MLSys), 2023.
+  guage models. In International Conference on Machine
+                                                                Gholami, A., Kim, S., Dong, Z., Yao, Z., Mahoney, M. W.,
+  Learning (ICML), 2022.
+                                                                  and Keutzer, K. A survey of quantization methods
+Computer, T.    RedPajama: An open source recipe                  for efficient neural network inference. arXiv preprint
+  to reproduce llama training dataset, 2023. URL                  arXiv:2103.13630, 2021.
+  https://github.com/togethercomputer/
+                                                                Google. T5x, 2023. URL https://github.com/
+  RedPajama-Data.
+                                                                  google-research/t5x.
+Dettmers, T. and Zettlemoyer, L. The case for 4-bit pre-
+                                                                Hoefler, T., Alistarh, D., Ben-Nun, T., Dryden, N., and
+  cision: k-bit inference scaling laws. arXiv preprint
+                                                                  Peste, A. Sparsity in deep learning: Pruning and growth
+  arXiv:2212.09720, 2022.
+                                                                  for efficient inference and training in neural networks.
+                                                                  arXiv preprint arXiv:2102.00554, 2021.
+Dettmers, T., Lewis, M., Belkada, Y., and Zettlemoyer, L.
+  LLM.int8(): 8-bit matrix multiplication for transformers      Hubara, I., Nahshan, Y., Hanani, Y., Banner, R., and Soudry,
+  at scale. arXiv preprint arXiv:2208.07339, 2022.                D. Accurate post training quantization with small cal-
+                                                                  ibration sets. In International Conference on Machine
+Dettmers, T., Pagnoni, A., Holtzman, A., and Zettlemoyer,
+                                                                  Learning (ICML), 2021.
+  L. QLoRA: Efficient finetuning of quantized llms. arXiv
+  preprint arXiv:2305.14314, 2023a.                             Huffman, D. A. A method for the construction of minimum-
+                                                                  redundancy codes. Proceedings of the IRE, 40(9):1098–
+Dettmers, T., Svirschevski, R., Egiazarian, V., Kuznedelev,
+                                                                 1101, 1952.
+  D., Frantar, E., Ashkboos, S., Borzunov, A., Hoefler, T.,
+  and Alistarh, D. SpQR: A sparse-quantized representation      Hwang, C., Cui, W., Xiong, Y., Yang, Z., Liu, Z., Hu, H.,
+  for near-lossless llm weight compression. arXiv preprint       Wang, Z., Salas, R., Jose, J., Ram, P., et al. Tutel: Adap-
+  arXiv:2306.03078, 2023b.                                       tive mixture-of-experts at scale. In Conference on Ma-
+                                                                 chine Learning and Systems (MLSys), 2023.
+Du, N., Huang, Y., Dai, A. M., Tong, S., Lepikhin, D.,
+ Xu, Y., Krikun, M., Zhou, Y., Yu, A. W., Firat, O.,            Kim, Y. J., Fahim, R., and Awadalla, H. H. Mixture of
+  et al. GLaM: Efficient scaling of language models with          quantized experts (MoQE): Complementary effect of low-
+  mixture-of-experts. In International Conference on Ma-          bit quantization and robustness. OpenReview, 2022a.
+  chine Learning (ICML), 2022.
+                                                                Kim, Y. J., Henry, R., Fahim, R., and Awadalla, H. H.
+Elsen, E., Dukhan, M., Gale, T., and Simonyan, K. Fast            Who says elephants can’t run: Bringing large scale
+  sparse convnets. In Conference on Computer Vision and           moe models into cloud scale production. arXiv preprint
+  Pattern Recognition (CVPR), 2020.                               arXiv:2211.10017, 2022b.
+
+Fedus, W., Zoph, B., and Shazeer, N. Switch transform-          Kim, Y. J., Henry, R., Fahim, R., and Awadalla, H. H.
+  ers: Scaling to trillion parameter models with simple           Finequant: Unlocking efficiency with fine-grained
+  and efficient sparsity. The Journal of Machine Learning         weight-only quantization for llms. arXiv preprint
+  Research, 23(1):5232–5270, 2022.                                arXiv:2308.09723, 2023.
+                           QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+Koishekenov, Y., Nikoulina, V., and Berard, A. Memory-          Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S.,
+  efficient NLLB-200: Language-specific expert pruning            Matena, M., Zhou, Y., Li, W., and Liu, P. J. Exploring the
+  of a massively multilingual machine translation model.          limits of transfer learning with a unified text-to-text trans-
+  arXiv preprint arXiv:2212.09811, 2022.                          former. Journal of Machine Learning Research (JMLR),
+                                                                  21(1):5485–5551, 2020b.
+Kurtic, E., Campos, D., Nguyen, T., Frantar, E., Kurtz,
+  M., Fineran, B., Goin, M., and Alistarh, D. The Op-           Roller, S., Sukhbaatar, S., Weston, J., et al. Hash layers for
+  timal BERT Surgeon: Scalable and accurate second-               large sparse models. In Conference on Neural Informa-
+  order pruning for large language models. arXiv preprint         tion Processing Systems (NeurIPS), 2021.
+  arXiv:2203.07259, 2022.
+                                                                Shazeer, N., Cheng, Y., Parmar, N., Tran, D., Vaswani, A.,
+Lepikhin, D., Lee, H., Xu, Y., Chen, D., Firat, O., Huang,        Koanantakool, P., Hawkins, P., Lee, H., Hong, M., Young,
+  Y., Krikun, M., Shazeer, N., and Gshard, Z. Scaling             C., et al. Mesh-tensorflow: Deep learning for supercom-
+  giant models with conditional computation and automatic         puters. Conference on Neural Information Processing
+  sharding. arXiv preprint arXiv:2006.16668, 2020.                Systems (NeurIPS), 2018.
+                                                                Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,
+Leviathan, Y., Kalman, M., and Matias, Y. Fast inference
+                                                                  M.-A., Lacroix, T., Rozière, B., Goyal, N., Hambro, E.,
+  from transformers via speculative decoding. In Interna-
+                                                                  Azhar, F., et al. Llama: Open and efficient foundation lan-
+  tional Conference on Machine Learning (ICML), 2023.
+                                                                  guage models. arXiv preprint arXiv:2302.13971, 2023a.
+Lin, B., Zheng, N., Wang, L., Cao, S., Ma, L., Zhang,           Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi,
+  Q., Zhu, Y., Cao, T., Xue, J., Yang, Y., et al. Efficient       A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P.,
+  GPU kernels for n:m-sparse weights in deep learning. In         Bhosale, S., et al. Llama 2: Open foundation and fine-
+  Conference on Machine Learning and Systems (MLSys),             tuned chat models. arXiv preprint arXiv:2307.09288,
+  2023.                                                           2023b.
+MacKay, D. J. Information theory, inference and learning        Wang, P., Chen, Q., He, X., and Cheng, J. Towards accurate
+ algorithms. Cambridge University Press, 2003.                   post-training network quantization via bit-split and stitch-
+                                                                 ing. In International Conference on Machine Learning
+Nagel, M., Amjad, R. A., Van Baalen, M., Louizos, C., and        (ICML), 2020.
+  Blankevoort, T. Up or down? Adaptive rounding for
+  post-training quantization. In International Conference       Welch, T. A. A technique for high-performance data com-
+  on Machine Learning (ICML), 2020.                              pression. Computer, 17(06):8–19, 1984.
+
+Nagel, M., Fournarakis, M., Amjad, R. A., Bondarenko,           Wolf, T., Debut, L., Sanh, V., Chaumond, J., Delangue, C.,
+ Y., van Baalen, M., and Blankevoort, T. A white pa-             Moi, A., Cistac, P., Rault, T., Louf, R., Funtowicz, M.,
+  per on neural network quantization. arXiv preprint             et al. Huggingface’s transformers: State-of-the-art natural
+  arXiv:2106.08295, 2021.                                        language processing. arXiv preprint arXiv:1910.03771,
+                                                                 2019.
+Park, G., Park, B., Kwon, S. J., Kim, B., Lee, Y., and Lee,
+                                                                Wu, X., Yao, Z., and He, Y. ZeroQuant-FP: A leap forward
+  D. nuQmm: Quantized matmul for efficient inference of
+                                                                 in llms post-training w4a8 quantization using floating-
+  large-scale generative language models. arXiv preprint
+                                                                 point formats. arXiv preprint arXiv:2307.09782, 2023.
+  arXiv:2206.09557, 2022.
+                                                                Yao, Z., Aminabadi, R. Y., Zhang, M., Wu, X., Li, C., and
+Puigcerver, J., Riquelme, C., Mustafa, B., and Houlsby, N.        He, Y. ZeroQuant: Efficient and affordable post-training
+  From sparse to soft mixtures of experts. arXiv preprint         quantization for large-scale transformers. arXiv preprint
+  arXiv:2308.00951, 2023.                                         arXiv:2206.01861, 2022.
+Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., and       Yi, R., Guo, L., Wei, S., Zhou, A., Wang, S., and Xu,
+  Sutskever, I. Language models are unsupervised multitask        M. Edgemoe: Fast on-device inference of moe-based
+  learners. OpenAI blog, 1(8):9, 2019.                            large language models. arXiv preprint arXiv:2308.14352,
+                                                                  2023.
+Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S.,
+  Matena, M., Zhou, Y., Li, W., and Liu, P. Exploring           Yu, C., Chen, T., and Gan, Z. Boost transformer-based
+  the limits of transfer learning with a unified text-to-text     language models with gpu-friendly sparsity and quanti-
+  transformer. Journal of Machine Learning Research, 21           zation. In Findings of the Association for Computational
+  (140):1–67, 2020a.                                              Linguistics: ACL 2023, 2023.
+                           QMoE: Practical Sub-1-Bit Compression of Trillion-Parameter Models
+
+Zhou, Y., Lei, T., Liu, H., Du, N., Huang, Y., Zhao, V.,
+  Dai, A. M., Le, Q. V., Laudon, J., et al. Mixture-of-
+  experts with expert choice routing. Conference on Neural
+  Information Processing Systems (NeurIPS), 2022.
+Zoph, B., Bello, I., Kumar, S., Du, N., Huang, Y., Dean, J.,
+  Shazeer, N., and Fedus, W. ST-MoE: Designing stable
+  and transferable sparse expert models. arXiv preprint
+  arXiv:2202.08906, 2022.
+

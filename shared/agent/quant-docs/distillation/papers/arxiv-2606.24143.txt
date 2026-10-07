@@ -1,0 +1,1420 @@
+                                         AsyncOPD: How Stale Can On-Policy Distillation Be?
+
+                                                Wonjun Kang∗ 1 Kevin Galim∗1 Seunghyuk Oh1 Minjun Kang2 Sanghyun Park2
+                                                 Donghoon Kim1 Minjae Lee1 Minseo Kim1 Rishabh Tiwari3 Yuchen Zeng4
+                                                                      Hyung Il Koo1,2 Kangwook Lee5,6
+                                                          1               2
+                                                              FuriosaAI       Ajou University 3 UC Berkeley 4 Microsoft Research
+                                                                                  5
+                                                                                    KRAFTON 6 Ludo Robotics
+arXiv:2606.24143v1 [cs.LG] 23 Jun 2026
+
+
+
+
+                                                                   Code: https://github.com/furiosa-ai/async-opd
+
+
+
+                                                                                             Abstract
+
+                                                     On-policy distillation (OPD) trains a student on its own rollouts guided by teacher
+                                                     feedback and is becoming increasingly important for large language model (LLM)
+                                                     post-training. Like reinforcement learning (RL), however, OPD faces an on-policy
+                                                     systems bottleneck, as rollouts can dominate training time for reasoning workloads.
+                                                     Asynchronous training pipelines can alleviate this bottleneck by decoupling rollout
+                                                     generation from learner updates, but doing so introduces stale-policy data. While
+                                                     prior work has studied stale data in asynchronous RL, its effects in OPD remain
+                                                     underexplored. We present the first systematic study of staleness in asynchronous
+                                                     OPD, focusing on a practical setting where teacher feedback is implemented
+                                                     through local KL losses and full-vocabulary teacher logits are too expensive to
+                                                     store or transfer, necessitating finite teacher-score caches. We first show that
+                                                     KL direction changes the stale-data problem: teacher-weighted forward KL is
+                                                     more robust to stale rollouts, whereas student-weighted reverse KL is vulnerable.
+                                                     Second, for this vulnerable reverse-KL case, we study whether methods designed to
+                                                     stabilize asynchronous RL can mitigate OPD staleness. In our experiments, they do
+                                                     not improve over a simpler OPD-specific surrogate: recomputing the reverse-KL
+                                                     signal under the current student at learner time. Third, we analyze how finite
+                                                     teacher-score caches create a bias-variance tradeoff for sparse and sampled reverse-
+                                                     KL OPD estimators. This motivates multi-sample Monte Carlo (MC), which
+                                                     preserves MC correctability while reducing one-sample variance. Finally, we
+                                                     present and open-source AsyncOPD, a fully asynchronous OPD training pipeline
+                                                     built from these estimator choices. Experiments show that AsyncOPD improves
+                                                     training throughput by 1.6× to 3.8× over strict synchronous training while reaching
+                                                     comparable accuracy.
+
+
+                                         1     Introduction
+
+                                         On-policy distillation (OPD) [1, 6, 20] and reinforcement learning (RL) [26, 28] have become
+                                         central post-training methods for improving large language model (LLM) reasoning [7], including
+                                         mathematics [17] and coding [27]. OPD trains a student on its own rollouts using dense token-level
+                                         feedback from a teacher [12], whereas RL learns from reward feedback on rollouts. OPD provides
+                                         an effective and efficient route for LLM post-training, especially for smaller student models [24].
+                                         Recent work shows that OPD is not limited to distilling large teachers into small students: it
+                                         also supports on-policy self-distillation [32] and multi-teacher distillation from domain-specialized
+                                         teachers comparable in size to the student [2, 21].
+                                             ∗ Equal Contribution. Emails: {kangwj1995,   kevin.galim}@furiosa.ai.
+
+
+                                         Preprint.
+                                                                                   Top-k
+                                                                                                                                                          Cache hit
+                                                                                                                                                          Cache miss
+
+
+
+
+                     (a) Dense KL (Reference)                        (b) Sparse Top-k                                             (c) Monte Carlo
+                     Forward 𝑲𝑳 σ𝑎∈𝒱 𝑞 log 𝑞 − log 𝑝𝜃                Forward 𝑲𝑳 σ𝑎∈𝑆𝑞 𝑞 log 𝑞 − log 𝑝𝜃                            Reverse 𝑲𝑳 – One-sample MC                𝒑old
+                     Reverse 𝑲𝑳 σ𝑎∈𝒱 𝑝𝜃 log 𝑝𝜃 – log 𝑞                                                                                          Importance Sampling
+                                                                                                                                                  (High Variance)
+                                                                                                                                                                             𝒂𝟏
+                                                                                              𝒒                𝒑𝜽                     𝒑old               𝒒             𝒑𝜽    𝒂𝟐
+     B0   B1             Actor         Teacher         Learner                                𝒂𝟏               𝒂𝟏                      𝒂𝟏                𝒂𝟏            𝒂𝟏    𝒂𝟑
+B0             B1                                                       Cache 𝒒 logits
+                       1. Student     2. Teacher     3. Student                               𝒂𝟐               𝒂𝟐                      𝒂𝟐                𝒂𝟐            𝒂𝟐
+
+
+
+
+                                                                                                                       Sample 𝟏
+                                                                         (𝒒’s top-3)                                                                                         𝒂𝟒
+                         Rollout       Scoring         Update                                 𝒂𝟑               𝒂𝟑                      𝒂𝟑                𝒂𝟑            𝒂𝟑    𝒂𝟓
+                          𝒑old            𝒒              𝒑𝜽                                   𝒂𝟒               𝒂𝟒                      𝒂𝟒                𝒂𝟒            𝒂𝟒
+                                                                        Drop 𝒒 logits              No cache
+                           𝒂𝟏             𝒂𝟏              𝒂𝟏            for efficiency        𝒂𝟓    misses     𝒂𝟓                      𝒂𝟓                𝒂𝟓            𝒂𝟓
+                           𝒂𝟐             𝒂𝟐              𝒂𝟐
+                           𝒂𝟑             𝒂𝟑              𝒂𝟑         Reverse 𝑲𝑳 σ𝑎∈𝑆𝑝 𝑝𝜃 log 𝑝𝜃 – log 𝑞                           Reverse 𝑲𝑳 – Ours
+                           𝒂𝟒             𝒂𝟒              𝒂𝟒
+                                                                                                                                       Low-variance multi-sample MC
+                           𝒂𝟓             𝒂𝟓              𝒂𝟓                                Cache                                       + recomputed advantage 𝑨𝜽
+                                                                       Old top-3           Old top-3       New top-3                                              𝑨𝜽
+                                                                                                                                             𝑨old
+                     Cache student   Cache full      Requires full       𝒑old                 𝒒                𝒑𝜽                     𝒑old               𝒒             𝒑𝜽
+                      trajectories teacher logits   teacher logits        𝒂𝟏                  𝒂𝟏               𝒂𝟏                      𝒂𝟏                𝒂𝟏            𝒂𝟏
+                                                                                                                                       𝒂𝟐                𝒂𝟐            𝒂𝟐
+
+
+
+
+                                                                                                                       Sample 𝑚
+                                                                          𝒂𝟐                  𝒂𝟐               𝒂𝟐
+                                                                          𝒂𝟑                  𝒂𝟑               𝒂𝟑                      𝒂𝟑                𝒂𝟑            𝒂𝟑
+                         Full teacher cache is costly                                                  Cache
+                          to transfer in async OPD                        𝒂𝟒                  𝒂𝟒        miss   𝒂𝟒                      𝒂𝟒                𝒂𝟒            𝒂𝟒
+                                                                          𝒂𝟓                  𝒂𝟓               𝒂𝟓                      𝒂𝟓                𝒂𝟓            𝒂𝟓
+
+
+
+                    Figure 1: Estimator design for asynchronous OPD. (a) Dense KL is the full-vocabulary reference, but
+                    full teacher-logit caches are costly to store or transfer in asynchronous OPD. (b) Sparse top-k exposes
+                    a support mismatch under staleness: forward KL is teacher-supported, but reverse KL is student-
+                    supported and may require actions outside the cached teacher-scored support. (c) One-sample Monte
+                    Carlo is correctable in expectation by importance sampling, but has high variance; our estimator
+                    recomputes Aθ at learner time and uses multi-sample MC to reduce variance.
+
+
+                    OPD and RL inherit an on-policy systems bottleneck: each learner update must wait for fresh rollouts
+                    from the model being trained [5]. For reasoning tasks, these rollouts are long and expensive, so
+                    synchronous training often waits on generation rather than updating the model, leaving learners
+                    underutilized. Asynchronous RL [4, 14] relieves this bottleneck by decoupling rollout generation
+                    from learner updates: rollout workers keep generating data while the learner updates on earlier
+                    rollouts, improving training efficiency and hardware utilization [18, 23, 34]. A similar pipeline can
+                    be applied to OPD by running student rollout, teacher scoring, and learner updates in parallel [19].
+                    However, asynchronous execution introduces stale-policy data, and learning from such data can
+                    degrade model quality [3]. This creates a trade-off: more aggressive asynchrony improves training
+                    throughput, but it also increases the policy lag between rollout and learning. Prior work on asyn-
+                    chronous RL therefore studies how to stabilize learning from stale-policy data [4, 10, 33]. However,
+                    it remains underexplored whether these ideas and stale-data solutions transfer to OPD, because
+                    practical implementations of OPD expose a different feedback interface. Teacher feedback is often
+                    implemented through local KL losses, which require teacher scores over actions at student-visited
+                    prefixes. Since full-vocabulary teacher logits are expensive to store or transfer, especially in an
+                    asynchronous pipeline, teacher scores are usually cached only on a finite set of actions (Fig. 1).
+                    Once the learner receives a teacher-scored cache, it can recompute current-student log probabilities
+                    on cached actions, but it cannot recover teacher scores for actions that were never scored. This
+                    raises three questions that structure our study: (i) how asynchronous OPD behaves under staleness,
+                    (ii) whether asynchronous RL ideas and stale-data solutions transfer to OPD, and (iii) how finite
+                    teacher-score caches shape OPD estimator design.
+                    First, we study how KL direction shapes staleness. Under asynchronous OPD with cached teacher
+                    scores, the same stale rollout cache can affect different KL objectives differently. As illustrated in
+                    Fig. 1, forward KL is teacher-weighted and is more robust to stale rollouts, whereas reverse KL is
+                    student-weighted and becomes vulnerable when current-student actions fall outside the scored cache.
+                    We therefore focus on reverse-KL OPD in the remainder of the staleness analysis.
+                    Second, focusing on the reverse-KL case, we ask whether methods designed to stabilize asynchronous
+                    RL can also mitigate OPD staleness. This comparison is natural because reverse KL in OPD admits
+                    an RL-style policy-gradient surrogate, where the teacher-student log-ratio acts as a token-level
+                    advantage. We therefore evaluate PPO-style clipping [16], decoupled PPO [4], and M2PO [33].
+
+
+                                                                                              2
+In our experiments, they do not improve over a simpler OPD-specific surrogate: recomputing the
+reverse-KL token-level advantage under the current student at learner time without clipping.
+Third, we return to the teacher-cache constraint and study the resulting bias-variance tradeoff for
+sparse and sampled reverse-KL OPD implementations. Stale student top-k supports provide deter-
+ministic coverage but are support-mismatched because they may omit actions required by the current
+top-k objective, and reweighting inside the stale support cannot recover the missing teacher scores.
+One-sample Monte Carlo (MC) avoids this fixed-support mismatch through importance-correctable
+samples from the stale rollout policy, but suffers from high variance. This motivates multi-sample
+MC, which caches and teacher-scores multiple stale-policy samples at each decoding step, preserving
+MC correctability while reducing one-sample variance.
+Finally, we instantiate these findings in AsyncOPD, a fully asynchronous OPD pipeline that overlaps
+student rollout, teacher scoring, and learner updates. On Qwen3-Base models, AsyncOPD improves
+training throughput by 1.6× to 3.8× over strict synchronous training while maintaining comparable
+accuracy. Our contributions are:
+• We provide the first systematic study of staleness in asynchronous OPD through the lens of an
+  OPD-specific teacher-cache constraint.
+• We show that KL direction changes the stale-data problem: forward KL is comparatively robust to
+  stale rollouts, whereas reverse KL is vulnerable because it is student-weighted (Section 4).
+• We identify that the most effective reverse-KL policy-gradient surrogate uses the advantage re-
+  computed at learner time without clipping, and that advanced asynchronous RL surrogates do not
+  improve over this choice (Section 5).
+• We show that stale student top-k supports are support-mismatched, while one-sample MC remains
+  correctable but high-variance; this motivates multi-sample MC (Section 6).
+• We present and open-source AsyncOPD, a fully asynchronous OPD training pipeline, and demon-
+  strate improved training efficiency while maintaining OPD quality (Section 7).
+
+2   Related Works
+On-Policy Distillation On-policy distillation (OPD) trains a student on its own rollouts while
+using a teacher to provide dense token-level feedback on the visited prefixes [12, 20]. GKD [1]
+introduced a token-level KL formulation, while MiniLLM [6] studied a sequence-level reverse-KL
+variant. Li et al. [11] study token-level OPD training dynamics and recipes for unstable configurations.
+TIP [22] characterizes per-token importance through student entropy and teacher-student divergence.
+G-OPD [25] interprets token-level OPD as dense KL-constrained RL and extends it with reward
+scaling. These works clarify OPD as an effective post-training objective, but assume rollouts, teacher
+scoring, and learner updates stay synchronized.
+
+Asynchronous RL In synchronous RL pipelines, training often waits for the longest rollout in
+a batch to finish, leaving learner resources idle. Asynchronous RL improves hardware utilization
+by decoupling rollout generation from learner updates. Async RLHF [14] overlaps generation and
+learning so that new samples are produced while the learner trains on earlier ones. StreamRL [34]
+further disaggregates the RLHF pipeline into streaming stages. AReaL [4] fully decouples rollout
+workers from training workers for continuous asynchronous execution. Laminar [18] uses fine-grained
+weight synchronization for trajectory-level asynchrony. However, asynchronous RL must learn from
+stale-policy data. Decoupled PPO [4] stabilizes asynchronous RL training by separating the behavior
+policy for stale rollouts from the proximal policy that anchors PPO [16] updates. M2PO [33] stabilizes
+stale updates with second-moment importance-weight constraints, and A-3PO [10] reduces decoupled
+PPO overhead through staleness-aware interpolation.
+
+Asynchronous OPD VeRL [19] implements step-off OPD schedulers that overlap student rollout,
+teacher scoring, and learner update by fixing rollout lag to one or two learner steps. These schedulers
+establish the practical feasibility of asynchronous OPD, but leave open how OPD estimators behave
+under stale teacher-scored caches. KDFlow [29] improves systems efficiency for LLM distillation
+by decoupling teacher inference from learner training and transmitting teacher hidden states, but
+targets synchronous OPD and leaves asynchronous execution as future work. We study this missing
+asynchronous OPD regime directly and build AsyncOPD from the resulting estimator choices.
+
+
+                                                   3
+3     Preliminaries: On-Policy Distillation
+OPD setup At each decoding timestep, we view the visited prefix s as the local state and the next
+token a as the action. Let q(a | s) denote the teacher policy and pθ (a | s) denote the current student
+policy. Following prior work on token-level OPD [11, 12, 25], we apply local losses to generated
+output tokens and analyze the resulting objectives at a fixed prefix state s. OPD can be defined with
+different divergences; forward and reverse KL are two standard choices [1].
+
+Forward-KL OPD          At a fixed prefix s, forward-KL OPD is teacher-weighted:
+                                                 P
+        DF (θ; s) = KL(q(· | s) ∥ pθ (· | s)) = a∈V q(a | s) (log q(a | s) − log pθ (a | s)) .         (1)
+                                                      P
+At a fixed prefix s, the gradient is ∇θ DF (θ; s) = − a∈V q(a | s)∇θ log pθ (a | s).
+
+Reverse-KL OPD       At the same prefix, reverse-KL OPD is student-weighted:
+                                                  P
+      DR (θ; s) = KL(pθ (· | s) ∥ q(· | s)) = − a∈V pθ (a | s) (log q(a | s) − log pθ (a | s)) .       (2)
+                                                              P
+Differentiating and using Ea∼pθ (·|s) [∇θ log pθ (a | s)] = ∇θ a pθ (a | s) = 0 gives
+                         P
+        ∇θ DR (θ; s) = a∈V pθ (a | s) (log pθ (a | s) − log q(a | s) + 1) ∇θ log pθ (a | s)
+                           P
+                      = − a∈V pθ (a | s) (log q(a | s) − log pθ (a | s)) ∇θ log pθ (a | s).            (3)
+Viewing Eq. (3) as a policy-gradient estimator and A = log q(a | s) − log p(a | s) as the advantage
+term connects reverse-KL OPD to standard RL training machinery, and practical implementations
+typically use PPO-style surrogates. Given behavior-policy samples a ∼ pbeh , define ρθ (a, s) =
+pθ (a | s)/pbeh (a | s) and ρ̄θ (a, s) = clip(ρθ (a, s), 1 − ϵ, 1 + ϵ). The PPO-style local surrogate uses
+these ratios with a frozen behavior-time signal Abeh (a, s), where sg(·) denotes stop-gradient:
+                  LPPO (θ; Abeh ) = −Ea∼pbeh [min (ρθ sg(Abeh ) , ρ̄θ sg(Abeh ))] .                    (4)
+
+Sparse and sampled implementations The dense objectives above are full-vocabulary references.
+Practical OPD instead evaluates local KL losses on finite supports or sampled actions [11, 12], trading
+computation against support coverage and estimator variance. Sparse top-k implementations choose
+a support S(s) and evaluate the corresponding restricted KL after renormalizing teacher and student
+distributions on S(s). Monte Carlo (MC) implementations draw actions from a proposal distribution
+and estimate the corresponding local gradient; for reverse KL, this yields the student-sampled
+policy-gradient estimator. Details are in Section A.
+
+4     Forward- and Reverse-KL OPD Under Staleness
+Asynchronous OPD has both prefix-level and action-level staleness. Once a rollout is generated, its
+visited prefixes are fixed, so an action-level estimator cannot change which states the learner sees.
+We therefore focus on the action-level staleness that estimator design can directly address.
+
+4.1   Asynchronous OPD Setup
+
+Asynchronous OPD is a cached-data pipeline: rollout first selects prefixes and actions, teacher scoring
+then annotates those actions, and the learner updates the student later. Unlike synchronous OPD,
+these stages are separated in time, so the visited prefixes, action cache, teacher scores, and update
+policy may be tied to different student versions. Figure 1 summarizes this cached-teacher setting and
+the estimator contrasts induced by the three-stage cache pipeline.
+
+Teacher-cache constraint Full-vocabulary teacher logits allow dense KL computation, but caching
+and transferring them is prohibitively expensive, especially in an asynchronous pipeline. We therefore
+focus on sparse top-k supports and MC samples as the sparse and sampled cases.
+
+Stage 1: Student rollout A rollout actor samples trajectories from a stale student pold , which fixes
+the visited prefixes s. At each prefix, it stores cached actions Cold (s) together with their rollout-time
+log probabilities under pold , such as a sampled token or a top-k support.
+
+
+                                                    4
+                                                                                                                           25
+                40
+                                                                    25                                                                                                        70
+
+                                                                                                                           20                                                 65
+
+
+
+
+ Accuracy (%)
+
+
+
+
+                                                     Accuracy (%)
+
+
+
+
+                                                                                                            Accuracy (%)
+
+
+
+
+                                                                                                                                                               Accuracy (%)
+                35
+                                                                    20                                                                                                        60
+                30
+                                                                                                                           15                                                 55
+                                                                    15
+                25       Reverse KL                                          Reverse KL                                             Reverse KL                                50       Reverse KL
+                         Forward KL                                          Forward KL                                    10       Forward KL                                         Forward KL
+                                                                                                                                                                              45
+                     0    1   2   4 8 16 32 64 128                       0   1   2   4 8 16 32 64 128                           0   1   2   4 8 16 32 64 128                       0   1   2   4 8 16 32 64 128
+                                  Staleness                                          Staleness                                              Staleness                                          Staleness
+
+
+
+                         (a) Average                                     (b) AIME24                                             (c) AIME25                                             (d) AMC
+Figure 2: Accuracy comparison under staleness for forward- and reverse-KL OPD. Reverse KL starts
+higher at zero staleness but degrades faster as staleness grows; forward KL is flatter across the sweep.
+
+
+Stage 2: Teacher scoring Let Cscore (s) denote the teacher-scored cache; it may come from the
+rollout cache Cold (s) or be selected by the teacher at scoring time. Once teacher scoring is complete,
+teacher logits are available only on Cscore (s).
+
+Stage 3: Student update By learner update time, the student has moved to the current policy pθ .
+The learner can recompute log pθ (a | s) for a ∈ Cscore (s), but the current local OPD objective may
+place mass on actions outside this teacher-scored cache, such as the current student top-k support or
+current student-sampled actions. Thus the learner can update current student probabilities on cached
+actions, but cannot recover teacher signals for missing actions without additional teacher access.
+
+Experimental setup Unless otherwise stated, we train a Qwen3-4B-Base student using a Qwen3-
+30B-A3B-Instruct-2507 teacher [24]. The training data is DeepMath [8], filtered to 57,630 math
+problems with difficulty level at least 6, and we report final-checkpoint Avg@32 accuracy on
+AIME24 [30], AIME25 [31], and AMC [13]. Experimental details are provided in Section B; dataset
+and metric details are in Section C.
+
+4.2                  Forward KL vs. Reverse KL Under Staleness
+
+The KL direction fixes the action weighting: forward KL weights actions by the teacher q, whereas
+reverse KL weights them by the student pθ . With cached teacher scores, this weighting difference
+becomes a support-ownership difference (Fig. 1). Under a scored-cache restriction, this makes
+forward KL less exposed to stale student action choices: it does not need to convert stale student-
+sampled actions into a current-student expectation. Reverse KL instead depends on student-weighted
+action terms, so the same asynchronous cache creates a different action-level staleness problem.
+
+Experimental results Figure 2 compares representative practical OPD implementations from prior
+work: sparse top-k forward KL [19] and PPO-style reverse-KL surrogates [12, 25]. Reverse KL
+starts higher at zero staleness, but as staleness increases it drops faster and is eventually overtaken by
+forward KL. We therefore focus the rest of the staleness analysis on how to make reverse-KL OPD
+robust under larger rollout staleness.
+
+      Finding 1. Forward KL is teacher-weighted and robust to rollout staleness, whereas reverse KL
+      is student-weighted and vulnerable to rollout staleness.
+
+Two axes of reverse-KL staleness The cache analysis above suggests a possible mechanism
+for this gap: because reverse KL is weighted by the current student, stale teacher-scored caches
+may fail to cover actions needed by the current reverse-KL objective. In addition, reverse-KL
+policy-gradient updates can be instantiated with multiple stale-data surrogates, including PPO-style
+and asynchronous-RL variants. We therefore split the reverse-KL analysis into a policy-gradient
+surrogate axis, studied in Section 5, and a cached-support axis, studied in Section 6.
+
+5                Reverse-KL: Policy-Gradient Surrogates Under Staleness
+Reverse-KL OPD admits several policy-gradient surrogate choices under stale rollouts. This section
+compares which choices remain effective under staleness.
+
+
+                                                                                                        5
+                                                                                     30                                                                                                                   80
+                        40                                                                                                                            25
+                                                                                     25
+                                                                                                                                                      20                                                  60
+
+
+
+
+         Accuracy (%)
+
+
+
+
+                                                                      Accuracy (%)
+
+
+
+
+                                                                                                                                       Accuracy (%)
+
+
+
+
+                                                                                                                                                                                           Accuracy (%)
+                        30                                                           20
+
+                                                                                     15                                                               15
+                                                                                                                                                                                                          40
+                        20
+                                 Aθ, no clip                                                  Aθ, no clip                                             10       Aθ, no clip                                         Aθ, no clip
+                                                                                     10
+                                 Aθ, clip                                                     Aθ, clip                                                         Aθ, clip                                            Aθ, clip
+                        10                                                                                                                                                                                20
+                                 Aold, no clip                                        5       Aold, no clip                                            5       Aold, no clip                                       Aold, no clip
+                                 Aold, clip                                                   Aold, clip                                                       Aold, clip                                          Aold, clip
+                         0                                                            0                                                                0                                                   0
+                             0    1   2   4 8 16 32 64 128                                0    1   2   4 8 16 32 64 128                                    0    1   2   4 8 16 32 64 128                       0    1   2   4 8 16 32 64 128
+                                          Staleness                                                    Staleness                                                        Staleness                                           Staleness
+
+
+
+                                 (a) Average                                              (b) AIME24                                                       (c) AIME25                                              (d) AMC
+Figure 3: Accuracy comparison under staleness for the advantage-and-clipping ablation. Recomputing
+Aθ at learner time and avoiding clipping gives the most stable performance across the sweep, while
+clipping mainly helps the frozen Aold baseline.
+
+                40.0                                                         27.5
+                                                                                                                                              25.0
+                                                                                                                                                                                                          70
+                37.5                                                         25.0
+                                                                                                                                              22.5
+Accuracy (%)
+
+
+
+
+                                                             Accuracy (%)
+
+
+
+
+                                                                                                                              Accuracy (%)
+
+
+
+
+                                                                                                                                                                                           Accuracy (%)
+                                                                                                                                                                                                          65
+                35.0                                                         22.5
+                                                                                                                                              20.0
+                32.5                                                         20.0                                                                                                                         60
+                                 Aθ, no clip                                                  Aθ, no clip                                     17.5             Aθ, no clip                                         Aθ, no clip
+                                 DecPPO                                                       DecPPO                                                           DecPPO                                              DecPPO
+                30.0             Aold, M2PO                                  17.5             Aold, M2PO                                                       Aold, M2PO                                 55       Aold, M2PO
+                                                                                                                                              15.0
+                                 Aθ, M2PO                                                     Aθ, M2PO                                                         Aθ, M2PO                                            Aθ, M2PO
+                27.5                                                         15.0
+                             0    1   2   4 8 16 32 64 128                                0    1   2   4 8 16 32 64 128                                    0    1   2   4 8 16 32 64 128                       0    1   2   4 8 16 32 64 128
+                                          Staleness                                                    Staleness                                                        Staleness                                           Staleness
+
+
+
+                                 (a) Average                                              (b) AIME24                                                       (c) AIME25                                              (d) AMC
+Figure 4: Accuracy comparison under staleness for advanced asynchronous RL surrogates. Decou-
+pled PPO [4] and M2PO [33] do not consistently improve over the simpler OPD/IS surrogate that
+recomputes Aθ without clipping; Decoupled PPO is clipped for readability because of low accuracy.
+
+
+5.1                          Policy-Gradient Surrogate Choices
+
+PPO-style objective In the PPO-style surrogate in Eq. (4), the advantage is computed under the
+behavior policy and then held fixed during the learner update. In stale reverse-KL OPD, the behavior
+policy is the rollout student, so a mechanical PPO-style adaptation sets pbeh = pold and uses the
+rollout-time reverse-KL advantage Aold (a, s) = log q(a | s) − log pold (a | s) as Abeh , together with
+the clipped old-to-current ratio. The unclipped variant simply drops the clipped term.
+
+Exact importance-sampling identity In contrast, rewriting the reverse-KL objective (Eq. (2)) by
+importance sampling suggests a different surrogate choice. With the current reverse-KL advantage
+Aθ (a, s) = log q(a | s) − log pθ (a | s), and assuming pold has support wherever pθ does, the current
+reverse-KL objective admits the exact old-to-current importance-sampling (IS) identity
+                                                 DR (θ; s) = −Ea∼pθ [Aθ (a, s)] = −Ea∼pold [ρθ (a, s)Aθ (a, s)] .                                                                                                                       (5)
+For the policy-gradient update, the advantage is used as a stop-gradient weight; the derivative of the
+omitted Aθ term cancels by the score-function identity, as in Eq. (3). Thus the IS view points to the
+opposite surrogate choice from the mechanical PPO adaptation: recompute Aθ under the current
+student and use the old-to-current ratio without clipping, with Aθ treated as a stop-gradient advantage.
+
+A two-by-two surrogate ablation The PPO-style adaptation and the OPD/IS identity suggest
+different surrogate choices. We therefore ablate the advantage (Aold versus Aθ ) and whether to clip
+the ratio, with sg(·) denoting stop-gradient:
+                        Lclip
+                         old (θ) = −Ea∼pold [min (ρθ sg(Aold ) , ρ̄θ sg(Aold ))] ,                                                                              Lnoclip
+                                                                                                                                                                 old    (θ) = −Ea∼pold [ρθ sg(Aold )] ,                                 (6)
+                        Lclip
+                         θ (θ) = −Ea∼pold [min (ρθ sg(Aθ ) , ρ̄θ sg(Aθ ))] ,                                                                                    Lnoclip
+                                                                                                                                                                 θ      (θ) = −Ea∼pold [ρθ sg(Aθ )] .                                   (7)
+
+Here Lclip                                    noclip
+      old is the PPO-style adaptation, while Lθ      is the OPD/IS surrogate.
+
+Advanced asynchronous RL surrogates Decoupled PPO [4] and M2PO [33] are asynchronous
+RL surrogates designed to improve robustness to stale-policy updates. We evaluate whether these
+previously unstudied asynchronous RL surrogates also help OPD under staleness.
+
+
+                                                                                                                          6
+5.2    Experimental Results                                                                                 Aθ, no clip
+                                                                                                        6   Aθ, clip
+
+
+
+
+                                                                                99th percentile of ρθ
+                                                                                                            Aold, no clip
+Fig. 3 and Table 1a compare the four combinations of Aold versus Aθ and        5                            Aold, clip
+
+clipping versus no clipping. The best variant is the OPD/IS choice: Aθ         4
+
+without clipping. The PPO-style baseline, Aold with clipping, remains          3
+
+a strong stale-surrogate baseline. Clipping helps Aold by limiting stale,      2
+
+large-ratio updates, but hurts Aθ : recomputing Aθ already reduces the         1
+                                                                                 0   50    100      150 200
+high-percentile ρθ tail at staleness 64 (Fig. 5), so clipping removes useful             Train step
+signal. Likewise, Fig. 4 and Table 1a show that advanced asynchronous
+RL surrogates such as decoupled PPO and M2PO do not outperform Aθ Figure 5: Aθ reduces the
+without clipping, which becomes our reference surrogate below.               p99 ρθ tail under no clip.
+
+    Finding 2. The most effective reverse-KL correction is to recompute Aθ at learner time without
+    clipping; advanced asynchronous RL surrogates such as decoupled PPO and M2PO do not
+    improve over it.
+
+
+6     Reverse-KL: Cached Supports Under Staleness
+Having fixed Aθ without clipping as the reference surrogate, we now ask which cached actions
+provide the teacher scores needed to evaluate it, and how to improve this cached-support estimator.
+This cached-support axis is specific to OPD because teacher scoring is local and expensive: the
+teacher cache determines which actions have teacher scores available to the learner.
+
+Sparse top-k: stale-support biased Although sparse top-k is biased relative to the dense reverse-
+KL objective, it is a practical low-variance approximation on the current student support Sθ (s) =
+TopK(pθ (· | s), k). Under asynchronous rollout reuse, however, teacher scores are cached on the
+rollout-time support Sold (s) = TopK(pold (· | s), k), which may miss actions in the current support
+Sθ (s). Reweighting within Sold cannot recover these missing teacher scores, so stale sparse top-k
+remains a support-mismatched approximation, not an exact correction of the current top-k objective.
+
+One-sample MC: correctable but high variance Sampled-token MC instead caches an action
+drawn from a behavior distribution: a ∼ pold (· | s) together with log pold (a | s). When the behavior
+policy covers the current policy support, exact old-to-current IS gives an unbiased estimator of
+the current reverse-KL fixed-prefix gradient. Thus one-sample MC is action-level correctable in
+expectation, but the resulting IS estimator can have high variance. This proposal-sampling structure
+is the key contrast with stale top-k, whose actions come from a deterministic stale support.
+
+6.1    Proposed Solution: Multi-Sample MC
+
+Multi-sample MC: correctable with reduced variance We propose multi-sample MC (Fig. 8),
+which, at each decoding timestep of a student rollout, draws multiple local next-token samples from
+the behavior policy without rolling them out into additional trajectories. It reduces one-sample MC
+variance by caching these local samples and averaging their IS-corrected gradients.
+Multi-sample MC is especially natural in asynchronous OPD. In RL for LLM post-training, branching
+a prefix into multiple actions is expensive because each branch typically requires a full continuation
+before the reward or advantage can be evaluated. In synchronous OPD, sparse top-k already provides
+
+
+Table 1: Staleness-sensitivity slopes. Entries fit accuracy against log2 (staleness + 1); more negative
+values indicate stronger degradation with staleness.
+                    (a) Policy-gradient surrogates                            (b) Multi-sample MC
+
+Benchmark Aold (clip) Aold Aθ (clip)    Aθ Aold (M2PO) Aθ (M2PO) Benchmark MC1 MC4 MC16 MC64
+AIME24           -1.44 -3.99     -1.64 -0.69         -0.66       -1.00 AIME24                           -0.69 -0.42         -0.46   -0.34
+AIME25           -1.42 -3.69     -1.88 -0.38         -0.78       -0.81 AIME25                           -0.38 -0.23         -0.24   -0.11
+AMC              -3.06 -8.00     -4.06 -1.12         -1.75       -1.72 AMC                              -1.12 -0.87         -0.74   -0.84
+
+
+
+                                                     7
+                                                                    30                                                                                                        80
+                40                                                  25                                                     25
+                                                                                                                                                                              60
+
+
+
+
+ Accuracy (%)
+
+
+
+
+                                                     Accuracy (%)
+
+
+
+
+                                                                                                            Accuracy (%)
+
+
+
+
+                                                                                                                                                               Accuracy (%)
+                                                                    20                                                     20
+                30
+
+                                                                    15                                                     15                                                 40
+                20
+                         MC1                                        10       MC1                                           10       MC1                                                MC1
+                         MC1 noIS                                            MC1 noIS                                               MC1 noIS                                  20       MC1 noIS
+                10
+                         Top-k+RW                                    5       Top-k+RW                                       5       Top-k+RW                                           Top-k+RW
+                         Top-k                                               Top-k                                                  Top-k                                              Top-k
+                 0                                                   0                                                      0                                                  0
+                     0    1   2   4 8 16 32 64 128                       0   1   2   4 8 16 32 64 128                           0   1   2   4 8 16 32 64 128                       0   1   2   4 8 16 32 64 128
+                                  Staleness                                          Staleness                                              Staleness                                          Staleness
+
+
+
+                         (a) Average                                     (b) AIME24                                             (c) AIME25                                             (d) AMC
+Figure 6: Accuracy comparison under staleness for sampled MC versus stale top-k. Top-k+RW
+denotes reweighting on the stale top-k support. Old-to-current IS corrects sampled MC in expectation,
+whereas reweighting cannot repair the missing teacher scores induced by stale top-k supports.
+
+                                                                    28
+                40                                                                                                         24
+                                                                    26                                                                                                        70
+                38
+ Accuracy (%)
+
+
+
+
+                                                     Accuracy (%)
+
+
+
+
+                                                                                                            Accuracy (%)
+
+
+
+
+                                                                                                                                                               Accuracy (%)
+                                                                    24                                                     22
+                36                                                                                                                                                            65
+                                                                    22
+                34       MC1                                                 MC1                                           20       MC1                                                MC1
+                                                                    20                                                                                                        60
+                         MC4                                                 MC4                                                    MC4                                                MC4
+                32       MC16                                                MC16                                                   MC16                                               MC16
+                                                                    18                                                     18
+                         MC64                                                MC64                                                   MC64                                      55       MC64
+                30
+                     0    1   2   4 8 16 32 64 128                       0   1   2   4 8 16 32 64 128                           0   1   2   4 8 16 32 64 128                       0   1   2   4 8 16 32 64 128
+                                  Staleness                                          Staleness                                              Staleness                                          Staleness
+
+
+
+                         (a) Average                                     (b) AIME24                                             (c) AIME25                                             (d) AMC
+Figure 7: Accuracy comparison under staleness for multi-sample MC. Increasing the number of
+samples improves large-staleness behavior.
+
+
+a low-variance approximation and one-sample MC provides an unbiased sampled gradient estimator,
+so there is little motivation to cache multiple sampled actions per prefix. Under asynchronous OPD,
+this tradeoff changes: sparse top-k becomes the stale fixed-support approximation analyzed above,
+and one-sample MC remains correctable but high-variance, making multi-sample MC a natural
+cached-support estimator for asynchronous OPD.
+Concretely, at each visited timestep t with prefix st , roll-
+out samples at,1 , . . . , at,m ∼ pold (· | st ) and caches              one student rollout path
+their rollout log probabilities and teacher scores. For no-       st            st+1           st+2
+                                                                         +                +                 ···
+tational simplicity, write s = st and ai = at,i below.           hello        ... what        ... is
+
+At learner time, we recompute Aθ (ai , s) and use the av-               at,1           at+1,1        at+2,1
+                                                                                                       your
+eraged  unclipped old-to-current IS surrogate L  b MC
+                                                   m   (θ; s) =
+                                                                        what             is
+
+   1
+      P m                                                               at,2           at+1,2        at+2,2
+− m i=1 ρθ (ai , s) sg(Aθ (ai , s)). By linearity, the gradient         how              did          going
+
+has the same expectation as the one-sample MC estimator;
+                                                                example: m = 2 local samples per timestep
+averaging independent behavior-policy samples reduces the
+Monte Carlo variance. We measure this variance reduction Figure 8: Multi-sample MC (m = 2).
+at large staleness in Section E.
+
+
+6.2                  Experimental Results
+
+Sparse top-k vs. one-sample MC Figure 6 compares one-sample MC and sparse top-k, with and
+without old-to-current reweighting. For one-sample MC, IS substantially improves robustness as
+staleness increases. For sparse top-k, the same reweighting does not improve performance, since it
+cannot recover missing current-support actions. As a result, one-sample MC with IS is the strongest of
+the four methods, consistent with the support-correctability analysis above. We include an additional
+ablation disentangling MC sample count from IS in Section F.
+
+
+One-sample MC vs. multi-sample MC Figure 7 and Table 1b show that multi-sample MC
+improves one-sample MC at large staleness: m = 4 already gives a clear jump, while m ∈ {4, 16, 64}
+performs similarly.
+
+
+                                                                                                        8
+ (a) Synchronous                                          (b) Step-off                                                (c) AsyncOPD
+         time                                                      time                         2 step-off example            time                            *: Streaming
+                                                                                                                                                                             𝒑old
+    𝒑𝜽   B0                B0        B1                     𝒑old   B0     B1                    B2               B3    𝒑old    B*
+
+    𝒒                B0                          B1          𝒒             B0             B1                  B2        𝒒              B0      B1        B2            B3
+                                                                                                                                                                              𝒂𝟏
+    WS                          B0                          𝒑𝜽                      B0               B1                𝒑𝜽                     B0         B1           B2      𝒂𝟐
+    Rollout     Teacher    Learner        Weight Sync       WS                             B0               B1         WS                           B0           B1
+                                                                                                                                                                              𝒂𝟑
+                                                                                                                                                                              𝒂𝟒
+Figure 9: Scheduler comparison for synchronous OPD, step-off scheduling, and AsyncOPD. Syn-                                                                                   𝒂𝟓
+chronous OPD is barriered; step-off scheduling [19] overlaps stages but keeps gated rollout batches,
+while AsyncOPD streams rollout data to reduce long-tail waiting.
+
+
+Table 2: AsyncOPD scheduler results for Qwen3-Base models. Train tok/s is training throughput;
+parentheses show speedup over the matched strict-sync baseline. Overlap is concurrent OPD-stage
+activity. Avg@32 is final AIME24. AsyncOPD achieves the highest throughput and overlap in all
+matched settings while maintaining comparable final accuracy.
+                                                                          MC64                                                          MC1
+Student                   Scheduler
+                                                        Train tok/s (× sync) Overlap Avg@32 Train tok/s (× sync) Overlap Avg@32
+                Strict sync                                   8.7k (1.00×)               0.81              8.85                8.6k (1.00×)         0.82              8.65
+Qwen3-1.7B-Base Two-step-off                                 14.2k (1.64×)               1.49              8.23               18.5k (2.15×)         1.65              8.12
+                AsyncOPD (ours)                              23.4k (2.70×)               2.13              9.38               28.1k (3.28×)         2.31              8.44
+                          Strict sync                         9.5k (1.00×)               0.81             25.00                8.1k (1.00×)         0.82          23.33
+Qwen3-4B-Base             Two-step-off                       12.4k (1.30×)               1.64             23.85               12.9k (1.60×)         1.65          23.54
+                          AsyncOPD (ours)                    15.8k (1.66×)               2.19             25.00               16.4k (2.03×)         2.27          23.44
+                          Strict sync                         7.5k (1.00×)               0.81             26.56                6.5k (1.00×)         0.84          28.44
+Qwen3-8B-Base             Two-step-off                       11.6k (1.55×)               1.76             26.56                9.6k (1.47×)         1.63          28.85
+                          AsyncOPD (ours)                    14.5k (1.94×)               2.24             28.65               10.6k (1.63×)         2.17          27.50
+
+
+
+
+    Finding 3. One-sample MC is more effective than stale sparse top-k; multi-sample MC further
+    improves this estimator by reducing one-sample variance while preserving MC correctability.
+
+
+7        AsyncOPD: Fully Asynchronous OPD
+
+AsyncOPD is our fully asynchronous OPD system. Following AReaL [4], it overlaps rollout, teacher
+scoring, and learner updates.
+
+
+Scheduler The step-off scheduler family was originally implemented in VeRL [19]: a k-step-off
+run fixes rollout lag to k learner updates, but still waits for complete rollout batches. AsyncOPD
+streams examples instead: workers pause only for weight sync, preserve in-flight prefixes, teacher
+scoring consumes completed items, and the learner updates once a scored batch is ready (Fig. 9).
+
+
+Experimental setup The main comparison uses Qwen3-{1.7B,4B,8B}-Base students with the
+Qwen3-30B-A3B-Instruct-2507 teacher. All runs use the same reverse-KL estimator: current-policy
+Aθ , no clipping, old-to-current IS, and either MC64 or MC1. We compare strict sync, two-step-off,
+and AsyncOPD for 100 training iterations on the same 8-GPU node; all AsyncOPD runs use τ = 4.
+Section G gives GPU allocation, queue-depth, and scheduler details.
+
+
+Experimental Results Table 2 reports training throughput, pipeline overlap (average concurrent
+OPD-stage activity), and final AIME24 Avg@32 for the Qwen3-Base students. AsyncOPD achieves
+the highest throughput and overlap in every matched comparison. In MC64, it reaches up to 2.7× the
+strict-sync throughput while achieving the best or tied-best final accuracy. MC1 shows the same trend:
+AsyncOPD delivers the highest throughput (up to 3.3× strict-sync) and overlap for every student,
+with competitive final accuracy. Train-time accuracy curves are reported in Section G.
+
+
+                                                                                9
+8   Conclusion
+We present the first systematic study of staleness in asynchronous on-policy distillation (OPD). Our
+results show that KL direction shapes the stale-data problem: forward KL remains robust to stale
+rollouts, whereas reverse KL is more vulnerable because it is student-weighted. In reverse-KL OPD,
+the most effective policy-gradient surrogate uses the current advantage recomputed at learner time
+without clipping; advanced asynchronous RL surrogates do not improve over this choice. We also
+find that stale student top-k supports are support-mismatched, whereas one-sample Monte Carlo (MC)
+remains correctable but high-variance. This contrast motivates multi-sample MC, which preserves MC
+correctability while reducing one-sample variance. Finally, we present and open-source AsyncOPD,
+a fully asynchronous OPD training pipeline built from these estimator choices, improving training
+efficiency while maintaining OPD quality.
+
+Limitations and Future Work We study sparse and Monte Carlo OPD estimators, not dense
+full-vocabulary KL in the asynchronous setting. Although dense KL avoids cached-support mismatch,
+it is difficult to implement efficiently when rollout, teacher scoring, and learner updates are decoupled.
+KDFlow [29] suggests one path by transmitting teacher hidden states and recomputing student logits,
+but only for synchronous OPD. Extending this approach to asynchronous OPD while handling stale
+rollouts and preserving throughput is an important future direction. Our experiments are also limited
+to a single 8-GPU node by available resources, not by the pipeline itself; scaling to larger multi-node
+clusters remains future work.
+
+Acknowledgments and Disclosure of Funding
+This work was supported by Institute for Information & communications Technology Promotion
+(IITP) grant funded by the Korea government (MSIT) (No. 04-26-03-0081, Energy-Efficient Train-
+ing–Inference System Optimization for Reinforcement Learning-Based Post-Training). This work
+was also supported by the “Advanced GPU Utilization Support Program” funded by the Government
+of the Republic of Korea (Ministry of Science and ICT).
+
+References
+ [1] R. Agarwal, N. Vieillard, Y. Zhou, P. Stanczyk, S. R. Garea, M. Geist, and O. Bachem. On-
+     policy distillation of language models: Learning from self-generated mistakes. In The Twelfth
+     International Conference on Learning Representations, 2024. URL https://openreview.
+     net/forum?id=3zKtaqxLhW.
+ [2] DeepSeek-AI. Deepseek-v4: Towards highly efficient million-token context intelligence, 2026.
+ [3] F. Devvrit, L. Madaan, R. Tiwari, R. Bansal, S. S. Duvvuri, M. Zaheer, I. S. Dhillon,
+     D. Brandfonbrener, and R. Agarwal. The art of scaling reinforcement learning compute
+     for LLMs. In The Fourteenth International Conference on Learning Representations, 2026.
+     URL https://openreview.net/forum?id=FMjeC9Msws.
+ [4] W. Fu, J. Gao, X. Shen, C. Zhu, Z. Mei, C. He, S. Xu, G. Wei, J. Mei, W. JIASHU, T. Yang,
+     B. Yuan, and Y. Wu. AREAL: A large-scale asynchronous reinforcement learning system for
+     language reasoning. In The Thirty-ninth Annual Conference on Neural Information Processing
+     Systems, 2025. URL https://openreview.net/forum?id=X9diEuva9R.
+ [5] W. Gao, Y. Zhao, D. An, T. Wu, L. Cao, S. Xiong, J. Huang, W. Wang, S. Yang, W. Su, et al.
+     Rollpacker: Mitigating long-tail rollouts for fast, synchronous rl post-training. arXiv preprint
+     arXiv:2509.21009, 2025.
+ [6] Y. Gu, L. Dong, F. Wei, and M. Huang. MiniLLM: Knowledge distillation of large language
+     models. In The Twelfth International Conference on Learning Representations, 2024. URL
+     https://openreview.net/forum?id=5h0qf7IBZZ.
+ [7] D. Guo, D. Yang, H. Zhang, J. Song, P. Wang, Q. Zhu, R. Xu, R. Zhang, S. Ma, X. Bi, et al.
+     Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement learning. arXiv
+     preprint arXiv:2501.12948, 2025.
+
+
+                                                   10
+ [8] Z. He, T. Liang, J. Xu, Q. Liu, X. Chen, Y. Wang, L. Song, D. Yu, Z. Liang, W. Wang, et al.
+     Deepmath-103k: A large-scale, challenging, decontaminated, and verifiable mathematical
+     dataset for advancing reasoning. arXiv preprint arXiv:2504.11456, 2025.
+
+ [9] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, and
+     I. Stoica. Efficient memory management for large language model serving with PagedAttention.
+     In Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles, 2023.
+
+[10] X. Li, S. Wu, and Z. Shen. A-3po: Accelerating asynchronous llm training with staleness-aware
+     proximal policy approximation. arXiv preprint arXiv:2512.06547, 2025.
+
+[11] Y. Li, Y. Zuo, B. He, J. Zhang, C. Xiao, C. Qian, T. Yu, H.-a. Gao, W. Yang, Z. Liu, et al.
+     Rethinking on-policy distillation of large language models: Phenomenology, mechanism, and
+     recipe. arXiv preprint arXiv:2604.13016, 2026.
+
+[12] K. Lu and T. M. Lab. On-policy distillation. Thinking Machines Lab: Connectionism, 2025.
+     doi: 10.64434/tml.20251026. https://thinkingmachines.ai/blog/on-policy-distillation.
+
+[13] Mathematical Association of America. American Mathematics Competitions – AMC. https:
+     //maa.org/, 2023. Accessed 2026-04-03.
+
+[14] M. Noukhovitch, S. Huang, S. Xhonneux, A. Hosseini, R. Agarwal, and A. Courville. Faster,
+     more efficient RLHF through off-policy asynchronous learning. In The Thirteenth International
+     Conference on Learning Representations, 2025. URL https://openreview.net/forum?
+     id=FhTAG591Ve.
+
+[15] A. Paszke, S. Gross, S. Chintala, G. Chanan, E. Yang, Z. DeVito, Z. Lin, A. Desmaison,
+     L. Antiga, and A. Lerer. Automatic differentiation in PyTorch. In NIPS-W, 2017.
+
+[16] J. Schulman, F. Wolski, P. Dhariwal, A. Radford, and O. Klimov. Proximal policy optimization
+     algorithms. arXiv preprint arXiv:1707.06347, 2017.
+
+[17] Z. Shao, P. Wang, Q. Zhu, R. Xu, J. Song, X. Bi, H. Zhang, M. Zhang, Y. Li, Y. Wu, et al.
+     Deepseekmath: Pushing the limits of mathematical reasoning in open language models. arXiv
+     preprint arXiv:2402.03300, 2024.
+
+[18] G. Sheng, Y. Tong, B. Wan, W. Zhang, C. Jia, X. Wu, Y. Wu, X. Li, C. Zhang, Y. Peng, et al.
+     Laminar: A scalable asynchronous rl post-training framework. arXiv preprint arXiv:2510.12633,
+     2025.
+
+[19] G. Sheng, C. Zhang, Z. Ye, X. Wu, W. Zhang, R. Zhang, Y. Peng, H. Lin, and C. Wu. Hybridflow:
+     A flexible and efficient rlhf framework. In Proceedings of the Twentieth European Conference
+     on Computer Systems, pages 1279–1297, 2025.
+
+[20] M. Song and M. Zheng. A survey of on-policy distillation for large language models. arXiv
+     preprint arXiv:2604.00626, 2026.
+
+[21] B. Xiao, B. Xia, B. Yang, B. Gao, B. Shen, C. Zhang, C. He, C. Lou, F. Luo, G. Wang, et al.
+     Mimo-v2-flash technical report. arXiv preprint arXiv:2601.02780, 2026.
+
+[22] Y. Xu, H. Sang, Z. Zhou, R. He, Z. Wang, and A. Geramifard. Tip: Token importance in
+     on-policy distillation. arXiv preprint arXiv:2604.14084, 2026.
+
+[23] R. Yan, Y. Jiang, T. Wu, J. Gao, Z. Mei, W. Fu, H. Mai, W. Wang, Y. Wu, and B. Yuan.
+     Areal-hex: Accommodating asynchronous rl training over heterogeneous gpus. arXiv preprint
+     arXiv:2511.00796, 2025.
+
+[24] A. Yang, A. Li, B. Yang, B. Zhang, B. Hui, B. Zheng, B. Yu, C. Gao, C. Huang, C. Lv, et al.
+     Qwen3 technical report. arXiv preprint arXiv:2505.09388, 2025.
+
+[25] W. Yang, W. Liu, R. Xie, K. Yang, S. Yang, and Y. Lin. Learning beyond teacher: Generalized
+     on-policy distillation with reward extrapolation. arXiv preprint arXiv:2602.12125, 2026.
+
+
+                                               11
+[26] Q. Yu, Z. Zhang, R. Zhu, Y. Yuan, X. Zuo, Y. Yue, W. Dai, T. Fan, G. Liu, L. Liu, et al. Dapo:
+     An open-source llm reinforcement learning system at scale. arXiv preprint arXiv:2503.14476,
+     2025.
+[27] A. Zeng, X. Lv, Z. Hou, Z. Du, Q. Zheng, B. Chen, D. Yin, C. Ge, C. Huang, C. Xie, et al.
+     Glm-5: from vibe coding to agentic engineering. arXiv preprint arXiv:2602.15763, 2026.
+[28] K. Zhang, Y. Zuo, B. He, Y. Sun, R. Liu, C. Jiang, Y. Fan, K. Tian, G. Jia, P. Li, et al. A survey
+     of reinforcement learning for large reasoning models. arXiv preprint arXiv:2509.08827, 2025.
+[29] S. Zhang, X. Zhang, T. Zhang, B. Hu, Y. Chen, and J. Xu. Kdflow: A user-friendly and efficient
+     knowledge distillation framework for large language models. arXiv preprint arXiv:2603.01875,
+     2026.
+[30] Y. Zhang and T. Math-AI.    AIME 2024.      https://huggingface.co/datasets/
+     Maxwell-Jia/AIME_2024, 2024. Hugging Face dataset; accessed 2026-04-03.
+[31] Y. Zhang and T. Math-AI.    AIME 2025.      https://huggingface.co/datasets/
+     yentinglin/aime_2025, 2025. Hugging Face dataset; accessed 2026-04-03.
+[32] S. Zhao, Z. Xie, M. Liu, J. Huang, G. Pang, F. Chen, and A. Grover. Self-distilled reasoner:
+     On-policy self-distillation for large language models. arXiv preprint arXiv:2601.18734, 2026.
+[33] H. Zheng, J. Zhao, and B. Chen. Prosperity before collapse: How far can off-policy RL
+     reach with stale data on LLMs? In The Fourteenth International Conference on Learning
+     Representations, 2026. URL https://openreview.net/forum?id=IIgl5MWelz.
+[34] Y. Zhong, Z. Zhang, X. Song, H. Hu, C. Jin, B. Wu, N. Chen, Y. Chen, Y. Zhou, C. Wan, et al.
+     Streamrl: Scalable, heterogeneous, and elastic rl for llms with disaggregated stream generation.
+     arXiv preprint arXiv:2504.15930, 2025.
+
+
+A     Sparse and Monte Carlo Reverse-KL Implementations
+A.1   Sparse Top-k Reverse-KL OPD
+
+The dense reverse-KL objective in Eq. (2) sums over the full vocabulary. A sparse top-k implementa-
+tion instead evaluates reverse KL on a finite student support
+                                         Sθ (s) = TopK(pθ (· | s), k) .                                    (8)
+                                                                       S                              S
+                                                                                P
+P any support S, define the restricted normalizers Zp (s) =
+For                                                                               u∈S pθ (u | s) and Zq (s) =
+   u∈S  q(u | s), and    the renormalized   distributions
+                                  pθ (a | s)1[a ∈ S]                           q(a | s)1[a ∈ S]
+                  p̃Sθ (a | s) =                        ,       q̃ S (a | s) =                    .        (9)
+                                        ZpS (s)                                     ZqS (s)
+The sparse reverse-KL objective is
+                        S
+                          (θ; s) = KL p̃Sθ (· | s) ∥ q̃ S (· | s)
+                                                                  
+                     DR
+                                      X
+                                               p̃Sθ (a | s) log q̃ S (a | s) − log p̃Sθ (a | s) .
+                                                                                               
+                                 =−                                                                       (10)
+                                       a∈S
+In practice, when S = Sθ (s), we treat the selected top-k support as fixed during the local update.
+
+A.2   Monte Carlo Reverse-KL OPD
+
+Let Aθ (a, s) = log q(a | s) − log pθ (a | s). From Eq. (3), the dense reverse-KL gradient can be
+written as
+                      ∇θ DR (θ; s) = −Ea∼pθ (·|s) [Aθ (a, s)∇θ log pθ (a | s)] .             (11)
+A one-sample current-policy Monte Carlo estimator is therefore
+                   gbMC (s, a) = −Aθ (a, s)∇θ log pθ (a | s),       a ∼ pθ (· | s).          (12)
+With m independent samples ai ∼ pθ (· | s), the corresponding multi-sample estimator averages the
+same local term:
+                                     1 Xm
+                         gbm (s) = −            Aθ (ai , s)∇θ log pθ (ai | s).               (13)
+                                     m      i=1
+
+
+                                                     12
+                                    Table 3: Experimental settings.
+ Setting                        Value
+ Student                       Qwen3-4B-Base for main staleness/estimator experiments; AsyncOPD exper-
+                               iments also use Qwen3-{1.7B,4B,8B}-Base and thinking-disabled Qwen3-
+                               {1.7B,4B,8B} [24].
+ Teacher                       Qwen3-30B-A3B-Instruct-2507 [24]
+ Training data                 DeepMath [8] filtered to 57,630 math problems with difficulty level at least
+                               6
+ Prompt / response lengths     2,048 prompt tokens / 16,384 response tokens
+ Training horizon              200 training iterations; in the common setup each iteration contains four
+                               mini-batch optimizer updates
+ Optimization                  batch size 256, mini-batch size 64
+ Optimizer                     AdamW-style optimizer with learning rate 3 × 10−6 , constant schedule,
+                               weight decay 0.01
+ PPO clipping                  ϵ = 0.2 for clipped PPO-style surrogates
+ M2PO budget                   0.01
+ Rollout generation            temperature 1.0, top-p = 1.0, no top-k truncation
+ Evaluation generation         32 samples per problem, temperature 1.0
+ Implementation                vLLM rollout and teacher scoring; PyTorch FSDP learner training
+ Hardware                      Single 8×B200 node
+ GPU allocation                One teacher GPU; strict sync time-shares seven GPUs between rollout and
+                               training; stale-cache sweeps and AsyncOPD use concurrent rollout and
+                               trainer GPU pools
+
+
+
+B    Experimental Details
+
+This section details the experimental setup. Unless explicitly stated otherwise, experiments use the
+common setup in Table 3 and report final-checkpoint Avg@32 accuracy. Our implementation uses
+vLLM [9] for rollout generation and teacher scoring, PyTorch FSDP [15] for learner training, and
+runs each experiment on a single 8×B200 node. Individual experiments take roughly 1–12 hours,
+depending on the setting. Asset URLs, license names, and versions are summarized in Table 5.
+
+Constructing the staleness axis. The main text uses staleness as an experimental control over
+how old the cached rollout data is when the learner updates on it. In all staleness plots and tables in
+Sections 4 to 6, staleness is measured in train-batch steps. One train-batch step is one logical rollout
+batch consumed by the learner for a training iteration. The sweep value k is therefore the target
+number of train-batch steps by which the consumed cache trails the current learner; equivalently, it
+is the target cache depth in logical rollout batches. A value k = 0 is synchronous: rollout, teacher
+scoring, training, and weight synchronization occur in strict sequence. For k > 0, the run first
+generates exactly k rollout batches with the initial student snapshot before the first learner update.
+Training then consumes the oldest available generated batch; after each learner update and weight
+synchronization, a new rollout batch is generated with the latest student snapshot whenever needed to
+restore the target cache depth.
+This protocol is the operational source of the prefix- and action-level staleness discussed in the main
+text: the consumed prefixes and cached actions come from an older rollout student, while the update
+is applied to the current student. For a consumed rollout batch, let troll be the train-batch index of the
+student snapshot used for generation and ttrain be the train-batch index at learner time. The staleness
+used in the plots is
+                                        ∆batch = ttrain − troll .
+All examples in a logical batch share the same rollout snapshot and therefore share the same ∆batch .
+Under the controlled cache protocol, ∆batch ramps as 0, 1, 2, . . . while the initial cache is drained and
+then plateaus at k. Thus a 64-batch target cache depth is plotted as staleness 64. A train-batch step
+can contain multiple mini-batch optimizer updates; in the common setup, B = 256 and Bmini = 64,
+so each train-batch step contains M = B/Bmini = 4 optimizer updates. This conversion is useful
+for implementation accounting, but it is not the staleness axis used in the plots.
+
+
+                                                   13
+                                       Table 4: Evaluation datasets.
+                                           Dataset         Problems
+                                           AIME 2024              30
+                                           AIME 2025              30
+                                           AMC 2023               40
+
+
+
+We use k as the x-axis because it is the controlled train-batch staleness intervention shared across
+methods. The sweep covers k ∈ {0, 1, 2, 4, 8, 16, 32, 64, 128} across the forward-KL, reverse-KL /
+PPO-style, M2PO / DecPPO, top-k, and Monte-Carlo support-size variants; apart from the estimator
+choice and k, these runs share the common model, data, batch-size, generation, and evaluation
+settings in Table 3.
+
+C    Datasets and Metrics
+Training data. We filter the DeepMath dataset [8] to retain 57,630 math problems with difficulty
+level greater than or equal to 6, and use this filtered subset as the training data.
+
+Evaluation datasets. Table 4 lists the evaluation datasets used: AIME 2024 [30], AIME 2025 [31],
+and AMC 2023 [13]. AIME24 is evaluated every 20 steps. The remaining datasets are only evaluated
+for the final checkpoint.
+
+Accuracy metric. Evaluation samples 32 responses per problem. For a dataset D, the reported
+Avg@32 is the mean per-problem pass rate,
+                                                 1 X ci
+                             Avg@32(D) = 100 ·             ,                           (14)
+                                                |D|     32
+                                                                  i∈D
+
+where ci is the number of sampled responses judged correct for problem i. Paper tables and plots use
+Avg@32 unless noted otherwise.
+
+D    Existing Asset Licenses
+Table 5 lists the reused assets.
+
+E    Multi-Sample MC Variance at Large Staleness
+We measure how multi-sample MC reduces the variance of the old-to-current IS surrogate at large stal-
+eness. At timestep t with prefix st , local MC actions at,1 , . . . , at,m are sampled iid with replacement
+from pold (· | st ) (duplicates are allowed), and the learner evaluates
+                              m
+          b MC             1 X                                                          pθ (a | s)
+          L m (θ; st ) = −       ρθ (at,i , st ) sg(Aθ (at,i , st )) ,   ρθ (a, s) =                .   (15)
+                           m i=1                                                       pold (a | s)
+                                                                  local                                 seq
+Using the Qwen3-4B-Base staleness-128 runs, we report Rm                in the fixed-prefix column and Rm
+in the sequence-level column of Table 6. Both ratios are normalized to the corresponding m = 1
+estimator within the same old-to-current pair:
+                                 h                                                    i
+                              Est Varat,1 ,...,at,m ∼pold (·|st ) L b MC (θ; st ) | st
+                                                                      m
+                      local
+                    Rm      =        h                                          i       ,            (16)
+                                  Est Varat ∼pold (·|st ) L     MC
+                                                              b (θ; st ) | st
+                                                                1
+                                 h P                        i
+                                       T
+                              Var T1 t=1 L    b MC
+                                                m (θ; st )
+                        seq
+                      Rm    =    h P                        i.                                         (17)
+                                       T
+                              Var T1 t=1 L    b MC (θ; st )
+                                                1
+
+
+
+                                                      14
+     Table 5: Existing assets used in this work, with source URLs, license names, and versions.
+Category    Asset                  URL                                        License name       Version
+
+Dataset     DeepMath                 https://huggingface.co/datasets/         MIT                2025
+                                     zwhe99/DeepMath-103K
+Dataset     AIME 2024                https://huggingface.co/datasets/         MIT                2024
+                                     Maxwell-Jia/AIME_2024
+Dataset     AIME 2025                https://huggingface.co/datasets/         Not specified      2025
+                                     yentinglin/aime_2025
+Dataset     AMC 2023 / American https://huggingface.co/datasets/              Not specified      2023
+            Mathematics Competitions math-ai/amc23
+Model       Qwen3-4B-Base            https://huggingface.co/Qwen/             Apache-2.0         Not specified
+                                     Qwen3-4B-Base
+Model       Qwen3-1.7B-Base          https://huggingface.co/Qwen/             Apache-2.0         Not specified
+                                     Qwen3-1.7B-Base
+Model       Qwen3-8B-Base            https://huggingface.co/Qwen/             Apache-2.0         Not specified
+                                     Qwen3-8B-Base
+Model       Qwen3-4B                 https://huggingface.co/Qwen/             Apache-2.0         Not specified
+                                     Qwen3-4B
+Model       Qwen3-1.7B               https://huggingface.co/Qwen/             Apache-2.0         Not specified
+                                     Qwen3-1.7B
+Model       Qwen3-8B                 https://huggingface.co/Qwen/             Apache-2.0         Not specified
+                                     Qwen3-8B
+Model       Qwen3-30B-A3B-Instruct- https://huggingface.co/Qwen/              Apache-2.0         Qwen3-2507
+            2507                     Qwen3-30B-A3B-Instruct-2507
+Software    vLLM                     https://github.com/vllm-project/         Apache-2.0         0.16.0
+                                     vllm
+Software    PyTorch / PyTorch FSDP https://github.com/pytorch/                BSD-3-Clause       2.9.1
+                                     pytorch
+
+
+
+Table 6: MC variance ratios at large staleness. The fixed-prefix column isolates local next-token
+action-sampling variance; the sequence-level column averages the same estimator over generated
+timesteps before computing variance.
+                                                             local                         seq
+                         Diagnostic m    Fixed-prefix ratio Rm       Sequence-level ratio Rm
+                                   1                        1.000                       1.000
+                                   4                        0.255                       0.338
+                                  16                       0.0588                       0.152
+                                  64                       0.0149                       0.112
+
+
+
+       seq
+For Rm     , the generated prefix path s1:T is fixed when computing the variance; the MC samples are
+local scorer queries at each fixed prefix, not separate rollout branches.
+Table 6 shows that larger m consistently reduces variance. Fixed-prefix ratios closely follow the 1/m
+reference (m = 64 leaves 1.49% of the one-sample local variance, versus 1/64 = 1.56%). After
+timestep aggregation, m = 64 still leaves only 11.2% of the one-sample sequence-level variance,
+showing that multi-sample MC reduces variance in practice even though sequence-level averaging
+makes the reduction less extreme than the local next-token effect.
+
+F       Importance-Sampling Ablation
+Before treating multi-sampling as an improvement, we separate it from IS. Increasing m changes the
+Monte Carlo variance of the estimator. It does not define the target distribution. Old-to-current IS is
+still the mechanism that turns behavior-policy samples into an estimator of the current reverse-KL
+local gradient. Figure 10 compares MC1 and MC16 with and without IS to test this distinction
+directly.
+
+G       AsyncOPD Scheduler Details
+This appendix gives the implementation details omitted from Section 7. Our scheduler, AsyncOPD,
+follows the fully asynchronous systems structure of AReaL [4], but the queue contains OPD cache
+items rather than reward-labeled RL trajectories.
+
+
+                                                          15
+                                                                                                                        30                                                 80
+                                                                    30
+                40                                                                                                      25
+                                                                                                                                                                           60
+
+
+
+
+ Accuracy (%)
+
+
+
+
+                                                     Accuracy (%)
+
+
+
+
+                                                                                                         Accuracy (%)
+
+
+
+
+                                                                                                                                                            Accuracy (%)
+                30                                                                                                      20
+                                                                    20
+                                                                                                                        15                                                 40
+                20
+                         MC1+IS                                              MC1+IS                                     10       MC1+IS                                             MC1+IS
+                                                                    10
+                         MC1 noIS                                            MC1 noIS                                            MC1 noIS                                  20       MC1 noIS
+                10
+                         MC16+IS                                             MC16+IS                                     5       MC16+IS                                            MC16+IS
+                         MC16 noIS                                           MC16 noIS                                           MC16 noIS                                          MC16 noIS
+                 0                                                   0                                                   0                                                  0
+                     0    1   2   4 8 16 32 64 128                       0   1   2   4 8 16 32 64 128                        0   1   2   4 8 16 32 64 128                       0   1   2   4 8 16 32 64 128
+                                  Staleness                                          Staleness                                           Staleness                                          Staleness
+
+
+
+                         (a) Average                                     (b) AIME24                                          (c) AIME25                                             (d) AMC
+Figure 10: Accuracy comparison under staleness for MC importance-sampling ablations. Increasing
+the number of samples reduces Monte Carlo variance, but old-to-current IS is still needed to correct
+stale-policy sampling.
+
+
+Queue interface. The pipeline has three long-running stages: rollout generation, teacher scoring,
+and learner training. Rollout workers sample trajectories from their latest synchronized student
+snapshot. For each visited prefix s, they cache the MC actions, rollout log probabilities under pold ,
+and the rollout student version. The main scheduler comparison uses MC64; the MC1 runs use the
+same queue interface with one cached action. The teacher scores the cached actions. The learner
+then recomputes log pθ (a | s) and Aθ (a, s) under the current student, and applies the unclipped
+old-to-current IS estimator from Section 6.
+
+Weight synchronization and queue capacity. During AsyncOPD weight synchronization, rollout
+workers pause generation. In the keep-mode used for the scheduler experiments, in-flight requests
+are not discarded: the already sampled token prefix is kept, the student weights are updated, and
+the running-request prefix cache is reset so the engine rebuilds the attention state for that prefix
+under the new weights before generation resumes. Thus, tokens before the synchronization point
+are reused rather than regenerated, while later tokens are sampled under the new student snapshot.
+Each completed sample records the token index at which the active weight version changes. The
+queue-depth parameter τ is enforced as a capacity bound rather than as a learner-side drop rule.
+The coordinator creates a semaphore with (τ + 1)B permits, where B is the effective train batch
+size. The prompt feeder acquires one permit before submitting a prompt to rollout, and the train
+dispatcher releases permits only after the corresponding samples have been consumed by a learner
+update. During weight synchronization, a sync gate prevents the feeder from using newly released
+permits until rollout workers have received the updated weights. Thus, smaller τ limits the amount of
+unconsumed rollout work in the pipeline, while larger τ permits a deeper backlog and more overlap.
+The queues themselves remain FIFO; items are not evicted for being stale.
+
+Training throughput metric. The table reports training throughput. Let nj be the number of
+response tokens used by learner update j, and let tj be the train wall-clock time after that update.
+Discarding the first five warmup updates, we compute
+                                              PJ               PJ
+                                                 j=6 nj           j=6 nj
+                           throughput = PJ                   =           .
+                                            j=6 (tj − tj−1 )
+                                                                tJ − t 5
+
+Speedups are normalized to the strict-sync run with the same student and MC setting.
+
+Pipeline overlap metric. Let S = {rollout, teacher, train}. For teacher and train, we merge
+overlapping busy intervals within each stage and compute the merged busy time Ts . Rollout has Nr
+workers, so we first merge intervals within each worker i and then define the rollout-stage busy time
+as the worker-normalized average
+                                                                                                      r N
+                                                                                                 1 X
+                                                                                 Trollout =             Trollout,i .
+                                                                                                 Nr i=1
+
+Let Twall be the elapsed train wall-clock interval from the first to the last recorded pipeline-stage
+interval. We define                                P
+                                                          Ts
+                                       overlap = s∈S .
+                                                     Twall
+
+                                                                                                    16
+                  10                                                                                                             30
+                                                                         25
+
+
+
+
+  AIME24 Avg@32
+
+
+
+
+                                                         AIME24 Avg@32
+
+
+
+
+                                                                                                                 AIME24 Avg@32
+                   8
+                                                                                                                                 25
+                                                                         20
+                   6
+                                                                                                                                 20
+                                                                         15
+                   4
+                           Strict sync                                            Strict sync                                    15       Strict sync
+                   2                                                     10
+                           Two-step-off                                           Two-step-off                                            Two-step-off
+                           AsyncOPD (ours)                                        AsyncOPD (ours)                                10       AsyncOPD (ours)
+                   0                                                      5
+                       0      2          4       6   8                        0       2           4          6                        0           5               10
+                                  Train time (h)                                          Train time (h)                                       Train time (h)
+
+
+                       (a) MC64, 1.7B-Base                                    (b) MC64, 4B-Base                                       (c) MC64, 8B-Base
+
+                  10                                                     25                                                      30
+  AIME24 Avg@32
+
+
+
+
+                                                         AIME24 Avg@32
+
+
+
+
+                                                                                                                 AIME24 Avg@32
+                   8                                                                                                             25
+                                                                         20
+                   6                                                                                                             20
+                                                                         15
+                   4                                                                                                             15
+                           Strict sync                                            Strict sync                                             Strict sync
+                   2       Two-step-off                                  10       Two-step-off                                   10       Two-step-off
+                           AsyncOPD (ours)                                        AsyncOPD (ours)                                         AsyncOPD (ours)
+                   0                                                                                                              5
+                       0      2           4      6                            0             2            4                            0          2            4
+                                  Train time (h)                                          Train time (h)                                       Train time (h)
+
+
+                       (d) MC1, 1.7B-Base                                     (e) MC1, 4B-Base                                        (f) MC1, 8B-Base
+Figure 11: Train-time AIME24 Avg@32 for Qwen3-Base students with MC64 and MC1. Lines are
+3-point moving averages; faint markers are raw evaluations; colors denote scheduler. AsyncOPD
+reaches later checkpoints sooner, so its accuracy improves earlier in wall-clock time.
+
+
+A mostly serial schedule has overlap near 1, and the maximum remains 3: all rollout workers, teacher
+scoring, and training busy for the full interval.
+
+Hardware and testing protocol. Each scheduler run uses one 8-GPU node. One GPU is reserved
+for teacher scoring. The remaining seven GPUs are the rollout/training pool. Rollout generation uses
+data parallelism, and learner training uses PyTorch FSDP. Strict sync runs time-share this pool: all
+seven GPUs run rollout, then all seven switch to training, and the cycle repeats. The two-step-off
+and our AsyncOPD runs split the same seven GPUs concurrently: 4 GPUs for rollout workers and 3
+GPUs for the FSDP trainer.
+For each student size and MC setting, we compare strict sync, two-step-off, and our AsyncOPD
+scheduler with the same teacher, training data, evaluation metrics, and reverse-KL estimator: current-
+policy Aθ , no clipping, and old-to-current IS correction. Two-step-off fixes a two-update offset
+between rollout and the learner update that consumes it, so stale rollout reuse is static and controlled
+rather than produced by queue timing. We use this offset because it is the fastest static step-off
+schedule under the 4-rollout/3-trainer split. The OPD pipeline has three serial stages: rollout
+generation, teacher scoring, and learner training. Therefore, a two-step offset is enough to keep all
+stages occupied in the gated schedule. Larger offsets only make the consumed data older; they do not
+create another OPD stage to overlap or remove the step-off batch barrier. We measure final-checkpoint
+Avg@32 and train wall-clock time over the same training horizon.
+
+Qwen3-Base train-time accuracy. Figure 11 provides the train-time view for Qwen3-Base students.
+AsyncOPD reaches later checkpoints sooner, so accuracy improves earlier in wall-clock time across
+student sizes and MC settings.
+
+Additional Qwen3 AsyncOPD results. For the Qwen3 1.7B, 4B, and 8B student rows, we disable
+thinking at the tokenizer prompt-formatting level: prompt construction uses the Qwen3 tokenizer’s
+non-thinking chat-template mode before rollout and evaluation. Table 7 and Fig. 12 report this
+comparison. The systems pattern matches the Qwen3-Base results: AsyncOPD has the highest
+throughput and overlap, reaching up to 3.8× strict-sync throughput on MC64 and up to 3.2× on
+MC1. The train-time accuracy plots show the same wall-clock pattern as the main Qwen3-Base
+
+
+                                                                                          17
+Table 7: Additional AsyncOPD scheduler results for Qwen3 students with thinking disabled. Train
+tok/s is training throughput; parentheses show speedup over the matched strict-sync baseline. Overlap
+is concurrent OPD-stage activity. Avg@32 is final AIME24. AsyncOPD achieves the highest
+throughput and overlap in all matched settings while maintaining comparable final accuracy.
+Student Scheduler                                                                       MC64                                                                MC1
+                                                     Train tok/s (× sync) Overlap Avg@32 Train tok/s (× sync) Overlap Avg@32
+                           Strict sync                         11.2k (1.00×)                          0.78        35.00          11.7k (1.00×)                         0.78         35.21
+1.7B                       Two-step-off                        18.0k (1.61×)                          1.58        32.81          20.8k (1.78×)                         1.71         33.54
+                           AsyncOPD (ours)                     24.2k (2.16×)                          2.07        33.23          37.0k (3.17×)                         2.56         34.79
+                           Strict sync                          4.5k (1.00×)                          0.87        54.90           7.4k (1.00×)                         0.83         56.15
+4B                         Two-step-off                        11.5k (2.58×)                          1.54        56.77          13.0k (1.75×)                         1.63         58.02
+                           AsyncOPD (ours)                     17.0k (3.82×)                          2.15        54.69          18.5k (2.49×)                         2.26         56.25
+                           Strict sync                          5.6k (1.00×)                          0.86        59.69           3.9k (1.00×)                         0.87         58.96
+8B                         Two-step-off                         7.5k (1.34×)                          1.45        58.33           9.6k (2.45×)                         1.61         60.73
+                           AsyncOPD (ours)                     10.1k (1.81×)                          2.11        60.52          10.9k (2.78×)                         2.17         58.65
+
+                  40                                                                                                                              65
+                                                                                   60
+
+                  35                                                                                                                              60
+  AIME24 Avg@32
+
+
+
+
+                                                                   AIME24 Avg@32
+
+
+
+
+                                                                                                                                  AIME24 Avg@32
+                                                                                   55
+
+                  30                                                                                                                              55
+                                                                                   50
+                  25                                                                                                                              50
+                                                                                   45
+                            Strict sync                                                     Strict sync                                                    Strict sync
+                  20        Two-step-off                                                    Two-step-off                                          45       Two-step-off
+                                                                                   40
+                            AsyncOPD (ours)                                                 AsyncOPD (ours)                                                AsyncOPD (ours)
+                  15
+                       0      1         2      3       4                                0         2         4        6       8                         0           2           4
+                                   Train time (h)                                                     Train time (h)                                              Train time (h)
+
+
+                           (a) MC64, 1.7B                                                   (b) MC64, 4B                                                   (c) MC64, 8B
+                                                                                                                                                  65
+                                                                                   60
+                  35                                                                                                                              60
+  AIME24 Avg@32
+
+
+
+
+                                                                   AIME24 Avg@32
+
+
+
+
+                                                                                                                                  AIME24 Avg@32
+
+
+
+
+                                                                                   55
+                  30                                                                                                                              55
+                                                                                   50
+                  25                                                                                                                              50
+
+                                                                                   45                                                             45
+                  20        Strict sync                                                     Strict sync                                                    Strict sync
+                            Two-step-off                                                    Two-step-off                                          40       Two-step-off
+                                                                                   40
+                  15        AsyncOPD (ours)                                                 AsyncOPD (ours)                                                AsyncOPD (ours)
+
+                       0       1         2       3         4                            0     1          2      3        4                             0      2         4       6     8
+                                   Train time (h)                                                     Train time (h)                                              Train time (h)
+
+
+                           (d) MC1, 1.7B                                                    (e) MC1, 4B                                                    (f) MC1, 8B
+Figure 12: Train-time AIME24 Avg@32 for Qwen3 1.7B, 4B, and 8B students with thinking disabled,
+using MC64 and MC1. Lines are 3-point moving averages; faint markers are raw evaluations; colors
+denote scheduler. AsyncOPD reaches later checkpoints sooner, so its accuracy improves earlier in
+wall-clock time.
+
+
+results: AsyncOPD reaches later checkpoints sooner, so accuracy improves earlier across student
+sizes and MC settings.
+
+
+
+
+                                                                                                      18
+

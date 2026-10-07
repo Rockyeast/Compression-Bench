@@ -1,0 +1,4373 @@
+SignRoundV2: Toward Closing the Performance Gap
+in Extremely Low-Bit Post-Training Quantization for
+LLMs
+
+arXiv:2512.04746v2 [cs.CL] 18 May 2026
+
+Wenhua Cheng1,†
+
+Weiwei Zhang1,∗ Heng Guo1,∗ Haihao Shen1
+1
+Intel 2 Beijing Institute of Technology
+
+Zaner Ma2,‡
+
+Abstract
+Extremely low-bit quantization is critical for efficiently deploying Large Language
+Models (LLMs), yet it often leads to severe performance degradation at 2 bits and
+even at 4 bits (e.g., MXFP4). We present SignRoundV2, a post-training quantization framework designed to maintain high performance even under aggressive
+compression. SignRoundV2 introduces (1) a simple yet efficient adaptive mixedprecision strategy that leverages gradient information and quantization-induced
+reconstruction errors to guide layer-wise bit allocation, and (2) a set of lightweight
+stabilization techniques, including loss filtering and a pre-tuning scale search, to
+improve tuning effectiveness in extremely low-bit regimes. Our approach takes
+a significant step toward closing the performance gap between quantized and
+full-precision models. Experimental results across diverse LLMs demonstrate
+that SignRoundV2 achieves near-lossless performance in mixed MXFP settings,
+narrowing the gap to ∼1% at an average of 4.5 bits, while substantially improving accuracy in challenging 2-bit weight-only quantization. The source code is
+available at https://github.com/intel/auto-round.
+
+1
+
+Introduction
+
+The advent of Large Language Models (LLMs) such as GPT [1], LLaMA [2, 3], Qwen [4, 5] and
+DeepSeek [6] has marked a major shift in modern artificial intelligence. As parameter counts scale
+from billions to hundreds of billions, these models have demonstrated unprecedented capabilities
+in reasoning, coding, multimodal understanding, and autonomous agent behaviors. However, such
+scaling comes at the cost of dramatically increased memory consumption, bandwidth pressure,
+and inference latency, posing significant barriers for real-world deployment, especially in resourceconstrained environments such as consumer GPUs, CPUs, and edge devices.
+To alleviate these limitations, post-training quantization (PTQ) [7–10] has emerged as one of the
+most practical approaches because it avoids costly re-training and can be applied to a wide range
+of pretrained LLMs. By compressing weights and activations to low-bit representations, PTQ
+yields substantial reductions in memory footprint and hardware cost. In particular, the push toward
+extremely low-bit quantization, for example, sub-4-bit weight-only quantization and 4-bit activation
+quantization, has become a crucial enabler for democratizing LLM deployment.
+Recent research has moved beyond conventional W4A16 and W8A8 schemes (where W and A
+denote weight and activation bit-widths) toward more expressive low-bit data types. For example, MXFP4 [11] and NVFP4 [12] are floating-point variants provided by modern accelerators,
+demonstrating that well-designed data types can maintain reasonable accuracy even under aggressive
+* These authors contributed equally.
+† Correspondence: wenhua.cheng@intel.com
+‡ Working done during the internship at Intel.
+
+Preprint.
+
+(a) W2A16 results on Llama 2/3 70B
+
+(b) Recovery ratio at 2.5 bits
+
+Figure 1: Left: results on pure 2 bits (W2A16) for Llama 2/3 70B. Right: recovery ratio for adaptive
+bit assignments at 2.5 bits across four models.
+
+activation quantization. Despite these architectural advances, achieving high-accuracy recovery remains non-trivial, primarily due to the prevalent outliers in large-scale model. In parallel, weight-only
+quantization continues to push the limits of bit efficiency. In particular, BitNet [13, 14] explores
+quantization down to approximately 1.58 bits, showing that extremely low-bit representations can
+still be learned with specialized training or distillation. However, these methods require training
+from scratch or costly post-training distillation, making them less suitable for scenarios where fast,
+scalable, and hardware-efficient PTQ is desired.
+To minimize the accuracy loss caused by quantization, adaptive mixed-precision quantization has
+emerged as a natural solution to the limitations of uniform quantization. By strategically allocating
+higher precision to sensitive layers while aggressively compressing more robust ones, it effectively
+balances model performance with computational efficiency [15–18]. Therefore, the central challenge
+is the design of an accurate and efficient layer sensitivity metric to guide bit allocation. Early
+methods estimate sensitivity using Hessian-based metrics [16, 18, 19], or rely on layer-wise or
+model-wise output distortion measured on a small calibration dataset [20]. However, these heuristics
+often exhibit imperfect correlation when applied layer-wise, and model-wise approaches typically
+require slow calibration, especially for large language models (LLMs). In contrast, learning-based or
+reinforcement-learning-based approaches automate precision assignment [21, 17, 22], but at the cost
+of substantial compute overhead.
+To address these challenges, we introduce SignRoundV2, an enhanced post-training quantization
+framework building upon SignRound [10]. Our method first utilizes a simple yet efficient adaptive
+mixed-precision strategy that integrates gradient information with quantization-induced deviations to
+capture both local parameter distortion and global task impact. By leveraging these reliable sensitivity
+signals, SignRoundV2 employs dynamic programming [23] to efficiently determine the optimal
+layer-wise bit configuration for a given budget, substantially narrowing the performance gap between
+quantized and full-precision models even under aggressive compression. Second, we emphasize that
+stabilizing the optimization process is important in extremely low-bit regimes. Building on findings
+that quantization parameter initialization is critical [9, 24], we introduce a lightweight pre-tuning
+search, inspired by the importance matrix in llama.cpp [25], to rapidly identify high-quality initial
+scales before the main tuning stage. To further ensure optimization stability, we incorporate a loss
+filtering mechanism that excludes loss outliers during tuning, preventing outlier gradients from
+degrading the learned quantization parameters. Figure 1 compares our method to state-of-the-art
+baselines, showing that it achieves similar performance at significantly lower cost and avoids the
+issues associated with Quantization-Aware Training (QAT), which are discussed in Section 2. In
+summary, our contributions are three-fold.
+• We introduce an efficient adaptive mixed-precision strategy that leverages gradient information and quantization-induced deviations to guide layer-wise bit allocation via dynamic
+programming, maintaining high performance even under aggressive compression.
+2
+
+• We employ simple yet effective stabilization techniques, such as loss filtering and a
+lightweight pre-tuning scale search, to improve stability and accuracy in extremely low-bit
+regimes.
+• We demonstrate that SignRoundV2 achieves competitive accuracy compared with recent
+high-cost QAT and vector-quantization methods in weight-only quantization, while requiring substantially lower quantization cost and maintaining strong performance in weightactivation scenarios.
+
+2
+
+Related Work
+
+Quantization-Aware Training (QAT). QAT integrates learnable quantizers directly into the training loop, minimizing the task loss and fine-tuning additional parameters beyond the quantizers
+introduced by low-precision operations, as described in EfficientQAT [26], LLM-QAT [27], DL-QAT
+[28], and BitDistiller [29]. Recent works [30–32] have revisited vector quantization for extremely
+low-bit settings, but these methods still rely on QAT to achieve high accuracy. Despite their effectiveness, QAT methods suffer from several practical limitations. First, because they optimize the
+task loss and may update non-quantizer parameters, they can be more sensitive to the fine-tuning
+data distribution and may introduce forgetting or domain-specific overfitting [33, 34]. Second, QAT
+often requires careful hyperparameter tuning, and the practical quantization cost can be substantially
+higher than that of PTQ. Third, QAT typically relies on more training data than PTQ to achieve stable
+generalization, further increasing the overall resource requirements.
+Post-Training Quantization (PTQ). Post-training quantization (PTQ) avoids task-loss optimization and additional fine-tuning of model parameters and therefore offers a simple and resource-efficient
+pipeline for compressing LLMs [35–38, 7, 39, 40]. Because LLM decoding is typically memorybound, weight-only PTQ has become the dominant approach [8, 9, 41–44, 10] in LLM inference.
+However, existing weight-only methods still suffer from a significant accuracy drop at extremely low
+bit-widths (e.g., 2-bit). Meanwhile, joint weight–activation quantization has emerged as a complementary direction, with techniques such as rotation-based transformations [30, 45–48] proposed to
+address activation outliers, albeit at the cost of additional inference overhead.
+Adaptive Mixed-Precision Quantization. Adaptive mixed-precision quantization assigns heterogeneous bit-widths across layers or channels to better align with their varying sensitivity to quantization
+error. Early frameworks utilized second-order information, such as Hessian-based methods (e.g.,
+HAWQ [16] and BAQ [49]), or reinforcement learning schemes like HAQ [17]. However, these
+approaches are prohibitively expensive for multi-billion-parameter LLMs due to the computational
+intensity of second-order matrix computations or extensive policy evaluations. While MixLLM [50]
+attempts to combine first- and second-order metrics for channel-level precision, its reliance on naive
+thresholding and neglect of activation distortion in weight-activation joint quantization often lead to
+suboptimal performance. To address these scalability issues, recent advances focus on optimizing the
+search space or eliminating search altogether. AMQ [22] treats mixed-precision assignment as an
+AutoML problem, employing search space pruning and quantization proxies to accelerate the process;
+nonetheless, it remains relatively slow for large-scale models. In contrast, SFMP [19] completely
+bypasses the computationally expensive search process by utilizing a fine-grained, hardware-friendly
+assignment logic. Similarly, MicroMix [51] applies FP4/FP6/FP8 precision at the channel level via
+MXFP microscaling kernels. While these methods achieve high efficiency, they often require specific
+hardware or specialized kernel support. In practical deployment, frameworks like llama.cpp [25]
+adopt lightweight heuristic strategies to assign mixed precision across different model architectures.
+Furthermore, given the rising prominence of Mixture-of-Experts (MoE) architectures, recent works
+such as MxMoE [52], MoQAE [53], and MoPEQ [54] have extended adaptive mixed-bit settings
+specifically to MoE models.
+Rounding and Optimized Quantizer Search. Rounding critically affects the quality of quantized
+weights. AdaRound [55] formulates weight rounding as a per-weight binary optimization problem,
+where a second-order Taylor expansion of the task loss approximates quantization-induced perturbations, and a layer-wise local reconstruction loss is minimized via continuous relaxation. This
+formulation has inspired subsequent works such as BRECQ [56] and SignRound [10]. FlexRound [57]
+increases rounding flexibility through element-wise scaling, albeit at the cost of introducing numerous
+3
+
+hyperparameters. Oscillation-Free training [58] highlights instability arising from learnable rounding parameters. Activation-dependent rounding in AQuant [59] reduces activation error but is not
+applicable to weight-only inference. SignRound [10] jointly optimizes rounding and weight clipping
+using sign-based gradient descent, achieving substantial improvements, particularly at extremely low
+bit-widths such as 2 bits.
+
+3
+
+Methodology
+
+This section presents our methodology. We begin in Section 3.1 by introducing the sensitivity metric,
+DeltaLoss, which guides mixed-bit assignment. Section 3.2 then leverages DeltaLoss with dynamic
+programming to determine adaptive bit-widths for each layer. Section 3.3 describes the tuning
+strategy for quantization parameters, while Section 3.4 introduces our loss exclusion strategy. Finally,
+Section 3.5 summarizes the main hyperparameters and presents a practical trick for loss computation.
+Before introducing our method, we briefly review the standard quantize-dequantize (QDQ) formulation and SignRoundV1 [10]. The QDQ operator for weights W is defined as follows:
+j W m
+
+QDQ(W) = s · clip
+, n, m , n, m ∈ N,
+(1)
+s
+where the rounding operation ⌊·⌉ is typically performed using the Round-to-Nearest (RTN) method.
+The scale factor s is defined as:
+max(W) − min(W)
+,
+2bit − 1
+and for simplicity, we ignore the zero point.
+s=
+
+(2)
+
+SignRoundV1 [10] introduces three trainable parameters v, α and β, to reduce the quantization error.
+The parameter v enhances the rounding operation
+j W
+m
+
+QDQ(W) = s · clip
++ v , n, m ,
+s
+
+n, m ∈ N,
+
+(3)
+
+while α and β refine the scale and zero-point through
+s=
+
+max(W) · α − min(W) · β
+.
+2bit − 1
+
+(a) W2A16 layer-wise DeltaLoss sensitivity
+
+(4)
+
+(b) MXFP4 layer-wise DeltaLoss sensitivity
+
+Figure 2: Layer-wise DeltaLoss sensitivity of Llama-3.1-8B-Instruct under W2A16 and MXFP4.
+3.1
+
+DeltaLoss Sensitivity Metric
+
+Prior work [16, 18] largely ignores first-order gradient information and instead relies on second-order
+approximations, such as the Hessian or Fisher information matrix, to estimate sensitivity under the
+assumption that gradients are near zero at the local optimum. However, this assumption breaks
+down when quantization induces a large loss. Moreover, although second-order metrics capture local
+curvature, they share a fundamental limitation with purely gradient-based methods: both fail to reflect
+4
+
+the actual impact of quantization on the loss and therefore provide only a relative trend rather than a
+reliable measure of the true loss.
+To address this limitation, we estimate the loss increase induced by the QDQ operation using a
+first-order Taylor approximation. Let Lf and Lq denote the losses of the full-precision and quantized
+models, respectively. We define the quantization-induced loss increase as
+∆L = Lq − Lf .
+
+(5)
+
+For a layer with full-precision weight tensor Wf and activation tensor Af , and their quantized
+counterparts Wq and Aq , we approximate the loss increase by a first-order Taylor expansion around
+the quantized point:
+⊤
+⊤
+∆L ≈ gaq
+(Aq − Af ) + gwq
+(Wq − Wf ),
+
+(6)
+
+where the gradients gaq = ∂L/∂Aq and gwq = ∂L/∂Wq are computed using the quantized model
+on a small calibration set.
+While Eq. 6 provides a signed first-order estimate, positive and negative element-wise contributions
+may cancel each other out when aggregated over tokens, channels, and calibration samples. We
+therefore instead use the magnitude of the gradient-weighted perturbation as a more stable sensitivity
+score:
+DeltaLoss = ∥gaq ⊙ (Aq − Af )∥1 + ∥gwq ⊙ (Wq − Wf )∥1 ,
+
+(7)
+
+where ⊙ denotes element-wise multiplication and ∥ · ∥1 denotes summation over all elements. The
+final layer-wise score is averaged over calibration samples.
+This metric combines two complementary factors: the magnitude of the quantization perturbation
+and the task-aware gradient sensitivity. Layers that exhibit both large quantization deviations and
+large gradients receive higher DeltaLoss scores and are therefore assigned higher precision under a
+fixed bit budget.
+For joint weight-activation quantization, both weight and activation perturbations can be included as
+in Eq. 7. In practice, prior studies [7, 39] indicate that activation quantization often dominates the
+degradation. Therefore, for memory-efficient mixed weight-activation settings where weights and
+activations share the same bit-width, we use the activation-induced term as the default sensitivity
+score:
+DeltaLossWA = ∥gaq ⊙ (Aq − Af )∥1 .
+
+(8)
+
+Figure 2 visualizes the layer-wise sensitivity measured by DeltaLoss. It is evident that sensitivity
+varies across different data types, making it prohibitively labor-intensive or suboptimal to rely on
+heuristic rules to manually assign quantization bit-widths for each scheme. Moreover, certain layers
+within a block, such as down_proj, exhibit consistently higher sensitivity, suggesting that traditional
+block-wise fallback strategies may be suboptimal.
+3.2
+
+Layer-wise Bit Allocation
+
+We formulate layer-wise bit allocation as a discrete optimization problem. Let n denote the total
+number of layers, and let B = {b1 , . . . , bK } be the set of allowed bit-widths. For each layer
+i ∈ {1, . . . , n} and bit-width b ∈ B, we introduce a binary variable Ii,b ∈ {0, 1}, where Ii,b = 1
+indicates that layer i is assigned bit-width b.
+For simplicity, we assume identical bit-widths for both weights and activations, although this formulation can be extended to accommodate different bit-widths or data types across layers.
+Let ∆Li (b) denote the DeltaLoss when quantizing layer i to b bits. Given a target average bit-width
+T , the mixed-precision assignment can be written as:
+5
+
+min
+Ii,b
+
+s.t.
+
+n X
+X
+
+∆Li (b) Ii,b
+
+i=1 b∈B
+
+X
+
+Ii,b = 1,
+
+b∈B
+n X
+X
+
+∀i = 1, . . . , n,
+(9)
+
+b Ii,b Pi ≤ T
+
+i=1 b∈B
+
+Ii,b ∈ {0, 1},
+
+X
+
+Pi ,
+
+i
+
+∀i = 1, . . . , n, b ∈ B.
+
+where Pi denotes the number of parameters in layer i. This optimization problem can be solved
+via dynamic programming [23] or as an integer linear program [60, 61], both of which are wellestablished approaches. We omit the details here and refer the reader to the existing literature.
+3.3
+
+Tuning Quantization Parameters
+
+In SignRoundV1 [10], all quantization parameters are initialized with trivial values, specifically, the
+weight clipping parameters α and β are set to 1.0, and the rounding perturbation v is initialized to 0. A
+better initialization could potentially improve performance, similar to the effect of careful initialization
+in training neural networks [62, 63]. Although initializing the rounding values is challenging, prior
+works [9, 43, 25] have proposed training-free methods to search for weight clipping by aligning layer
+outputs or optimizing certain objectives. While effective, these approaches require layer-wise forward
+passes, which can be slow, or rely on floating-point zero points for better accuracy.
+Inspired primarily by the importance matrix in llama.cpp [25], we adopt a simple variant to initialize
+the scale. The search process is formulated as
+min
+s∈S
+
+N
+2
+1 X
+(Wf − Wq ) ⊙ A i ,
+N i=1
+
+(10)
+
+where S denotes a predefined set of candidate scales, and A represents the channel-wise average of
+input activations, calibrated from a set of samples.
+For symmetric quantization, which is the default setting used in this work, the set S = {s0 , . . . , sc }
+is constructed from the following candidates:
+si =
+
+max(|W|)
+,
+2b−1 + ϵi
+
+ϵi ∈ {−t, −t + δ, . . . , t}.
+
+(11)
+
+t and δ are fixed for each scheme. Specifically, we set t = 0.9 and δ = 0.01 for W2A16. We refine
+the optimal scale sinit with a learnable parameter α, i.e., s = sinit · α, where α ∈ [0, 2.0]. Finally,
+we follow SignRoundV1 [10] to tune v in Equation 3.
+3.4
+
+Tuning Stabilization via Loss Filtering
+
+To enhance tuning stability, we exclude the top-k largest losses in a batch when computing the mean
+squared error between the quantized block output and the full-precision block, where k is set to 0.1%
+of the total number of elements. Let TopK(L, k) denote the set of the k largest losses in L. The
+effective loss used for optimization is defined as follows, where “\” denotes the exclusion operation:
+X
+1
+Leff =
+Li .
+(12)
+|L \ TopK(L, k)|
+Li ∈L\TopK(L,k)
+
+3.5
+
+Hyperparameters
+
+For DeltaLoss, we use only 16 calibration samples with a sequence length of 256. For tuning, we
+follow the setup in SignRoundV1 [10]. Each transformer block is optimized for 200 steps using
+signed gradient descent, with a learning rate of 1/steps and a batch size of 8. The sequence length is
+6
+
+Table 1: Average accuracies across five tasks (Section 4.2) using W2A16 at 2 bits and mixed W2A16
+and W4A16G128 at 2.5 bits. “G” denotes the group size, and “Avg. Bits” denotes the average
+per-weight bit-width. Ours* indicates our improved recipe (Section 3.5). “-” denotes missing data
+from the original work.
+Avg. Bits Method Group Size Llama2-7B Llama2-13B Llama2-70B Llama3-8B Llama3-70B
+16
+
+2
+
+2.5
+
+16-bit
+
+-
+
+64.66
+
+67.44
+
+72.41
+
+68.64
+
+75.28
+
+AQLM
+AQLM
+QuIP#
+EQAT
+EQAT
+
+2x8
+1x16
+128
+64
+
+57.61
+61.85
+60.61
+59.50
+60.14
+
+62.22
+64.95
+64.44
+63.88
+63.48
+
+69.85
+70.84
+70.91
+68.93
+69.48
+
+64.10
+59.37
+60.76
+
+70.10
+67.57
+67.89
+
+GPTQ
+AWQ
+OmniQ
+SRV1
+Ours
+Ours*
+Ours*
+
+128
+128
+128
+128
+128
+128
+64
+
+41.56
+34.74
+46.98
+54.50
+57.88
+58.67
+59.04
+
+48.29
+35.99
+53.56
+60.72
+61.88
+62.34
+62.81
+
+34.38
+35.49
+54.87
+67.70
+68.39
+68.82
+69.30
+
+52.66
+55.25
+57.90
+59.97
+60.38
+
+60.06
+64.76
+69.02
+70.16
+70.93
+
+Ours
+Ours*
+Ours
+Ours*
+
+128
+128
+64
+64
+
+59.96
+60.28
+60.08
+60.44
+
+63.65
+63.73
+64.09
+64.57
+
+70.10
+70.04
+70.25
+70.60
+
+62.76
+62.60
+63.67
+63.56
+
+72.37
+72.68
+71.97
+72.32
+
+fixed at 2048. To reduce quantization cost, we lower the default number of calibration samples from
+512 to 128. We additionally provide a higher-cost recipe for improved accuracy, denoted as Ours*,
+where the number of steps is increased from 200 to 500, the learning rate is set to 2.0/steps and
+the number of calibration samples is restored to 512. Automatic mixed precision (AMP) is applied
+throughout to improve tuning efficiency.
+
+4
+
+Experiments
+
+4.1
+
+Experimental Setup
+
+Models and Benchmarks. We evaluate SignRoundV2 on two prominent LLM families: LLaMA
+[64, 65] and Qwen [4, 5]. Our evaluation spans both low-bit and mixed-precision quantization
+settings across a comprehensive suite of standard benchmarks. All evaluations are conducted in a
+zero-shot setting using the LM - EVALUATION - HARNESS framework [66]. To ensure fair comparisons,
+all methods within each experimental group are evaluated with a version of lm_eval that produces
+identical or closely aligned baseline results, unless explicitly stated otherwise. The benchmark suite
+includes ARC-Challenge [67], ARC-Easy [67], BoolQ [68], HellaSwag [69], LAMBADA [70],
+MMLU [71], OpenBookQA [72], PIQA [73], TruthfulQA [74], and WinoGrande [75].
+Quantization Configurations. Following SignRoundV1 [10], we utilize the Pile [76] as the
+calibration dataset. Unlike SignRoundV1, we adopt symmetric quantization to enhance hardware and
+kernel compatibility. All experiments are executed on NVIDIA A100 (80GB) GPUs. For clarity, the
+bit costs associated with scales and zero points are omitted unless otherwise specified. For MXFP4
+and MXFP8 settings, we strictly adhere to the standard definitions specified in [11].
+4.2
+
+Comparison of Weight-Only Quantization Methods
+
+Table 1 reports average accuracies across five representative tasks for W2A16 with and without
+mixed-precision support. In uniform W2A16 settings, SignRoundV2 consistently outperforms
+established PTQ baselines, including GPTQ [8], AWQ [9], OmniQuant [77], and SignRoundV1
+[10], by a substantial margin. Compared to high-complexity methods such as AQLM [32], QuIP#
+[31], and EfficientQAT [26], our approach achieves competitive performance on large-scale models
+while maintaining a significantly lower optimization overhead. Furthermore, at slightly higher
+average bit-widths (e.g., 2.5 bits), our adaptive layer-wise strategy effectively preserves model
+7
+
+Table 2: Comparison of mixed-bit algorithms. Average accuracy (acc_norm preferred) and recovery
+rate across six tasks (see Appendix B for details). Gray rows: uniform 3-bit and 4-bit baselines quantized with SignRoundV2. Note: Ours employs hardware-friendly per-tensor mixed-bit granularity,
+avoiding per-group granularity overhead in SFMP.
+Avg. bits Method
+
+Llama3.1-8B
+
+Qwen3-8B
+
+Qwen3-14B
+
+Qwen3-32B
+
+75.83
+75.01
+
+74.07
+74.20
+
+77.41
+77.38
+
+78.05
+77.99
+
+16
+
+Ours
+SFMP
+
+2.5
+
+AMQ
+SFMP
+Ours
+
+3
+
+AMQ
+68.78 (91.69%)
+SFMP
+69.74 (92.89%)
+Ours
+71.64 (94.48%)
+W3G128 72.84 (96.06%)
+
+3.5
+
+AMQ
+SFMP
+Ours
+
+4
+
+AMQ
+73.46 (97.93%) 72.64 (97.90%) 76.62 (99.02%) 77.15 (98.92%)
+SFMP
+74.33 (99.09%) 73.29 (98.77%) 77.13 (99.68%) 77.89 (99.87%)
+Ours
+75.07 (99.00%) 73.76 (99.58%) 77.05 (99.53%) 77.48 (99.27%)
+W4G128 75.06 (98.99%) 74.11 (100.05%) 77.33 (99.90%) 77.75 (99.62%)
+
+58.65 (78.19%) 58.62 (79.00%) 66.56 (86.02%) 69.37 (88.95%)
+64.34 (85.78%) 66.16 (89.16%) 71.12 (91.91%) 73.33 (94.02%)
+68.57 (90.43%) 66.82 (90.20%) 72.63 (93.83%) 74.96 (96.04%)
+68.40 (92.18%)
+71.36 (96.17%)
+72.21 (97.49%)
+73.24 (98.88%)
+
+71.32 (92.17%) 74.02 (94.91%)
+75.30 (97.31%) 76.24 (97.76%)
+74.66 (96.45%) 76.61 (98.16%)
+76.39 (98.68%) 76.66 (98.22%)
+
+72.56 (96.73%) 71.65 (96.56%) 75.76 (97.91%) 76.01 (97.46%)
+72.97 (97.28%) 72.74 (98.03%) 76.89 (99.37%) 77.24 (99.04%)
+73.94 (97.51%) 72.99 (98.54%) 76.32 (98.59%) 77.36 (99.12%)
+
+quality, demonstrating robust recovery capabilities in extreme compression regimes. Detailed INT2/4
+mixed-bit results are in Appendix E.
+4.3
+
+Comparison of Adaptive Bit-Width Quantization
+
+Table 2 shows that SignRoundV2 achieves strong accuracy across evaluated bit-widths, with particularly large gains in the ultra-low-bit regime and competitive performance at higher bit-widths.
+Following SFMP [19], we report average accuracy across six tasks, prioritizing acc_norm. To ensure
+fair comparison, we account for scaling factor and zero-point overhead while restricting the bit-width
+search space to a maximum difference of 1. For reference, we provide the accuracy of uniform-bit
+SignRoundV2 at 3 and 4 bits (shown in gray), serving as non-mixed baselines. Notably, SFMP [19]
+and AMQ [22] use AWQ [9] as their base weight quantizer. Against these baselines, SignRoundV2
+achieves significant gains in ultra-low-bit regimes; e.g., on Llama-3.1-8B at 2.5 bits, it improves the
+recovery rate over AMQ by 12.24 percentage points. SignRoundV2 achieves competitive performance with SFMP while maintaining hardware-friendly per-tensor granularity, avoiding kernel-level
+overhead inherent in SFMP’s per-group strategy. These results, supported by Table 6, highlight our
+favorable accuracy–cost trade-off. We further compare DeltaLoss against naive strategies such as
+head/tail fallback in Appendix A.
+4.4
+
+Performance under MXFP Quantization
+
+Table 3 presents our results using the MX format [11]. Given that most existing PTQ methods
+do not support MX formats or lack comparable baselines, we primarily compare SignRoundV2
+against SignRoundV1 [10] and RTN. SignRoundV2 exhibits performance gains in the 4-bit regime,
+surpassing RTN and outperforming SignRoundV1 in most scenarios. At average bit-widths of 4.5
+and 5 bits, our method approaches full-precision performance on most evaluated models. Detailed
+results for MXFP4/8 are deferred to Appendix C.2, while Appendix D reports the NVFP4 results.
+4.5
+
+Ablation Studies
+
+We conduct ablation studies to isolate the individual contributions of pre-tuning initialization and
+loss filtering. As summarized in Table 4, both strategies consistently enhance performance under the
+W2A16G64 setting. Notably, incorporating loss filtering yields a significant boost in average accuracy
+(+0.82% on Qwen3), while its synergy with proper initialization (Ours) achieves a substantial 3.41%
+8
+
+Table 3: Mixed-precision MXFP 4/6-bit quantization results. Average accuracies and recovery rates
+(%) across 10 tasks. “Avg. Bits”: average bit-width per weight; “DL”: DeltaLoss without tuning; “I”:
+Instruct models. See Appendix C.1 for details.
+Avg. Bits
+
+Method
+
+Llama3.1-8B-I
+
+Llama3.1-70B-I
+
+Qwen2.5-7B-I
+
+Qwen3-8B
+
+16
+
+16-bit
+
+64.16
+
+70.00
+
+65.67
+
+63.24
+
+Qwen3-32B
+67.00
+
+4
+
+RTN
+SRV1
+Ours
+
+58.31 (90.88%)
+60.72 (94.64%)
+61.47 (95.81%)
+
+68.76 (98.23%)
+69.01 (98.60%)
+69.31 (99.01%)
+
+60.62 (92.32%)
+64.06 (97.55%)
+63.72 (97.03%)
+
+58.54 (92.57%)
+60.25 (95.28%)
+61.45 (97.17%)
+
+64.87 (96.82%)
+66.92 (99.88%)
+65.90 (98.36%)
+
+4.5
+
+DL
+Ours
+
+62.00 (96.63%)
+63.34 (98.72%)
+
+70.17 (100.24%)
+70.31 (100.44%)
+
+64.16 (97.70%)
+64.77 (98.63%)
+
+61.35 (97.01%)
+62.74 (99.21%)
+
+66.26 (98.90%)
+67.10 (100.15%)
+
+5
+
+DL
+Ours
+
+63.53 (99.02%)
+64.00 (99.75%)
+
+70.69 (100.99%)
+70.66 (100.94%)
+
+65.22 (99.31%)
+65.35 (99.51%)
+
+62.06 (98.13%)
+62.81 (99.32%)
+
+66.41 (99.12%)
+67.19 (100.28%)
+
+absolute improvement on Llama3.1. These results underscore that stabilizing the initial optimization
+phase is paramount for preserving the reasoning capabilities of ultra-low-bit quantized models.
+Table 4: Ablation studies of loss filtering and pre-tuning initialization at W2A16G64.
+Model
+
+Method
+
+ARC-c ARC-e BoolQ Hella LAMB MMLU OBQA PIQA Truth. Wino AVG.
+
+Qwen3-8B
+
+V1
+V1+Filtering
+V1+Init
+Ours
+
+38.65
+45.14
+40.78
+43.52
+
+73.11
+75.97
+73.82
+75.13
+
+80.83
+78.62
+76.94
+74.89
+
+44.60
+44.78
+44.75
+45.10
+
+48.28
+51.50
+51.29
+52.80
+
+56.19
+55.23
+56.77
+57.56
+
+28.40
+25.80
+28.60
+26.00
+
+71.82
+72.36
+71.33
+71.22
+
+30.84
+31.21
+32.07
+31.70
+
+63.14 53.59
+64.48 54.51
+64.25 54.06
+64.64 54.26
+
+Llama3.1-8B-I
+
+V1
+V1+Filtering
+V1+Init
+Ours
+
+36.95
+36.86
+36.52
+38.65
+
+69.82
+69.99
+71.76
+71.21
+
+73.06
+70.89
+80.21
+77.46
+
+44.89
+46.72
+46.87
+47.27
+
+50.15
+55.48
+59.11
+60.45
+
+43.80
+46.05
+48.28
+49.67
+
+25.20
+27.80
+26.40
+26.20
+
+73.18
+72.31
+72.91
+73.61
+
+29.74
+31.58
+29.74
+29.87
+
+65.19 51.20
+65.75 52.34
+66.69 53.85
+67.48 54.19
+
+4.6
+
+Quantization Cost
+
+Table 5 compares end-to-end quantization time. QAT-based and vector quantization methods (e.g.,
+EfficientQAT, QuIP#, AQLM) typically require tens to hundreds of GPU hours and careful hyperparameter tuning, often leading to higher practical costs than reported. In contrast, SignRoundV1
+completes in 2.2 hours, while our method requires 2.5 hours, and 6 hours for the enhanced version
+(Ours*). Overall, our approach achieves competitive accuracy with substantially lower time cost.
+Table 6 reports the additional VRAM and runtime overhead of DeltaLoss for weight-only quantization
+(e.g., W2A16), which remains comparable to MXFP4.
+Table 5: Runtime Cost Comparison for
+Llama2-70B
+Method
+
+5
+
+Fits A100-80GB
+
+GPU hours
+
+SignRoundV1
+EfficientQAT
+QuIP#
+AQLM
+
+✓
+✓
+×
+✓
+
+2.2
+41
+270
+336
+
+Ours
+Ours*
+
+✓
+✓
+
+2.5
+6
+
+Table 6: Cost Comparison for Adaptive Bit-Width Assignment (Excluding Quantization Overhead).
+Model
+
+Method
+
+VRAM (GB)
+
+GPU hours
+
+Qwen3-8B
+
+AMQ
+SFMP
+Ours
+
+20
+48
+15
+
+7
+0.05
+0.017×len(opt)
+
+Qwen3-32B
+
+AMQ
+SFMP
+Ours
+
+70
+150
+30
+
+≈ 48
+≈ 0.2
+0.05×len(opt)
+
+Llama2-70B
+
+AMQ
+SFMP
+Ours
+
+160
+350
+40
+
+176
+0.6
+0.117×len(opt)
+
+Conclusion
+
+We present SignRoundV2, a robust post-training quantization framework engineered for extremely
+low-bit LLM deployment. By integrating a gradient-informed sensitivity metric with a lightweight
+pre-tuning mechanism, SignRoundV2 ensures stable and accurate quantization under aggressive
+compression regimes. Extensive experiments demonstrate that our approach maintains high-fidelity
+performance at 4–5 bits and yields robust results even at 2 bits. These results confirm that effective
+9
+
+PTQ can significantly reduce the computational and memory footprints of LLMs, offering a scalable
+solution for efficient large-scale model inference.
+
+6
+
+Limitations
+
+Despite its strong performance, SignRoundV2 has several limitations. First, in uniform 2-bit settings,
+it still exhibits a noticeable accuracy gap compared with full-precision baselines, indicating that
+extremely low-bit PTQ remains challenging without mixed precision or additional training. Second,
+the bit-width configuration is determined before block-wise tuning and remains static during optimization; jointly updating bit allocation and rounding parameters may further improve accuracy but
+would increase search complexity. Third, DeltaLoss relies on gradient computation, which limits its
+immediate applicability in inference-only frameworks such as ONNX Runtime.
+
+Ethics Statement
+This research aims to advance efficient LLM quantization. SignRoundV2 leverages open-source
+models and publicly available datasets, adhering to their respective licenses and usage terms. As
+our method requires only minimal tuning of pre-existing models and is not tied to specific high-risk
+applications, it carries no significant new ethical risks. We acknowledge the contributions of the
+creators and maintainers of these resources and provide proper citations to the original sources.
+
+References
+[1] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are
+few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+[2] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open
+and efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023.
+[3] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei,
+Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Meta llama 3: The
+most capable openly available llm to date, April 2024. URL https://ai.meta.com/blog/
+meta-llama-3/.
+[4] Jinze Bai, Shuai Bai, Yunfei Chu, Zeyu Cui, Kai Dang, Xiaodong Deng, Yang Fan, Wenbin Ge,
+Yu Han, Fei Huang, et al. Qwen technical report. arXiv preprint arXiv:2309.16609, 2023.
+[5] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu,
+Chang Gao, Chengen Huang, Chenxu Lv, et al. Qwen3 technical report. arXiv preprint
+arXiv:2505.09388, 2025.
+[6] Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao Wu, Chengda Lu, Chenggang Zhao,
+Chengqi Deng, Chenyu Zhang, Chong Ruan, et al. Deepseek-v3 technical report. arXiv preprint
+arXiv:2412.19437, 2024.
+[7] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han.
+Smoothquant: Accurate and efficient post-training quantization for large language models.
+In International Conference on Machine Learning, pages 38087–38099. PMLR, 2023.
+[8] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. Gptq: Accurate post-training
+quantization for generative pre-trained transformers. arXiv preprint arXiv:2210.17323, 2022.
+[9] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Xingyu Dang, and Song Han. Awq:
+Activation-aware weight quantization for llm compression and acceleration. arXiv preprint
+arXiv:2306.00978, 2024.
+[10] Wenhua Cheng, Weiwei Zhang, Haihao Shen, Yiyang Cai, Xin He, Lv Kaokao, and Yi Liu.
+Optimize weight rounding via signed gradient descent for the quantization of llms. In Findings
+of the Association for Computational Linguistics: EMNLP 2024, pages 11332–11350, 2024.
+10
+
+[11] Open Compute Project Foundation MX Alliance.
+Ocp microscaling formats (mx) specification version 1.0. open compute project foundation
+technical
+specification.
+https://www.opencompute.org/documents/
+ocp-microscaling-formats-mx-v1-0-spec-final-pdf., 2023.
+[Accessed 1711-2025].
+[12] NVIDIA. Nvidia blackwell architecture technical brief. https://resources.nvidia.com/
+en-us-blackwell-architecture, 2024. [Accessed 17-11-2025].
+[13] Hongyu Wang, Shuming Ma, Lingxiao Ma, Lei Wang, Wenhui Wang, Li Dong, Shaohan Huang,
+Huaijie Wang, Jilong Xue, Ruiping Wang, et al. Bitnet: 1-bit pre-training for large language
+models. Journal of Machine Learning Research, 26(125):1–29, 2025.
+[14] Xun Wu, Shaohan Huang, Wenhui Wang, Ting Song, Li Dong, Yan Xia, and Furu Wei. Bitnet
+distillation. arXiv preprint arXiv:2510.13998, 2025.
+[15] Yiren Zhou, Seyed-Mohsen Moosavi-Dezfooli, Ngai-Man Cheung, and Pascal Frossard. Adaptive quantization for deep neural network. In Proceedings of the AAAI Conference on Artificial
+Intelligence, volume 32, 2018.
+[16] Zhen Dong, Zhewei Yao, Amir Gholami, Michael W Mahoney, and Kurt Keutzer. Hawq:
+Hessian aware quantization of neural networks with mixed-precision. In Proceedings of the
+IEEE/CVF international conference on computer vision, pages 293–302, 2019.
+[17] Kuan Wang, Zhijian Liu, Yujun Lin, Ji Lin, and Song Han. Haq: Hardware-aware automated
+quantization with mixed precision. In Proceedings of the IEEE/CVF conference on computer
+vision and pattern recognition, pages 8612–8620, 2019.
+[18] Haoran You, Yipin Guo, Yichao Fu, Wei Zhou, Huihong Shi, Xiaofan Zhang, Souvik Kundu,
+Amir Yazdanbakhsh, and Yingyan (Celine) Lin. Shiftaddllm: Accelerating pretrained llms
+via post-training multiplication-less reparameterization. In A. Globerson, L. Mackey, D. Belgrave, A. Fan, U. Paquet, J. Tomczak, and C. Zhang, editors, Advances in Neural Information
+Processing Systems, volume 37, pages 24822–24848. Curran Associates, Inc., 2024. doi:
+10.52202/079017-0782. URL https://proceedings.neurips.cc/paper_files/paper/
+2024/file/2c30a37c75f062e0bf79297c73db8c6c-Paper-Conference.pdf.
+[19] Xin Nie, Haicheng Zhang, Liang Dong, Beining Feng, Jinhong Weng, and Guiling Sun. Sfmp:
+Fine-grained, hardware-friendly and search-free mixed-precision quantization for large language
+models. arXiv preprint arXiv:2602.01027, 2026.
+[20] Itay Hubara, Yury Nahshan, Yair Hanani, Ron Banner, and Daniel Soudry. Improving post
+training neural quantization: Layer-wise calibration and integer programming. arXiv preprint
+arXiv:2006.10518, 2020.
+[21] Qian Lou, Feng Guo, Lantao Liu, Minje Kim, and Lei Jiang. Autoq: Automated kernel-wise
+neural network quantization. arXiv preprint arXiv:1902.05690, 2019.
+[22] Sangjun Lee, Seung-taek Woo, Jun-gyu Jin, Changhun Lee, and Eunhyeok Park. Amq: Enabling
+automl for mixed-precision weight-only quantization of large language models. In Proceedings
+of the 2025 Conference on Empirical Methods in Natural Language Processing, pages 35520–
+35538, 2025.
+[23] Richard Bellman. Dynamic programming. science, 153(3731):34–37, 1966.
+[24] Shuming Ma, Hongyu Wang, Lingxiao Ma, Lei Wang, Wenhui Wang, Shaohan Huang, Lifeng
+Dong, Ruiping Wang, Jilong Xue, and Furu Wei. The era of 1-bit llms: All large language
+models are in 1.58 bits. arXiv preprint arXiv:2402.17764, 1(4), 2024.
+[25] Georgi Gerganov. llama.cpp: LLM inference in C/C++. https://github.com/ggml-org/
+llama.cpp, 2023.
+[26] Mengzhao Chen, Wenqi Shao, Peng Xu, Jiahao Wang, Peng Gao, Kaipeng Zhang, and Ping Luo.
+Efficientqat: Efficient quantization-aware training for large language models. In Proceedings of
+the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long
+Papers), pages 10081–10100, 2025.
+11
+
+[27] Zechun Liu, Barlas Oguz, Changsheng Zhao, Ernie Chang, Pierre Stock, Yashar Mehdad,
+Yangyang Shi, Raghuraman Krishnamoorthi, and Vikas Chandra. Llm-qat: Data-free quantization aware training for large language models. arXiv preprint arXiv:2305.17888, 2023.
+[28] Wenjing Ke, Zhe Li, Dong Li, Lu Tian, and Emad Barsoum. Dl-qat: Weight-decomposed
+low-rank quantization-aware training for large language models. In Proceedings of the 2024
+Conference on Empirical Methods in Natural Language Processing: Industry Track, pages
+113–119, 2024.
+[29] Dayou Du, Yijia Zhang, Shijie Cao, Jiaqi Guo, Ting Cao, Xiaowen Chu, and Ningyi Xu.
+Bitdistiller: Unleashing the potential of sub-4-bit llms via self-distillation. arXiv preprint
+arXiv:2402.10631, 2024.
+[30] Jerry Chee, Yaohui Cai, Volodymyr Kuleshov, and Christopher M De Sa. Quip: 2-bit quantization of large language models with guarantees. Advances in Neural Information Processing
+Systems, 36:4396–4429, 2023.
+[31] Albert Tseng, Jerry Chee, Qingyao Sun, Volodymyr Kuleshov, and Christopher De Sa. Quip#:
+Even better llm quantization with hadamard incoherence and lattice codebooks. arXiv preprint
+arXiv:2402.04396, 2024.
+[32] Vage Egiazarian, Andrei Panferov, Denis Kuznedelev, Elias Frantar, Artem Babenko, and Dan
+Alistarh. Extreme compression of large language models via additive quantization. arXiv
+preprint arXiv:2401.06118, 2024.
+[33] Yun Luo, Zhen Yang, Fandong Meng, Yafu Li, Jie Zhou, and Yue Zhang. An empirical
+study of catastrophic forgetting in large language models during continual fine-tuning. IEEE
+Transactions on Audio, Speech and Language Processing, 2025.
+[34] Damjan Kalajdzievski. Scaling laws for forgetting when fine-tuning large language models.
+arXiv preprint arXiv:2401.05605, 2024.
+[35] Markus Nagel, Mart van Baalen, Tijmen Blankevoort, and Max Welling. Data-free quantization
+through weight equalization and bias correction. In Proceedings of the IEEE/CVF International
+Conference on Computer Vision, pages 1325–1334, 2019.
+[36] Zhenhua Liu, Yunhe Wang, Kai Han, Wei Zhang, Siwei Ma, and Wen Gao. Post-training
+quantization for vision transformer. Advances in Neural Information Processing Systems, 34:
+28092–28103, 2021.
+[37] Elias Frantar and Dan Alistarh. Optimal brain compression: A framework for accurate posttraining quantization and pruning. Advances in Neural Information Processing Systems, 35:
+4475–4488, 2022.
+[38] Zhewei Yao, Zhen Dong, Zhangcheng Zheng, Amir Gholami, Jiali Yu, Eric Tan, Leyuan
+Wang, Qijing Huang, Yida Wang, Michael Mahoney, et al. Hawq-v3: Dyadic neural network
+quantization. In International Conference on Machine Learning, pages 11875–11886. PMLR,
+2021.
+[39] Xiuying Wei, Yunchen Zhang, Yuhang Li, Xiangguo Zhang, Ruihao Gong, Jinyang Guo, and
+Xianglong Liu. Outlier suppression+: Accurate quantization of large language models by
+equivalent and optimal shifting and scaling. arXiv preprint arXiv:2304.09145, 2023.
+[40] Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. Gpt3. int8 (): 8-bit matrix
+multiplication for transformers at scale. Advances in Neural Information Processing Systems,
+35:30318–30332, 2022.
+[41] Wenhua Cheng, Yiyang Cai, Kaokao Lv, and Haihao Shen. Teq: Trainable equivalent transformation for quantization of llms. arXiv preprint arXiv:2310.10944, 2023.
+[42] Zhewei Yao, Xiaoxia Wu, Cheng Li, Stephen Youn, and Yuxiong He. Exploring post-training
+quantization in llms from comprehensive study to low rank compensation. In Proceedings of
+the AAAI Conference on Artificial Intelligence, volume 38, pages 19377–19385, 2024.
+12
+
+[43] Hicham Badri and Appu Shaji. Half-quadratic quantization of large machine learning models,
+November 2023. URL https://mobiusml.github.io/hqq_blog/.
+[44] Sehoon Kim, Coleman Hooper, Amir Gholami, Zhen Dong, Xiuyu Li, Sheng Shen, Michael W
+Mahoney, and Kurt Keutzer. Squeezellm: Dense-and-sparse quantization. arXiv preprint
+arXiv:2306.07629, 2023.
+[45] Saleh Ashkboos, Amirkeivan Mohtashami, Maximilian L Croci, Bo Li, Pashmina Cameron,
+Martin Jaggi, Dan Alistarh, Torsten Hoefler, and James Hensman. Quarot: Outlier-free 4-bit
+inference in rotated llms. Advances in Neural Information Processing Systems, 37:100213–
+100240, 2024.
+[46] Zechun Liu, Changsheng Zhao, Igor Fedorov, Bilge Soran, Dhruv Choudhary, Raghuraman
+Krishnamoorthi, Vikas Chandra, Yuandong Tian, and Tijmen Blankevoort. Spinquant: Llm
+quantization with learned rotations. arXiv preprint arXiv:2405.16406, 2024.
+[47] Haokun Lin, Haobo Xu, Yichen Wu, Jingzhi Cui, Yingtao Zhang, Linzhan Mou, Linqi Song,
+Zhenan Sun, and Ying Wei. Duquant: Distributing outliers via dual transformation makes
+stronger quantized llms. Advances in Neural Information Processing Systems, 37:87766–87800,
+2024.
+[48] Yuxuan Sun, Ruikang Liu, Haoli Bai, Han Bao, Kang Zhao, Yuening Li, Jiaxin Hu, Xianzhi
+Yu, Lu Hou, Chun Yuan, et al. Flatquant: Flatness matters for llm quantization. arXiv preprint
+arXiv:2410.09426, 2024.
+[49] Chao Zhang, Li Wang, Samson Lasaulce, and Merouane Debbah. Baq: Efficient bit allocation
+quantization for large language models. arXiv preprint arXiv:2506.05664, 2025.
+[50] Zhen Zheng, Xiaonan Song, and Chuanjie Liu. Mixllm: Llm quantization with global
+mixed-precision between output-features and highly-efficient system design. arXiv preprint
+arXiv:2412.14590, 2024.
+[51] Wenyuan Liu, Haoqian Meng, Yilun Luo, Peng Zhang, and Xindian Ma. Micromix: Efficient
+mixed-precision quantization with microscaling formats for large language models. arXiv
+preprint arXiv:2508.02343, 2025.
+[52] Haojie Duanmu, Xiuhong Li, Zhihang Yuan, Size Zheng, Jiangfei Duan, Xingcheng Zhang, and
+Dahua Lin. Mxmoe: Mixed-precision quantization for moe with accuracy and performance
+co-design. arXiv preprint arXiv:2505.05799, 2025.
+[53] Wei Tao, Haocheng Lu, Xiaoyang Qu, Bin Zhang, Kai Lu, Jiguang Wan, and Jianzong Wang.
+Moqae: Mixed-precision quantization for long-context llm inference via mixture of quantizationaware experts. arXiv preprint arXiv:2506.07533, 2025.
+[54] Krishna Teja Chitty-Venkata, Jie Ye, and Murali Emani. Mopeq: Mixture of mixed precision
+quantized experts. In Proceedings of the IEEE/CVF International Conference on Computer
+Vision, pages 4023–4032, 2025.
+[55] Markus Nagel, Rana Ali Amjad, Mart Van Baalen, Christos Louizos, and Tijmen Blankevoort.
+Up or down? adaptive rounding for post-training quantization. In International Conference on
+Machine Learning, pages 7197–7206. PMLR, 2020.
+[56] Yuhang Li, Ruihao Gong, Xu Tan, Yang Yang, Peng Hu, Qi Zhang, Fengwei Yu, Wei Wang,
+and Shi Gu. Brecq: Pushing the limit of post-training quantization by block reconstruction.
+arXiv preprint arXiv:2102.05426, 2021.
+[57] Jung Hyun Lee, Jeonghoon Kim, Se Jung Kwon, and Dongsoo Lee. Flexround: Learnable rounding based on element-wise division for post-training quantization. arXiv preprint
+arXiv:2306.00317, 2023.
+[58] Shih-Yang Liu, Zechun Liu, and Kwang-Ting Cheng. Oscillation-free quantization for low-bit
+vision transformers. In International Conference on Machine Learning, pages 21813–21824.
+PMLR, 2023.
+13
+
+[59] Zhengyi Li, Cong Guo, Zhanda Zhu, Yangjie Zhou, Yuxian Qiu, Xiaotian Gao, Jingwen Leng,
+and Minyi Guo. Efficient activation quantization via adaptive rounding border for post-training
+quantization. arXiv preprint arXiv:2208.11945, 2022.
+[60] Laurence A Wolsey. Integer programming. John Wiley & Sons, 2020.
+[61] Dimitris Bertsimas and John Tsitsiklis. Introduction to Linear Optimization. Athena Scientific,
+1997.
+[62] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Delving deep into rectifiers:
+Surpassing human-level performance on imagenet classification. In Proceedings of the IEEE
+international conference on computer vision, pages 1026–1034, 2015.
+[63] Xavier Glorot and Yoshua Bengio. Understanding the difficulty of training deep feedforward neural networks. In Proceedings of the thirteenth international conference on artificial
+intelligence and statistics, pages 249–256. JMLR Workshop and Conference Proceedings, 2010.
+[64] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei,
+Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open
+foundation and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+[65] Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian,
+Ahmad Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten, Alex Vaughan, et al. The llama
+3 herd of models. arXiv preprint arXiv:2407.21783, 2024.
+[66] Leo Gao, Jonathan Tow, Baber Abbasi, Stella Biderman, Sid Black, Anthony DiPofi, Charles
+Foster, Laurence Golding, Jeffrey Hsu, Alain Le Noac’h, Haonan Li, Kyle McDonell, Niklas
+Muennighoff, Chris Ociepa, Jason Phang, Laria Reynolds, Hailey Schoelkopf, Aviya Skowron,
+Lintang Sutawika, Eric Tang, Anish Thite, Ben Wang, Kevin Wang, and Andy Zou. A framework
+for few-shot language model evaluation, 12 2023. URL https://zenodo.org/records/
+10256836.
+[67] Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick,
+and Oyvind Tafjord. Think you have solved question answering? try arc, the ai2 reasoning
+challenge. arXiv preprint arXiv:1803.05457, 2018.
+[68] Christopher Clark, Kenton Lee, Ming-Wei Chang, Tom Kwiatkowski, Michael Collins, and
+Kristina Toutanova. Boolq: Exploring the surprising difficulty of natural yes/no questions. In
+Proceedings of the 2019 Conference of the North American Chapter of the Association for
+Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers),
+pages 2924–2936, 2019.
+[69] Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. Hellaswag: Can
+a machine really finish your sentence? In Proceedings of the 57th Annual Meeting of the
+Association for Computational Linguistics. Association for Computational Linguistics, 2019.
+doi: 10.18653/v1/p19-1472. URL http://dx.doi.org/10.18653/v1/p19-1472.
+[70] Denis Paperno, Germán Kruszewski, Angeliki Lazaridou, Ngoc-Quan Pham, Raffaella Bernardi,
+Sandro Pezzelle, Marco Baroni, Gemma Boleda, and Raquel Fernández. The lambada dataset:
+Word prediction requiring a broad discourse context. In Proceedings of the 54th Annual Meeting
+of the Association for Computational Linguistics (Volume 1: Long Papers), pages 1525–1534,
+2016.
+[71] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and
+Jacob Steinhardt. Measuring massive multitask language understanding. In International
+Conference on Learning Representations, 2020.
+[72] Todor Mihaylov, Peter Clark, Tushar Khot, and Ashish Sabharwal. Can a suit of armor conduct
+electricity? a new dataset for open book question answering. In Proceedings of the 2018
+Conference on Empirical Methods in Natural Language Processing, pages 2381–2391, 2018.
+[73] Yonatan Bisk, Rowan Zellers, Jianfeng Gao, Yejin Choi, et al. Piqa: Reasoning about physical commonsense in natural language. In Proceedings of the AAAI conference on artificial
+intelligence, volume 34, pages 7432–7439, 2020.
+14
+
+[74] Stephanie Lin, Jacob Hilton, and Owain Evans. Truthfulqa: Measuring how models mimic
+human falsehoods. In Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 3214–3252, 2022.
+[75] Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavatula, and Yejin Choi. Winogrande: An
+adversarial winograd schema challenge at scale. Communications of the ACM, 64(9):99–106,
+2021.
+[76] Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis Hoppe, Charles Foster, Jason
+Phang, Horace He, Anish Thite, Noa Nabeshima, et al. The pile: An 800gb dataset of diverse
+text for language modeling. arXiv preprint arXiv:2101.00027, 2020.
+[77] Wenqi Shao, Mengzhao Chen, Zhaoyang Zhang, Peng Xu, Lirui Zhao, Zhiqian Li, Kaipeng
+Zhang, Peng Gao, Yu Qiao, and Ping Luo. Omniquant: Omnidirectionally calibrated quantization for large language models. In The Twelfth International Conference on Learning
+Representations, 2023.
+
+A
+
+Comparison with Naive Mixed-bit Methods
+
+The results in Tables 7 and 8 demonstrate that our method consistently outperforms simple head-layer
+and tail-layer heuristics across a range of precision budgets and model architectures. For MXFP
+quantization (4.5, 5, and 6 bits), the DL strategy achieves the highest average accuracy for all three
+models without requiring any tuning, showing clear improvements over allocating 4-bit precision
+only to the head (near the LM head) or tail layers (near the embedding). At lower precision (average
+3 bits using W2G128/W4G128), the performance gap becomes even more obvious: both head- and
+tail-focused heuristics degrade substantially, while our method remains robust and delivers the best
+accuracy across all evaluated models.
+Table 7: Comparison with head-layer (Head) and tail-layer (Tail) heuristics at 4.5, 5, and 6 bits using
+DeltaLoss without tuning. The average accuracies are computed over 10 tasks; see Section 4.4 for
+details. The “I” in the model name is short for “Instruct”.
+Avg. bits Method
+
+Llama3.1-8B-I Qwen2.5-7B-I Qwen3-8B
+
+4.5
+
+Head 4-bit
+Middle 8-bit
+Middle 4-bit
+Tail 4-bit
+DL
+
+58.93
+58.96
+58.94
+59.18
+60.64
+
+61.38
+60.79
+62.21
+60.63
+63.13
+
+59.26
+59.36
+59.50
+58.92
+59.81
+
+5
+
+Head 4-bit
+Middle 8-bit
+Middle 4-bit
+Tail 4-bit
+DL
+
+60.12
+59.40
+59.61
+60.82
+62.57
+
+61.35
+61.03
+62.79
+61.75
+64.04
+
+59.65
+60.26
+60.20
+59.43
+61.45
+
+6
+
+Head 4-bit
+Middle 8-bit
+Middle 4-bit
+Tail 4-bit
+DL
+
+62.65
+60.92
+61.80
+59.88
+63.64
+
+63.39
+62.87
+62.91
+62.22
+65.45
+
+61.53
+61.42
+60.65
+60.54
+62.00
+
+Table 8: Average accuracies across 10 tasks at an average of 3 bits (W2G128 / W4G128). The “I” in
+the model name is short for “Instruct”.
+Avg. bits = 3 Llama3.1-8B-I Qwen2.5-7B-I Qwen3-8B
+Head 4-bit
+Tail 4-bit
+Ours
+
+31.98
+60.58
+61.48
+
+32.70
+37.98
+40.58
+
+15
+
+31.96
+45.36
+48.62
+
+B
+
+Comparison with Prior Mixed-bit Methods
+
+This appendix provides the detailed six-task accuracies for the mixed-bit weight-only quantization
+results reported in Section 4.3. We report HellaSwag, WinoGrande, ARC-Easy, ARC-Challenge,
+PIQA, BoolQ, and the average accuracy (AVG) for each model and method. Gray rows denote
+uniform-bit baselines, namely W3G128 and W4G128. Specifically, Table 9 reports results for
+Llama-3.1-8B, Table 10 for Qwen3-8B, Table 11 for Qwen3-14B, and Table 12 for Qwen3-32B.
+Table 9: Detailed accuracies on six tasks for Llama3.1-8B with mixed-bit weight-only quantization.
+“Avg. Bits” indicates the average bit-width. Gray rows denote uniform-bit baselines.
+Avg. bits Method
+
+ARC-c ARC-e BoolQ Hella. PIQA Wino. AVG
+
+16
+
+Ours
+SFMP-16-bit
+
+54.78
+53.41
+
+82.70
+81.19
+
+83.12
+82.15
+
+79.26
+78.99
+
+80.90
+81.39
+
+74.19 75.83
+72.93 75.01
+
+2.5
+
+AMQ
+SFMP
+Ours
+
+34.89
+41.13
+45.90
+
+59.63
+66.58
+73.40
+
+65.57
+73.49
+78.38
+
+57.18
+64.35
+69.02
+
+71.00
+74.05
+75.57
+
+63.61 58.65
+66.46 64.34
+69.14 68.57
+
+3
+
+AMQ
+SFMP
+Ours
+W3G128
+
+45.48
+47.40
+49.06
+51.88
+
+72.69
+75.80
+76.60
+78.79
+
+76.48
+77.43
+79.88
+81.44
+
+70.38
+71.89
+74.75
+75.87
+
+77.64
+78.13
+78.18
+78.18
+
+70.01
+67.80
+71.35
+70.88
+
+3.5
+
+AMQ
+SFMP
+Ours
+
+49.57
+49.49
+52.82
+
+77.10
+76.72
+80.18
+
+80.00
+81.16
+81.35
+
+76.15
+76.95
+76.94
+
+79.54
+79.87
+79.16
+
+73.01 72.56
+73.64 72.97
+73.16 73.94
+
+4
+
+AMQ
+SFMP
+Ours
+W4G128
+
+50.68
+52.22
+54.18
+54.01
+
+78.20
+79.50
+81.82
+81.65
+
+81.04
+81.53
+81.93
+82.42
+
+77.83
+77.76
+78.38
+78.84
+
+79.92
+81.01
+79.60
+80.03
+
+73.09
+73.95
+74.51
+73.40
+
+68.78
+69.74
+71.64
+72.84
+
+73.46
+74.33
+75.07
+75.06
+
+Table 10: Detailed accuracies on six tasks for Qwen3-8B with mixed-bit weight-only quantization.
+“Avg. Bits” indicates the average bit-width. Grayed rows denote uniform 3-bit and 4-bit baselines
+quantized with SignRoundV2.
+Avg. bits Method
+
+ARC-c ARC-e BoolQ Hella. PIQA Wino. AVG
+
+16
+
+Ours
+SFMP-16-bit
+
+56.14
+56.65
+
+80.77
+80.85
+
+86.61
+86.64
+
+74.98
+74.93
+
+77.97
+77.47
+
+67.96 74.07
+68.66 74.20
+
+2.5
+
+AMQ
+SFMP
+Ours
+
+35.75
+44.37
+44.97
+
+56.19
+72.05
+72.81
+
+75.90
+83.09
+81.77
+
+55.76
+61.46
+62.30
+
+69.70
+72.69
+73.29
+
+58.41 58.62
+63.30 66.16
+65.75 66.82
+
+3
+
+AMQ
+SFMP
+Ours
+W3G128
+
+47.61
+54.18
+53.58
+55.55
+
+73.78
+79.08
+78.70
+80.30
+
+84.40
+84.56
+86.12
+85.72
+
+66.71
+70.10
+68.74
+71.50
+
+73.94
+75.24
+76.61
+77.69
+
+63.93
+65.00
+69.53
+68.67
+
+3.5
+
+AMQ
+SFMP
+Ours
+
+51.02
+55.12
+54.10
+
+77.06
+78.28
+80.05
+
+86.40
+85.69
+86.39
+
+71.42
+72.70
+71.93
+
+76.93
+76.12
+77.26
+
+67.08 71.65
+68.51 72.74
+68.19 72.99
+
+4
+
+AMQ
+SFMP
+Ours
+W4G128
+
+53.92
+55.15
+56.31
+57.42
+
+78.49
+79.04
+79.67
+80.26
+
+85.29
+85.88
+86.61
+86.88
+
+73.64
+74.20
+73.77
+73.79
+
+77.25
+77.09
+77.53
+77.26
+
+67.27
+68.35
+68.67
+69.06
+
+C
+
+Mixed MXFP Results
+
+C.1
+
+Mixed MXFP4/6 Results
+
+68.40
+71.36
+72.21
+73.24
+
+72.64
+73.29
+73.76
+74.11
+
+This subsection reports the detailed results for mixed MXFP4/6 quantization. We list the task-wise
+accuracies across 10 tasks for each model provided in Tables 13, 14, 15, 16, and 17.
+16
+
+Table 11: Detailed accuracies on six tasks for Qwen3-14B with mixed-bit weight-only quantization.
+“Avg. Bits” indicates the average bit-width. Grayed rows denote uniform 3-bit and 4-bit baselines
+quantized with SignRoundV2.
+Avg. bits Method
+
+ARC-c ARC-e BoolQ Hella. PIQA Wino. AVG
+
+16
+
+Ours
+SFMP-16-bit
+
+60.49
+60.41
+
+82.74
+82.79
+
+89.39
+89.33
+
+78.80
+78.92
+
+80.03
+79.98
+
+73.01 77.41
+72.84 77.38
+
+2.5
+
+AMQ
+SFMP
+Ours
+
+44.18
+50.68
+51.62
+
+70.47
+75.21
+78.58
+
+84.39
+86.73
+87.98
+
+64.31
+69.14
+70.21
+
+72.09
+76.44
+77.09
+
+63.90 66.56
+68.51 71.12
+70.32 72.63
+
+3
+
+AMQ
+SFMP
+Ours
+W3G128
+
+50.27
+57.58
+57.08
+59.56
+
+75.89
+80.89
+80.26
+82.15
+
+85.33
+87.80
+87.37
+88.01
+
+71.16
+75.35
+74.15
+76.12
+
+75.94
+78.45
+77.58
+79.27
+
+69.34
+71.74
+71.51
+73.24
+
+3.5
+
+AMQ
+SFMP
+Ours
+
+58.31
+59.98
+59.04
+
+81.56
+82.49
+81.94
+
+87.56
+88.96
+88.99
+
+76.04
+77.35
+77.05
+
+79.12
+79.60
+79.22
+
+71.98 75.76
+72.93 76.89
+71.67 76.32
+
+4
+
+AMQ
+SFMP
+Ours
+W4G128
+
+59.42
+60.41
+59.81
+61.01
+
+82.05
+83.08
+82.58
+82.91
+
+88.76
+89.02
+88.90
+89.08
+
+77.68
+78.23
+78.19
+78.17
+
+79.65
+79.60
+79.71
+80.09
+
+72.13
+72.45
+73.09
+72.69
+
+71.32
+75.30
+74.66
+76.39
+
+76.62
+77.13
+77.05
+77.33
+
+Table 12: Detailed accuracies on six tasks for Qwen3-32B with mixed-bit weight-only quantization.
+“Avg. Bits” indicates the average bit-width. Gray rows denote uniform-bit baselines.
+Avg. bits Method
+
+ARC-c ARC-e BoolQ Hella. PIQA Wino. AVG
+
+16
+
+Ours
+SFMP-16-bit
+
+60.92
+60.92
+
+83.29
+83.25
+
+86.42
+86.42
+
+82.60
+82.56
+
+81.99
+81.88
+
+73.09 78.05
+72.93 77.99
+
+2.5
+
+AMQ
+SFMP
+Ours
+
+50.63
+55.89
+55.97
+
+73.90
+78.41
+79.21
+
+80.08
+82.26
+88.41
+
+71.68
+76.93
+74.50
+
+75.74
+79.16
+78.24
+
+64.19 69.37
+67.32 73.33
+73.40 74.96
+
+3
+
+AMQ
+SFMP
+Ours
+W3G128
+
+58.83
+59.64
+58.79
+60.32
+
+79.62
+81.35
+80.81
+82.74
+
+83.26
+86.70
+89.02
+85.20
+
+77.10
+80.00
+78.29
+78.66
+
+77.14
+79.27
+79.49
+79.92
+
+68.15
+70.48
+73.24
+73.09
+
+3.5
+
+AMQ
+SFMP
+Ours
+
+59.71
+60.41
+62.37
+
+81.15
+82.02
+82.91
+
+84.78
+85.88
+85.14
+
+80.02
+81.18
+80.57
+
+79.14
+81.42
+80.58
+
+71.26 76.01
+72.53 77.24
+72.61 77.36
+
+4
+
+AMQ
+SFMP
+Ours
+W4G128
+
+60.87
+61.09
+61.01
+61.43
+
+82.31
+83.46
+82.11
+82.37
+
+85.42
+86.20
+85.05
+85.75
+
+81.58
+82.01
+80.98
+82.24
+
+80.95
+81.73
+81.39
+81.28
+
+71.76
+72.83
+74.35
+73.40
+
+74.02
+76.24
+76.61
+76.66
+
+77.15
+77.89
+77.48
+77.75
+
+Table 13: The detailed accuracies of 10 tasks for Llama-3.1-8B-Instruct model with MXFP4/6
+mixed precision. “Avg. Bits” indicates average per-weight bit-width. “DL”: DeltaLoss without
+tuning.
+Avg. Bits Method ARC-c. ARC-e BoolQ Hella. Lamb. MMLU Open. PIQA Truth. Wino. Avg.
+16
+
+16-bit
+
+51.54
+
+81.78
+
+84.04 59.13 73.14
+
+67.96
+
+33.00 80.03 37.21 73.80 64.16
+
+4
+
+RTN
+SRV1
+Ours
+
+44.37
+46.25
+50.68
+
+75.55
+79.00
+80.05
+
+80.86 55.19 61.96
+83.09 55.28 69.63
+83.12 56.28 69.05
+
+57.06
+60.55
+61.69
+
+31.80 76.28 29.25 70.80 58.31
+31.80 77.75 33.41 70.48 60.72
+32.40 78.13 32.19 71.11 61.47
+
+4.5
+
+DL
+Ours
+
+48.38
+50.43
+
+79.29
+80.13
+
+83.88 58.31 68.48
+84.86 57.83 71.36
+
+64.51
+65.75
+
+31.60 78.78 35.01 71.74 62.00
+34.60 79.43 36.60 72.45 63.34
+
+5
+
+DL
+Ours
+
+50.94
+51.11
+
+81.06
+81.52
+
+85.11 58.90 68.64
+84.68 58.77 71.76
+
+66.47
+66.81
+
+35.00 79.54 35.25 74.35 63.53
+34.60 79.43 36.35 74.98 64.00
+
+17
+
+Table 14: The detailed accuracies of 10 tasks for Llama-3.1-70B-Instruct model with MXFP4/6
+mixed precision. “Avg. Bits” indicates average per-weight bit-width. “DL”: DeltaLoss without
+tuning.
+Avg. Bits Method ARC-c. ARC-e BoolQ Hella. Lamb. MMLU Open. PIQA Truth. Wino. Avg.
+16
+
+16-bit
+
+62.46
+
+86.87
+
+87.80 65.15 75.51
+
+82.34
+
+37.20 83.30 40.64 78.69 70.00
+
+4
+
+RTN
+SRV1
+Ours
+
+59.56
+58.28
+59.39
+
+85.10
+85.06
+85.02
+
+88.81 63.16 73.36
+88.53 63.35 75.24
+89.27 63.12 74.75
+
+79.03
+79.66
+79.92
+
+36.20 82.10 40.88 79.40 68.76
+37.60 82.32 40.15 79.95 69.01
+37.60 82.21 40.64 81.14 69.31
+
+4.5
+
+DL
+Ours
+
+61.01
+59.98
+
+86.32
+85.94
+
+88.96 65.09 75.53
+89.24 65.10 76.98
+
+81.01
+81.21
+
+37.40 83.03 41.86 81.53 70.17
+36.80 83.03 41.00 83.82 70.31
+
+5
+
+DL
+Ours
+
+61.86
+61.35
+
+86.57
+86.36
+
+88.81 65.57 76.79
+88.75 65.89 76.98
+
+81.75
+82.19
+
+37.40 83.35 42.59 82.16 70.69
+38.00 83.35 40.76 82.95 70.66
+
+Table 15: The detailed accuracies of 10 tasks for Qwen2.5-7B-Instruct model with MXFP4/6 mixed
+precision. “Avg. Bits” indicates average per-weight bit-width. “DL”: DeltaLoss without tuning.
+Avg. Bits Method ARC-c. ARC-e BoolQ Hella. Lamb. MMLU Open. PIQA Truth. Wino. Avg.
+16
+
+16-bit
+
+52.56
+
+81.61
+
+86.36 62.01 69.44
+
+71.76
+
+34.60 79.65 47.98 70.72 65.67
+
+4
+
+RTN
+SRV1
+Ours
+
+48.81
+53.24
+51.28
+
+75.59
+80.89
+80.81
+
+82.48 56.84 57.68
+85.47 57.88 64.41
+85.72 58.16 66.47
+
+65.15
+68.05
+68.49
+
+34.80 75.79 41.62 67.48 60.62
+35.00 77.48 46.76 71.43 64.06
+34.20 77.64 45.29 69.14 63.72
+
+4.5
+
+DL
+Ours
+
+50.60
+53.92
+
+80.13
+81.73
+
+86.51 59.27 69.22
+86.21 59.56 69.03
+
+69.73
+70.43
+
+33.80 76.66 45.53 70.17 64.16
+34.60 77.20 45.41 69.61 64.77
+
+5
+
+DL
+Ours
+
+52.47
+53.50
+
+81.78
+82.07
+
+86.73 60.66 68.41
+86.33 60.75 69.36
+
+70.32
+70.77
+
+36.80 77.69 46.39 70.96 65.22
+35.00 78.07 46.88 70.80 65.35
+
+Table 16: The detailed accuracies of 10 tasks for Qwen3-8B model with MXFP4/6 mixed precision.
+“Avg. Bits” indicates average per-weight bit-width. “DL”: DeltaLoss without tuning.
+Avg. Bits Method ARC-c. ARC-e BoolQ Hella. Lamb. MMLU Open. PIQA Truth. Wino. Avg.
+16
+
+16-bit
+
+55.46
+
+83.38
+
+86.73 57.04 64.00
+
+72.96
+
+31.20 76.61 36.72 68.27 63.24
+
+4
+
+RTN
+SRV1
+Ours
+
+50.17
+51.28
+53.92
+
+76.14
+81.02
+81.65
+
+84.98 52.00 58.08
+85.20 52.86 58.26
+85.50 52.75 62.14
+
+65.90
+68.51
+69.41
+
+28.60 73.01 33.66 62.83 58.54
+31.40 75.03 32.44 66.54 60.25
+30.40 75.19 35.62 67.88 61.45
+
+4.5
+
+DL
+Ours
+
+52.05
+54.95
+
+80.30
+82.66
+
+85.96 53.96 62.57
+86.67 54.82 64.37
+
+70.99
+71.52
+
+31.00 74.32 34.27 68.03 61.35
+30.80 76.12 37.33 68.19 62.74
+
+5
+
+DL
+Ours
+
+51.54
+54.44
+
+80.22
+82.53
+
+87.25 55.43 62.41
+86.97 55.75 64.27
+
+71.96
+71.90
+
+31.80 76.17 35.62 68.19 62.06
+31.80 76.33 35.62 68.51 62.81
+
+Table 17: The detailed accuracies of 10 tasks for Qwen3-32B model with MXFP4/6 mixed precision.
+“Avg. Bits” indicates average per-weight bit-width. “DL”: DeltaLoss without tuning.
+Avg. Bits Method ARC-c. ARC-e BoolQ Hella. Lamb. MMLU Open. PIQA Truth. Wino. Avg.
+16
+
+16-bit
+
+57.94
+
+84.47
+
+86.39 63.91 67.13
+
+80.74
+
+36.00 80.96 39.05 73.40 67.00
+
+4
+
+RTN
+SRV1
+Ours
+
+56.66
+57.51
+55.97
+
+81.23
+84.55
+82.70
+
+84.95 61.73 65.96
+87.13 61.61 68.83
+85.87 61.23 68.79
+
+76.59
+78.32
+78.41
+
+33.80 77.97 39.17 70.64 64.87
+36.20 79.71 41.37 73.95 66.92
+34.60 78.62 40.15 72.69 65.90
+
+4.5
+
+DL
+Ours
+
+57.08
+56.57
+
+83.25
+84.22
+
+86.39 63.07 66.08
+88.04 63.44 68.33
+
+79.48
+79.91
+
+33.40 80.96 42.11 70.80 66.26
+36.00 80.14 40.88 73.48 67.10
+
+5
+
+DL
+Ours
+
+57.85
+60.15
+
+84.22
+84.22
+
+85.20 63.35 67.53
+87.25 63.38 68.45
+
+79.84
+80.15
+
+35.60 79.27 39.53 71.67 66.41
+35.40 80.09 39.53 73.32 67.19
+
+18
+
+C.2
+
+Mixed MXFP4/8 Results
+
+This subsection reports the detailed results for mixed MXFP4/8 quantization. Table 18 reports the
+average accuracies and recovery rates across 10 tasks, for MXFP4/8 mixed-precision quantization.
+The results show that our method generally improves over RTN and achieves competitive or better
+accuracy than SignRoundV1 (SRV1) in the 4-bit setting. At higher average bit widths (4.5–6 bits),
+DeltaLoss-only (DL) and our method approach full-precision accuracy, with our method achieving
+the best recovery in most scenarios. Overall, these results demonstrate that our approach effectively
+preserves model performance under extreme low-bit mixed-precision quantization while minimizing
+accuracy loss. The corresponding task-wise accuracies are provided in Tables 19, 20, 21, 22, and 23.
+Table 18: Average accuracies and recovery rates (%) across 10 tasks, with MXFP4 at 4 bits and
+mixed MXFP4/8 for the higher-bit settings. “Avg. Bits” indicates the average per-weight bit-width.
+“DL” denotes DeltaLoss without tuning. The “I” in the model name is short for “Instruct”.
+Avg. Bits
+
+Method
+
+Llama3.1-8B-I
+
+Llama3.1-70B-I
+
+Qwen2.5-7B-I
+
+Qwen3-8B
+
+16
+
+16-bit
+
+64.16
+
+70.00
+
+65.67
+
+63.24
+
+Qwen3-32B
+67.00
+
+4
+
+RTN
+SRV1
+Ours
+
+58.31 (90.88%)
+60.72 (94.64%)
+61.34 (95.59%)
+
+68.71 (98.16%)
+69.01 (98.60%)
+69.32 (99.04%)
+
+60.62 (92.32%)
+64.06 (97.55%)
+63.37 (96.50%)
+
+58.54 (92.57%)
+60.25 (95.28%)
+61.89 (97.87%)
+
+65.07 (97.12%)
+66.92 (99.88%)
+66.86 (99.79%)
+
+4.5
+
+DL
+Ours
+
+60.64 (94.50%)
+62.33 (97.14%)
+
+69.78 (99.70%)
+69.96 (99.95%)
+
+63.13 (96.13%)
+64.51 (98.24%)
+
+59.81 (94.58%)
+62.28 (98.49%)
+
+66.05 (98.58%)
+66.89 (99.83%)
+
+5
+
+DL
+Ours
+
+62.57 (97.51%)
+63.19 (98.49%)
+
+70.10 (100.15%)
+70.31 (100.45%)
+
+64.04 (97.52%)
+65.04 (99.03%)
+
+61.45 (97.18%)
+62.54 (98.89%)
+
+66.00 (98.51%)
+67.17 (100.25%)
+
+6
+
+DL
+Ours
+
+63.64 (99.18%)
+64.12 (99.93%)
+
+70.56 (100.80%)
+70.50 (100.71%)
+
+65.45 (99.67%)
+65.30 (99.43%)
+
+62.00 (98.04%)
+62.19 (98.34%)
+
+66.61 (99.42%)
+67.21 (100.32%)
+
+Table 19: The detailed accuracies of 10 tasks for Llama-3.1-8B-Instruct model with MXFP4/8
+mixed precision. “Avg. Bits” indicates average per-weight bit-width. “DL” denotes DeltaLoss-only
+without tuning.
+Avg. Bits Method ARC-c. ARC-e BoolQ Hella. Lamb. MMLU Open. PIQA Truth. Wino. Avg.
+
+D
+
+16
+
+16-bit
+
+51.54
+
+81.78
+
+84.04 59.13 73.14
+
+67.96
+
+33.00 80.03 37.21 73.80 64.16
+
+4
+
+RTN
+SRV1
+Ours
+
+44.37
+46.25
+47.35
+
+75.55
+79.00
+79.63
+
+80.86 55.19 61.96
+83.09 55.28 69.63
+82.60 56.10 69.53
+
+57.06
+60.55
+62.00
+
+31.80 76.28 29.25 70.80 58.31
+31.80 77.75 33.41 70.48 60.72
+33.60 77.69 32.80 72.06 61.34
+
+4.5
+
+DL
+Ours
+
+47.18
+49.06
+
+77.61
+80.43
+
+83.70 57.57 63.67
+83.18 57.35 71.41
+
+62.83
+64.86
+
+33.60 77.64 31.21 71.35 60.64
+33.40 78.40 34.76 70.40 62.33
+
+5
+
+DL
+Ours
+
+50.43
+49.83
+
+79.17
+80.93
+
+84.10 58.22 68.62
+84.19 57.92 72.19
+
+64.77
+65.43
+
+34.60 78.62 34.52 72.61 62.57
+35.80 79.22 35.37 71.03 63.19
+
+6
+
+DL
+Ours
+
+51.45
+51.54
+
+81.19
+81.40
+
+84.59 58.94 69.73
+84.89 58.57 71.96
+
+65.98
+66.85
+
+36.40 79.33 34.76 74.03 63.64
+35.40 79.38 36.84 74.35 64.12
+
+NVFP4 Results
+
+This section provides detailed NVFP4 accuracy results reported in Table 24. Our method achieves
+the best average accuracy on four out of five models and remains competitive on Qwen3-32B.
+
+E
+
+INT2/4 Mixed-bit Results
+
+This appendix provides the detailed task-wise results for the INT2/4 mixed-bit weight-only quantization experiments discussed in Section 4.2. We report accuracies on ARC-Challenge, ARC-Easy,
+HellaSwag, PIQA, and WinoGrande for both uniform and mixed-precision settings across different
+model scales. These results complement the averaged comparisons in Table 1 and provide a more
+fine-grained view of the behavior of each method under extreme low-bit quantization. Specifically,
+Table 25 reports the detailed accuracies for Llama-3 models, and Table 26 reports the results for
+Llama-2 models.
+19
+
+Table 20: The detailed accuracies of 10 tasks for Llama-3.1-70B-Instruct model with MXFP4/8
+mixed precision. “Avg. Bits” indicates average per-weight bit-width. “DL” denotes DeltaLoss-only
+without tuning.
+Avg. Bits Method ARC-c. ARC-e BoolQ Hella. Lamb. MMLU Open. PIQA Truth. Wino. Avg.
+16
+
+16-bit
+
+62.46
+
+86.87
+
+87.80 65.15 75.51
+
+82.34
+
+37.20 83.30 40.64 78.69 70.00
+
+4
+
+RTN
+SRV1
+Ours
+
+59.47
+58.28
+59.90
+
+85.10
+85.06
+85.82
+
+88.90 63.18 73.53
+88.53 63.35 75.24
+88.53 63.63 75.45
+
+78.72
+79.66
+79.97
+
+36.00 82.32 40.88 79.01 68.71
+37.60 82.32 40.15 79.95 69.01
+37.00 81.88 40.76 80.27 69.32
+
+4.5
+
+DL
+Ours
+
+59.73
+59.64
+
+86.24
+86.24
+
+88.69 64.68 75.28
+88.69 64.51 76.89
+
+80.70
+81.20
+
+36.40 82.10 41.62 82.40 69.78
+37.20 82.86 40.39 82.00 69.96
+
+5
+
+DL
+Ours
+
+60.15
+61.18
+
+86.57
+86.95
+
+88.84 64.94 75.65
+89.17 64.89 77.18
+
+81.08
+81.23
+
+38.20 82.70 41.13 81.77 70.10
+37.40 83.19 41.00 80.90 70.31
+
+6
+
+DL
+Ours
+
+61.09
+62.12
+
+86.53
+86.15
+
+88.93 65.45 76.89
+88.72 65.65 76.69
+
+81.99
+82.00
+
+38.00 83.08 41.13 82.48 70.56
+37.60 83.30 40.88 81.85 70.50
+
+Table 21: The detailed accuracies of 10 tasks for Qwen2.5-7B-Instruct model with MXFP4/8 mixed
+precision. “Avg. Bits” indicates average per-weight bit-width. “DL” denotes DeltaLoss-only without
+tuning.
+Avg. Bits Method ARC-c. ARC-e BoolQ Hella. Lamb. MMLU Open. PIQA Truth. Wino. Avg.
+16
+
+16-bit
+
+52.56
+
+81.61
+
+86.36 62.01 69.44
+
+71.76
+
+34.60 79.65 47.98 70.72 65.67
+
+4
+
+RTN
+SRV1
+Ours
+
+48.81
+53.24
+53.67
+
+75.59
+80.89
+80.18
+
+82.48 56.84 57.68
+85.47 57.88 64.41
+85.08 57.99 66.27
+
+65.15
+68.05
+68.30
+
+34.80 75.79 41.62 67.48 60.62
+35.00 77.48 46.76 71.43 64.06
+33.60 76.66 43.08 68.90 63.37
+
+4.5
+
+DL
+Ours
+
+50.09
+53.50
+
+77.74
+81.65
+
+85.96 58.98 67.86
+85.90 59.32 69.05
+
+68.39
+69.59
+
+34.60 75.84 43.33 68.51 63.13
+33.60 78.62 44.92 68.98 64.51
+
+5
+
+DL
+Ours
+
+51.11
+54.61
+
+80.26
+82.62
+
+86.85 59.54 68.27
+85.90 59.78 69.67
+
+69.42
+70.43
+
+35.20 76.77 44.31 68.67 64.04
+33.60 78.07 45.90 69.77 65.04
+
+6
+
+DL
+Ours
+
+53.50
+54.18
+
+82.45
+82.24
+
+86.51 60.89 68.93
+86.30 60.68 69.73
+
+70.64
+70.52
+
+36.80 77.91 46.39 70.48 65.45
+34.80 78.73 45.78 70.01 65.30
+
+Table 22: The detailed accuracies of 10 tasks for Qwen3-8B model with MXFP4/8 mixed precision.
+“Avg. Bits” indicates average per-weight bit-width. “DL” denotes DeltaLoss-only without tuning.
+Avg. Bits Method ARC-c. ARC-e BoolQ Hella. Lamb. MMLU Open. PIQA Truth. Wino. Avg.
+16
+
+16-bit
+
+55.46
+
+83.38
+
+86.73 57.04 64.00
+
+72.96
+
+31.20 76.61 36.72 68.27 63.24
+
+4
+
+RTN
+SRV1
+Ours
+
+50.17
+51.28
+53.84
+
+76.14
+81.02
+80.98
+
+84.98 52.00 58.08
+85.20 52.86 58.26
+85.84 53.09 61.91
+
+65.90
+68.51
+68.88
+
+28.60 73.01 33.66 62.83 58.54
+31.40 75.03 32.44 66.54 60.25
+32.00 75.30 36.35 70.72 61.89
+
+4.5
+
+DL
+Ours
+
+50.51
+53.75
+
+79.38
+81.61
+
+86.02 52.96 60.76
+86.21 54.26 64.16
+
+68.91
+70.25
+
+28.60 73.78 33.17 64.01 59.81
+31.40 75.57 37.09 68.51 62.28
+
+5
+
+DL
+Ours
+
+51.11
+54.10
+
+80.30
+81.82
+
+86.09 54.23 62.04
+86.42 54.62 64.20
+
+70.26
+71.53
+
+31.40 75.19 35.62 68.27 61.45
+30.80 76.01 37.58 68.27 62.54
+
+6
+
+DL
+Ours
+
+53.84
+52.65
+
+81.57
+81.65
+
+86.94 55.36 62.10
+86.97 55.57 64.06
+
+71.46
+71.54
+
+31.20 75.95 35.50 66.06 62.00
+30.20 76.17 35.74 67.32 62.19
+
+20
+
+Table 23: The detailed accuracies of 10 tasks for Qwen3-32B model with MXFP4/8 mixed precision.
+“Avg. Bits” indicates average per-weight bit-width. “DL” denotes DeltaLoss-only without tuning.
+Avg. Bits Method ARC-c. ARC-e BoolQ Hella. Lamb. MMLU Open. PIQA Truth. Wino. Avg.
+16
+
+16-bit
+
+57.94
+
+84.47
+
+86.39 63.91 67.13
+
+80.74
+
+36.00 80.96 39.05 73.40 67.00
+
+4
+
+RTN
+SRV1
+Ours
+
+55.38
+57.51
+59.47
+
+81.82
+84.55
+83.16
+
+85.54 61.54 65.67
+87.13 61.61 68.83
+87.19 61.70 68.78
+
+76.39
+78.32
+78.39
+
+34.40 78.94 38.80 72.22 65.07
+36.20 79.71 41.37 73.95 66.92
+35.40 79.71 41.74 73.01 66.86
+
+4.5
+
+DL
+Ours
+
+56.23
+57.59
+
+83.33
+84.09
+
+86.88 62.40 67.49
+88.23 62.51 69.42
+
+78.93
+79.51
+
+34.60 79.11 40.64 70.88 66.05
+33.00 79.49 41.00 74.03 66.89
+
+5
+
+DL
+Ours
+
+56.83
+57.85
+
+83.38
+84.47
+
+84.50 63.18 66.25
+87.92 63.33 67.22
+
+79.58
+80.10
+
+34.00 79.92 40.39 71.98 66.00
+35.60 80.25 40.51 74.43 67.17
+
+6
+
+DL
+Ours
+
+57.51
+58.19
+
+83.04
+83.88
+
+86.12 63.28 67.69
+86.85 63.44 68.12
+
+80.02
+80.40
+
+36.40 80.36 40.15 71.51 66.61
+36.40 80.47 40.88 73.48 67.21
+
+Table 24: Comparison of SignRoundV1 (SRV1), RTN, and our method under NVFP4 quantization.
+We report accuracy (%) across 10 tasks (listed in Section 4.1) and the average (AVG). The “I” in the
+model name is short for "Instruct".
+Model
+
+Method ARC-c. ARC-e BoolQ Hella. Lamb. MMLU Open. PIQA Truth. Wino. AVG
+
+Llama3.1-8B-I
+
+16-bit
+RTN
+SRV1
+Ours
+
+53.75
+50.60
+50.26
+50.68
+
+82.15
+80.01
+80.39
+81.65
+
+85.35
+83.43
+84.28
+85.44
+
+59.79
+58.30
+58.23
+57.93
+
+72.06
+71.34
+71.07
+71.49
+
+68.28
+64.13
+65.39
+64.91
+
+35.60
+35.00
+34.00
+35.00
+
+80.30
+78.89
+79.22
+79.49
+
+38.07
+34.27
+35.86
+37.58
+
+73.32
+71.90
+72.77
+74.51
+
+64.87
+62.79
+63.15
+63.87
+
+Llama3.1-70B-I
+
+16-bit
+RTN
+SRV1
+Ours
+
+61.09
+60.58
+59.73
+60.75
+
+86.20
+85.94
+85.98
+86.87
+
+89.11
+89.45
+88.84
+88.87
+
+66.28
+65.03
+64.77
+65.10
+
+76.46
+75.47
+75.59
+75.82
+
+82.52
+80.54
+81.31
+81.25
+
+38.80
+37.20
+39.00
+38.20
+
+83.73
+83.24
+83.13
+82.54
+
+41.98
+42.11
+40.88
+41.00
+
+83.43
+81.14
+82.32
+81.29
+
+70.96
+70.07
+70.16
+70.17
+
+Qwen2.5-7B-I
+
+16-bit
+RTN
+SRV1
+Ours
+
+53.07
+51.96
+52.82
+54.18
+
+81.69
+80.18
+81.14
+81.69
+
+86.33
+86.24
+86.09
+86.79
+
+62.06
+60.65
+60.90
+60.23
+
+69.38
+67.15
+69.07
+69.65
+
+71.71
+70.47
+70.61
+70.67
+
+34.60
+33.20
+34.80
+34.00
+
+79.71
+78.51
+78.67
+78.51
+
+47.98
+43.82
+47.61
+47.12
+
+71.03
+67.96
+70.40
+70.96
+
+65.76
+64.01
+65.21
+65.38
+
+Qwen3-8B
+
+16-bit
+RTN
+SRV1
+Ours
+
+55.20
+53.41
+54.86
+55.29
+
+83.54
+82.37
+82.91
+83.04
+
+86.61
+85.87
+86.88
+86.85
+
+57.16
+55.29
+55.31
+55.41
+
+64.10
+62.45
+62.95
+63.71
+
+72.90
+70.82
+71.97
+71.36
+
+31.60
+30.80
+31.20
+29.20
+
+76.66
+76.44
+76.28
+75.79
+
+36.47
+33.66
+36.35
+37.94
+
+67.96
+67.56
+67.48
+69.22
+
+63.22
+61.87
+62.62
+62.78
+
+Qwen3-32B
+
+16-bit
+RTN
+SRV1
+Ours
+
+58.02
+57.51
+59.56
+57.51
+
+84.39
+84.01
+84.22
+84.68
+
+86.42
+87.03
+88.01
+86.51
+
+63.89
+63.39
+62.99
+63.09
+
+67.13
+65.83
+68.29
+68.89
+
+80.74
+79.80
+79.50
+79.80
+
+36.20
+35.40
+37.60
+36.00
+
+81.23
+79.43
+79.54
+79.60
+
+38.56
+39.53
+41.00
+39.05
+
+73.09
+71.51
+72.22
+72.38
+
+66.97
+66.34
+67.29
+66.75
+
+21
+
+Table 25: The detailed accuracies of 5 tasks for Llama3 models with INT2/4 mixed precision. “Avg.
+Bits” indicates average bit-width.
+Model
+
+Llama3-8B
+
+Llama3-70B
+
+Method
+
+Avg. Bits
+
+Group Size
+
+ARC-c
+
+ARC-e
+
+Hella.
+
+PIQA
+
+Wino.
+
+Avg.
+
+16-bit
+AQLM
+EfficientQAT
+EfficientQAT
+
+16
+2
+2
+2
+
+1x16
+128
+64
+
+50.17
+41.21
+36.01
+37.03
+
+80.09
+74.24
+69.15
+71.17
+
+60.14
+55.44
+50.74
+51.86
+
+79.54
+77.80
+75.30
+76.03
+
+73.24
+71.82
+65.67
+67.72
+
+68.64
+64.10
+59.37
+60.76
+
+SignRoundV1
+Ours
+Ours
+Ours*
+Ours*
+
+2
+2
+2
+2
+2
+
+128
+128
+64
+128
+64
+
+34.22
+35.67
+37.37
+38.99
+39.42
+
+67.09
+70.03
+70.29
+72.18
+71.42
+
+44.15
+47.70
+48.69
+49.19
+50.04
+
+71.65
+72.96
+74.59
+73.94
+74.43
+
+59.12
+63.14
+66.14
+65.57
+66.61
+
+55.25
+57.90
+59.42
+59.97
+60.38
+
+Ours
+Ours
+Ours*
+Ours*
+
+2.5
+2.5
+2.5
+2.5
+
+128
+64
+128
+64
+
+41.72
+43.34
+41.38
+43.00
+
+74.87
+75.42
+74.87
+74.87
+
+52.81
+53.27
+53.31
+54.13
+
+75.57
+76.06
+75.46
+76.28
+
+68.82
+70.24
+67.96
+69.53
+
+62.76
+63.67
+62.60
+63.56
+
+16-bit
+AQLM
+EfficientQAT
+EfficientQAT
+
+16
+2
+2
+2
+
+1x16
+128
+64
+
+60.24
+50.34
+48.81
+49.06
+
+86.83
+78.83
+79.25
+77.40
+
+66.40
+63.47
+60.75
+61.60
+
+82.21
+79.65
+79.60
+77.37
+
+80.74
+78.22
+69.46
+74.03
+
+75.28
+70.10
+67.57
+67.89
+
+SignRoundV1
+Ours
+Ours
+Ours*
+Ours*
+
+2
+2
+2
+2
+2
+
+128
+128
+64
+128
+64
+
+47.87
+49.91
+52.22
+52.05
+54.95
+
+79.71
+80.81
+81.73
+82.41
+82.53
+
+43.96
+59.75
+60.93
+60.41
+61.05
+
+78.62
+79.49
+80.09
+79.38
+79.82
+
+73.64
+75.14
+75.69
+76.56
+76.32
+
+64.76
+69.02
+70.13
+70.16
+70.93
+
+Ours
+Ours
+Ours*
+Ours*
+
+2.5
+2.5
+2.5
+2.5
+
+128
+64
+128
+64
+
+56.83
+55.29
+56.48
+56.40
+
+83.67
+83.08
+83.04
+82.95
+
+63.06
+62.60
+63.57
+63.07
+
+80.47
+81.23
+81.56
+80.63
+
+77.82
+77.66
+78.77
+78.53
+
+72.37
+71.97
+72.68
+72.32
+
+22
+
+Table 26: The detailed accuracies of 5 tasks for Llama2 models with INT2/4 mixed precision. “Avg.
+Bits” indicates average bit-width.
+Model
+
+Method
+
+Avg. Bits Group Size ARC-c ARC-e Hella. PIQA Wino. Avg.
+
+16-bit
+AQLM
+AQLM
+QuIP#
+EfficientQAT
+EfficientQAT
+
+16
+2
+2
+2
+2
+2
+
+2x8
+1x16
+128
+64
+
+42.83
+32.85
+39.68
+37.88
+36.52
+36.86
+
+75.97
+66.92
+74.07
+71.84
+69.78
+70.96
+
+57.27
+49.96
+53.42
+52.19
+50.84
+51.58
+
+77.91
+73.07
+76.88
+75.46
+74.16
+75.30
+
+69.30
+65.27
+65.19
+65.67
+66.22
+65.98
+
+64.66
+57.61
+61.85
+60.61
+59.50
+60.14
+
+GPTQ
+AWQ
+OmniQ
+SignRoundV1
+Ours
+Ours
+Ours*
+Ours*
+Ours
+Ours
+Ours*
+Ours*
+
+2
+2
+2
+2
+2
+2
+2
+2
+2.5
+2.5
+2.5
+2.5
+
+128
+128
+128
+128
+128
+64
+128
+64
+128
+64
+128
+64
+
+21.25
+21.08
+23.46
+32.25
+33.53
+32.93
+34.64
+35.32
+35.41
+35.92
+36.01
+36.09
+
+40.45
+24.62
+50.13
+65.99
+69.32
+67.97
+69.95
+69.99
+71.46
+71.25
+72.01
+71.72
+
+32.59
+25.69
+40.28
+40.28
+48.17
+48.54
+48.92
+49.30
+50.62
+51.44
+51.19
+51.85
+
+58.32
+52.34
+65.13
+72.96
+74.43
+74.21
+74.43
+74.16
+75.30
+75.35
+74.92
+74.81
+
+55.17
+49.96
+55.88
+61.01
+63.93
+65.59
+65.43
+66.41
+67.01
+66.46
+67.25
+67.72
+
+41.56
+34.74
+46.98
+54.50
+57.88
+57.85
+58.67
+59.04
+59.96
+60.08
+60.28
+60.44
+
+16-bit
+AQLM
+AQLM
+QuIP#
+EfficientQAT
+EfficientQAT
+
+16
+2
+2
+2
+2
+2
+
+2x8
+1x16
+128
+64
+
+47.18
+40.10
+43.52
+42.92
+42.83
+41.89
+
+78.32
+73.06
+75.25
+75.72
+75.04
+74.83
+
+60.25
+54.62
+57.62
+56.53
+55.66
+55.27
+
+79.22
+77.09
+78.29
+77.97
+76.99
+77.04
+
+72.22
+66.22
+70.09
+69.06
+68.90
+68.36
+
+67.44
+62.22
+64.95
+64.44
+63.88
+63.48
+
+GPTQ
+AWQ
+Llama2-13B OmniQ
+SignRoundV1
+Ours
+Ours
+Ours*
+Ours*
+Ours
+Ours
+Ours*
+Ours*
+
+2
+2
+2
+2
+2
+2
+2
+2
+2.5
+2.5
+2.5
+2.5
+
+128
+128
+128
+128
+128
+64
+128
+64
+128
+64
+128
+64
+
+21.93
+23.12
+30.29
+38.57
+39.08
+40.53
+40.44
+40.78
+41.04
+41.13
+40.02
+42.83
+
+55.60
+26.22
+63.22
+71.17
+73.78
+74.33
+74.24
+74.58
+75.42
+75.55
+75.08
+76.43
+
+41.06
+25.80
+46.23
+53.35
+52.96
+53.87
+53.15
+53.73
+55.39
+55.81
+55.61
+55.97
+
+67.08
+52.99
+70.13
+76.17
+75.68
+76.44
+75.90
+76.77
+76.77
+77.42
+76.82
+77.37
+
+55.80
+51.85
+57.93
+64.33
+67.88
+68.43
+67.96
+68.19
+69.61
+70.56
+71.11
+70.24
+
+48.29
+35.99
+53.56
+60.72
+61.88
+62.72
+62.34
+62.81
+63.65
+64.09
+63.73
+64.57
+
+16-bit
+AQLM
+AQLM
+QuIP#
+EfficientQAT
+EfficientQAT
+
+16
+2
+2
+2
+2
+2
+
+2x8
+1x16
+128
+64
+
+54.44
+51.45
+52.99
+52.65
+49.23
+50.77
+
+82.70
+79.76
+81.36
+81.90
+80.01
+80.13
+
+64.77
+61.94
+62.78
+62.86
+61.58
+61.78
+
+82.15
+80.47
+81.07
+81.39
+80.20
+80.14
+
+77.98
+75.61
+76.01
+75.77
+73.64
+74.59
+
+72.41
+69.85
+70.84
+70.91
+68.93
+69.48
+
+GPTQ
+AWQ
+Llama2-70B OmniQ
+SignRoundV1
+Ours
+Ours
+Ours*
+Ours*
+Ours
+Ours
+Ours*
+Ours*
+
+2
+2
+2
+2
+2
+2
+2
+2
+2.5
+2.5
+2.5
+2.5
+
+128
+128
+128
+128
+128
+64
+128
+64
+128
+64
+128
+64
+
+22.70
+22.35
+33.28
+46.59
+49.06
+49.06
+48.81
+50.60
+51.71
+50.77
+50.64
+51.02
+
+25.08
+25.76
+67.21
+78.37
+79.59
+78.91
+80.22
+79.92
+80.56
+80.77
+80.64
+81.31
+
+25.04
+25.46
+35.45
+59.65
+59.99
+60.21
+60.23
+60.52
+61.77
+61.91
+61.68
+62.29
+
+49.51
+52.50
+74.10
+79.00
+78.35
+79.00
+78.73
+79.22
+79.82
+80.30
+79.89
+80.58
+
+49.57
+51.38
+64.33
+74.90
+74.98
+75.61
+76.09
+76.24
+76.64
+77.51
+77.35
+77.82
+
+34.38
+35.49
+54.87
+67.70
+68.39
+68.56
+68.82
+69.30
+70.10
+70.25
+70.04
+70.60
+
+Llama2-7B
+
+23
+

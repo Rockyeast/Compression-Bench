@@ -1,0 +1,1536 @@
+                                            GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+
+                                            Jiawei Zhao 1 Zhenyu Zhang 3 Beidi Chen 2 4 Zhangyang Wang 3 Anima Anandkumar * 1 Yuandong Tian * 2
+
+
+                                                                  Abstract
+                                                                                                                                     BF16 AdamW
+
+                                              Training Large Language Models (LLMs)                                                      Adafactor
+                                              presents significant memory challenges, predom-
+                                                                                                                         AdamW (no retaining grad)
+                                              inantly due to the growing size of weights and
+arXiv:2403.03507v2 [cs.LG] 2 Jun 2024
+
+
+
+
+                                              optimizer states. Common memory-reduction                                                8-bit Adam
+
+                                              approaches, such as low-rank adaptation                               8-bit Adam (no retaining grad)
+                                              (LoRA), add a trainable low-rank matrix to the
+                                                                                                                  8-bit GaLore (no retaining grad)       RTX 4090
+                                              frozen pre-trained weight in each layer. How-
+                                              ever, such approaches typically underperform
+                                              training with full-rank weights in both pre-
+                                              training and fine-tuning stages since they limit                   Figure 1: Estimated memory consumption of pre-training a
+                                                                                                                 LLaMA 7B model with a token batch size of 256 on a single de-
+                                              the parameter search to a low-rank subspace
+                                                                                                                 vice, without activation checkpointing and memory offloading2 .
+                                              and alter the training dynamics, and further,                      Details refer to Section 5.5.
+                                              may require full-rank warm start. In this work,
+                                              we propose Gradient Low-Rank Projection                            Algorithm 1: GaLore, PyTorch-like
+                                              (GaLore), a training strategy that allows full-                    for weight in model.parameters():
+                                              parameter learning but is more memory-efficient                        grad = weight.grad
+                                                                                                                     # original space -> compact space
+                                              than common low-rank adaptation methods                                lor grad = project(grad)
+                                              such as LoRA. Our approach reduces memory                              # update by Adam, Adafactor, etc.
+                                              usage by up to 65.5% in optimizer states while                         lor update = update(lor grad)
+                                                                                                                     # compact space -> original space
+                                              maintaining both efficiency and performance for                        update = project back(lor update)
+                                              pre-training on LLaMA 1B and 7B architectures                          weight.data += update
+                                              with C4 dataset with up to 19.7B tokens, and on
+                                              fine-tuning RoBERTa on GLUE tasks. Our 8-bit
+                                              GaLore further reduces optimizer memory by up                      and fine-tuning LLMs require not only a huge amount of
+                                              to 82.5% and total training memory by 63.3%,                       computation but is also memory intensive. The memory
+                                              compared to a BF16 baseline. Notably, we                           requirements include not only billions of trainable parame-
+                                              demonstrate, for the first time, the feasibility of                ters, but also their gradients and optimizer states (e.g., gra-
+                                              pre-training a 7B model on consumer GPUs with                      dient momentum and variance in Adam) that can be larger
+                                              24GB memory (e.g., NVIDIA RTX 4090) with-                          than parameter storage themselves (Raffel et al., 2020;
+                                              out model parallel, checkpointing, or offloading                   Touvron et al., 2023; Chowdhery et al., 2023). For exam-
+                                              strategies. Code is provided in the link.                          ple, pre-training a LLaMA 7B model from scratch with a
+                                                                                                                 single batch size requires at least 58 GB memory (14GB for
+                                        1. Introduction
+                                                                                                                 trainable parameters, 42GB for Adam optimizer states and
+                                        Large Language Models (LLMs) have shown impressive                       weight gradients, and 2GB for activations1 ). This makes
+                                        performance across multiple disciplines, including conver-               the training not feasible on consumer-level GPUs such as
+                                        sational AI and language translation. However, pre-training              NVIDIA RTX 4090 with 24GB memory.
+                                           *
+                                             Equal advising 1 California Institute of Technology 2 Meta AI       In addition to engineering and system efforts, such as gra-
+                                        3
+                                         University of Texas at Austin 4 Carnegie Mellon University. Cor-        dient checkpointing (Chen et al., 2016), memory offload-
+                                        respondence to: Jiawei Zhao <jiawei@caltech.edu>, Yuandong
+                                                                                                                     1
+                                        Tian <yuandong@meta.com>.                                                     The calculation is based on LLaMA architecture, BF16 nu-
+                                                                                                                 merical format, and maximum sequence length of 2048.
+                                        Proceedings of the 41 st International Conference on Machine                2
+                                                                                                                      In the figure, “no retaining grad” denotes the application of
+                                        Learning, Vienna, Austria. PMLR 235, 2024. Copyright 2024                per-layer weight update to reduce memory consumption of storing
+                                        by the author(s).                                                        weight gradient (Lv et al., 2023b).
+
+                                                                                                             1
+                        GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+ing (Rajbhandari et al., 2020), etc., to achieve faster and       C4 dataset, 8-bit GaLore, combined with 8-bit optimizers
+more efficient distributed training, researchers also seek        and layer-wise weight updates techniques, achieves com-
+to develop various optimization techniques to reduce the          parable performance to its full-rank counterpart, with less
+memory usage during pre-training and fine-tuning.                 than 10% memory cost of optimizer states.
+Parameter-efficient fine-tuning (PEFT) techniques allow           Notably, for pre-training, GaLore keeps low memory
+for the efficient adaptation of pre-trained language mod-         throughout the entire training, without requiring full-rank
+els (PLMs) to different downstream applications without           training warmup like ReLoRA. Thanks to GaLore’s mem-
+the need to fine-tune all of the model’s parameters (Ding         ory efficiency, it is possible to train LLaMA 7B from
+et al., 2022). Among them, the popular Low-Rank Adapta-           scratch on a single GPU with 24GB memory (e.g., on
+tion (LoRA Hu et al. (2022)) reparameterizes weight ma-           NVIDIA RTX 4090), without any costly memory offload-
+trix W ∈ Rm×n into W = W0 + BA, where W0 is a                     ing techniques (Fig. 1).
+frozen full-rank matrix and B ∈ Rm×r , A ∈ Rr×n are
+                                                                  GaLore is also used to fine-tune pre-trained LLMs on
+additive low-rank adaptors to be learned. Since the rank
+                                                                  GLUE benchmarks with comparable or better results than
+r ≪ min(m, n), A and B contain fewer number of train-
+                                                                  existing low-rank methods. When fine-tuning RoBERTa-
+able parameters and thus smaller optimizer states. LoRA
+                                                                  Base on GLUE tasks with a rank of 4, GaLore achieves
+has been used extensively to reduce memory usage for fine-
+                                                                  an average score of 85.89, outperforming LoRA, which
+tuning in which W0 is the frozen pre-trained weight. Its
+                                                                  achieves a score of 85.61.
+variant ReLoRA is also used in pre-training, by periodi-
+cally updating W0 using previously learned low-rank adap-         As a gradient projection method, GaLore is independent
+tors (Lialin et al., 2024).                                       of the choice of optimizers and can be easily plugged into
+                                                                  existing ones with only two lines of code, as shown in Al-
+However, many recent works demonstrate the limitation of
+                                                                  gorithm 1. Our experiment (Fig. 3) shows that it works
+such a low-rank reparameterization. For fine-tuning, LoRA
+                                                                  for popular optimizers such as AdamW, 8-bit Adam, and
+is not shown to reach a comparable performance as full-
+                                                                  Adafactor. In addition, its performance is insensitive to
+rank fine-tuning (Xia et al., 2024). For pre-training from
+                                                                  very few hyper-parameters it introduces. We also provide
+scratch, it is shown to require a full-rank model training
+                                                                  theoretical justification on the low-rankness of gradient up-
+as a warmup (Lialin et al., 2024), before optimizing in the
+                                                                  date, as well as the convergence analysis of GaLore.
+low-rank subspace. There are two possible reasons: (1) the
+optimal weight matrices may not be low-rank, and (2) the
+reparameterization changes the gradient training dynamics.        2. Related Works
+Our approach: To address the above challenge, we pro-             Low-rank adaptation. Hu et al. (2022) proposed Low-
+pose Gradient Low-Rank Projection (GaLore), a training            Rank Adaptation (LoRA) to fine-tune pre-trained models
+strategy that allows full-parameter learning but is more          with low-rank adaptors. This method reduces the mem-
+memory-efficient than common low-rank adaptation meth-            ory footprint by maintaining a low-rank weight adaptor for
+ods, such as LoRA. Our key idea is to leverage the slow-          each layer. There are a few variants of LoRA proposed to
+changing low-rank structure of the gradient G ∈ Rm×n of           enhance its performance (Renduchintala et al., 2023; Sheng
+the weight matrix W , rather than trying to approximate the       et al., 2023; Zhang et al., 2023; Xia et al., 2024), sup-
+weight matrix itself as low rank.                                 porting multi-task learning (Wang et al., 2023b), and fur-
+                                                                  ther reducing the memory footprint (Dettmers et al., 2024).
+We first show theoretically that the gradient matrix G be-
+                                                                  Lialin et al. (2024) proposed ReLoRA, a variant of LoRA
+comes low-rank during training. Then, we propose Ga-
+                                                                  designed for pre-training, but requires a full-rank training
+Lore that computes two projection matrices P ∈ Rm×r
+                                                                  warmup to achieve comparable performance as the stan-
+and Q ∈ Rn×r to project the gradient matrix G into a low-
+                                                                  dard baseline. Inspired by LoRA, Hao et al. (2024) also
+rank form P ⊤ GQ. In this case, the memory cost of opti-
+                                                                  suggested that gradients can be compressed in a low-rank
+mizer states, which rely on component-wise gradient statis-
+                                                                  subspace, and they proposed to use random projections to
+tics, can be substantially reduced. Occasional updates of P
+                                                                  compress the gradients. There have also been approaches
+and Q (e.g., every 200 iterations) incur minimal amortized
+                                                                  that propose training networks with low-rank factorized
+additional computational cost. GaLore is more memory-
+                                                                  weights from scratch (Kamalakara et al., 2022; Wang et al.,
+efficient than LoRA as shown in Table 1. In practice, this
+                                                                  2023a; Zhao et al., 2023).
+yields up to 30% memory reduction compared to LoRA
+during pre-training.
+We demonstrate that GaLore works well in both LLM pre-            Subspace learning. Recent studies have demonstrated
+training and fine-tuning. When pre-training LLaMA 7B on           that the learning primarily occurs within a significantly
+                                                                  low-dimensional parameter subspace (Gur-Ari et al., 2018;
+
+                                                              2
+                         GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+Larsen et al., 2022). These findings promote a spe-                      to regularize the gradient Gt into G̃t :
+cial type of learning called subspace learning, where the
+model weights are optimized within a low-rank subspace.                                 Mt = β1 Mt−1 + (1 − β1 )Gt                (2)
+This notion has been widely used in different domains of                                  Vt = β2 Vt−1 + (1 − β2 )G2t             (3)
+machine learning, including meta-learning and continual                                             p
+learning (Lee & Choi, 2018; Chaudhry et al., 2020).                                      G̃t = Mt / Vt + ϵ                        (4)
+                                                                                            √
+                                                                         Here G2t and Mt / Vt + ϵ means element-wise multipli-
+Projected gradient descent. GaLore is closely related to
+                                                                         cation and division. η is the learning rate. Together with
+the traditional topic of projected gradient descent (PGD)
+                                                                         W ∈ Rm×n , this takes 3mn memory.
+(Chen & Wainwright, 2015; Chen et al., 2019). A key dif-
+ference is that, GaLore considers the specific gradient form             Low-rank updates. For a linear layer W ∈ Rm×n , LoRA
+that naturally appears in training multi-layer neural net-               and its variants utilize the low-rank structure of the update
+works (e.g., it is a matrix with specific structures), proving           matrix by introducing a low-rank adaptor AB:
+many of its properties (e.g., Lemma 3.3, Theorem 3.2, and
+Theorem 3.8). In contrast, traditional PGD mostly treats                                     W T = W 0 + B T AT ,                 (5)
+the objective as a general blackbox nonlinear function, and
+study the gradients in the vector space only.                            where B ∈ Rm×r and A ∈ Rr×n , and r ≪ min(m, n).
+                                                                         A and B are the learnable low-rank adaptors and W0 is a
+                                                                         fixed weight matrix (e.g., pre-trained weight).
+Low-rank gradient. Gradient is naturally low-rank dur-
+ing training of neural networks, and this property have been
+                                                                         3.2. Low-Rank Property of Weight Gradient
+studied in both theory and practice (Zhao et al., 2022; Cos-
+son et al., 2023; Yang et al., 2023). It has been applied                While low-rank updates are proposed to reduce memory
+to reduce communication cost (Wang et al., 2018; Vogels                  usage, it remains an open question whether the weight ma-
+et al., 2020), and memory footprint during training (Goon-               trix should be parameterized as low-rank. In many situa-
+eratne et al., 2020; Huang et al., 2023; Modoranu et al.,                tions, this may not be true. For example, in linear regres-
+2023).                                                                   sion y = W x, if the optimal W ∗ is high-rank, then impos-
+                                                                         ing a low-rank assumption on W never leads to the optimal
+Memory-efficient optimization. There have been some                      solution, regardless of what optimizers are used.
+works trying to reduce the memory cost of gradient statis-               Surprisingly, while the weight matrices are not necessarily
+tics for adaptive optimization algorithms (Shazeer & Stern,              low-rank, the gradient indeed becomes low-rank during the
+2018; Anil et al., 2019; Dettmers et al., 2022). Quantiza-               training for certain gradient forms and associated network
+tion is widely used to reduce the memory cost of optimizer               architectures.
+states (Dettmers et al., 2022; Li et al., 2024). Recent works
+have also proposed to reduce weight gradient memory by                   Reversible networks. Obviously, for a general loss func-
+fusing the backward operation with the optimizer update                  tion, its gradient can be arbitrary and is not necessarily
+(Lv et al., 2023a;b).                                                    low rank. Here we study the gradient structure for a gen-
+                                                                         eral family of nonlinear networks known as “reversible net-
+                                                                         works” (Tian et al., 2020), which includes not only simple
+3. GaLore: Gradient Low-Rank Projection                                  linear networks but also deep ReLU/polynomial networks:
+3.1. Background                                                          Definition 3.1 (Reversiblity (Tian et al., 2020)). A network
+                                                                         N that maps input x to output y = N (x) is reversible,
+Regular full-rank training. At time step t, Gt =
+                                                                         if there exists L(x; W ) so that y = L(x; W )x, and the
+−∇W φt (Wt ) ∈ Rm×n is the backpropagated (negative)
+                                                                         backpropagated gradient gx satisfies gx = L⊤ (x; W )gy ,
+gradient matrix. Then the regular pre-training weight up-
+                                                                         where gy is the backpropagated gradient at the output y.
+date can be written down as follows (η is the learning rate):
+                                                                         Here L(x; W ) depends on the input x and weight W in the
+                       T −1                  T −1                        network N .
+                       X                     X
+      WT = W0 + η             G̃t = W0 + η          ρt (Gt )   (1)
+                       t=0                   t=0
+                                                                         Please check Appendix B.1 for its properties. For re-
+                                                                         versible networks, the gradient takes a specific form.
+where G̃t is the final processed gradient to be added to                 Theorem 3.2 (Gradient Form of reversible mod-
+the weight matrix and ρt is an entry-wise stateful gradient              els). Consider a chained reversible neural net-
+regularizer (e.g., Adam). The state of ρt can be memory-                 work N (x)    :=  NL (NL−1 (. . . N1 (x))) and de-
+intensive. For example, for Adam, we need M, V ∈ Rm×n                    fine Jl := Jacobian(NL ) . . . Jacobian(Nl+1 ) and
+
+                                                                     3
+                            GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+fl := Nl (. . . N1 (x)). Then the weight matrix Wl at layer               dynamics has smaller null space V1 , which also makes Gt
+l has gradient Gl in the following form for batch size 1:                 low-rank. The full-rank assumption of {Bi } is reasonable,
+                                                                          e.g., in LLMs, the output dimensions of the networks (i.e.,
+(a) For ℓ2 -objective φ := 12 ∥y − fL ∥22 :
+                                                                          the vocabulary size) is often huge compared to matrix di-
+                                                                          mensions.
+              Gl = Jl⊤ y − Jl⊤ Jl Wl fl−1 fl−1
+                                          ⊤
+                                                                (6)
+                                                                          In general if the batch size N is large, then it becomes a bit
+(b) Left P1⊥   := I − K  1
+                           11⊤ be the zero-mean PSD pro-                  tricky to characterize the minimal eigenspace V1 of S. On
+                                                                          the other hand, if V1 has nice structure, then sr(Gt ) can be
+jection matrix. For   K-way logsoftmax loss φ(y; fL
+                                                    √
+                                                      ) :=
+                                                                          bounded even further:
+         exp(y ⊤ fL )                    ⊥
+− log 1⊤ exp(fL ) with small logits ∥P1 fL ∥∞ ≪ K:
+                                                                          Corollary 3.5 (Low-rank Gt with special structure of V1 ).
+                                                                          If V1 (S) is 1-dimensional with decomposable eigenvector
+              Jl P1⊥ y − γK −1 Jl⊤ P1⊥ Jl Wl fl−1        ⊤
+                                                    
+    Gl =                                                fl−1    (7)                             ∥
+                                                                          v = y ⊗ z, then sr(Gt0 ) = 1 and thus Gt becomes rank-1.
+where γ ≈ 1 and y is a data label with y ⊤ 1 = 1.
+                                                                                                                           ∥
+                                                                          One rare failure case of Lemma 3.3 is when Gt0 is precisely
+From the theoretical analysis above, we can see that for                                       ∥
+                                                                          zero, in which sr(Gt0 ) becomes undefined. This happens to
+ 1
+   PNsize N , the gradient G has certain structures: G =
+batch                                                                     be true if t0 = 0, i.e., Ai , Bi and Ci are constant through-
+N     i=1 (Ai − Bi W Ci ) for input-dependent matrix Ai ,                 out the entire training process. Fortunately, for practical
+Positive Semi-definite (PSD) matrices Bi and Ci . In the                  training, this does not happen.
+following, we prove that such a gradient will become low-
+rank during training in certain conditions:                               Transformers. For Transformers, we can also separately
+                                                                          prove that the weight gradient of the lower layer (i.e.,
+Lemma 3.3 (Gradient becomes low-rank during training).
+                                                                          project-up) weight of feed forward network (FFN) becomes
+Suppose the gradient follows the parametric form:
+                                                                          low rank over time, using the JoMA framework (Tian et al.,
+                            N                                             2024). Please check Appendix (Sec. B.3) for details.
+                       1 X
+                Gt =         (Ai − Bi Wt Ci )                   (8)
+                       N i=1                                              3.3. Gradient Low-rank Projection (GaLore)
+with constant Ai , PSD matrices Bi and Ci after t ≥ t0 . We               Since the gradient G may have a low-rank structure, if we
+study vanilla SGD weight update: Wt = Wt−1 + ηGt−1 .                      can keep the gradient statistics of a small “core” of gradient
+              PN
+Let S := N1 i=1 Ci ⊗ Bi and λ1 < λ2 its two smallest                      G in optimizer states, rather than G itself, then the memory
+distinct eigenvalues. Then the stable rank sr(Gt ) satisfies:             consumption can be reduced substantially. This leads to
+                                                                          our proposed GaLore strategy:
+                                    2(t−t0 )               ∥
+                                                ∥G0 −Gt0 ∥2F
+                        
+               ∥            1−ηλ2                                         Definition 3.6 (Gradient Low-rank Projection (GaLore)).
+ sr(Gt ) ≤ sr(Gt0 )+                                    ∥
+                                                                (9)
+                            1−ηλ1                 ∥Gt0 ∥22                Gradient low-rank projection (GaLore) denotes the follow-
+                                                                          ing gradient update rules (η is the learning rate):
+          ∥
+where Gt0 is the projection of Gt0 onto the minimal                                          T −1
+eigenspace V1 of S corresponding to λ1 .                                                     X
+                                                                             WT = W0 + η            G̃t ,   G̃t = Pt ρt (Pt⊤ Gt Qt )Q⊤
+                                                                                                                                     t
+                                                                                              t=0
+In practice, the constant assumption can approximately
+                                                                                                                                     (10)
+hold for some time, in which the second term in Eq. 9 goes
+to zero exponentially and the stable rank of Gt goes down,                where Pt ∈ Rm×r and Qt ∈ Rn×r are projection matrices.
+yielding low-rank gradient Gt . The final stable rank is de-
+                 ∥
+termined by sr(Gt0 ), which is estimated to be low-rank by                Different from LoRA, GaLore explicitly utilizes the low-
+the following:                                                            rank updates instead of introducing additional low-rank
+Corollary 3.4 (Low-rankPGt ). If the gradient takes the                   adaptors and hence does not alter the training dynamics.
+                            N
+parametric form Gt = N1 i=1 (ai − Bi Wt fi )fi⊤ with all                  In the following, we show that GaLore converges under
+                                                   ∥
+Bi full-rank, and N ′ := rank({fi }) < n, then sr(Gt0 ) ≤                 a similar (but more general) form of gradient update rule
+       ′
+n − N and thus sr(Gt ) ≤ n/2 for large t.                                 (Eqn. 8). This form corresponds to Eqn. 6 but with a larger
+                                                                          batch size.
+Remarks. The gradient form is justified by Theorem 3.2.
+                                                                          Definition 3.7 (L-continuity). A function h(W ) has (Lip-
+Intuitively, when N ′ is small, Gt is a summation of N ′
+                                                                          schitz) L-continuity, if for any W1 and W2 , ∥h(W1 ) −
+rank-1 update and is naturally low rank; on the other hand,
+                                                                          h(W2 )∥F ≤ L∥W1 − W2 ∥F .
+when N ′ becomes larger and closer to n, then the training
+
+                                                                      4
+                            GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+Theorem 3.8 (Convergence of GaLore with fixed projec-
+tions). Suppose the gradient has the form of Eqn. 8 and
+Ai , Bi and Ci have LA , LB and LC continuity with re-
+                                                                                                      𝑾𝟎 + ∆𝑾𝑻𝟏
+spect to W and ∥Wt ∥ ≤ D. Let Rt := Pt⊤ Gt Qt ,
+                                                                                               !𝒕
+                                                                                               𝑮
+B̂itP:= Pt⊤ Bi (Wt )Pt , Ĉit := Q⊤        t Ci (Wt )Qt and κt :=                                 𝟏
+                                                                                                             !𝒕
+                                                                                                             𝑮  𝟐
+ 1
+N     i λ min (B̂ it )λmin (Ĉ it ). If we choose constant Pt = P
+and Qt = Q, then GaLore with ρt ≡ 1 satisfies:                                                               𝑾𝟎 + ∆𝑾𝑻𝟏 + ∆𝑾𝑻𝟐
+                                                                                         𝑾𝟎
+ ∥Rt ∥F ≤ 1−η(κt−1 −LA −LB LC D2 ) ∥Rt−1 ∥F (11)
+                                 
+
+
+As a result, if mint κt > LA + LB LC D2 , Rt → 0 and thus
+GaLore converges with fixed Pt and Qt .                                    Figure 2:    Learning through low-rank subspaces ∆WT1 and
+                                                                           ∆WT2 using GaLore. For t1 ∈ [0, T1 − 1], W are updated by
+Setting P and Q. The theorem tells that P and Q should                     projected gradients G̃t1 in a subspace determined by fixed Pt1
+project into the subspaces corresponding to the first few                  and Qt1 . After T1 steps, the subspace is changed by recomputing
+largest eigenvectors of B̂it and Ĉit for faster convergence               Pt2 and Qt2 for t2 ∈ [T1 , T2 − 1], and the process repeats until
+(large κt ). While all eigenvalues of the positive semidefi-               convergence.
+nite (PSD) matrix B and C are non-negative, some of them
+can be very small and hinder convergence (i.e., it takes a                 4.1. Composition of Low-Rank Subspaces
+long time for Gt to become 0). With the projection P and                   We allow GaLore to switch across low-rank subspaces:
+Q, P ⊤ Bit P and Q⊤ Cit Q only contain the largest eigen
+subspaces of B and C, improving the convergence of Rt                           Wt = W0 + ∆WT1 + ∆WT2 + . . . + ∆WTn ,               (14)
+and at the same time, reduces the memory usage.                                               hP                     i
+                                                                                                   n−1      Pn
+                                                                           where t ∈               i=1 Ti ,   i=1 Ti    and ∆WTi =
+While it is tricky to obtain the eigenstructure of B̂it and Ĉit             PTi −1
+(they are parts of Jacobian), one way is to instead use the                η t=0 G̃t is the summation of all Ti updates within the
+spectrum of Gt via Singular Value Decomposition (SVD):                     i-th subspace. When switching to i-th subspace at step
+                                                                           t = Ti , we re-initialize the projector Pt and Qt by perform-
+                          r
+                          X                                                ing SVD on the current gradient Gt by Equation 12. We il-
+     Gt = U SV ⊤ ≈              si ui vi⊤                       (12)       lustrate how the trajectory of G̃t traverses through multiple
+                          i=1
+                                                                           low-rank subspaces in Fig. 2. In the experiment section, we
+      Pt = [u1 , u2 , ..., ur ],    Qt = [v1 , v2 , ..., vr ]   (13)       show that allowing multiple low-rank subspaces is the key
+                                                                           to achieving the successful pre-training of LLMs.
+Difference between GaLore and LoRA. While both Ga-                         Following the above procedure, the switching frequency
+Lore and LoRA have “low-rank” in their names, they fol-                    T becomes a hyperparameter. The ablation study (Fig. 5)
+low very different training trajectories. For example, when                shows a sweet spot exists. A very frequent subspace change
+r = min(m, n), GaLore with ρt ≡ 1 follows the ex-                          increases the overhead (since new Pt and Qt need to be
+act training trajectory of the original model, as G̃t =                    computed) and breaks the condition of constant projection
+Pt Pt⊤ Gt Qt Q⊤t  = Gt . On the other hand, when BA                        in Theorem 3.8. In practice, it may also impact the fidelity
+reaches full rank (i.e., B ∈ Rm×m and A ∈ Rm×n ), op-                      of the optimizer states, which accumulate over multiple
+timizing B and A simultaneously follows a very different                   training steps. On the other hand, a less frequent change
+training trajectory compared to the original model.                        may make the algorithm stuck into a region that is no longer
+                                                                           important to optimize (convergence proof in Theorem 3.8
+4. GaLore for Memory-Efficient Training                                    only means good progress in the designated subspace, but
+                                                                           does not mean good overall performance). While optimal
+For a complex optimization problem such as LLM pre-                        T depends on the total training iterations and task com-
+training, it may be difficult to capture the entire gradient               plexity, we find that a value between T = 50 to T = 1000
+trajectory with a single low-rank subspace. One reason is                  makes no much difference. Thus, the total computational
+that the principal subspaces of Bt and Ct (and thus Gt ) may               overhead induced by SVD is negligible (< 10%) compared
+change over time. In fact, if we keep the same projection                  to other memory-efficient training techniques such as mem-
+P and Q, then the learned weights will only grow along                     ory offloading (Rajbhandari et al., 2020).
+these subspaces, which is not longer full-parameter train-
+ing. Fortunately, for this, GaLore can switch subspaces
+                                                                           4.2. Memory-Efficient Optimization
+during training and learn full-rank weights without increas-
+ing the memory footprint.                                                  Reducing memory footprint of gradient statistics. Ga-
+
+                                                                       5
+                              GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+Algorithm 2: Adam with GaLore
+                                                                                   Table 1: Comparison between GaLore and LoRA. Assume W ∈
+                                                                                   Rm×n (m ≤ n), rank r.
+  Input: A layer weight matrix W ∈ Rm×n with m ≤ n. Step size η,
+  scale factor α, decay rates β1 , β2 , rank r, subspace change frequency
+  T.                                                                                                         GaLore           LoRA
+  Initialize first-order moment M0 ∈ Rn×r ← 0
+  Initialize second-order moment V0 ∈ Rn×r ← 0                                            Weights             mn         mn + mr + nr
+  Initialize step t ← 0                                                                   Optim States      mr + 2nr      2mr + 2nr
+  repeat
+      Gt ∈ Rm×n ← −∇W φt (Wt )                                                            Multi-Subspace        ✓               ✗
+      if t mod T = 0 then                                                                 Pre-Training          ✓               ✗
+          U, S, V ← SVD(Gt )                                                              Fine-Tuning           ✓               ✓
+          Pt ← U [:, : r]               {Initialize left projector as m ≤ n}
+      else
+          Pt ← Pt−1                          {Reuse the previous projector}
+                                                                                   cost of projection matrices by quantization and efficient pa-
+      end if                                                                       rameterization, which we leave for future work.
+      Rt ← Pt Gt ⊤                  {Project gradient into compact space}
+
+     UPDATE (Rt ) by Adam
+                                                                                   4.3. Combining with Existing Techniques
+           Mt ← β1 · Mt−1 + (1 − β1 ) · Rt
+           Vt ← β2 · Vt−1 + (1 − β2 ) · Rt2                                        GaLore is compatible with existing memory-efficient opti-
+           Mt ← Mt /(1 − β1t )                                                     mization techniques. In our work, we mainly consider ap-
+           Vt ← Vt /(1 − β2t )                                                     plying GaLore with 8-bit optimizers and per-layer weight
+                      √
+           Nt ← Mt /( Vt + ϵ)
+                                                                                   updates.
+     G̃t ← α · P Nt                      {Project back to original space}
+     Wt ← Wt−1 + η · G̃t                                                           8-bit optimizers. Dettmers et al. (2022) proposed 8-bit
+     t←t+1                                                                         Adam optimizer that maintains 32-bit optimizer perfor-
+  until convergence criteria met
+  return Wt                                                                        mance at a fraction of the memory footprint. We apply Ga-
+                                                                                   Lore directly to the existing implementation of 8-bit Adam.
+
+Lore significantly reduces the memory cost of optimizer                            Per-layer weight updates. In practice, the optimizer typ-
+that heavily rely on component-wise gradient statistics,                           ically performs a single weight update for all layers after
+such as Adam (Kingma & Ba, 2015). When ρt ≡ Adam,                                  backpropagation. This is done by storing the entire weight
+by projecting Gt into its low-rank form Rt , Adam’s gra-                           gradients in memory. To further reduce the memory foot-
+dient regularizer ρt (Rt ) only needs to track low-rank gra-                       print during training, we adopt per-layer weight updates to
+dient statistics. where Mt and Vt are the first-order and                          GaLore, which performs the weight updates during back-
+second-order momentum, respectively. GaLore computes                               propagation. This is the same technique proposed in recent
+the low-rank normalized gradient Nt as follows:                                    works to reduce memory requirement (Lv et al., 2023a;b).
+                                    p
+               Nt = ρt (Rt ) = Mt /( Vt + ϵ).           (15)                       4.4. Hyperparameters of GaLore
+GaLore can also apply to other optimizers (e.g., Adafactor)                        In addition to Adam’s original hyperparameters, GaLore
+that have similar update rules and require a large amount of                       only introduces very few additional hyperparameters: the
+memory to store gradient statistics.                                               rank r which is also present in LoRA, the subspace change
+                                                                                   frequency T (see Sec. 4.1), and the scale factor α.
+Reducing memory usage of projection matrices. To
+                                                                                   Scale factor α controls the strength of the low-rank update,
+achieve the best memory-performance trade-off, we only
+                                                                                   which is similar to the scale factor α/r appended to the
+use one project matrix P or Q, projecting the gradient G
+                                                                                   low-rank adaptor in Hu et al. (2022). We note that the α
+into P ⊤ G if m ≤ n and GQ otherwise. We present the
+                                                                                   does not depend on the rank r in our case. This is because,
+algorithm applying GaLore to Adam in Algorithm 2.
+                                                                                   when r is small during pre-training, α/r significantly af-
+With this setting, GaLore requires less memory than LoRA                           fects the convergence rate, unlike fine-tuning.
+during training. As GaLore can always merge ∆Wt to
+W0 during weight updates, it does not need to store a                              5. Experiments
+separate low-rank factorization BA. In total, GaLore re-
+quires (mn + mr + 2nr) memory, while LoRA requires                                 We evaluate GaLore on both pre-training and fine-tuning of
+(mn + 3mr + 3nr) memory. A comparison between Ga-                                  LLMs. All experiments run on NVIDIA A100 GPUs.
+Lore and LoRA is shown in Table 1.
+                                                                                   Pre-training on C4. To evaluate its performance, we ap-
+As Theorem 3.8 does not require the projection matrix to                           ply GaLore to train LLaMA-based large language models
+be carefully calibrated, we can further reduce the memory                          on the C4 dataset. C4 dataset is a colossal, cleaned version
+
+                                                                               6
+                          GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+Table 2: Comparison with low-rank algorithms on pre-training various sizes of LLaMA models on C4 dataset. Validation perplexity
+is reported, along with a memory estimate of the total of parameters and optimizer states based on BF16 format. The actual memory
+footprint of GaLore is reported in Fig. 4.
+
+                                              60M                130M             350M                1B
+                   Full-Rank            34.06 (0.36G)      25.08 (0.76G)      18.80 (2.06G)     15.56 (7.80G)
+                   GaLore               34.88 (0.24G)      25.36 (0.52G)      18.95 (1.22G)     15.64 (4.38G)
+                   Low-Rank             78.18 (0.26G)      45.51 (0.54G)      37.41 (1.08G)    142.53 (3.57G)
+                   LoRA                 34.99 (0.36G)      33.92 (0.80G)      25.58 (1.76G)     19.21 (6.17G)
+                   ReLoRA               37.04 (0.36G)      29.37 (0.80G)      29.08 (1.76G)     18.33 (6.17G)
+                   r/dmodel               128 / 256          256 / 768         256 / 1024        512 / 2048
+                   Training Tokens          1.1B               2.2B               6.4B              13.1B
+
+                    AdamW                                     8-Bit Adam                                   Adafactor
+
+
+
+
+Figure 3: Applying GaLore to different optimizers for pre-training LLaMA 1B on C4 dataset for 10K steps. Validation perplexity over
+training steps is reported. We apply GaLore to each optimizer with the rank of 512 and 1024, where the 1B model dimension is 2048.
+
+Table 3: Pre-training LLaMA 7B on C4 dataset for 150K steps.          Fine-tuning on GLUE tasks. GLUE is a benchmark for
+Validation perplexity and memory estimate are reported.               evaluating the performance of NLP models on a variety
+                                                                      of tasks, including sentiment analysis, question answering,
+                    Mem       40K      80K      120K      150K        and textual entailment (Wang et al., 2019). We use GLUE
+ 8-bit GaLore       18G      17.94    15.39     14.95     14.65       tasks to benchmark GaLore against LoRA for memory-
+ 8-bit Adam         26G      18.09    15.47     14.83     14.61       efficient fine-tuning.
+ Tokens (B)                    5.2     10.5     15.7      19.7
+                                                                      5.1. Comparison with Existing Low-Rank Methods
+of Common Crawl’s web crawl corpus, which is mainly                   We first compare GaLore with existing low-rank methods
+intended to pre-train language models and word represen-              using Adam optimizer across a range of model sizes.
+tations (Raffel et al., 2020). To best simulate the practical
+pre-training scenario, we train without data repetition over          Full-Rank Our baseline method that applies Adam opti-
+a sufficiently large amount of data, across a range of model          mizer with full-rank weights and optimizer states.
+sizes up to 7 Billion parameters.
+                                                                      Low-Rank We also evaluate a traditional low-rank ap-
+Architecture and hyperparameters. We follow the ex-                   proach that represents the weights by learnable low-rank
+periment setup from Lialin et al. (2024), which adopts a              factorization: W = BA (Kamalakara et al., 2022).
+LLaMA-based3 architecture with RMSNorm and SwiGLU
+activations (Zhang & Sennrich, 2019; Shazeer, 2020; Tou-              LoRA Hu et al. (2022) proposed LoRA to fine-tune pre-
+vron et al., 2023). For each model size, we use the same              trained models with low-rank adaptors: W = W0 + BA,
+set of hyperparameters across methods, except the learn-              where W0 is fixed initial weights and BA is a learnable
+ing rate. We run all experiments with BF16 format to re-              low-rank adaptor. In the case of pre-training, W0 is the
+duce memory usage, and we tune the learning rate for each             full-rank initialization matrix. We set LoRA alpha to 32
+method under the same amount of computational budget                  and LoRA dropout to 0.05 as their default settings.
+and report the best performance. The details of our task
+setups and hyperparameters are provided in the appendix.
+                                                                      ReLoRA Lialin et al. (2024) proposed ReLoRA, a vari-
+   3
+   LLaMA materials in our paper are subject to LLaMA com-             ant of LoRA designed for pre-training, which periodically
+munity license.                                                       merges BA into W , and initializes new BA with a reset on
+
+                                                                  7
+                        GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+optimizer states and learning rate. ReLoRA requires care-                                                  Memory Comparsion
+ful tuning of merging frequency, learning rate reset, and                                60     BF16
+optimizer states reset. We evaluate ReLoRA without a full-                               50     Adafactor
+rank training warmup for a fair comparison.                                                     8-bit Adam
+
+
+
+
+                                                                      Memory cost (GB)
+                                                                                         40     8-bit GaLore (retaining grad)
+For GaLore, we set subspace frequency T to 200 and scale                                        8-bit GaLore
+factor α to 0.25 across all model sizes in Table 2. For each                             30
+                                                                                               RTX 4090
+model size, we pick the same rank r for all low-rank meth-                               20
+ods, and we apply them to all multi-head attention layers
+                                                                                         10
+and feed-forward layers in the models. We train all mod-
+els using Adam optimizer with the default hyperparame-                                   0
+                                                                                              350M          1B
+                                                                                                           3B         7B
+ters (e.g., β1 = 0.9, β2 = 0.999, ϵ = 10−8 ). We also                                             Model Size
+estimate the memory usage based on BF16 format, includ-            Figure 4: Memory usage for different methods at various model
+ing the memory for weight parameters and optimizer states.         sizes, evaluated with a token batch size of 256. 8-bit GaLore (re-
+As shown in Table 2, GaLore outperforms other low-rank             taining grad) disables per-layer weight updates but stores weight
+methods and achieves comparable performance to full-rank           gradients during training.
+training. We note that for 1B model size, GaLore even
+outperforms full-rank baseline when r = 1024 instead of            150K steps, 8-bit GaLore achieves a perplexity of 14.65,
+r = 512. Compared to LoRA and ReLoRA, GaLore re-                   comparable to 8-bit Adam with a perplexity of 14.61.
+quires less memory for storing model parameters and opti-
+mizer states. A detailed training setting of each model and        5.4. Memory-Efficient Fine-Tuning
+memory estimation for each method are in the appendix.
+                                                                   GaLore not only achieves memory-efficient pre-training
+5.2. GaLore with Memory-Efficient Optimizers                       but also can be used for memory-efficient fine-tuning. We
+                                                                   fine-tune pre-trained RoBERTa models on GLUE tasks us-
+We demonstrate that GaLore can be applied to various               ing GaLore and compare its performance with a full fine-
+learning algorithms, especially memory-efficient optimiz-          tuning baseline and LoRA. We use hyperparameters from
+ers, to further reduce the memory footprint. We apply              Hu et al. (2022) for LoRA and tune the learning rate and
+GaLore to AdamW, 8-bit Adam, and Adafactor optimiz-                scale factor for GaLore. As shown in Table 4, GaLore
+ers (Shazeer & Stern, 2018; Loshchilov & Hutter, 2019;             achieves better performance than LoRA on most tasks with
+Dettmers et al., 2022). We consider Adafactor with first-          less memory footprint. This demonstrates that GaLore can
+order statistics to avoid performance degradation.                 serve as a full-stack memory-efficient training strategy for
+                                                                   both LLM pre-training and fine-tuning.
+We evaluate them on LLaMA 1B architecture with 10K
+training steps, and we tune the learning rate for each set-
+ting and report the best performance. As shown in Fig. 3,          5.5. Measurement of Memory and Throughput
+applying GaLore does not significantly affect their conver-        While Table 2 gives the theoretical benefit of GaLore com-
+gence. By using GaLore with a rank of 512, the memory              pared to other methods in terms of memory usage, we also
+footprint is reduced by up to 62.5%, on top of the mem-            measure the actual memory footprint of training LLaMA
+ory savings from using 8-bit Adam or Adafactor optimizer.          models by various methods, with a token batch size of 256.
+Since 8-bit Adam requires less memory than others, we de-          The training is conducted on a single device setup with-
+note 8-bit GaLore as GaLore with 8-bit Adam, and use it            out activation checkpointing, memory offloading, and opti-
+as the default method for the following experiments on 7B          mizer states partitioning (Rajbhandari et al., 2020).
+model pre-training and memory measurement.
+                                                                   Training 7B models on consumer GPUs with 24G mem-
+5.3. Scaling up to LLaMA 7B Architecture                           ory. As shown in Fig. 4, 8-bit GaLore requires signifi-
+                                                                   cantly less memory than BF16 baseline and 8-bit Adam,
+Scaling ability to 7B models is a key factor for demonstrat-       and only requires 22.0G memory to pre-train LLaMA 7B
+ing if GaLore is effective for practical LLM pre-training          with a small per-GPU token batch size (up to 500 tokens).
+scenarios. We evaluate GaLore on an LLaMA 7B architec-             This memory footprint is within 24GB VRAM capacity of
+ture with an embedding size of 4096 and total layers of 32.        a single GPU such as NVIDIA RTX 4090. In addition,
+We train the model for 150K steps with 19.7B tokens, using         when activation checkpointing is enabled, per-GPU token
+8-node training in parallel with a total of 64 A100 GPUs.          batch size can be increased up to 4096. While the batch size
+Due to computational constraints, we compare 8-bit Ga-             is small per GPU, it can be scaled up with data parallelism,
+Lore (r = 1024) with 8-bit Adam with a single trial with-          which requires much lower bandwidth for inter-GPU com-
+out tuning the hyperparameters. As shown in Table 3, after         munication, compared to model parallelism. Therefore, it
+
+                                                               8
+                              GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+Table 4: Evaluating GaLore for memory-efficient fine-tuning on GLUE benchmark using pre-trained RoBERTa-Base. We report the
+average score of all tasks.
+
+                               Memory     CoLA     STS-B    MRPC        RTE      SST2     MNLI      QNLI      QQP       Avg
+    Full Fine-Tuning            747M       62.24    90.92    91.30      79.42    94.57    87.18     92.33     92.28    86.28
+    GaLore (rank=4)             253M       60.35    90.73    92.25      79.42    94.04    87.00     92.24     91.06    85.89
+    LoRA (rank=4)               257M       61.38    90.57    91.07      78.70    92.89    86.82     92.18     91.29    85.61
+    GaLore (rank=8)             257M       60.06    90.82    92.01      79.78    94.38    87.17     92.20     91.11    85.94
+    LoRA (rank=8)               264M       61.83    90.80    91.90      79.06    93.46    86.94     92.25     91.22    85.93
+
+is possible that GaLore can be used for elastic training (Lin
+et al., 2019) 7B models on consumer GPUs such as RTX
+4090s.
+Specifically, we present the memory breakdown in Fig. 1.
+It shows that 8-bit GaLore reduces 37.92G (63.3%) and
+24.5G (52.3%) total memory compared to BF16 Adam
+baseline and 8-bit Adam, respectively. Compared to 8-
+bit Adam, 8-bit GaLore mainly reduces the memory in
+two parts: (1) low-rank gradient projection reduces 9.6G
+(65.5%) memory of storing optimizer states, and (2) using           Figure 5: Ablation study of GaLore on 130M models. Left:
+per-layer weight updates reduces 13.5G memory of storing            varying subspace update frequency T . Right: varying subspace
+                                                                    rank and training iterations.
+weight gradients.
+Throughput overhead of GaLore. We also measure the
+throughput of the pre-training LLaMA 1B model with 8-bit
+GaLore and other methods, where the results can be found            This shows that GaLore can be used to trade-off between
+in the appendix. Particularly, the current implementation           memory and computational cost. In a memory-constrained
+of 8-bit GaLore achieves 1019.63 tokens/second, which               scenario, reducing the rank allows us to stay within the
+induces 17% overhead compared to 8-bit Adam imple-                  memory budget while training for more steps to preserve
+mentation. Disabling per-layer weight updates for GaLore            the performance.
+achieves 1109.38 tokens/second, improving the throughput
+by 8.8%. We note that our results do not require offloading         7. Conclusion
+strategies or checkpointing, which can significantly impact
+training throughput. We leave optimizing the efficiency of          We propose GaLore, a memory-efficient pre-training and
+GaLore implementation for future work.                              fine-tuning strategy for large language models. GaLore sig-
+                                                                    nificantly reduces memory usage by up to 65.5% in opti-
+6. Ablation Study                                                   mizer states while maintaining both efficiency and perfor-
+                                                                    mance for large-scale LLM pre-training and fine-tuning.
+How many subspaces are needed during pre-training?
+We observe that both too frequent and too slow changes of           We identify several open problems for GaLore, which in-
+subspaces hurt the convergence, as shown in Fig. 5 (left).          clude (1) applying GaLore on training of various mod-
+The reason has been discussed in Sec. 4.1. In general, for          els such as vision transformers (Dosovitskiy et al., 2021)
+small r, the subspace switching should happen more to               and diffusion models (Ho et al., 2020), (2) further enhanc-
+avoid wasting optimization steps in the wrong subspace,             ing memory efficiency by employing low-memory projec-
+while for large r the gradient updates cover more sub-              tion matrices, and (3) exploring the feasibility of elastic
+spaces, providing more cushion.                                     data distributed training on low-bandwidth consumer-grade
+                                                                    hardware.
+How does the rank of subspace affect the convergence?               We hope that our work will inspire future research on
+Within a certain range of rank values, decreasing the rank          memory-efficient training from the perspective of gradi-
+only slightly affects the convergence rate, causing a slow-         ent low-rank projection. We believe that GaLore will be
+down with a nearly linear trend. As shown in Fig. 5 (right),        a valuable tool for the community, enabling the training of
+training with a rank of 128 using 80K steps achieves a              large-scale models on consumer-grade hardware with lim-
+lower loss than training with a rank of 512 using 20K steps.        ited resources.
+
+                                                                9
+                        GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+Impact Statement                                                    Dettmers, T., Lewis, M., Shleifer, S., and Zettlemoyer, L.
+                                                                      8-bit optimizers via block-wise quantization. In The
+This paper aims to improve the memory efficiency of train-            Tenth International Conference on Learning Represen-
+ing LLMs in order to reduce the environmental impact of               tations, ICLR 2022, Virtual Event, April 25-29, 2022.
+LLM pre-training and fine-tuning. By enabling the training            OpenReview.net, 2022.
+of larger models on hardware with lower memory, our ap-
+proach helps to minimize energy consumption and carbon              Dettmers, T., Pagnoni, A., Holtzman, A., and Zettlemoyer,
+footprint associated with training LLMs.                              L. Qlora: Efficient finetuning of quantized llms. Ad-
+                                                                      vances in Neural Information Processing Systems, 2024.
+Acknowledgments
+                                                                    Ding, N., Qin, Y., Yang, G., Wei, F., Yang, Z., Su, Y., Hu,
+We thank Meta AI for computational support. We ap-                    S., Chen, Y., Chan, C.-M., Chen, W., Yi, J., Zhao, W.,
+preciate the helpful feedback and discussion from Florian             Wang, X., Liu, Z., Zheng, H.-T., Chen, J., Liu, Y., Tang,
+Schäfer, Jeremy Bernstein, and Vladislav Lialin. B. Chen             J., Li, J., and Sun, M. Delta Tuning: A Comprehensive
+greatly appreciates the support by Moffett AI. Z. Wang is             Study of Parameter Efficient Methods for Pre-trained
+in part supported by NSF Awards 2145346 (CAREER),                     Language Models. ArXiv preprint arXiv:2203.06904,
+02133861 (DMS), 2113904 (CCSS), and the NSF AI In-                    2022.
+stitute for Foundations of Machine Learning (IFML). A.
+Anandkumar is supported by the Bren Foundation and the              Dosovitskiy, A., Beyer, L., Kolesnikov, A., Weissenborn,
+Schmidt Sciences through AI 2050 senior fellow program.               D., Zhai, X., Unterthiner, T., Dehghani, M., Minderer,
+                                                                      M., Heigold, G., Gelly, S., Uszkoreit, J., and Houlsby,
+References                                                            N. An image is worth 16x16 words: Transformers for
+                                                                      image recognition at scale. In International Conference
+Anil, R., Gupta, V., Koren, T., and Singer, Y. Memory                 on Learning Representations, 2021.
+  efficient adaptive optimization. Advances in Neural In-
+  formation Processing Systems, 2019.                               Gooneratne, M., Sim, K. C., Zadrazil, P., Kabel, A., Beau-
+BELLEGroup. Belle: Be everyone’s large language model                 fays, F., and Motta, G. Low-rank gradient approximation
+  engine. https://github.com/LianjiaTech/                             for memory-efficient on-device training of deep neural
+  BELLE, 2023.                                                        network. In 2020 IEEE International Conference on
+                                                                      Acoustics, Speech and Signal Processing, ICASSP 2020,
+Chaudhry, A., Khan, N., Dokania, P., and Torr, P. Continual           Barcelona, Spain, May 4-8, 2020. IEEE, 2020.
+  learning in low-rank orthogonal subspaces. Advances in
+  Neural Information Processing Systems, 2020.                      Gur-Ari, G., Roberts, D. A., and Dyer, E. Gradient De-
+                                                                      scent Happens in a Tiny Subspace. ArXiv preprint
+Chen, H., Raskutti, G., and Yuan, M. Non-Convex Pro-
+                                                                      arXiv:1812.04754, 2018.
+  jected Gradient Descent for Generalized Low-Rank Ten-
+  sor Regression. Journal of Machine Learning Research,             Hao, Y., Cao, Y., and Mou, L. Flora: Low-Rank Adapters
+  2019.                                                               Are Secretly Gradient Compressors. ArXiv preprint
+Chen, T., Xu, B., Zhang, C., and Guestrin, C. Training                arXiv:2402.03293, 2024.
+  Deep Nets with Sublinear Memory Cost. ArXiv preprint
+  arXiv:1604.06174, 2016.                                           Ho, J., Jain, A., and Abbeel, P. Denoising diffusion proba-
+                                                                      bilistic models. Advances in neural information process-
+Chen, Y. and Wainwright, M. J. Fast low-rank estimation               ing systems, 2020.
+  by projected gradient descent: General statistical and al-
+  gorithmic guarantees. ArXiv preprint arXiv:1509.03025,            Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang,
+  2015.                                                               S., Wang, L., and Chen, W. Lora: Low-rank adaptation
+Chowdhery, A., Narang, S., Devlin, J., Bosma, M., Mishra,             of large language models. In The Tenth International
+  G., Roberts, A., Barham, P., Chung, H. W., Sutton, C.,              Conference on Learning Representations, ICLR 2022,
+  Gehrmann, S., et al. Palm: Scaling language modeling                Virtual Event, April 25-29, 2022. OpenReview.net, 2022.
+  with pathways. Journal of Machine Learning Research,
+                                                                    Huang, S., Hoskins, B. D., Daniels, M. W., Stiles, M. D.,
+  2023.
+                                                                      and Adam, G. C. Low-Rank Gradient Descent for
+Cosson, R., Jadbabaie, A., Makur, A., Reisizadeh, A., and             Memory-Efficient Training of Deep In-Memory Arrays.
+  Shah, D. Low-Rank Gradient Descent. IEEE Open Jour-                 ACM Journal on Emerging Technologies in Computing
+  nal of Control Systems, 2023.                                       Systems, 2023.
+
+                                                               10
+                         GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+Kamalakara, S. R., Locatelli, A., Venkitesh, B., Ba, J.,              Modoranu, I.-V., Kalinov, A., Kurtic, E., Frantar, E., and
+  Gal, Y., and Gomez, A. N. Exploring Low Rank                         Alistarh, D. Error Feedback Can Accurately Compress
+  Training of Deep Neural Networks. ArXiv preprint                     Preconditioners.    ArXiv preprint arXiv:2306.06098,
+  arXiv:2209.13569, 2022.                                              2023.
+
+Kingma, D. P. and Ba, J. Adam: A method for stochastic                Rae, J. W., Borgeaud, S., Cai, T., Millican, K., Hoffmann,
+  optimization. In 3rd International Conference on Learn-               J., Song, F., Aslanides, J., Henderson, S., Ring, R.,
+  ing Representations, ICLR 2015, San Diego, CA, USA,                   Young, S., et al. Scaling language models: Methods,
+  May 7-9, 2015, Conference Track Proceedings, 2015.                    analysis & insights from training gopher. arXiv preprint
+                                                                        arXiv:2112.11446, 2021.
+Köpf, A., Kilcher, Y., von Rütte, D., Anagnostidis, S., Tam,
+  Z. R., Stevens, K., Barhoum, A., Nguyen, D., Stan-                  Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S.,
+  ley, O., Nagyfi, R., et al. Openassistant conversations-              Matena, M., Zhou, Y., Li, W., and Liu, P. J. Exploring
+  democratizing large language model alignment. Ad-                     the limits of transfer learning with a unified text-to-text
+  vances in Neural Information Processing Systems, 2024.                transformer. J. Mach. Learn. Res., 2020.
+
+Larsen, B. W., Fort, S., Becker, N., and Ganguli, S. How              Rajbhandari, S., Rasley, J., Ruwase, O., and He, Y. Zero:
+  many degrees of freedom do we need to train deep net-                 Memory optimizations toward training trillion param-
+  works: a loss landscape perspective. In The Tenth Inter-              eter models. In SC20: International Conference for
+  national Conference on Learning Representations, ICLR                 High Performance Computing, Networking, Storage and
+  2022, Virtual Event, April 25-29, 2022. OpenReview.net,               Analysis, 2020.
+  2022.
+                                                                      Rajpurkar, P., Zhang, J., Lopyrev, K., and Liang, P.
+Lee, Y. and Choi, S. Gradient-based meta-learning with                  SQuAD: 100,000+ questions for machine comprehen-
+  learned layerwise metric and subspace. In Proceedings                 sion of text. In Proceedings of the 2016 Conference
+  of the 35th International Conference on Machine Learn-                on Empirical Methods in Natural Language Processing.
+  ing, ICML 2018, Stockholmsmässan, Stockholm, Swe-                    Association for Computational Linguistics, 2016.
+  den, July 10-15, 2018. PMLR, 2018.
+                                                                      Renduchintala, A., Konuk, T., and Kuchaiev, O. Tied-Lora:
+Li, B., Chen, J., and Zhu, J. Memory efficient optimizers               Enhacing parameter efficiency of LoRA with weight ty-
+  with 4-bit states. Advances in Neural Information Pro-                ing. ArXiv preprint arXiv:2311.09578, 2023.
+  cessing Systems, 2024.
+                                                                      Shazeer, N. Glu variants improve transformer.          arXiv
+Lialin, V., Muckatira, S., Shivagunde, N., and Rumshisky,               preprint arXiv:2002.05202, 2020.
+  A. ReloRA: High-rank training through low-rank up-
+  dates. In The Twelfth International Conference on                   Shazeer, N. and Stern, M. Adafactor: Adaptive learning
+  Learning Representations, 2024.                                       rates with sublinear memory cost. In Proceedings of
+                                                                        the 35th International Conference on Machine Learn-
+Lin, H., Zhang, H., Ma, Y., He, T., Zhang, Z., Zha, S., and             ing, ICML 2018, Stockholmsmässan, Stockholm, Swe-
+  Li, M. Dynamic mini-batch sgd for elastic distributed                 den, July 10-15, 2018. PMLR, 2018.
+  training: Learning in the limbo of resources. arXiv
+  preprint arXiv:1904.12043, 2019.                                    Sheng, Y., Cao, S., Li, D., Hooper, C., Lee, N., Yang,
+                                                                        S., Chou, C., Zhu, B., Zheng, L., Keutzer, K., Gon-
+Loshchilov, I. and Hutter, F. Decoupled weight decay reg-               zalez, J. E., and Stoica, I. S-LoRA: Serving Thou-
+  ularization. In 7th International Conference on Learn-                sands of Concurrent LoRA Adapters. ArXiv preprint
+  ing Representations, ICLR 2019, New Orleans, LA, USA,                 arXiv:2311.03285, 2023.
+  May 6-9, 2019. OpenReview.net, 2019.
+                                                                      Team, G., Mesnard, T., Hardin, C., Dadashi, R., Bhu-
+Lv, K., Yan, H., Guo, Q., Lv, H., and Qiu, X. AdaLomo:                  patiraju, S., Pathak, S., Sifre, L., Rivière, M., Kale,
+  Low-memory Optimization with Adaptive Learning                        M. S., Love, J., et al. Gemma: Open models based
+  Rate. ArXiv preprint arXiv:2310.10195, 2023a.                         on gemini research and technology. arXiv preprint
+                                                                        arXiv:2403.08295, 2024.
+Lv, K., Yang, Y., Liu, T., Gao, Q., Guo, Q., and Qiu, X. Full
+  Parameter Fine-tuning for Large Language Models with                Tian, Y., Yu, L., Chen, X., and Ganguli, S. Understanding
+  Limited Resources. ArXiv preprint arXiv:2306.09782,                   self-supervised learning with dual deep networks. ArXiv
+  2023b.                                                                preprint arXiv:2010.00578, 2020.
+
+                                                                 11
+                        GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+Tian, Y., Wang, Y., Zhang, Z., Chen, B., and Du, S. S.              Zhang, L., Zhang, L., Shi, S., Chu, X., and Li, B. Lora-fa:
+  JoMA: Demystifying multilayer transformers via joint                Memory-efficient low-rank adaptation for large language
+  dynamics of MLP and attention. In The Twelfth Interna-              models fine-tuning. arXiv preprint arXiv:2308.03303,
+  tional Conference on Learning Representations, 2024.                2023.
+
+Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi,          Zhao, J., Schaefer, F. T., and Anandkumar, A. Zero ini-
+  A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P.,             tialization: Initializing neural networks with only zeros
+  Bhosale, S., et al. Llama 2: Open foundation and fine-              and ones. Transactions on Machine Learning Research,
+  tuned chat models. arXiv preprint arXiv:2307.09288,                 2022.
+  2023.
+                                                                    Zhao, J., Zhang, Y., Chen, B., Schäfer, F., and Anandku-
+Vogels, T., Karimireddy, S. P., and Jaggi, M. Practical low-          mar, A. Inrank: Incremental low-rank learning. arXiv
+  rank communication compression in decentralized deep                preprint arXiv:2306.11250, 2023.
+  learning. Advances in Neural Information Processing
+  Systems, 2020.
+
+Wang, A., Singh, A., Michael, J., Hill, F., Levy, O., and
+ Bowman, S. R. GLUE: A multi-task benchmark and
+ analysis platform for natural language understanding. In
+ 7th International Conference on Learning Representa-
+ tions, ICLR 2019, New Orleans, LA, USA, May 6-9,
+ 2019. OpenReview.net, 2019.
+
+Wang, H., Sievert, S., Liu, S., Charles, Z., Papailiopoulos,
+ D., and Wright, S. Atomo: Communication-efficient
+ learning via atomic sparsification. Advances in neural
+ information processing systems, 31, 2018.
+
+Wang, H., Agarwal, S., Tanaka, Y., Xing, E., Papailiopou-
+ los, D., et al. Cuttlefish: Low-rank model training with-
+ out all the tuning. Proceedings of Machine Learning and
+ Systems, 2023a.
+
+Wang, Y., Lin, Y., Zeng, X., and Zhang, G. MultiLoRA:
+ Democratizing LoRA for Better Multi-Task Learning.
+ ArXiv preprint arXiv:2311.11501, 2023b.
+
+Wortsman, M., Dettmers, T., Zettlemoyer, L., Morcos, A.,
+ Farhadi, A., and Schmidt, L. Stable and low-precision
+ training for large-scale vision-language models. Ad-
+ vances in Neural Information Processing Systems, 2023.
+
+Xia, W., Qin, C., and Hazan, E. Chain of LoRA: Efficient
+  Fine-tuning of Language Models via Residual Learning.
+  ArXiv preprint arXiv:2401.04151, 2024.
+
+Yang, G., Simon, J. B., and Bernstein, J. A spec-
+  tral condition for feature learning. arXiv preprint
+  arXiv:2310.17813, 2023.
+
+Zhai, X., Kolesnikov, A., Houlsby, N., and Beyer, L. Scal-
+  ing Vision Transformers. In 2022 IEEE/CVF Conference
+  on Computer Vision and Pattern Recognition (CVPR).
+  IEEE, 2022.
+
+Zhang, B. and Sennrich, R. Root mean square layer nor-
+  malization. Advances in Neural Information Processing
+  Systems, 32, 2019.
+
+                                                               12
+                         GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+A. Additional Related Works
+Adafactor (Shazeer & Stern, 2018) achieves sub-linear memory cost by factorizing the second-order statistics by a row-
+column outer product. GaLore shares similarities with Adafactor in terms of utilizing low-rank factorization to reduce
+memory cost, but GaLore focuses on the low-rank structure of the gradients, while Adafactor focuses on the low-rank
+structure of the second-order statistics.
+GaLore can reduce the memory cost for both first-order and second-order statistics, and can be combined with Adafactor
+to achieve further memory reduction. In contrast to the previous memory-efficient optimization methods, GaLore operates
+independently as the optimizers directly receive the low-rank gradients without knowing their full-rank counterparts.
+The fused backward operation proposed by LOMO (Lv et al., 2023b) mitigates the memory cost of storing weight gradients
+during training. Integrated with the standard SGD optimizer, LOMO achieves zero optimizer and gradient memory cost
+during training. AdaLOMO (Lv et al., 2023a) enhances this approach by combining the fused backward operation with
+adaptive learning rate for each parameter, similarly achieving minimal optimizer memory cost.
+While LOMO and AdaLOMO represent significant advancements in memory-efficient optimization for fine-tuning or
+continual pre-training, they might not be directly applicable to pre-training from scratch at larger scales. For example, the
+vanilla Adafactor, adopted by AdaLOMO, has been demonstrated to lead to increased training instabilities at larger scales
+(Rae et al., 2021; Chowdhery et al., 2023; Wortsman et al., 2023; Zhai et al., 2022). We believe integrating GaLore with
+the fused backward operation may offer a promising avenue for achieving memory-efficient large-scale pre-training from
+scratch.
+
+B. Proofs
+B.1. Reversibility
+Definition B.1 (Reversiblity (Tian et al., 2020)). A network N that maps input x to output y = N (x) is reversible, if
+there exists L(x; W ) so that y = L(x; W )x, and the backpropagated gradient gx satisfies gx = L⊤ (x; W )gy , where gy
+is the backpropagated gradient at the output y. Here L(x; W ) depends on the input x and weight W in the network N .
+
+Note that many layers are reversible, including linear layer (without bias), reversible activations (e.g., ReLU, leaky ReLU,
+polynomials, etc). Furthermore, they can be combined to construct more complicated architectures:
+Property 1. If N1 and N2 are reversible networks, then (Parallel) y = α1 N1 (x) + α2 N2 (x) is reversible for constants
+α1 and α2 , and (Composition) y = N2 (N1 (x)) is reversible.
+
+From this property, it is clear that ResNet architecture x + N (x) is reversible, if N contains bias-free linear layers and
+reversible activations, which is often the case in practice. For a detailed analysis, please check Appendix A in (Tian et al.,
+2020). For architectures like self-attention, one possibility is to leverage JoMA (Tian et al., 2024) to analyze, and we leave
+for future work.
+The gradient of chained reversible networks has the following structure:
+Theorem 3.2 (Gradient Form of reversible models). Consider a chained reversible neural network N (x) :=
+NL (NL−1 (. . . N1 (x))) and define Jl := Jacobian(NL ) . . . Jacobian(Nl+1 ) and fl := Nl (. . . N1 (x)). Then the weight
+matrix Wl at layer l has gradient Gl in the following form for batch size 1:
+(a) For ℓ2 -objective φ := 12 ∥y − fL ∥22 :
+
+                                              Gl = Jl⊤ y − Jl⊤ Jl Wl fl−1 fl−1
+                                                                          ⊤
+                                                                                                                          (6)
+
+           ⊥          1   ⊤
+      P1 ⊤ := I − K 11 be the zero-mean PSD
+(b) Left
+                                                √
+                                                   projection matrix. For K-way logsoftmax loss φ(y; fL ) :=
+        exp(y fL )
+− log 1⊤ exp(fL ) with small logits ∥P1⊥ fL ∥∞ ≪ K:
+
+                                        Gl = Jl P1⊥ y − γK −1 Jl⊤ P1⊥ Jl Wl fl−1 fl−1
+                                                                                 ⊤
+                                                                                                                          (7)
+
+where γ ≈ 1 and y is a data label with y ⊤ 1 = 1.
+
+                                                             13
+                        GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+Proof. Note that for layered reversible network, we have
+
+                             N (x) = NL (NL−1 (...N1 (x))) = KL (x)KL−1 (x) . . . K1 (x)x                               (16)
+
+Let fl := Nl (Nl−1 (. . . N1 (x))) and Jl := KL (x) . . . Kl+1 (x), and for linear layer l, we can write N (x) = Jl Wl fl−1 .
+Therefore, for the linear layer l with weight matrix Wl , we have:
+
+                    dφ = (y − N (x))⊤ dN (x)                                                                            (17)
+                                       ⊤
+                        = (y − N (x)) KL (x) . . . Kl+1 (x)dWl fl−1 + terms not related to dWl                          (18)
+                                            ⊤
+                        = (y − Jl Wl fl−1 ) Jl dWl fl−1                                                                 (19)
+                        = tr(dWl⊤ Jl⊤ (y − Jl Wl fl−1 )fl−1
+                                                        ⊤
+                                                            )                                                           (20)
+
+This gives the gradient of Wl :
+
+                                           Gl = Jl⊤ yfl−1
+                                                      ⊤
+                                                          − Jl⊤ Jl Wl fl−1 fl−1
+                                                                            ⊤
+                                                                                                                        (21)
+
+
+
+Softmax Case. Note that for softmax objective with small logits, we can also prove a similar structure of backpropagated
+gradient, and thus Theorem 3.2 can also apply.
+                                                                                                     ⊤
+                                                                                                         
+Lemma B.2 (Gradient structure of softmax loss). For K-way logsoftmax loss φ(y; f ) := − log 1exp(y     f)        ˆ    ⊥
+                                                                                                 ⊤ exp(f ) , let f = P1 f
+
+be the zero-mean version of network output f , where P1⊥ := I − K
+                                                                1
+                                                                  11⊤ , then we have:
+
+                                       −dφ = y ⊤ dfˆ − γ fˆ⊤ dfˆ/K + O(fˆ2 /K)dfˆ                                       (22)
+
+where γ(y, f ) ≈ 1 and y is a data label with y ⊤ 1 = 1.
+
+Proof. Let fˆ := P1⊥ f be the zero-mean version of network output f . Then we have 1⊤ fˆ = 0 and f = fˆ+ c1. Therefore,
+we have:
+                                                              !
+                                           exp(c) exp(y ⊤ fˆ)
+                               −φ = log                         = y ⊤ fˆ − log(1⊤ exp(fˆ))                         (23)
+                                           exp(c)1⊤ exp(fˆ)
+                                                  2
+Using the Taylor expansion exp(x) = 1 + x + x2 + o(x2 ), we have:
+
+                                                1
+                       1⊤ exp(fˆ) = 1⊤ (1 + fˆ + fˆ2 ) + o(fˆ2 ) = K(1 + fˆ⊤ fˆ/2K + o(fˆ2 /K))                         (24)
+                                                2
+So
+
+                                  −φ = y ⊤ fˆ − log(1 + fˆ⊤ fˆ/2K + o(fˆ2 /K)) − log K                                  (25)
+
+Therefore
+                                                                                 !
+                                                     γ                     fˆ2
+                                        −dφ = y dfˆ − fˆ⊤ dfˆ + O
+                                                  ⊤
+                                                                                     dfˆ                                (26)
+                                                     K                     K
+
+where γ := (1 + fˆ⊤ fˆ/2K + o(fˆ2 /K))−1 ≈ 1.
+
+Remarks. With this lemma, it is clear that for a reversible network f := N (x) = Jl (x)Wl fl−1 (x), the gradient Gl of
+Wl has the following form:
+
+                                     Gl = Jl P1⊥ yfl−1 − γJl⊤ P1⊥ Jl Wl fl−1 fl−1
+                                                                              ⊤
+                                                                                  /K                                    (27)
+                                          |     {z   } | {z }           |    {z     }
+                                                 A              B                C
+
+                                                             14
+                         GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+B.2. Gradient becomes low-rank
+Lemma B.3 (Gradient becomes low-rank during training). Suppose the gradient follows the parametric form:
+
+                                                                     N
+                                                        1 X
+                                                   Gt =       (Ai − Bi Wt Ci )                                       (8)
+                                                        N i=1
+
+with constant Ai , PSD matrices Bi and Ci after t ≥ t0 . We study vanilla SGD weight update: Wt = Wt−1 + ηGt−1 . Let
+        PN
+S := N1 i=1 Ci ⊗ Bi and λ1 < λ2 its two smallest distinct eigenvalues. Then the stable rank sr(Gt ) satisfies:
+                                                                                  2(t−t0 )                ∥
+                                                                                              ∥G0 −Gt0 ∥2F
+                                                                 
+                                                  ∥                  1−ηλ2
+                                    sr(Gt ) ≤ sr(Gt0 )+                                                ∥
+                                                                                                                     (9)
+                                                                     1−ηλ1                          ∥Gt0 ∥22
+
+         ∥
+where Gt0 is the projection of Gt0 onto the minimal eigenspace V1 of S corresponding to λ1 .
+
+Proof. We have
+                       N                        N                                        N
+                    1 X                      1 X                                      η X
+             Gt =         (Ai − Bi Wt Ci ) =       Ai − Bi (Wt−1 + ηGt−1 )Ci = Gt−1 −       Bi Gt−1 Ci             (28)
+                    N i=1                    N i=1                                    N i=1
+
+           PN
+Let S := N1 i=1 Ci ⊗ Bi , and gt := vec(Gt ) ∈ Rmn be a vectorized version of the gradient Gt ∈ Rm×n . Using
+vec(BW C) = (C ⊤ ⊗ B)vec(W ), we have:
+
+                                                             gt = (I − ηS)gt−1                                     (29)
+
+Now let’s bound the stable rank of Gt :
+
+                                                                                      ∥Gt ∥2F
+                                                        stable-rank(Gt ) :=                                        (30)
+                                                                                      ∥Gt ∥22
+
+Now λ1 < λ2 are the smallest two distinct eigenvectors of S. The smallest eigenvalue λ1 has multiplicity κ1 . We can
+                                           ∥                ∥
+decompose g0 into two components, g0 = g0 + g0⊥ , in which g0 lies in the κ1 -dimensional eigenspace V1 that corresponds
+to the minimal eigenvalue λ1 , and g0⊥ is its residue. Then V1 ⊂ Rmn and its orthogonal complements are invariant
+subspaces under S and thus:
+                                                                                                ∥
+                        ∥Gt ∥2F = ∥gt ∥22 = ∥(I − ηS)t g0 ∥22 = ∥(I − ηS)t g0 ∥22 + ∥(I − ηS)t g0⊥ ∥22             (31)
+                                                                                 ∥
+                                 ≤ (1 − ηλ2 )     2t
+                                                       ∥g0⊥ ∥22 + (1 − ηλ1 )2t ∥g0 ∥22                             (32)
+
+                                              ∥
+On the other hand, by our assumption, G0 is rank L and thus has SVD decomposition:
+
+                                                                         L
+                                                                 ∥
+                                                                         X
+                                                                G0 =            cl zl yl⊤                          (33)
+                                                                         l=1
+
+
+with orthonormal unit vectors {zl }L            L                            L
+                                   l=1 and {yl }l=1 and singular values {cl }l=1 1. This means that
+
+                                                                     L                          L
+                                          ∥                 ∥
+                                                                     X                          X
+                                        g0 = vec(G0 ) =                    cl (yl ⊗ zl ) =:            cl vl       (34)
+                                                                     l=1                        l=1
+
+with unit vector vl := yl ⊗ zl ∈ V1 . It is clear that
+
+                               vl⊤ vl′ = (yl⊤ ⊗ zl⊤ )(yl′ ⊗ zl′ ) = (yl⊤ yl′ )(zl⊤ zl′ ) = I(l = l′ )              (35)
+
+                                                                           15
+                        GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+Therefore, by the definition of spectral norm (or matrix 2-norm), we know it corresponds to the largest singular value,
+which means:
+                                                                           ′
+                                       ∥Gt ∥2 =          max              z ⊤ Gt y ′                                                           (36)
+                                                  ∥y ′ ∥2 =1,∥z ′ ∥2 =1
+
+                                             ≥ max zl⊤ Gt yl = max(yl ⊗ zl )⊤ gt                                                               (37)
+                                                    l                          l
+                                             = max vl⊤ (1 − ηS)t g0 = (1 − ηλ1 )t max vl⊤ g0                                                   (38)
+                                                    l                                                   l
+
+Note that the last equation is because any v ∈ V1 is an eigenvector of S with eigenvalue of λ1 .
+                           ∥                              ∥                ∥               ∥
+Since vl⊤ g0 = vl⊤ (g0⊥ + g0 ) = cl , maxl cl = ∥G0 ∥2 and ∥g0 ∥22 = ∥G0 ∥2F , we have:
+                                                                                                                2t
+                                             ∥Gt ∥2F                                                                  ∥G⊥  2
+                                                                                                
+                                                                    ∥                               1 − ηλ2             0 ∥F
+                         stable-rank(Gt ) :=         ≤ stable-rank(G0 ) +                                                                      (39)
+                                             ∥Gt ∥22                                                1 − ηλ1              ∥
+                                                                                                                      ∥G0 ∥22
+
+
+                                                                                    PN
+Corollary B.4 (Low-rank Gt ). If the gradient takes the parametric form Gt = N1 i=1 (ai − Bi Wt fi )fi⊤ with all Bi
+                                                ∥
+full-rank, and N ′ := rank({fi }) < n, then sr(Gt0 ) ≤ n − N ′ and thus sr(Gt ) ≤ n/2 for large t.
+
+
+Proof. Let Ci = fi fi⊤ ∈ Rn×n . Since N ′ := rank({fi }N                       n                                N
+                                                         i=1 ) < n and fi ∈ R , the collections of vectors {fi }i=1 cannot
+                                         ′
+                                    n−N
+span the entire space Rn . Let {uj }j=1 be the orthonormal bases for the null space of {fi }N                  m
+                                                                                                i=1 , and {ek }k=1 be any
+                       m
+orthonormal bases for R . Then the product bases {uj ⊗ ek } form a set of bases for the minimal eigenspace V1 of S with
+the minimal eigenvalue of 0. Since Bi are full-rank, no extra dimensions exist for V1 .
+Therefore, when we project Gt0 onto V1 , we have:
+
+                                               n−N ′
+                                                     m                             n−N ′
+                                                                                                m
+                                                                                                                !⊤
+                                        ∥
+                                                X X                                 X           X
+                                       Gt0 =                  cjk uj e⊤
+                                                                      k =                  uj         cjk ek                                   (40)
+                                                  j=1 k=1                          j=1          k=1
+
+              ∥                ∥
+and thus sr(Gt0 ) ≤ rank(Gt0 ) ≤ n − N ′ , since stable rank is a lower-bound of the rank.
+                                                                                                                                PN ′
+On the other hand, Gt can be written as a summation of N ′ rank-1 matrices, by representing each fi =                                      ′
+                                                                                                                                  j=1 bij fj as a
+                              ′
+linear combination of {fj′ }N
+                            j=1 :
+
+                                               ′          ⊤
+                                                                   N′
+                          N                      N
+                                                                      "N                      #
+                       1 X                     X
+                                                         ′     1 X X                           ′
+                  Gt =       (ai − Bi Wt fi )      bij fj    =           bij (ai − Bi Wt fi ) fj ⊤                                            (41)
+                       N i=1                    j=1
+                                                                N j=1 i=1
+
+and thus has rank at most N ′ . Therefore, when t is sufficiently large so that the second term in Eqn. 39 is negligible, by
+Lemma 3.3, we have (notice that N ′ < n):
+
+                                                  sr(Gt ) ≤ min(n − N ′ , N ′ ) ≤ n/2                                                          (42)
+
+
+
+Corollary B.5 (Low-rank Gt with special structure of V1 ). If V1 (S) is 1-dimensional with decomposable eigenvector
+                    ∥
+v = y ⊗ z, then sr(Gt0 ) = 1 and thus Gt becomes rank-1.
+
+                                   ∥                                                                        ∥                              ∥
+Proof. In this case, we have g0 = vv ⊤ g0 ∝ v. Since v = y ⊗ z, the resulting G0 is a rank-1 matrix and thus sr(Gt0 ) =
+1.
+
+                                                                           16
+                        GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+B.3. Gradient Low-rank property for Transformers
+Note that Transformers do not belong to the family of reversible networks. However, we can still show that the gradient of
+the lower layer (i.e., project-up) weight W ∈ Rm×n of feed forward network (FFN) becomes low rank over time, using the
+JoMA framework (Tian et al., 2024). Here m is the embedding dimension, and n is the number of hidden nodes in FFNs.
+Lemma B.6 (Gradient of Project-up in Transformer FFNs). Suppose the embedding matrix U ∈ Rm×M is fixed and
+column-orthonormal (M is vocabulary size), the activation functions are linear and the backpropagated gradient are
+stationary (Tian et al., 2024), then the training dynamics of transformed project-up matrix V := U ⊤ W ∈ RM ×n satisfies
+the following:
+                                                                       
+                                                   1              V ◦V
+                                             V̇ = diag exp                1 ∆                                      (43)
+                                                   A                 2
+
+where A is the normalization factor of softmax, ◦ is the Hadamard (element-wise) product and ∆ is defined in the proof.
+As a result, the gradient of V is “exponentially more low-rank” than V itself.
+
+Proof. Let ∆ := [∆1 , . . . , ∆n ] ∈ RM ×n , where ∆j := Eq [gj x] ∈ RM . Here gj is the backpropagated gradient of hidden
+node j in FFN layer, Eq [·] is the conditional expectation given the query is token q, and x is the representation of token
+distribution in the previous layer of Transformer. Specifically, for intermediate layer, x represents the activation output of
+the previous project-up layer; for the first layer, x represents the frequency count of the input tokens. Then following the
+derivation of Theorem 2 (Tian et al., 2024), we have for each hidden node j and its weight wj , the transformed weight
+vj := U ⊤ wj satisfies the following dynamics:
+
+                                                          1
+                                                  v̇j =     ∆j ◦ exp(vj2 /2)                                             (44)
+                                                          A
+
+where vj2 := vj ◦ vj is the element-wise square of a vector and ◦ is the Hadamard (element-wise) product. Since V :=
+[v1 , . . . , vn ], Eqn. 43 follows.
+Note that the dynamics of vj shows that the direction of vj will change over time (because of exp(vj2 /2)), and it is not
+clear how such dynamics leads to low-rank V and even more low-rank V̇ . For this, we per-row decompose the matrix V :
+                                                           ⊤ 
+                                                            u1
+                                                           u⊤2 
+                                                                  
+                                                    V :=  ...                                                     (45)
+                                                            u⊤M
+
+where ul ∈ Rn . We can also do the same for ∆:
+
+                                                              µ⊤
+                                                                 
+                                                               1
+                                                             µ⊤
+                                                               2
+                                                                  
+                                                       ∆ :=      
+                                                             ...                                                       (46)
+                                                              µ⊤
+                                                               M
+
+where µl ∈ Rn . Then Eqn. 43 can be decomposed along each row:
+
+                                                              1 u2l
+                                                      u̇l =     (e · 1)µl                                                (47)
+                                                              A
+Then it is clear that ul is always along the direction of µl , which is a fixed quality since the backpropagated gradient gj
+and input x are assumed to be stationary (and thus ∆j := Eq [gj x] is a constant).
+Therefore, let ul (t) = αl (t)µl with initial condition of the magnitude αl (0) = 0, and we have:
+                                                                      n
+                                                     1 α2l µ2l     1 X α2l µ2lj
+                                             α̇l =     e       ·1=       e                                               (48)
+                                                     A             A j=1
+
+
+                                                                17
+                            GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+where 1 ≤ l ≤ M is the token index. In the following we will show that for different l, the growth of αl can be very
+different. This leads to very different row norms of V and V̇ over time, leading to their low-rank structures. Note that
+Eqn. 48 does not have a close form solution, instead we could estimate its growth:
+                                                           1 α2l µ̄2l        n 2 2
+                                                             e        ≤ α̇l ≤ eαl µ̄l                                            (49)
+                                                           A                 A
+where µ̄2l := maxj µ2lj .
+                                                                                                     R x −t2
+Note that both sides have analytic solutions using Gaussian error functions erf(x) = √2π              0
+                                                                                                        e dt ∈ [−1, 1]. Specifically,
+                                       2   2
+for dynamic system like ẋ = Ceβ x , we have
+                                                                    2   2
+                                                              e−β x dx = Cdt                                                     (50)
+
+which gives:
+                                               √                            Z x(t)
+                                                π                                       2 2
+                                                  erf (βx(t)) =                      e−β y dy = Ct                               (51)
+                                               2β                            0
+
+or
+                                                                                          
+                                                                    1 −1             2βC
+                                                           x(t) =     erf            √ t                                         (52)
+                                                                    β                  π
+
+                               2   2               2   2
+For inequality like ẋ ≥ Ceβ x or ẋ ≤ Ceβ x , similar equation can be derived. Plug that in, we have:
+                                                                                
+                                    1            2µ̄l              1         2nµ̄l
+                                       erf −1     √ t ≤ αl (t) ≤ erf −1        √ t                                               (53)
+                                   µ̄l          A π               µ̄l        A π
+
+Let
+                                                                                           
+                                                                    1 −1               2 a
+                                                       h(t; a) :=     erf             √    t                                     (54)
+                                                                    a                   πA
+
+then limt→A√π/2a h(t; a) = +∞, and h(t; µ̄l ) ≤ αl (t) ≤ nh(t; nµ̄l ).
+                                                                                                                                 √
+Let l∗ = arg maxl µ̄∗l be the row with the largest entry of µ, then if µ̄∗l > nµ̄l for all l ̸= l∗ , then when t → t∗ := A2µ̄∗π ,
+                                                                                                                            √     l
+
+the magnitude αl∗ (t) ≥ h(t; µ̄l∗ ) → +∞, while αl (t) ≤ nh(t; nµ̄l ) still stay finite, since its critical time t′ := A  π     ∗
+                                                                                                                       2nµ̄l > t .
+Since αl (t) controls the magnitude of each row of V , This means that V eventually becomes rank-1 and so does W .
+Finally, V̇ is even more low rank than V , since α̇l has αl in its exponents.
+
+B.4. Convergence of GaLore
+Theorem 3.8 (Convergence of GaLore with fixed projections). Suppose the gradient has the form of Eqn. 8 and Ai , Bi
+                                                                                        ⊤              ⊤
+         ⊤                      1
+                                  P with respect to W and ∥Wt ∥ ≤ D. Let Rt := Pt Gt Qt , B̂it := Pt Bi (Wt )Pt ,
+and Ci have LA , LB and LC continuity
+Ĉit := Qt Ci (Wt )Qt and κt := N i λmin (B̂it )λmin (Ĉit ). If we choose constant Pt = P and Qt = Q, then GaLore
+with ρt ≡ 1 satisfies:
+
+                                ∥Rt ∥F ≤ 1−η(κt−1 −LA −LB LC D2 ) ∥Rt−1 ∥F
+                                                                         
+                                                                                                               (11)
+
+As a result, if mint κt > LA + LB LC D2 , Rt → 0 and thus GaLore converges with fixed Pt and Qt .
+
+Proof. Using vec(AXB) = (B ⊤ ⊗ A)vec(X) where ⊗ is the Kronecker product, the gradient assumption can be written
+as the following:
+
+                                                               gt = at − St wt                                                   (55)
+
+                                                                            18
+                        GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+        := vec(Gt ) ∈ Rmn , wt := vec(Wt ) ∈ Rmn be the vectorized versions of Gt and Wt , at := N1
+                                                                                                            P
+where gtP                                                                                                      i vec(Ait ) and
+      1
+St = N i Cit ⊗ Bit are mn-by-mn PSD matrix.
+Using the same notation, it is clear to show that:
+
+                           (Q ⊗ P )⊤ gt = (Q⊤ ⊗ P ⊤ )vec(Gt ) = vec(P ⊤ Gt Q) = vec(Rt ) =: rt                           (56)
+                                                     ⊤        ⊤
+                         g̃t := vec(G̃t ) = vec(P P Gt QQ ) = (Q ⊗ P )vec(Rt ) = (Q ⊗ P )rt                              (57)
+
+Then we derive the recursive update rule for gt :
+
+                                   gt = at − St wt                                                                       (58)
+                                      = (at − at−1 ) + (St−1 − St )wt + at−1 − St−1 wt                                   (59)
+                                      = et + at−1 − St−1 (wt−1 + ηg̃t−1 )                                                (60)
+                                      = et + gt−1 − ηSt−1 g̃t−1                                                          (61)
+
+where et := (at − at−1 ) + (St−1 − St )wt . Left multiplying by (Q ⊗ P )⊤ , we have:
+
+                               rt = (Q ⊗ P )⊤ et + rt−1 − η(Q ⊗ P )⊤ St−1 (Q ⊗ P )rt−1                                   (62)
+
+Let
+                                          1 X                                  1 X ⊤
+      Ŝt := (Q ⊗ P )⊤ St (Q ⊗ P ) =          (Q ⊗ P )⊤ (Cit ⊗ Bit )(Q ⊗ P ) =     (Q Cit Q) ⊗ (P ⊤ Bit P )              (63)
+                                          N i                                  N i
+
+Then we have:
+
+                                             rt = (I − η Ŝt−1 )rt−1 + (Q ⊗ P )⊤ et                                      (64)
+
+Now we bound the norm. Note that since P and Q are projection matrices with P ⊤ P = I and Q⊤ Q = I, we have:
+
+                              ∥(Q ⊗ P )⊤ et ∥2 = ∥vec(P ⊤ Et Q)∥2 = ∥P ⊤ Et Q∥F ≤ ∥Et ∥F                                 (65)
+
+where Et := N1                         1
+                 P                          P
+                   i (Ait − Ai,t−1 ) + N      i (Bi,t−1 Wt Ci,t−1 − Bit Wt Cit ). So we only need to bound ∥Et ∥F . Note that:
+
+                           ∥At − At−1 ∥F ≤ LA ∥Wt − Wt−1 ∥F = ηLA ∥G̃t−1 ∥F ≤ ηLA ∥Rt−1 ∥F                               (66)
+                                                                                                    2
+                 ∥(Bt − Bt−1 )Wt Ct−1 ∥F ≤ LB ∥Wt − Wt−1 ∥F ∥Wt ∥F ∥Ct−1 ∥F = ηLB LC D ∥Rt−1 ∥F                          (67)
+                                                                                                2
+                   ∥Bt Wt (Ct−1 − Ct )∥F ≤ LC ∥Bt ∥F ∥Wt ∥F ∥Wt−1 − Wt ∥F = ηLB LC D ∥Rt−1 ∥F                            (68)
+
+
+Now we estimate the minimal eigenvalue of Ŝt−1 . Let λit := λmin (P ⊤ Bit P ) and ν it := λmin (Q⊤ Cit Q), then
+λmin ((P ⊤ Bit P ) ⊗ (Q⊤ Cit Q)) = λit ν it and for any unit vector v:
+                                          1 X ⊤ ⊤                          1 X
+                            v ⊤ Ŝt v =       v (P Bit P ) ⊗ (Q⊤ Cit Q) v ≥
+                                                                       
+                                                                                λ ν                                      (69)
+                                          N i                               N i it it
+
+And thus λmin (Ŝt ) ≥ N1 i λit ν it . Therefore, λmax (I − η Ŝt−1 ) ≤ 1 − Nη
+                           P                                                   P
+                                                                                i λi,t−1 ν i,t−1 . Therefore, let κt :=
+1
+  P
+N     λ ν
+    i it it and  using the fact that ∥rt ∥2 =  ∥R t ∥F , we have:
+
+                                  ∥Rt ∥F ≤ 1 − η(κt−1 − LA − 2LB LC D2 ) ∥Rt−1 ∥F
+                                                                          
+                                                                                                                    (70)
+
+and the conclusion follows.
+
+
+
+
+                                                              19
+                        GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+C. Details of Pre-Training Experiment
+C.1. Architecture and Hyperparameters
+We introduce details of the LLaMA architecture and hyperparameters used for pre-training. Table 5 shows the most
+hyperparameters of LLaMA models across model sizes. We use a max sequence length of 256 for all models, with a batch
+size of 131K tokens. For all experiments, we adopt learning rate warmup for the first 10% of the training steps, and use
+cosine annealing for the learning rate schedule, decaying to 10% of the initial learning rate.
+
+            Table 5: Hyperparameters of LLaMA models for evaluation. Data amount are specified in tokens.
+
+
+                       Params     Hidden    Intermediate    Heads     Layers      Steps    Data amount
+                         60M        512          1376          8         8         10K         1.3 B
+                        130M        768          2048         12        12         20K         2.6 B
+                        350M       1024          2736         16        24         60K         7.8 B
+                         1B        2048         5461          24        32        100K        13.1 B
+                         7B        4096         11008         32        32        150K        19.7 B
+
+For all methods on each size of models (from 60M to 1B), we tune their favorite learning rate from a set of
+{0.01, 0.005, 0.001, 0.0005, 0.0001}, and the best learning rate is chosen based on the validation perplexity. We find
+GaLore is insensitive to hyperparameters and tends to be stable with the same learning rate across different model sizes.
+For all models, GaLore use the same hyperparameters, including the learning rate of 0.01, scale factor α of 0.25, and the
+subspace change frequency of T of 200. We note that since α can be viewed as a fractional learning rate, most of the
+modules (e.g., multi-head attention and feed-forward layers) in LLaMA models have the actual learning rate of 0.0025.
+This is, still, a relatively large stable learning rate compared to the full-rank baseline, which usually uses a learning rate
+≤ 0.001 to avoid spikes in the training loss.
+
+C.2. Memory Estimates
+As the GPU memory usage for a specific component is hard to measure directly, we estimate the memory usage of the
+weight parameters and optimizer states for each method on different model sizes. The estimation is based on the number
+of original parameters and the number of low-rank parameters, trained by BF16 format. For example, for a 60M model,
+LoRA (r = 128) requires 42.7M parameters on low-rank adaptors and 60M parameters on the original weights, resulting
+in a memory cost of 0.20G for weight parameters and 0.17G for optimizer states. Table 6 shows the memory estimates for
+weight parameters and optimizer states for different methods on different model sizes, as a compliment to the total memory
+reported in the main text.
+
+                          Table 6: Memory estimates for weight parameters and optimizer states.
+
+           (a) Memory estimate of weight parameters.                         (b) Memory estimate of optimizer states.
+
+                     60M       130M     350M       1B                                 60M       130M      350M          1B
+       Full-Rank     0.12G     0.25G    0.68G    2.60G                Full-Rank       0.23G     0.51G     1.37G     5.20G
+       GaLore        0.12G     0.25G    0.68G    2.60G                GaLore          0.13G     0.28G     0.54G     1.78G
+       Low-Rank      0.08G     0.18G    0.36G    1.19G                Low-Rank        0.17G     0.37G     0.72G     2.38G
+       LoRA          0.20G     0.44G    1.04G    3.79G                LoRA            0.17G     0.37G     0.72G     2.38G
+       ReLoRA        0.20G     0.44G    1.04G    3.79G                ReLoRA          0.17G     0.37G     0.72G     2.38G
+
+
+
+
+                                                             20
+                                      GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+C.3. Training Progression
+We show the training progression of 130M, 350M, 1B and 7B models in Figure 6. Compared to LoRA, GaLore closely
+matches the training trajectory of the full-rank baseline, and it even converges slightly faster at the beginning of the training.
+
+                                                  LLaMA-130M                                                    LLaMA-350M
+                          50                                                                    40
+                                                                       Baseline                                                        Baseline
+                          45                                           LoRA                     35                                     LoRA
+                          40                                           GaLore                                                          GaLore
+             Perplexity
+
+
+
+
+                                                                                   Perplexity
+                                                                                                30
+                          35
+                                                                                                25
+                          30
+                          25                                                                    20
+
+                          20                                                                    15
+                                         0.5        1.0        1.5        2.0                        0   2            4            6              8
+                                               Token Seen (Billions)                                         Token Seen (Billions)
+                                                   LLaMA-1B                                                      LLaMA-7B
+                          30
+                                                                       Baseline                 24                              8-bit AdamW
+                                                                       LoRA                     22                              8-bit GaLore
+                          25                                           GaLore
+             Perplexity
+
+
+
+
+                                                                                   Perplexity
+                                                                                                20
+                          20                                                                    18
+                                                                                                16
+                          15                                                                    14
+                               0.0       2.5      5.0     7.5      10.0    12.5                      0   5         10          15             20
+                                               Token Seen (Billions)                                      Token Seen (Billions)
+
+                                     Figure 6: Training progression for pre-training LLaMA models on C4 dataset.
+
+
+
+
+                                                                                  21
+                       GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+D. Fine-Tuning Experiments
+D.1. Details of Fine-Tuning on GLUE
+We fine-tune the pre-trained RoBERTa-Base model on the GLUE benchmark using the model provided by the Hugging
+Face1 . We trained the model for 30 epochs with a batch size of 16 for all tasks except for CoLA, which uses a batch size
+of 32. We tune the learning rate and scale factor for GaLore. Table 7 shows the hyperparameters used for fine-tuning
+RoBERTa-Base for GaLore.
+
+                          Table 7: Hyperparameters of fine-tuning RoBERTa base for GaLore.
+
+                                 MNLI      SST-2    MRPC           CoLA    QNLI    QQP     RTE     STS-B
+                 Batch Size       16        16         16           32      16      16      16      16
+                  # Epochs        30        30         30            30     30      30      30      30
+                Learning Rate    1E-05     1E-05      3E-05        3E-05   1E-05   1E-05   1E-05   1E-05
+                Rank Config.                                       r=4
+                  GaLore α                                           4
+                Max Seq. Len.                                       512
+
+                                 MNLI      SST-2    MRPC           CoLA    QNLI    QQP     RTE     STS-B
+                 Batch Size       16        16         16           32      16      16      16      16
+                  # Epochs        30        30         30            30     30      30      30      30
+                Learning Rate    1E-05     2E-05      2E-05        1E-05   1E-05   2E-05   2E-05   3E-05
+                Rank Config.                                       r=8
+                  GaLore α                                           2
+                Max Seq. Len.                                       512
+
+
+D.2. Fine-Tuning on SQuAD dataset
+We evaluate GaLore on the SQuAD dataset (Rajpurkar et al., 2016) using the pre-trained BERT-Base model. We use rank
+16 for both GaLore and LoRA. GaLore outperforms LoRA in both Exact Match and F1 scores.
+
+              Table 8: Evaluating GaLore on SQuAD dataset. Both Exact Match and F1 scores are reported.
+
+                                                        Exact Match         F1
+                                           Baseline           80.83        88.41
+                                           GaLore             80.52        88.29
+                                            LoRA              77.99        86.11
+
+
+D.3. Fine-Tuning on OpenAssistant Conversations Dataset
+We apply GaLore on fine-tuning experiments on the OpenAssistant Conversations dataset (Köpf et al., 2024), using the
+pre-trained models, including Gemma-2b, Phi-2, and LLaMA-7B (Touvron et al., 2023; Team et al., 2024). We use rank
+of 128 for both GaLore and LoRA. The results are shown in Table 9.
+
+D.4. Fine-Tuning on Belle-1M Dataset
+We also apply GaLore on fine-tuning experiments on the Belle-1M dataset (BELLEGroup, 2023), using the pre-trained
+models, including Gemma-2b, Phi-2, and LLaMA-7B. We use rank of 128 for both GaLore and LoRA. The results are
+shown in Table 10.
+
+   1
+       https://huggingface.co/transformers/model_doc/roberta.html
+
+                                                              22
+                      GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection
+
+          Table 9: Evaluating GaLore on OpenAssistant Conversations dataset. Testing perplexity is reported.
+
+                                                Gemma-2b       Phi-2   LLaMA-7B
+                                   Baseline       4.53         3.81       2.98
+                                   GaLore         4.51         3.83       2.95
+                                    LoRA          4.56         4.24       2.94
+                   Table 10: Evaluating GaLore on Belle-1M dataset. Testing perplexity is reported.
+
+                                                Gemma-2b       Phi-2   LLaMA-7B
+                                   Baseline       5.44         2.66       2.27
+                                   GaLore         5.35         2.62       2.28
+                                    LoRA          5.37         2.75       2.30
+
+E. Additional Memory Measurements
+We empirically measure the memory usage of different methods for pre-training LLaMA 1B model on C4 dataset with a
+token batch size of 256, as shown in Table 11.
+
+                         Table 11: Measuring memory and throughput on LLaMA 1B model.
+
+                                                                                             Throughput
+     Model Size    Layer Wise      Methods       Token Batch Size      Memory Cost
+                                                                                      #Tokens / s #Samples / s
+                                   AdamW                 256              13.60        1256.98        6.33
+                                  Adafactor              256              13.15         581.02        2.92
+         1B             ✘
+                                  Adam8bit               256               9.54        1569.89        7.90
+                                 8-bit GaLore            256               7.95        1109.38        5.59
+                                   AdamW                 256               9.63         1354.37         6.81
+                                  Adafactor              256              10.32          613.90         3.09
+         1B             ✔         Adam8bit               256               6.93         1205.31         6.07
+                                 8-bit GaLore            256               5.63         1019.63         5.13
+
+
+
+
+                                                          23
+

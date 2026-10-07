@@ -1,0 +1,1063 @@
+                                                 XFP: Quality-Targeted Adaptive Codebook
+                                                                Quantization
+                                              with Sparse Outlier Separation for LLM Inference
+
+                                                                                       Thomas Witt
+                                                                                  Gemini Stiftung Leipzig
+arXiv:2605.14844v1 [cs.LG] 14 May 2026
+
+
+
+
+                                                                                   witt@gemini-stiftung.de
+
+                                                              Code & Data: https://github.com/flash7777/vllm/tree/multiquant
+
+
+
+                                                                                          Abstract
+                                         We introduce XFP, a dynamic weight quantizer for LLM inference that inverts the conventional quantization
+                                         workflow: the operator specifies reconstruction quality floors on per-channel cosine similarity (one strict
+                                         floor for attention and shared experts, one lazy floor for routed-expert MoE); XFP determines codebook
+                                         size, outlier budget, and packing per layer automatically—no Hessian, no calibration data, no manual
+                                         bit-width selection.
+                                         Each weight matrix is decomposed into a sparse fp16 outlier residual and a dense sub-byte index tensor
+                                         into a per-group learned codebook (group size 128, configurable). The same auto-select frontend, the same
+                                         outlier path, and the same fused decode kernel serve two codebook storage modes: V2 (per-channel Lloyd
+                                         codebook) and V2a (shared library of L = 32 codebooks per layer, indexed per group). V2 is the headline
+                                         configuration; V2a is an alternative trading codebook precision for ∼1 KB constant per-CTA SMEM, useful
+                                         where the activation-cache budget is tight.
+                                         Three contributions: (C1) The XFP quantizer with quality-targeted two-threshold auto-select, converging
+                                         to ∼3.97 effective bits on Qwen3.5-122B-A10B and to ∼3.4 on Qwen3.5-397B-A17B under the H-Process
+                                         (§6.3). (C2) Two codebook storage modes sharing one auto-select frontend and one fused decode kernel,
+                                         covering 30B–397B on workstation-class GPUs without NVFP4 Tensor Cores. (C3) The H-Process: a
+                                         quality-driven iteration over the two cosine thresholds that fits a 397B MoE into 2×96 GB at single-stream
+                                         throughput exceeding INT4 with routed-expert pruning, without removing experts.
+                                         On Qwen3.5-122B-A10B under V2, XFP achieves 138 tok/s single-stream decode on workstation hardware
+                                         (RTX PRO 6000 Blackwell, TP=2) at 94.49% GSM8K strict-match (3 seeds, n = 3,957), and is 49%
+                                         faster than Marlin INT4 at TP=1. On Qwen3.5-397B-A17B under the H-Process at H1.5 (τstrict = 0.96,
+                                         τlazy = 0.93, ∼3.4 effective bits), the same engine delivers 100.9 tok/s long-output decode at 66.72% GSM8K
+                                         strict-match on the full 1,319-problem set (single seed at submission; multi-seed evaluation in progress).
+
+
+                                         1    Introduction                                            nations of both. The result was consistent: below
+                                                                                                      a certain compression threshold, output quality col-
+                                         It was still snowing in Leipzig when we first tried to       lapses. The question that drove this work was not
+                                         serve Qwen3.5-397B-A17B—a 397-billion-parameter              how to quantize—GPTQ, AWQ, and others have
+                                         Mixture-of-Experts model—on two freshly delivered            solved that—but why the quality loss at 4 bits is as
+                                         RTX PRO 6000 Blackwell GPUs with 96 GB each.                 large as it is.
+                                         The uncompressed weights exceed 700 GB. At INT4
+                                         the model fits, but barely: KV cache is starved,                Today’s quantization landscape offers two
+                                         context length is capped, and the quality loss from          paradigms: linear quantization (the INT-N fam-
+                                         uniform 4-bit quantization is substantial. We tried          ily), which maps weights to a uniform grid scaled
+                                         aggressive quantization, expert pruning, and combi-          by a single factor, and logarithmic quantization
+
+
+                                                                                                  1
+(NVFP4 and related formats), which uses a fixed              tral region. At N = 2, outlier-driven scaling leaves
+non-uniform codebook whose entries follow a                  effectively one usable non-zero level for the bulk.
+floating-point-like spacing. Both add per-group or
+per-block scaling to absorb magnitude variation.
+                                                             P2—The MoE Heterogeneity Problem. In
+Both apply the same grid—linear or logarithmic—to
+                                                             Mixture-of-Experts (MoE) models, individual ex-
+every layer, every expert, every projection matrix in
+                                                             perts and component classes exhibit distinct weight
+the model. Weights, activations, KV cache: every-
+                                                             distributions. Routed experts are empirically more
+thing is forced through the same representational
+                                                             tolerant of coarse quantization than attention or
+template.
+                                                             shared experts; a single global quality floor cannot
+   Once this uniformity is acknowledged, the qual-           exploit this asymmetry.
+ity loss is unsurprising. A weight distribution with
+catastrophic outliers at 49σ (as we observed in GLM-
+4.7-Flash attention) and a weight distribution with a        P3—The Codebook-Storage Problem. A per-
+tight Gaussian bulk (as in the same model’s routed           channel learned codebook occupies kernel shared
+experts) receive the same codebook. The outlier-             memory in proportion to the output dimension; on
+dominated layer wastes most of its representational          workstation-class GPUs with 99 KB SMEM/CTA
+budget on a range that contains 0.3% of its weights;         this caps the activation-row cache and forces an early
+the well-behaved layer is over-provisioned with en-          split-K, limiting the reachable model size at single-
+tries it does not need.                                      stream decode.
+   We then looked at NVIDIA’s NVFP4—announced
+with considerable fanfare as a “4-bit floating-point”        1.1    Design Principle: Quality as Con-
+format with dedicated Tensor Core support on
+                                                                    straint
+Blackwell. Upon inspection, the mechanism is
+straightforward: a fixed 16-entry codebook lookup.           Existing quantization formats require the operator
+The same 16 values for every layer, every model, ev-         to choose a target bit width and accept whatever
+ery architecture. The “floating point” in the name           quality results. XFP inverts this: the operator spec-
+refers to the codebook entries, not to the represen-         ifies two reconstruction quality floors on per-
+tation. On our RTX PRO 6000 (SM120), the dedi-               channel cosine similarity—a strict floor for atten-
+cated Tensor Core path for NVFP4 is unavailable—             tion and shared-expert projections, a lazy floor for
+that hardware acceleration is reserved for datacenter        routed-expert MoE—and XFP determines the min-
+Blackwell (SM100+). So we were left with a format            imum bit width per layer that meets the relevant
+that promises hardware support we cannot use and             floor. Weights not captured by the codebook are
+a universal codebook that ignores the distributions          separated into a sparse fp16 outlier residual.
+we can see.
+                                                                Three consequences follow: (1) bit width becomes
+   This led to a straightforward idea: if the under-         a per-layer derived quantity; (2) the outlier residual
+lying primitive is a codebook lookup, why not learn          is not a heuristic add-on but the structural comple-
+the codebook individually—one per layer, one per             ment guaranteeing the quality floor; (3) the same al-
+group of output channels—from the actual weight              gorithm adapts to different models without manual
+distribution? And if the codebook is learned, why fix        tuning, with the threshold gap as the single operator-
+its size to 16 entries when some layers need only 4 or       tunable knob trading memory against quality on a
+8? XFP is our answer: a quantizer that learns a per-         fixed deployment target.
+layer codebook of adaptive size, separates outliers
+into a sparse residual, and lets the operator specify
+quality rather than bit width.                               1.2    MultiQuant
+   Three structural problems in existing approaches
+                                                             XFP is developed within MultiQuant, a component-
+frame the design:
+                                                             level quantization engine for vLLM [Kwon et al.,
+                                                             2023]. MultiQuant maintains independent precision
+P1—The Outlier Problem. Transformer weight                   policies per component class (attention, routed ex-
+matrices exhibit heavy-tailed distributions. A small         perts, shared experts, LM heads) through registry-
+fraction of weights (typically 0.3–2%) occupy a mag-         based dispatch. This per-component architecture
+nitude range far exceeding the bulk. Linear INT-N            enables XFP’s sub-4-bit operation: at 3 or 2 bits,
+quantization accommodates this range in a single             the margin between “works” and “collapses” is de-
+scale factor, degrading resolution for the dense cen-        termined by the worst-case component class.
+
+                                                         2
+1.3    Contributions                                         Codebook-based and non-linear quantiza-
+                                                             tion. AQLM [Egiazarian et al., 2024] represents
+(C1) A Dynamic, Quality-Targeted Quantizer.                  each weight vector as a sum of entries from
+The operator specifies two quality floors; XFP deter-        multiple learned codebooks (typically 2), achiev-
+mines everything else—codebook size, outlier bud-            ing strong results at 2 bits but requiring ex-
+get, packing—per layer, with a single auto-select            pensive calibration-data-driven multi-codebook op-
+frontend driving both supported codebook storage             timization. QuIP/QuIP# [Chee et al., 2023, Tseng
+modes (§3–5).                                                et al., 2024a] use random orthogonal transforms (in-
+  (C2) Two Codebook Storage Modes, One                       coherence processing) to spread outlier energy across
+Engine. A per-channel Lloyd codebook (V2) and                all weights before quantization, achieving excellent 2-
+a per-group shared-library codebook (V2a) share              bit results at the cost of Hessian computation and a
+the same outlier path, the same two-threshold                decode-time transform. QTIP [Tseng et al., 2024b]
+auto-select, and the same fused decode kernel                extends QuIP# with trellis-coded quantization for
+skeleton—covering the 30B–397B parameter range               near-optimal rate-distortion at 2 bits.
+on workstation-class GPUs without NVFP4 Tensor                  SqueezeLLM       [Kim     et    al.,  2023]    and
+Cores.                                                       SpQR [Dettmers et al., 2023a] are conceptually
+                                                             closest to XFP: both decompose weight matrices
+   (C3) The H-Process: Constrained Com-
+                                                             into a sparse high-precision component (for out-
+pression on 397B. A quality-driven iteration over
+                                                             liers or salient weights) and a dense low-precision
+the two cosine thresholds fits Qwen3.5-397B-A17B
+                                                             component. The key difference is the identification
+(512 routed experts/layer) on a 2×96 GB worksta-
+                                                             criterion: SpQR uses the Hessian to determine
+tion at ∼3.4 effective bits, retaining the full ex-
+                                                             which weights are “sensitive”; XFP uses the weight
+pert population, at 100.9 tok/s single-stream decode
+                                                             distribution itself (|w − µ| > kσ), eliminating the
+and 66.72% GSM8K strict-match on the full 1,319-
+                                                             Hessian entirely. SpQR’s dense component uses
+problem set (§6.3).
+                                                             a fixed linear quantizer; XFP replaces it with a
+                                                             per-group learned codebook (group size 128 by
+                                                             default, configurable).
+2     Related Work
+                                                             Expert pruning for MoE deployment. For
+Linear quantization. Round-to-nearest (RTN)                  very large MoE models that exceed a target mem-
+with per-group or per-channel scaling is the simplest        ory envelope, an orthogonal family of methods re-
+post-training quantization scheme. GPTQ [Fran-               duces the routed-expert population rather than the
+tar et al., 2022] improves on RTN via column-wise            per-weight precision. REAP [Lasby et al., 2024]
+quantization with Hessian-based error compensa-              identifies low-utility experts from a calibration set
+tion, yielding substantially better perplexity at the        and removes them permanently. The approach is
+cost of calibration data and O(d2 ) compute per layer.       effective but introduces a sensitivity to the calibra-
+AWQ [Lin et al., 2023] identifies salient weight chan-       tion distribution: experts deleted offline may have
+nels via activation statistics and applies per-channel       been load-bearing for a workload the calibration set
+scaling before quantization; it avoids the Hessian but       did not represent. The authors’ REAP-it-Yourself
+still requires calibration data. Both operate in the         (RIY) workflow addresses this by letting operators
+linear INT-N paradigm—the codebook is implicitly             run the identification pass on their own traffic, pro-
+a uniform grid, and outliers are handled through             ducing deployment-specific expert profiles; a paper
+scale adjustment or error compensation, not sepa-            on RIY is in preparation separately. We compare
+ration.                                                      to REAP/RIY as an alternative deployment path
+                                                             for the 397B case (§6.3): XFP+H trades per-weight
+   Intel’s AutoRound [Cheng et al., 2024] takes a dif-
+                                                             bits for memory; REAP/RIY trades expert popula-
+ferent approach: it optimizes weight rounding de-
+                                                             tion for memory. Both are valid responses to the
+cisions via signed gradient descent on a small cal-
+                                                             same constraint.
+ibration set, achieving near-lossless INT4 quality
+in minutes. Independent benchmarks [Marie, 2025]
+show AutoRound INT4 consistently matching or ex-             Hardware-specific formats and NVIDIA’s
+ceeding NVIDIA’s own NVFP4 format in accuracy                quantization ecosystem. NVIDIA has in-
+on identical models—a notable result given that              vested heavily in format-level quantization support
+NVFP4 has dedicated hardware support.                        across several generations.     FP8 (E4M3/E5M2)
+
+                                                         3
+                                         Sparse fp16
+                                       Outlier Residual
+                       |w − µ| > kσ
+
+
+       Weight          Outlier
+      Matrix W        Extraction
+
+
+                                                                Auto-Select            N -bit           Fused Kernel
+                                           Lloyd
+                                                                                                        depack→LUT→
+                                         Iteration                cos ≥ τ             Packing
+                                                                                                        scatter→GEMM
+
+                                                                 N ∈ {2, 3, 4}
+
+
+
+                                                   Quality floor τ (input)       Bit width N (output)
+
+
+
+Figure 1: XFP pipeline overview. The operator specifies a quality floor τ ; XFP determines everything
+else. Outlier extraction separates high-magnitude weights into a sparse fp16 residual. Lloyd iteration learns
+a per-layer codebook on the cleaned bulk distribution. Auto-select (Algorithm 1) tests candidate codebook
+sizes and picks the minimum N meeting τ . The fused decode kernel reconstructs weights at inference via
+codebook gather + outlier scatter-add.
+
+
+is supported on Hopper (SM90+) and Black-                       Inference kernels and practical deployment.
+well; NVFP4 [NVIDIA, 2024] adds a fixed                         Marlin [Frantar & Alistarh, 2024] is the most op-
+16-entry codebook with dedicated Tensor Core                    timized INT4 dequantization kernel for NVIDIA
+acceleration on datacenter Blackwell (SM100+).                  GPUs, using a 128-thread warp-level tile structure
+MXFP4/MXFP6 [OCP, 2023] (OCP Microscaling)                      with cooperative shared-memory staging. It serves
+provide block-scaled floating-point with shared                 as our primary throughput reference. The llama.cpp
+exponents.                                                      project [Gerganov et al., 2023] provides block-level
+                                                                codebook quantization (Q2 K through Q6 K) for
+   On workstation Blackwell (SM120/121), NVFP4                  CPU inference —the closest practical precedent
+support was initially absent despite NVIDIA’s                   to per-block codebook quantization at deployment
+launch-day marketing. The CUTLASS NVFP4                         scale, though with fixed rather than learned code-
+MoE kernels failed on SM120 due to TMA work-                    books and without outlier separation.
+sharing grouped-GEMM initialization errors; Flash-
+Infer did not compile for the sm120f family target re-            XFP is integrated into vLLM [Kwon et al., 2023]
+quired for the FP4 conversion PTX instruction; and              via the MultiQuant engine, which provides per-
+vLLM’s backend selection did not recognize SM120                component-class quantization dispatch (§2, Multi-
+as NVFP4-capable, falling back silently to Marlin               Quant).
+INT4. Community-contributed patches to vLLM,
+FlashInfer, and the CUTLASS dispatch logic were
+required before NVFP4 checkpoints could run at all
+on RTX PRO 6000 or DGX Spark hardware. Even
+after these fixes, the native NVFP4 Tensor Core
+path on SM120 underperforms the Marlin W4A16
+fallback on MoE workloads, as the grouped-GEMM
+specialization remains incomplete.
+                                                                Positioning. XFP trades the rate-distortion opti-
+  The software side is equally active: NVIDIA’s Ten-            mality of Hessian-aware methods for a different opti-
+sorRT Model Optimizer [NVIDIA, 2024b] bundles                   mization target: where GPTQ/AQLM/QuIP# pro-
+SmoothQuant, AWQ, and—since 2025—NVFP4                          duce the best reconstruction at a given bit width,
+PTQ and QAT pipelines.          Despite this invest-            XFP takes a quality floor as input and finds the
+ment, independent evaluations consistently find that            minimum compression meeting it—automatically,
+NVFP4’s fixed universal codebook underperforms                  per layer, without calibration. Where NVFP4
+calibration-aware methods (AutoRound, AWQ) in                   offers hardware-accelerated throughput with a
+accuracy at the same bit width. The format’s advan-             universal codebook, XFP offers software-defined
+tage is throughput via Tensor Core acceleration—an              throughput with a learned codebook—and achieves
+advantage unavailable on the workstation tier where             higher throughput on workstation hardware where
+memory pressure is most acute.                                  NVFP4’s Tensor Core path is unavailable.
+
+
+                                                            4
+Table 1: Positioning of XFP vs. existing methods.           Table 2: XFP sub-byte packing schemes. V2
+                GPTQ AQLM QuIP# SpQR NVFP4 XFP              supports all listed N ; V2a imposes the addi-
+                                                            tional constraint that LANES PER GROUP =
+Learned CB       –    ✓     –      –      –     ✓
+Hessian-free     –    –     –      –      ✓     ✓           group size / values per word be an integer with
+Calib.-free      –    –     –      –      ✓     ✓           warpSize mod LANES PER GROUP = 0. At the
+Outlier sep.     –    –     –      ✓      –     ✓           default group size of 128 this selects N ∈ {2, 4}:
+Auto bit sel.    –    –     –      –      –     ✓
+                                                            N = 3 fails 128 mod 10 ̸= 0; N = 5, 6 exceed the
+HW-agnostic      ✓    ✓     ✓      ✓      –     ✓
+MoE-native       –    –     –      –      –     ✓           warp-wide LUT budget (§3.4).
+                                                              N Vals/word     Word     Used Reserve V2 V2a
+3     The XFP Format                                          2       16      uint32   32       0      ✓    ✓
+                                                              3       10      uint32   30       2      ✓    —
+3.1    Decomposition                                          4        8      uint32   32       0      ✓    ✓
+XFP represents a weight matrix W as:                          5        3      uint16   15       1      ✓    —
+                                                              6        5      uint32   30       2      ✓    —
+          W ≈ Woutlier + Codebook[Qbulk ]        (1)
+
+where Woutlier is a sparse fp16 matrix of high-             this gives effective bit widths of ∼2.31 (V2a at N = 2)
+magnitude weights at their original positions, and          and ∼4.31 (V2a at N = 4) per parameter, before the
+Qbulk is a dense N -bit index matrix into a learned         sparse outlier residual.
+Codebook. The XFP engine supports two codebook
+storage modes behind a single auto-select frontend          3.3    Sub-Byte Packing
+and a single fused decode kernel skeleton:
+• V2: per-channel codebook. One independent                 3.4    V2a: Shared Codebook Library
+  fp16 codebook of 2N entries per output channel,
+  learned via per-channel Lloyd iteration. Supports         V2a is an alternative storage mode in which the per-
+  N ∈ {2, 3, 4, 5, 6}.                                      channel codebook is replaced by a shared library at
+                                                            the layer level. Where V2 stores one codebook of
+• V2a: shared codebook library. A small fp16                2N entries per output channel, V2a stores a library
+  library of L codebooks (default L = 32) per layer;        of L codebooks (default L = 32) per layer and a 5-
+  each weight group (default 128 contiguous weights         bit group→library assignment per 128-weight group.
+  along the output dimension) is assigned the best-         The motivation is SMEM efficiency on workstation-
+  fitting library entry. Supports N ∈ {2, 4} (§3.4).        class GPUs (99 KB opt-in SMEM per CTA on
+V2 is the production format for the 30B–122B ref-           SM120/121, less than half the budget of data-center
+erence experiments (§6); V2a is the format that             SMs): the V2 per-channel codebook occupies SMEM
+brought a 397B MoE into single-node 2×96 GB de-             in proportion to the output dimension, while a V2a
+ployment (§6.3).                                            library of L = 32, N = 4 codebooks takes 32 · 16 · 2 B
+                                                            = 1 KB regardless of dimension. The freed budget
+                                                            extends the activation-row cache from K ≤ 8,192 (V2
+3.2    Storage Layout                                       without split-K) to K ≤ 32,768 on SM120/121.
+Per layer, V2 stores: packed bulk indices (N                   V2 with split-K dispatch handles K > 8,192 as
+bits/weight), codebook (fp16, 2N entries per output         well at a 10–20% single-stream latency cost (§5);
+channel), and outlier triples (row index int64, col-        V2a is the alternative that avoids the split-K over-
+umn index int64, value fp16 = 18 bytes/outlier). At         head at the cost of slightly lower codebook precision
+the default 2% outlier cap, outlier storage adds 0.36       per group. On the 397B Front B deployment (§6.3),
+bytes/weight.                                               V2 with split-K is the headline configuration; V2a
+                                                            serves the same workload with equivalent function-
+   V2a replaces the per-channel codebook by a per-
+                                                            ality and lower single-stream throughput, and we
+layer library of L codebooks (fp16, 2N entries each,
+                                                            report V2 numbers for clarity.
+L = 32) plus a 5-bit group→library assignment, one
+assignment per 128-weight group along the output
+dimension. The per-group overhead is amortized              Library learning. Per layer, we collect the per-
+across 128 weights: ∼0.31 bits/weight for the assign-       channel Lloyd codebooks that V2 would produce,
+ment, group-scale, and mid-point. Across N ∈ {2, 4}         then run a second Lloyd pass over the codebooks
+
+
+                                                        5
+themselves to condense them into a library of L = 32        Algorithm 1 XFP Auto-Select (two-threshold)
+representative codebooks (LibFit). Each 128-weight          Require: Weight matrix W, layer class c, candi-
+group is then re-indexed to the closest library entry           date set N , strict floor τstrict , lazy floor τlazy ≤
+under a per-group scale and mid-point.                          τstrict
+                                                             1: Extract outliers, compute Wbulk
+Lane geometry. The decode kernel walks 128-                  2: τ ← τlazy if c ∈ MoErouted else τstrict
+weight groups with LANES PER GROUP =                         3: for N ∈ N in ascending order do
+128/values per word threads of the warp per group,           4:    cb ← LearnCodebook(Wbulk , 2N ) {V2: per-
+and CB PER ITER = 32/LANES PER GROUP                               channel Lloyd; V2a: LibFit}
+groups per warp iteration. For N = 4 this gives              5:    Ŵ ← Reconstruct(cb, Woutlier )
+LANES PER GROUP = 16, CB PER ITER = 2; for                   6:    cosi ← cos sim(Wi,: , Ŵi,: ) ∀i
+N = 2, LANES PER GROUP = 8, CB PER ITER =                    7:    if median(cos) ≥ τ then
+4. N = 3 fails the integer constraint at g = 128             8:       return N
+(128 mod 10 ̸= 0) and would require a separate               9:    end if
+g = 80 pack path (deferred); the group size itself          10: end for
+is a tunable parameter not further explored in this         11: return max(N ) {fallback}
+work.
+
+                                                            class was forced to choose between coarse and exces-
+4     Encoding               and           Auto-            sive precision. V2a removes the N = 3 slot (packing
+                                                            constraint, §3.4); on the 397B MoE this collapses
+      Selection                                             auto-select to a binary choice between ∼2.31 and
+                                                            ∼4.31 effective bits per parameter for every layer
+4.1    Outlier Extraction                                   class. Routed experts are empirically more robust
+                                                            to coarse quantization than attention or shared ex-
+For each weight matrix W: compute µ, σ; extract
+                                                            perts, but with a single threshold the binary choice
+weights where |w − µ| > kσ (default k = 4.0, capped
+                                                            forces 100% xfp4 (memory infeasible at 2×96 GB)
+at 2%) into a sparse fp16 residual; replace extracted
+                                                            or near-100% xfp2 (math collapses).
+positions with µ in the bulk.
+                                                               The two-threshold split decouples the regimes.
+                                                            τstrict governs attention, linear-attention and shared-
+4.2    Learned Codebook via Lloyd Iter-                     expert projections; τlazy governs the routed-expert
+       ation                                                path. The threshold gap controls the routed-expert
+                                                            xfp2/xfp4 mix and is the single parameter opera-
+Initialize 2N codebook entries via CDF-uniform              tors tune to trade memory against quality on a
+quantiles of the bulk distribution; iterate 20 rounds       fixed deployment target (§6.3, Table 10). The
+of assignment (nearest-neighbor) and centroid up-           strict floor defaults to 0.96 and the lazy floor to
+date (conditional mean). The codebook is stored             0.93; we configure them via the environment vari-
+as fp16 per output channel.                                 ables XFP MIN COS STRICT and XFP MIN COS LAZY.
+                                                            The two-threshold mechanism is engine-wide: V2
+4.3    Quality-Targeted Auto-Selection                      and V2a use the same dispatch.
+
+   Auto-mode tests codebook sizes in ascending or-
+der and returns the first achieving the active qual-        Why cosine similarity, not MSE. MSE is
+ity floor. The candidate set is N = {2, 3, 4} for V2        magnitude-sensitive; cosine similarity is direction-
+and N = {2, 4} for V2a (§3.4). The gate uses per-           sensitive. In a GEMM (y = x · Wcol ), directional
+channel cosine similarity, aggregated via me-               preservation matters more—activations absorb mag-
+dian—not mean (sensitive to outlier channels) or            nitude scaling via learned norms. Empirically, XFP2
+min (overly conservative at N = 2).                         on routed experts has 12× higher MSE than XFP4
+                                                            with identical math accuracy.
+Two thresholds, two regimes. A single global
+threshold (the earlier XFP convention, τ = 0.98) suf-       MoE sampling. For MoE layers with E experts,
+ficed for 35B and 122B under V2 because N con-              auto-select runs on 4 concatenated experts (not the
+tained the intermediate option N = 3: routed ex-            full population). Offline validation on three mod-
+perts landed at xfp3, attention escalated to xfp4, no       els confirms: 0% disagreement on GLM (64 experts)
+
+
+                                                        6
+Table 3: Auto-mode convergence on GLM-4.7-Flash.              once per thread block, making the kernel bit-width-
+                                                              portable: the same gather path serves N = 2 through
+    Component         Layers    Auto-selected                 N = 6 in V2 and N ∈ {2, 4} in V2a.
+    Attention          235      233×xfp3, 2×xfp4                The kernel operates natively in bf16 for both
+    Routed (64×)    46 groups   46×xfp3                       activation input and output, eliminating the
+                                                              bf16→fp16→bf16 conversion overhead that earlier
+    Shared              92      92×xfp3
+                                                              prototypes showed added 124% per call.            It
+    Total             ∼375      ∼3.0 eff. bits                is wrapped as a torch.library.custom op for
+                                                              torch.compile compatibility and CUDA Graph
+                                                              capture.
+and Qwen-35B (256), 11.5% on Qwen-122B (256)—
+with zero math impact from disagreements due to
+the sparse outlier path absorbing the error. We re-           Activation-row caching. For M = 1 decode
+tain the 4-expert sample for V2a; on Qwen-397B                (the dominant autoregressive regime), the kernel
+(512 experts/layer) the auto-select cost is dominated         caches the full K-dimensional activation row in
+not by sampling but by Lloyd convergence: the V2a             shared memory once per CTA, then iterates output
+MoE-LibFit benefits from a higher iteration bud-              groups with codebook lookups against the cached
+get (XFP MOE LLOYD ITERS = 20 vs the V2 default               row. This eliminates repeated global-memory reads
+of 5), since under-converged centroids systematically         of the activation—the dominant traffic at M = 1.
+under-estimate xfp2 quality and bias auto-select to-          The reachable K is bounded by the shared-memory
+ward xfp4.                                                    budget per CTA after the codebook itself is loaded,
+                                                              which on SM120/121 is 99 KB of opt-in SMEM. Un-
+                                                              der V2 the per-channel codebook scales with the out-
+4.4    Auto-Selection Results                                 put dimension; once an activation row of K = 8,192
+                                                              in bf16 is resident, the remaining SMEM is fully con-
+On Qwen3.5-122B, auto-mode selects XFP3 for
+                                                              sumed. For K > 8,192 the V2 kernel dispatches a
+GatedDeltaNet and shared layers but XFP4 for
+                                                              split-K variant that partitions the activation row
+routed experts (∼3.97 eff. bits). The algorithm is
+                                                              across multiple CTAs at a ∼10–20% single-stream
+identical; different models produce different—and
+                                                              latency cost. This is the default path for the linear-
+appropriate—profiles.
+                                                              attention projections of Qwen3.5-397B-A17B and is
+                                                              what carries Front B (§6.3).
+4.5    Encoding Cost
+Auto-mode bit-width selection (Algorithm 1 on 4               V2a: an alternative for K > 8,192. The V2a
+sampled experts per MoE layer) completes in under             shared codebook library (§3.4) takes ∼1 KB of
+one minute. Full quantize-on-load — Lloyd code-               SMEM regardless of output dimension, extending
+book fitting (V2) or LibFit (V2a), outlier extrac-            the single-CTA activation cache to K ≤ 32,768 on
+tion, and sub-byte packing for all layers — takes             SM120/121 without split-K. It is an alternative to
+∼10 minutes for Qwen3.5-35B-A3B and ∼25 min-                  the V2 split-K path: V2a avoids the partition over-
+utes for Qwen3.5-122B-A10B under V2, and ∼30                  head at the cost of slightly lower per-group code-
+minutes for Qwen3.5-122B-A10B and ∼55 minutes                 book precision (one library entry per group instead
+for Qwen3.5-397B-A17B under V2a, on an RTX                    of one codebook per channel). On the 397B Front B
+PRO 6000. Packed weights are cached to disk; subse-           workload, V2 with split-K delivers modestly higher
+quent loads are I/O-bound. By comparison, GPTQ                single-stream throughput than V2a; we use V2 for
+requires comparable or longer calibration times with          the headline numbers and report V2a as an option.
+additional data-dependency.                                   The V2a kernel ships in three dispatched variants
+                                                              (split-N for the M = 1 decode path; split-M for
+                                                              batched prefill at M ≥ 16; split-K for K > 8,192),
+5     Fused Decode Kernel                                     all sharing the V2 depack, gather, outlier-scatter,
+                                                              GEMM skeleton.
+The decode kernel fuses four operations per layer for-
+ward pass: (1) depack N -bit indices to int8; (2) code-       Performance. On Qwen3.5-122B-A10B (RTX
+book gather from shared memory; (3) sparse out-               PRO 6000 Blackwell, TP=2), the V2 fused kernel
+lier scatter-add (fp16→bf16); (4) bf16 GEMM via               delivers 138 tok/s single-stream decode at ∼3.97 ef-
+Tensor Cores. The codebook is loaded into SMEM                fective bits (§6). On Qwen3.5-397B-A17B at TP=2
+
+
+                                                          7
+with V2 plus split-K dispatch under the H1.5 qual-
+                                                            Table 4: XFP auto-mode (V2, τstrict = 0.96, τlazy =
+ity profile (§6.3) the kernel delivers 98.2 tok/s at
+                                                            0.93). GSM8K via lm-eval-harness 0.4.11 (5-shot,
+medium prompts and 100.9 tok/s at long prompts;
+                                                            1,319 problems, 3 seeds, mean ± std). Throughput
+the absolute throughput reflects the model being
+                                                            is single-stream wall-clock decode at 1,500 output
+3.3× larger by parameter count combined with the
+                                                            tokens.
+split-K partition overhead on linear-attention rows.
+                                                                    Model        Eff. bits   tok/s   GSM8K strict
+At M = 1 the kernel remains memory-bandwidth
+bound; XFP’s lower effective bit width reads fewer                  Qwen 122Ba    ∼3.97      138     94.49±0.57
+                                                                    Qwen 122Bb    ∼3.97      110     94.62±0.67
+weight bytes per token than INT4, which is the struc-               Qwen 35Bb     ∼4.0        37     77.18±0.72
+tural source of its throughput advantage on the 122B
+and 397B headline workloads (§6).
+                                                            6.2     Front A: Quality-Validated De-
+                                                                    ployment (V2)
+6     Experiments
+                                                            Front A reports paper-grade GSM8K under the V2
+                                                            per-channel codebook on models that fit comfort-
+6.1    Setup
+                                                            ably within the workstation memory envelope. The
+Platforms. Two workstation-class Blackwell plat-            operative question is quality: how well does two-
+forms: (i) NVIDIA DGX Spark (GB10, SM121,                   threshold auto-select preserve accuracy against the
+120 GB unified memory), single-GPU; (ii) RTX                best available 4-bit calibration-aware baseline (Au-
+PRO 6000 Blackwell (SM120, 2×96 GB), with                   toRound INT4 via Marlin)?
+                                                            a RTX PRO 6000 Blackwell, TP=2. b RTX PRO 6000 Black-
+TP=2.      Native NVFP4 Tensor Core paths on
+SM120/121 required community fixes to vLLM,                 well, TP=1.
+FlashInfer, and CUTLASS dispatch and remain in-                Auto-mode adapts to model structure: on Qwen-
+complete on grouped-GEMM MoE workloads (§2);                122B-A10B routed experts require XFP4 due to
+XFP targets the bf16 SM path on this tier, which is         broader distributions (∼3.97 eff. bits); on Qwen-35B
+what is reliably available.                                 and GLM-4.7-Flash the same algorithm converges
+                                                            differently according to per-layer cosine similarity
+Models. GLM-4.7-Flash (30B, MoE-64, pure                    (Table 3).
+self-attention), Qwen3.5-35B-A3B (35B, MoE-
+256),     Qwen3.5-122B-A10B (122B, MoE-256,                 6.2.1   Why Auto-Select Converges Differ-
+hybrid GatedDeltaNet + self-attention) under                        ently per Class
+V2; Qwen3.5-397B-A17B (397B, MoE-512, hybrid
+GatedDeltaNet + self-attention) under V2a. All              Auto-mode’s per-class bit-width choices reflect the
+served via quantize-on-load.                                underlying weight distributions, not a hand-coded
+                                                            policy. Routed experts (95% of MoE parameters)
+                                                            tolerate XFP2 quantization with no measurable ac-
+Evaluation. For sample-size-sensitive accuracy              curacy degradation against an XFP4 baseline; the
+claims, we use lm-eval-harness 0.4.11 [Biderman             sensitivity bottleneck is in attention and shared-
+et al., 2023]: GSM8K, 5-shot, flexible-extract              expert projections. This is consistent with the per-
+and strict-match, 1,319 problems per seed, 3 seeds          layer reconstruction data (Table 5): routed experts
+per configuration. For internal regression tracking         show ∆cos < 0.001 from outlier extraction—near-
+and quick model-development feedback we also use            Gaussian bulk distributions that a small codebook
+bench.py: deterministic (seed=42), 5 performance            covers adequately. The two-threshold auto-select
+rounds, 50 GSM8K-style problems.                            (§4) is the mechanism that exploits this asymmetry
+                                                            without operator intervention.
+FP8 KV-cache and LM-head qualification.
+All XFP configurations use fp8 KV-cache and fp8             6.2.2   Outlier Extraction Ablation
+LM-head. To verify this introduces no confound-
+ing accuracy loss, we measured the BF16 baseline of         Outlier extraction is decisive for attention (1.9×
+Qwen3.5-35B-A3B under both bf16 and fp8 KV/LM-              MSE improvement) but negligible for routed experts
+head pipelines: 76.12% vs 76.35% GSM8K strict-              (+0.0003 cos). Cross-model: comparing GLM-4.7-
+match (∆ = 0.2 pp, within single-seed variance).            Flash with Qwen3.5-35B-A3B, GLM concentrates
+The fp8 infrastructure path is accuracy-neutral.            catastrophic outliers (49σ) in kv a proj while Qwen
+
+
+                                                        8
+Table 5: Outlier extraction effect (XFP3, k=4,                   Table 6: XFP vs. Marlin INT4 on Qwen3.5-122B-
+GLM-4.7-Flash).      MSE ratio = MSEbulk /                       A10B, DGX Spark, SM121 (bench.py, 50 prob-
+MSE+outlier at population median.                                lems).
+    Layer type       n    cos (bulk)    ∆cos     MSE ratio                               long    medium      short    Math
+
+    attn kva         48     0.981      +0.009     1.90×                   XFP auto       29.9     34.8        2.6      98%
+    attn kvb         48     0.983      +0.004     1.24×                   Marlin INT4    25.8     29.6        2.5      94%
+    shared gate up   94     0.981      +0.002     1.13×
+                                                                          ∆             +16%      +18%        ∼0        —
+    routed gate up   96     0.982      +0.0003    1.02×
+    routed down      96     0.982      +0.0003    1.02×
+
+                                                                 Table 7: XFP vs. Marlin INT4 (AutoRound) on
+distributes moderate tails uniformly; Qwen’s routed              Qwen3.5-122B-A10B, RTX PRO 6000 Blackwell,
+experts respond 6.7× more strongly to outlier ex-                SM120. lm-eval-harness 0.4.11, GSM8K (5-shot,
+traction. This is the data behind “the algorithm                 1,319 problems, 3 seeds, mean ± std). Throughput
+is identical; the profiles differ because distributions          is single-stream wall-clock at 1,500 output tokens.
+differ.”                                                         Format          TP     tok/s      flex             strict   Bits
+
+                                                                 XFP V2 (auto)    1     110     94.54±0.67    94.62±0.67     ∼3.97
+                                                                 XFP V2 (auto)    2     138     94.41±0.57    94.49±0.57     ∼3.97
+6.2.3   Decoder Throughput vs. Marlin INT4
+                                                                 Marlin INT4      1     73.6    95.17±0.09    95.27±0.12      4.0
+
+We use Marlin [Frantar & Alistarh, 2024] as the
+primary throughput reference: it is the most op-                 reads fewer bytes per token at M = 1—holds across
+timized INT4 dequantization kernel available on                  platforms.
+NVIDIA GPUs and serves AutoRound INT4 check-                        The math difference (98% vs 94%) is observed on
+points [Cheng et al., 2024] that consistently match              the bench.py 50-problem sample but not isolated
+or exceed NVFP4 in calibration-aware accuracy.                   from the AutoRound calibration configuration of the
+AutoRound and XFP take different methodologi-                    Marlin checkpoint; the controlled comparison is the
+cal paths (uniform quantization with Hessian-aware               throughput.
+rounding vs. per-group learned codebooks with
+cosine-targeted auto-select); the comparisons below
+are decoder-speed comparisons on identical hard-                 Paper-grade head-to-head on RTX PRO 6000.
+ware, with accuracy reported alongside as a docu-                A controlled measurement at TP=1 on identical
+mentary data point, not a verdict on either method.              hardware (Table 7) shows XFP at 110 tok/s vs
+                                                                 Marlin INT4 at 73.6 tok/s (+49% single-stream de-
+                                                                 code), with GSM8K strict-match of 94.62 ± 0.67 vs
+RTX PRO 6000 Blackwell (SM120), TP=2.                            95.27 ± 0.12. The ∼0.65 pp accuracy difference is
+On a workstation-class dual-GPU node (2×96 GB),                  within the Lloyd-init jitter envelope (∼0.67 pp std
+the XFP V2 single-user reference kernel delivers                 on this scale); both formats land in the same 94–95%
+138 tok/s wall-clock single-stream decode at full                band, with the structural difference being through-
+GSM8K quality (Table 9). GPU utilization dur-                    put: XFP reads ∼3.97 effective bits per weight
+ing single-stream decode is 98% on each device at                versus Marlin’s 4.0, and the fused depack–gather–
+240 W, well below the 600 W TDP—kernel-launch                    scatter–GEMM kernel exploits this directly at the
+overhead in the single-stream path dominates, leav-              memory-bandwidth limit.
+ing compute headroom that the present implemen-
+tation does not yet exploit. Massively concurrent
+batched serving is not a goal of this work and would             6.2.4    V2a Storage Mode (probes)
+require a different kernel scheduling strategy (see              The V2a storage mode (§3.4) shares the auto-select
+§7.5).                                                           frontend and decode-kernel skeleton with V2 and dif-
+                                                                 fers only in codebook layout (per-group library en-
+DGX Spark (SM121), single-GPU. An ear-                           try vs. per-channel codebook). Bench-probe mea-
+lier measurement on DGX Spark (SM121) shows                      surements (n = 50 GSM8K, deterministic, seed=42,
+the throughput characteristic on a second plat-                  RTX PRO 6000 TP=1) on three models show the
+form: XFP outperforms Marlin INT4 by 16–18%                      speed characteristic (Table 8):
+on long and medium decode (Table 6). The archi-                     On Qwen3.5-122B-A10B, V2a delivers +47%
+tectural argument—fewer effective bits per weight                throughput vs Marlin INT4 at comparable footprint;
+
+
+                                                             9
+Table 8: V2a storage-mode decode throughput                                                               150                                                  138
+probes, bench.py (n = 50, RTX PRO 6000 TP=1).
+                                                                                                                      110
+Marlin INT4 columns where available, on the same
+
+
+
+
+                                                                                                 tok/s
+                                                                                                          100
+hardware in the same session.                                                                                                               73.6
+
+     Model                  V2a     math        Marlin    vs.
+                           tok/s   (n = 50)     tok/s    Marlin                                               50
+
+     Qwen3.5-35B-A3B       204.0    90%       (no Q3.5)  —
+     Qwen3.5-122B-A10B     108.1    96%          73.6   +47%                                                  0
+     GLM-4.7-Flash         118.1    68%         121.1   −2.5%                                                      XFP TP=1          Marlin TP=1             XFP TP=2
+
+
+                                                                        Figure 2: Single-stream decode throughput on
+                                                                        Qwen3.5-122B-A10B, RTX PRO 6000 Blackwell
+Table 9: XFP on Qwen3.5-122B-A10B, RTX PRO                              (SM120), 1,500-token output. At identical TP=1
+6000 Blackwell, TP=2, quantize-on-load. Decode                          single-stream (the regime this work targets), XFP is
+throughput at 1,500-token output; GSM8K via lm-                         +49% faster than Marlin INT4 (AutoRound); TP=2
+eval-harness 0.4.11.                                                    extends this to +87%. Both XFP and Marlin are
+          Metric (single-stream reference)          Value               memory-bandwidth-bound at M = 1; XFP reads
+                                                                        ∼3.97 effective bits per weight versus Marlin’s 4.0.
+          Single-stream decode (wall)            138 tok/s
+          Engine sustained                       137 tok/s              Concurrent / batched serving is out of scope (§7.5).
+          GSM8K flex.-extract∗                94.41 ± 0.57
+          GSM8K strict-match∗
+
+
+
+
+                                                                                                                                                                          GSM8K strict-match (%)
+                                              94.49 ± 0.57               tok/s (single-stream)                                                                       96
+                                                                                                    150                                                  138
+          Effective bits                             ∼3.97
+          VRAM / GPU                          57 / 96 GiB                                                                                                            95
+                                                                                                                    110
+          GPU util. (single-stream)            98% / 98%
+                                                                                                    100
+          GPU power (single-stream)           240 / 240 W
+                                                                                                                                     73.6                            94
+ ∗
+     3 seeds, 1,319 problems/seed, mean ± std (%). All numbers
+     from the single-user reference kernel; concurrent / batched                                         50
+                    serving is out of scope (§7.5).                                                                                                                  93
+
+
+                                                                                                    0                                                                92
+                                                                                                          1                       P=1                    2
+                                                                                                      TP=                       nT                 TP=
+                                                                                                  XFP                     Marli              XFP
+on GLM-4.7-Flash, the two are within ∼2.5% (XFP
+slightly slower, V2a math probe +4 pp on the n = 50                     Figure 3: XFP vs. Marlin INT4 on Qwen3.5-
+sample). Full-1,319 GSM8K runs under V2a on                             122B-A10B, RTX PRO 6000 Blackwell. Bars (left):
+these models are in the queue (§6.3 status note). The                   single-stream tok/s. Markers (right): GSM8K strict-
+35B comparison is not currently fair: no Q3.5 INT4                      match (3 seeds, mean ± std). At TP=1, XFP is 49%
+Marlin checkpoint exists at the time of measurement;                    faster at −0.65 pp accuracy (within seed-variance).
+the Q3.6 Marlin path is on a different model variant.
+
+                                                                        6.3                               Front B: The H-Process — Con-
+                                                                                                          strained Compression on a 397B
+                                                                                                          Model
+Cross-platform consistency. The same V2 auto-
+mode quantization profile (∼3.97 eff. bits) general-                    Qwen3.5-397B-A17B is a hybrid linear-/self-
+izes from a single-GPU 120 GB unified-memory de-                        attention MoE with 512 routed experts per layer,
+vice (DGX Spark) to a dual-GPU discrete TP=2                            60 layers, and an unquantized BF16 footprint
+setup (RTX PRO 6000) without code changes. To-                          of ∼795 GB—one order of magnitude above the
+gether these two platforms span the workstation-                        35B/122B platforms of Front A. At any conven-
+class hardware tier where native NVFP4 Tensor                           tional 4-bit format (∼200 GB after quantization
+Core support remains community-patched and in-                          plus KV-cache, activations, and library buffers), the
+complete on grouped-GEMM MoE workloads—and                              model does not fit on 2×96 GB. Front B reports the
+where, unlike server-class A100/H100 deployments,                       H-Process: a quality-driven iteration over the two
+memory-bound 4-bit kernels matter most. XFP                             cosine thresholds (§4) that finds the operating point
+places this tier at top-of-class for 100B+ MoE in-                      at which the model just fits while still producing
+ference.                                                                sensible output.
+
+
+                                                                   10
+Three constraints define the H-Process search                     Table 10: H-Process operating points on Qwen3.5-
+space. The operator-facing constraint is the pair                 397B-A17B, 2×RTX PRO 6000 TP=2, engine V2.
+(τstrict , τlazy ): bit widths are derived from these, not        Steady = post-load steady-state VRAM per GPU;
+chosen directly. Two hard boundaries flank the op-                Spike = max during quantize-on-load. Probe ac-
+erating window:                                                   curacy on bench.py (n = 50 GSM8K, determinis-
+• OOM at quantize-on-load. High thresholds                        tic, seed=42); H1.5 also reports full-1,319 single-
+  force more routed-expert groups into xfp4, rais-                seed paper-grade GSM8K. H1.7 was attempted three
+  ing the Lloyd-iteration spike past the 96 GB-                   times with successively more aggressive serving-side
+  per-GPU envelope. The boundary is set by                        reductions (see text); all three attempts failed dur-
+  the encoding spike, not the steady-state serv-                  ing the encoding spike. Multi-seed H1.5 evaluation
+  ing footprint: serving-side reductions (KV-cache,               is in progress.
+  max model len, gpu memory utilization) do                        Var.   τstrict τlazy Steady Spike Eff    probe     full-1319
+  not help, because the spike occurs before serving                                      GiB    GiB bits   (n = 50)   (1 seed)
+  allocation (Table 10, H1.7 entry).                               G      0.92   0.80     70    96   ∼2.3 garbage       —
+                                                                   H1     0.96   0.92     72    96   ∼2.6 0.52±0.07     —
+• Garbage output. Low thresholds force most                        H1.5   0.96    0.93    83    97   ∼3.4 0.60±0.07   0.6672
+  routed experts into xfp2; bit-width reconstruction               H1.7   0.96   0.935   OOM (3×)     —       —         —
+  passes the cosine gate numerically, but genera-                  H      0.96   0.94       OOM       —       —         —
+  tion degenerates to repeated tokens despite ap-
+  parently valid arithmetic. Cosine similarity is a
+  chosen indicator for steering bit-width selection,
+                                                                  on τlazy is steep and sharply non-linear: at 0.80 the
+  not a quality guarantee. The garbage boundary
+                                                                  routed-expert path collapses to near-100% xfp2 and
+  exists strictly inside the cos-passes region and is
+                                                                  math output degenerates to repeated tokens (cosine
+  the empirical reminder that the operating enve-
+                                                                  passes, benches do not); at 0.935 already enough
+  lope is verified by benches, not by the indicator
+                                                                  routed-expert groups escalate to xfp4 that the Lloyd-
+  alone.
+                                                                  iteration spike exceeds the 96 GB envelope. The
+   The H-Process iterates (τstrict , τlazy ) from aggres-         OOM boundary is set by the encoding spike, not the
+sive toward conservative settings until both bound-               steady-state serving footprint: H1.7 (τlazy = 0.935)
+aries are clear and the resulting model serves with               failed across three load attempts even with aggres-
+acceptable bench output.                                          sive serving-side reduction (gpu mem util 0.97, KV-
+                                                                  cache 2 GB, max model len 8192), because the spike
+                                                                  occurs before any serving allocation. Between the
+Hardware and serving setup. 2×RTX PRO
+                                                                  two boundaries the window is narrow: τlazy = 0.92
+6000 Blackwell (SM120, 96 GB each), TP=2, BF16
+                                                                  yields 52% GSM8K strict-match at n = 50 and
+KV-cache (FlashInfer FP8-KV is incompatible
+                                                                  72 GiB/GPU steady state; raising to 0.93 adds
+with the model’s head dim = 256 projections;
+                                                                  11 GiB/GPU and shifts the n = 50 probe by +8 pp.
+the Triton attention backend with BF16 KV
+                                                                  On the H1.5 configuration (τlazy = 0.93, ∼3.4 effec-
+is the path that runs).     XFP GROUP SIZE=128,
+                                                                  tive bits) the full-1,319 single-seed GSM8K strict-
+XFP MOE LLOYD ITERS=20,         LM-head      FP8,
+                                                                  match reaches 66.72% at 100.9 tok/s long-output
+max model len=65,536, custom all-reduce dis-
+                                                                  decode.
+abled (a known SM120 issue at TP=2). The engine
+is V2 (per-group Lloyd codebook) with split-K
+dispatch on the linear-attention projections that
+exceed K = 8192; under the V2a storage mode (§3.4)
+                                                                  Per-class bit-width assignment under H1.5.
+we observe equivalent functionality with slightly
+                                                                  Auto-select picks xfp4 for 100% of self-attention,
+lower throughput, and use V2 for the headline
+                                                                  linear-attention and shared-expert projections, and
+numbers below.
+                                                                  xfp2 for the majority of routed-expert groups; xfp4
+                                                                  escalations on the routed path concentrate in lay-
+The quality gradient. With the candidate set ef-                  ers 1–3 (the initial GatedDeltaNet transition) and
+fectively {2, 4} (xfp3 is rare on this model under ei-            layer 13. The pattern is stable across runs and is con-
+ther storage mode, see §3.4), the two-threshold split             sistent with the per-component outlier-extraction
+(§4) controls memory through the lazy-vs-strict gap.              sensitivity reported in Table 5: routed experts have
+Table 10 reports five operating points; the strict floor          near-Gaussian bulk distributions that admit aggres-
+is held at τstrict = 0.96 throughout. The dependence              sive quantization, attention does not.
+
+
+                                                             11
+Table 11: Qwen3.5-397B-A17B on 2×RTX PRO                         (6 GiB/GPU headroom); H1.5 is marginal (effec-
+6000 TP=2: H-Process versus AutoRound INT4                       tively zero headroom). H100 80 GB SXM is not
+with REAP-style routed-expert pruning. INT4 num-                 viable at TP=2 for either profile; H200 141 GB
+bers from earlier deployment runs of the same model              TP=2 has ∼51 GiB headroom and should serve H1.5
+on the same hardware; GSM8K via bench.py n = 50                  comfortably. Single-device deployment on the DGX
+unless otherwise noted.                                          Spark (120 GB unified) is not viable at the present
+                                                                 effective bit widths without further reduction.
+   Format       Prune    Steady GSM8K        n    tok/s
+                        GiB/GPU  strict            long
+
+   INT4 + RIY −36%        ∼75       33%    50   ∼50              Status. The H1.5 GSM8K strict-match (66.72%,
+   INT4 + RIY −24%        ∼80       44%    50   ∼50              full-1,319) is a single-seed measurement at submis-
+   XFP H1      0%         72        52%    50   65               sion time; multi-seed evaluation is in progress and
+   XFP H1.5    0%          83     66.72% 1319∗ 100.9
+                                                                 will replace the single-seed value in the final version.
+  INT4 = AutoRound INT4 served via Marlin. ∗ Single seed;
+            multi-seed evaluation in progress.
+                                                                 H1 paper-grade evaluation and a full-1,319 measure-
+                                                                 ment on the V2a storage mode are also in the queue.
+Throughput. Single-stream wall-clock decode on
+H1.5: 73.4 tok/s at short outputs, 98.2 tok/s at                 7     Discussion
+medium, 100.9 tok/s at long outputs (n = 5
+runs, temp=0, 1,500-token outputs). H1 through-
+put on the same setup is approximately 65–97 tok/s
+                                                                 7.1    Two Quality Floors as Operator
+depending on output length.                                             Knob
+                                                                 The two-threshold split (τstrict = 0.96 for atten-
+An alternative path: routed-expert reduc-                        tion/shared, τlazy = 0.93 for routed-expert MoE,
+tion. A different family of methods addresses the                §4) collapses the per-layer auto-select into a single
+same memory constraint by reducing the routed-                   operator-facing parameter: the threshold gap. On
+expert population at fixed 4-bit precision. We com-              the 397B sweep (Table 10), each +0.01 to τlazy shifts
+pare against the REAP-it-Yourself (RIY) workflow                 roughly one xfp2→xfp4 transition per routed-expert
+on the same model and hardware, applying Au-                     layer, costing ∼11 GiB/GPU steady-state and yield-
+toRound INT4 with REAP-style calibration-aware                   ing +8 pp GSM8K. The same two-threshold mecha-
+expert removal (§2). Table 11 reports two RIY op-                nism applied to 122B under V2 reproduces the single-
+erating points alongside the H-Process. The two                  threshold τ = 0.98 behaviour: with N = {2, 3, 4} the
+approaches reach the same envelope along different               intermediate option N = 3 absorbs the elasticity, and
+axes: XFP+H reduces per-weight bits while retain-                the lazy floor is rarely binding.
+ing all experts; RIY retains 4-bit precision while
+removing routed experts. Both are legitimate re-                 7.2    Storage Tradeoff: Bits vs. Out-
+sponses to the constraint; the comparison documents
+how the axes trade off on this particular model.
+                                                                        liers
+   On this model, the H-Process operates at a                    On the linear path, each outlier costs 18 bytes.
+lower memory footprint than RIY-24% (72 vs                       The break-even between XFP3 with elevated outlier
+80 GiB/GPU at H1; 83 at H1.5), with the n = 50                   fraction and XFP4 at 2% cap is: 0.375 + 18y =
+probe favoring XFP at both operating points and                  0.5 + 0.02 × 18 =⇒ y = 2.7%. The default 2%
+the full-1,319 H1.5 measurement extending the gap                cap sits near this break-even—no hidden win from
+further. On throughput, the XFP fused decode ker-                aggressive outlier extraction.
+nel reads fewer bytes per token than INT4 at M = 1
+and exploits this directly at the memory-bandwidth
+limit; this is the structural reason for the speed dif-          7.3    The Minimalist Device Dilemma
+ference, not a Marlin-specific shortfall (§2, Marlin             The K ≤ 8192 bound under V2 is not driven by algo-
+is the most optimized INT4 dequantization kernel                 rithmic constraints—the same kernel design works
+available and serves as our throughput reference).               at K ≤ 32,768 on data-center silicon. It is a direct
+                                                                 consequence of how shared-memory capacity is seg-
+Hardware projection. Reserving 8 GiB for KV-                     mented across the Blackwell generation:
+cache and 10 GiB for activations and compile buffers,               The same building blocks are present on each tier;
+the H1 steady state fits comfortably on 2×96 GB                  the per-CTA SMEM ceiling on the workstation tier
+
+
+                                                            12
+Table 12: Per-CTA opt-in shared-memory limit                       variant is also available at a 10–20% single-stream
+across NVIDIA SMs.                                                 latency cost.
+ SM tier                   Hardware           SMEM/CTA         3. No Hessian feedback. Hessian-weighted Lloyd
+ SM90 (Hopper d/c)         H100, H200            228 KB           is a planned extension.
+ SM100 (Blackwell d/c)     B100, B200            228 KB
+ SM120 (Blackwell wkst.)   RTX PRO 6000          99 KB
+                                                               4. Lloyd non-determinism. ±8pp math variance
+ SM121 (Blackwell SoC)     DGX Spark (GB10)      99 KB            on 50-problem benchmarks under bench.py prob-
+                                                                  ing (each problem = 2pp); under paper-grade lm-
+                                                                  eval-harness with 1,319 problems and 3 seeds the
+is less than half that of data-center silicon. For                cross-seed std drops to 0.57% on GSM8K (Ta-
+memory-bound 4-bit GEMM kernels with activation-                  ble 9).
+row caching, the largest contiguous K drops from
+∼32K to ∼8K under V2’s per-channel codebook—a                  5. Evaluation scope. GSM8K under lm-eval-
+4× regression on the dimension governing single-user              harness is the primary accuracy metric. MMLU
+decode latency. V2a’s shared codebook library lifts               and additional reasoning suites are natural exten-
+the bound back to K ≤ 32,768 on the workstation                   sions for future work.
+tier (§3.4, §5), restoring the data-center operating           6. Hardware. Validated on two workstation-class
+envelope at the cost of the per-channel codebook                  platforms (DGX Spark SM121, RTX PRO 6000
+precision. For V2 users on the workstation tier, a                Blackwell SM120). Native NVFP4 Tensor Core
+split-K extension lifts the K ≤ 8192 bound at ∼10–                paths on these SMs required community fixes to
+20% latency cost (§7.5).                                          vLLM, FlashInfer, and CUTLASS dispatch (§2);
+                                                                  server-class A100/H100 evaluation is not part of
+                                                                  this work as it would not meaningfully test the
+7.4        Lloyd Non-Determinism                                  memory-bound regime XFP targets.
+Quantize-on-load does not produce bit-identical                7. Auto-mode range. V2 tests N ∈ {2, 3, 4}; V2a
+weights across runs. On Qwen-35B, identical bit-                  tests N ∈ {2, 4} (the g = 128 packing constraint
+width decisions yield ±8pp math variance due to                   excludes N = 3). A g = 80 V2a path supporting
+Lloyd initialization jitter. Weight caching eliminates            N = 3 is deferred.
+run-to-run variance after the first load.
+
+                                                               8     Conclusion
+7.5        Limitations and Scope
+                                                               XFP is a quality-targeted, adaptive weight quantizer
+1. Single-user reference implementation. The
+                                                               that inverts the conventional workflow: the oper-
+   XFP fused decode kernel presented here is op-
+                                                               ator specifies a cosine-similarity floor; XFP picks
+   timized for low-latency single-stream inference.
+                                                               bit widths, outlier budgets, and packing per layer
+   At concurrency ≥8, per-request throughput col-
+                                                               to meet it. The format and its supporting auto-
+   lapses because the per-call kernel-launch over-
+                                                               select frontend, fused decode kernel, and two stor-
+   head is not amortized across the batch. A high-
+                                                               age modes (per-channel V2 and shared-library V2a)
+   throughput batched-serving variant is planned fu-
+                                                               are not the contribution by themselves—they are
+   ture work and is explicitly out of scope for this
+                                                               means to an end. The end is appliance-class deploy-
+   paper. All accuracy and throughput numbers
+                                                               ment: large language models serving on workstation
+   reported here are from the single-user reference
+                                                               hardware, without datacenter backends and without
+   path.
+                                                               NVFP4-accelerated Tensor Core paths that arrived
+2. K ≤ 8192 bound under V2 on the worksta-                     late and remain incomplete on this tier.
+   tion tier. The V2 fused decode kernel caches the               Four results support this trajectory: (1) the same
+   full activation row in shared memory (∼24 KB                auto-select frontend drives both codebook storage
+   at K = 8192 in bf16; see §5). On the target                 modes, covering the 30B–397B parameter range on
+   workstation hardware (DGX Spark, RTX PRO                    the same workstation platforms; (2) auto-mode con-
+   6000 Blackwell; both 99 KB opt-in SMEM per                  verges to ∼3.97 effective bits on Qwen3.5-122B-
+   CTA) this bound covers the Qwen3.5 family but               A10B and to ∼2.6–3.4 on Qwen3.5-397B-A17B de-
+   excludes models with wider intermediate dimen-              pending on the H-Process operating point; (3) XFP
+   sions. V2a lifts this bound to K ≤ 32,768 via               on Qwen3.5-122B-A10B (RTX PRO 6000, TP=2)
+   the shared-library codebook (§3.4); a split-K V2            under V2 reaches 138 tok/s single-stream decode at
+
+
+                                                          13
+94.49% GSM8K strict-match (3 seeds, n = 3,957
+problems)—paper-grade accuracy preservation on
+workstation-class dual-GPU hardware; (4) the H-
+Process on Qwen3.5-397B-A17B (512 routed ex-
+perts/layer) serves the full expert population in
+2×96 GB at ∼3.4 effective bits and 100.9 tok/s long-
+output decode, with 66.72% GSM8K strict-match on
+the full 1,319-problem set (single seed, multi-seed in
+progress).
+
+The H-Process closes the loop to the motiva-
+tion. The H-Process (§6.3) is the application that
+makes the format into a process. The motivation
+was appliance deployment of models that do not fit;
+the H-Process is the quality-driven iteration over
+the two cosine thresholds that finds the operating
+point at which a given model just fits on a given
+hardware envelope while still producing sensible out-
+put. Three constraints define its search space: the
+operator-set (τstrict , τlazy ) pair, the OOM boundary
+at quantize-on-load, and the garbage boundary in
+generation. The garbage boundary is the empirical
+reminder that cosine similarity is a chosen indicator
+for steering bit-width selection—a much better in-
+dicator than bit width alone, but not a guarantee.
+Quality is verified by benches; cosine steers. The H-
+Process puts both in the operator’s hands as explicit
+knobs, where fixed-bit-width formats have neither.
+
+A different family of methods. XFP belongs to
+a family of per-group codebook approaches; the dom-
+inant 4-bit deployment formats are uniform quantiz-
+ers with calibration-aware corrections (AutoRound,
+AWQ, GPTQ) decoded by Marlin or NVFP4-class
+kernels. These are different methodological choices
+for the same goal, with different strengths. XFP
+requires no Hessian, no calibration data, and no spe-
+cialized hardware—and provides the operator a tun-
+able quality knob that uniform formats do not. The
+trade-off is the per-group codebook overhead and the
+encoding-time Lloyd iterations. On the deployments
+measured here, the trade-off favors XFP at the work-
+station tier; on other workloads it may not. The
+choice is a deployment decision, not a benchmark
+verdict. Code is available at the project repository
+linked above.
+
+
+
+
+                                                         14
+A     Per-Expert Reconstruction Tables
+All tables report per-layer metrics aggregated across n layers per component type, at XFP3 (N = 3) with
+outlier threshold k = 4.0.
+  Column definitions: cos bulk—cosine similarity of codebook-only reconstruction (no outlier path);
+cos outlier—cosine similarity with sparse fp16 outlier extraction enabled; ∆cos mean / max—
+improvement from outlier extraction across the layer population; MSE p50 / p90—ratio of MSEbulk-only
+to MSEwith-outliers at the 50th and 90th percentile of the layer population (values > 1× indicate outlier
+extraction reduces error; e.g. 1.90× means the bulk-only MSE is 1.9× larger).
+
+
+A.1    GLM-4.7-Flash (XFP3, k=4)
+
+         Type             n    cos bulk   cos outlier   ∆cos mean   ∆cos max   MSE p50    MSE p90
+
+         attn kva         48   0.98070     0.98973       +0.00903   +0.01495    1.90×        2.26×
+         attn kvb         48   0.98294     0.98654       +0.00360   +0.01051    1.24×        1.36×
+         shared gate up   94   0.98114     0.98356       +0.00242   +0.00600    1.13×        1.23×
+         shared down      47   0.97964     0.98195       +0.00231   +0.00828    1.07×        1.27×
+         attn o           48   0.98212     0.98391       +0.00179   +0.00627    1.06×        1.14×
+         attn qb          48   0.98173     0.98336       +0.00163   +0.00964    1.06×        1.17×
+         attn qa          48   0.98191     0.98264       +0.00073   +0.00303    1.03×        1.08×
+         routed down      96   0.98238     0.98265       +0.00027   +0.00053    1.02×        1.02×
+         routed gate up   96   0.98237     0.98265       +0.00028   +0.00050    1.02×        1.02×
+
+                      Table 13: GLM-4.7-Flash per-expert reconstruction statistics.
+
+
+
+A.2    Qwen3.5-35B-A3B (XFP3, k=4)
+
+         Type             n    cos bulk   cos outlier   ∆cos mean   ∆cos max   MSE p50    MSE p90
+
+         shared gate up   96   0.96555     0.98279       +0.01724   +0.06805    1.39×        4.70×
+         shared down      41   0.97757     0.98220       +0.00463   +0.01780    1.24×        1.29×
+         attn other       33   0.97900     0.98431       +0.00531   +0.02224    1.21×        1.46×
+         attn o           11   0.97909     0.98302       +0.00393   +0.01109    1.17×        1.28×
+         routed down      96   0.98025     0.98207       +0.00182   +0.01174    1.07×        1.20×
+         routed gate up   96   0.98059     0.98238       +0.00180   +0.00963    1.08×        1.16×
+
+                     Table 14: Qwen3.5-35B-A3B per-expert reconstruction statistics.
+
+
+
+B     Codebook Analysis Detail
+B.1    Cross-Model Distribution Profiles
+
+C     MoE Sampling Validation
+Offline validation of the 4-expert sampling approximation for auto-select bit-width decisions, comparing
+against full-population auto-select (Table 16), and live end-to-end corroboration of the resulting bit-width
+decisions on running models (Table 17):
+
+
+                                                        15
+                    Component          GLM 3σ%         Qwen 3σ%   GLM max|w|         Qwen max|w|
+
+                    attn k                 1.48          0.94       1.63 (49σ)         0.22 (14σ)
+                    attn v                  —            0.82           —                 0.20
+                    dense mlp              0.40          1.19          0.94               0.32
+                    routed down            0.28          0.40          0.26               0.32
+                    shared gate up         0.54          1.02          0.49               0.13
+
+              Table 15: Weight distribution profiles: GLM-4.7-Flash vs. Qwen3.5-35B-A3B.
+
+          Model                 Experts      MoE blocks     4-sample ̸= full     %       Failure mode
+
+          GLM-4.7-Flash               64          94               0            0%       —
+          Qwen3.5-35B-A3B            256          80              0             0%       —
+          Qwen3.5-122B-A10B          256          96              11           11.5%     10× under, 1× over
+
+                  Table 16: Offline bit-width agreement: 4-expert sample vs. full population.
+
+  Model                4-sample tok/s / Math      All-experts tok/s / Math                          ∆
+
+  GLM-4.7-Flash              59.8 / 52%                   59.5 / 52%                       Byte-identical
+  Qwen3.5-35B-A3B            55.4 / 82%                   54.7 / 90%           Bits identical; ∆Math = Lloyd noise
+  Qwen3.5-122B               29.9 / 98%                 (UMA-blocked)                 2 layers flip as predicted
+
+                      Table 17: Live E2E corroboration: 4-expert sample vs. all-experts.
+
+   Across 178 validated MoE blocks (all GLM + 35B + 32 live layers on 122B), live bit-width decisions
+agree 100% with offline predictions. The ±8pp math variance on Qwen-35B reflects Lloyd non-determinism
+(identical bit decisions, different codebook centroids), not a sampling effect.
+
+
+
+
+                                                          16
+References                                                   G. Gerganov et al. llama.cpp. https://github.
+                                                               com/ggerganov/llama.cpp, 2023.
+L. Gao, J. Tow, B. Abbasi, S. Biderman, S. Black,
+  A. DiPofi, C. Foster, L. Golding, J. Hsu,                  M. Lasby et al.   REAP: Reaping Experts for
+  A. Le Noac’h, H. Li, K. McDonell, N. Muen-                  Activation-Aware Pruning of MoE Models. arXiv
+  nighoff, C. Ociepa, J. Phang, L. Reynolds,                  preprint, 2024.
+  H. Schoelkopf, A. Skowron, L. Sutawika, E. Tang,
+                                                             S. Kim, C. Hooper, A. Gholami, Z. Dong,
+  A. Thite, B. Wang, K. Wang, and A. Zou.
+                                                               X. Li, S. Shen, M. Mahoney, and K. Keutzer.
+  A framework for few-shot language model
+                                                               SqueezeLLM: Dense-and-Sparse Quantization.
+  evaluation. https://github.com/EleutherAI/
+                                                               arXiv:2306.07629, 2023.
+  lm-evaluation-harness, v0.4.11, 2024.
+                                                             W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng,
+J. Chee, Y. Cai, V. Kuleshov, and C. De Sa. QuIP: 2-          C. Yu, J. Gonzalez, H. Zhang, and I. Stoica. Ef-
+   Bit Quantization of Large Language Models with             ficient Memory Management for Large Language
+   Guarantees. arXiv:2307.13304, 2023.                        Model Serving with PagedAttention. In SOSP,
+T. Dettmers, M. Lewis, Y. Belkada, and L. Zettle-             2023.
+  moyer. LLM.int8(): 8-bit Matrix Multiplication             J. Lin, J. Tang, H. Tang, S. Yang, X. Dang, and
+  for Transformers at Scale. In NeurIPS, 2022.                 S. Han. AWQ: Activation-aware Weight Quanti-
+                                                               zation for LLM Compression and Acceleration. In
+T. Dettmers, R. Svirschevski, V. Egiazarian,
+                                                               MLSys, 2024.
+  D. Kuznedelev, E. Frantar, S. Ashkboos,
+  A. Borzunov, T. Hoefler, and D. Alistarh.                  S.P. Lloyd. Least Squares Quantization in PCM.
+  SpQR: A Sparse-Quantized Representation                      IEEE Trans. Information Theory, 28(2):129–137,
+  for Near-Lossless LLM Weight Compression.                    1982.
+  arXiv:2306.03078, 2023.
+                                                             NVIDIA.    NVFP4 Tensor Core Quantization—
+T. Dettmers, A. Pagnoni, A. Holtzman, and                     Blackwell Architecture Whitepaper. 2024.
+  L. Zettlemoyer. QLoRA: Efficient Finetuning of
+  Quantized LLMs. In NeurIPS, 2023.                          Open Compute Project. OCP Microscaling (MX)
+                                                              Specification, v1.0. 2023.
+V. Egiazarian, A. Panferov, D. Kuznedelev, E. Fran-
+  tar, A. Babenko, and D. Alistarh. AQLM: Ex-                A. Tseng, J. Chee, Q. Sun, V. Kuleshov, and
+  treme Compression of Large Language Models via               C. De Sa. QuIP#: Even Better LLM Quanti-
+  Additive Quantization. In ICML, 2024.                        zation with Hadamard Incoherence and Lattice
+                                                               Codebooks. arXiv:2402.04396, 2024.
+E. Frantar, S. Ashkboos, T. Hoefler, and D. Alistarh.
+  GPTQ: Accurate Post-Training Quantization for              A. Tseng, Q. Sun, D. Yin, C. De Sa, and
+  Generative Pre-trained Transformers. In ICLR,                V. Kuleshov. QTIP: Quantization with Trellises
+  2023.                                                        and Incoherence Processing. arXiv:2406.11235,
+                                                               2024.
+W. Cheng, W. Lu, et al. Optimize Weight Rounding
+ via Signed Gradient Descent for the Quantization
+ of LLMs. arXiv:2309.05516, 2024.
+
+E. Frantar and D. Alistarh. Marlin: Near-Ideal 4-Bit
+  LLM Inference on NVIDIA GPUs. GitHub, IST
+  Austria, 2024.
+
+B. Marie. NVFP4: Same Accuracy with 2.3x Higher
+  Throughput for 4-Bit LLMs. The Kaitchup – AI
+  on a Budget, 2025.
+
+NVIDIA.           TensorRT    Model     Opti-
+ mizer:     Post-Training  Quantization  for
+ LLMs.           https://github.com/NVIDIA/
+ TensorRT-Model-Optimizer, 2024.
+
+
+                                                        17
+

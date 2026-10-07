@@ -1,0 +1,924 @@
+                                                  GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+
+                                                                Soosung Kim * 1 Minjae Park * 2 Eui-Young Chung 1 Jaeyong Chung 2 1
+
+
+                                                                 Abstract                                     long-context inference introduces a significant memory bot-
+                                              The deployment of Large Language Models                         tleneck, particularly in deployment scenarios where high
+                                              (LLMs) with extended context windows is increas-                throughput is required through batch processing. This over-
+                                              ingly constrained by the linear growth of Key–                  head is primarily caused by the KV cache, which stores
+                                                                                                              attention states to avoid redundant computation. Since the
+arXiv:2607.01065v1 [cs.LG] 1 Jul 2026
+
+
+
+
+                                              Value (KV) cache memory. Vector Quantization
+                                              (VQ), particularly Residual Quantization (RQ), is               KV cache size scales linearly with both sequence length and
+                                              a promising approach for pushing KV cache stor-                 batch size, it often exceeds the available memory of modern
+                                              age toward the sub-1-bit regime by progressively                GPUs. For instance, LLaMA-3.1-8B fits comfortably in a
+                                              encoding residuals with small codebooks. How-                   single H100-80GB GPU with FP16 weights (16GB), but
+                                              ever, most VQ methods still rely on standard ℓ2                 with a 128K context and batch size 8, the KV cache can
+                                              K-means as the core codebook-learning primitive.                grow to 128GB and exceed GPU memory. This KV cache
+                                              We identify a subtle high-dimensional issue of this             growth becomes the primary bottleneck, limiting throughput
+                                              primitive: Euclidean centroid averaging can in-                 and practical long-context serving.
+                                              duce centroid shrinkage, which weakens the angu-                To mitigate these demands, post-training compression meth-
+                                              lar alignment term in the ℓ2 distortion and makes               ods typically employ token eviction/pruning or quantization.
+                                              directional preservation harder. To address this is-            Token eviction/pruning reduces the number of tokens to
+                                              sue, we propose Gain–Shape K-means (GSKM),                      store by retaining only a subset of past tokens, typically
+                                              a drop-in replacement for K-means that improves                 guided by a token saliency signal derived from attention
+                                              directional fidelity while matching, and in some                statistics (Zhang et al., 2023; Liu et al., 2023; Xiao et al.,
+                                              regimes improving, ℓ2 distortion. We then build                 2024b). Quantization instead reduces the per-element stor-
+                                              Gain–Shape Residual Quantization (GSRQ) by                      age cost by lowering the bit-width (Liu et al., 2024; Hooper
+                                              incorporating a weighted extension of GSKM into                 et al., 2024; Su et al., 2025). Importantly, saliency can
+                                              an RQ pipeline. On LLaMA-3-8B, GSRQ sub-                        also be used to enable mixed precision, where a small set
+                                              stantially improves over strong KV cache quan-                  of salient (or outlier) tokens is stored at higher precision
+                                              tization baselines across bit rates. At 1-bit, it               while the remainder is more aggressively quantized (He
+                                              improves the average accuracy across LongBench                  et al., 2024). Offloading provides an orthogonal system-
+                                              tasks from 11.34 to 33.54, a gain of 22.20 percent-             level knob by moving (parts of) the cache to host memory
+                                              age points over VQLLM.                                          or disk, but often trades memory for data-movement latency
+                                                                                                              (Sheng et al., 2023; Aminabadi et al., 2022).
+                                                                                                              Most existing KV cache quantization methods adopt scalar
+                                        1. Introduction
+                                                                                                              quantization, treating each key/value element independently
+                                        Large Language Models (LLMs) have demonstrated strong                 (Liu et al., 2024; Hooper et al., 2024); for instance, KIVI
+                                        performance across various tasks, including complex rea-              quantizes the Key cache per-channel and the Value cache
+                                        soning and code generation. Extending the context window              per-token to minimize outlier impact. Quantization theory
+                                        of these models is essential for processing long documents,           implies that jointly quantizing vectors can provide a higher
+                                        large-scale codebases, and complex dependencies. However,             effective signal-to-noise ratio over scalar quantization even
+                                          *
+                                                                                                              when the source components are i.i.d. Gaussian (Gray &
+                                            Equal contribution 1 Department of Electrical and Elec-           Neuhoff, 2002), motivating vector-quantized KV caches.
+                                        tronic Engineering, Yonsei University, Seoul, Republic of Korea
+                                        2
+                                          Department of Systems Semiconductor Engineering, Yonsei Uni-        Vector Quantization (VQ) has a long history in audio/speech
+                                        versity, Seoul, Republic of Korea. Correspondence to: Jaeyong         coding and large-scale similarity search (Makhoul et al.,
+                                        Chung <jyc@yonsei.ac.kr>.                                             1985; Gersho & Gray, 1992). In VQ, a vector is encoded
+                                                                                                              by the index of a nearest codeword from a learned code-
+                                        Proceedings of the 43 rd International Conference on Machine          book; Product Quantization (PQ) makes this scalable by
+                                        Learning, Seoul, South Korea. PMLR 306, 2026. Copyright 2026
+                                        by the author(s).                                                     partitioning the vector into low-dimensional subspaces and
+
+                                                                                                          1
+                            GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+quantizing each subvector with its own codebook (Jégou                 random-like—making it complementary to structure-
+et al., 2011).                                                          exploiting methods.
+Beyond PQ, Additive Quantization (AQ) represents a vec-
+tor as a sum of multiple codewords drawn from multiple                • We build GSRQ by integrating GSKM with a robust
+(typically full-dimensional) codebooks, and Residual Quan-              gradient-based weighting scheme within a RQ pipeline
+tization (RQ) is its sequential specialization that greed-              for KV cache quantization. This combined design
+ily encodes the residual at each stage (Martinez et al.,                yields substantial improvements over state-of-the-art
+2014). Importantly, the stages in RQ naturally have un-                 VQ/RQ baselines on LLM inference workloads.
+equal significance—early codewords capture most of the
+energy while later stages refine the residual—which enables        2. Related Works
+adaptive computation by truncating decoding to a prefix of
+stages under a compute or latency budget.                          Gain-Shape Decomposition. Gain–shape vector quanti-
+                                                                   zation (GSVQ), also referred to as shape–gain quantization,
+Recently, VQ has started to be explored for KV cache com-          decomposes a vector into its magnitude (gain) and direction
+pression in LLM inference. Coupled Quantization (CQ)               (shape), which are encoded using separate gain and shape
+can be interpreted as a PQ-style scheme: it partitions KV          codebooks. This formulation can be viewed as a special case
+channels into small contiguous blocks and jointly quantizes        of product vector quantization, where the overall codebook
+each block with a per-block codebook (Zhang et al., 2024).         is formed by the Cartesian product of lower-dimensional
+VQLLM instead adopts RQ to reduce reconstruction error             component codebooks (Sabin & Gray, 1984; Gray, 1984;
+by sequentially encoding the residual (Kumar, 2024). Mean-         Gersho & Gray, 1992; Canta et al., 1996). This separation
+while, AnTKV (Li et al., 2025) focuses on mitigating the           is motivated by both computational and statistical consid-
+impact of outliers by using weighted k-means and preserv-          erations. Computationally, product codes reduce storage
+ing anchor (important) tokens without compression. Despite         and search complexity: while the effective codebook size
+these differences, most VQ pipelines in prior work rely on         grows multiplicatively, memory usage and encoding com-
+K-means as a core primitive for learning codebooks under           plexity scale only additively with the component codebook
+an ℓ2 reconstruction objective.                                    sizes (Sabin & Gray, 1984; Gray, 1984; Gray & Neuhoff,
+In this paper, we identify a subtle failure mode of standard       2002). Statistically, gain and shape often carry different
+K-means under an ℓ2 reconstruction objective: in high di-          types of information. In waveform and signal coding, the
+mensions, centroid averaging can compromise direction and          gain spans a wide dynamic range but carries relatively little
+magnitude in a way that is easy to miss yet consequential          information, whereas the shape lies on a unit sphere and cap-
+for reconstruction quality. This effect is especially likely       tures the essential structural content of the signal, justifying
+when high-dimensional vectors are handled in multi-stage           independent quantization and separate bit allocation for the
+schemes such as RQ. To mitigate this issue, we propose             two components (Gray, 1984; Canta et al., 1996). In high-
+Gain–Shape K-means (GSKM), a drop-in replacement for               dimensional text or embedding data, the norm can be less
+standard K-means. Building on GSKM, we develop Gain-               informative than angular similarity, motivating spherical
+Shape Residual Quantization (GSRQ), a RQ pipeline for              k-means and related methods that discard gain and cluster
+KV cache compression and show that it improves recon-              on the unit sphere (Dhillon & Modha, 2001; Banerjee et al.,
+struction quality and downstream accuracy compared to              2005). However, discarding gain can be undesirable for KV
+recent VQ/RQ baselines.                                            cache compression, where magnitude still affects ℓ2 recon-
+                                                                   struction and downstream attention behavior. In contrast,
+In summary, our contributions are as follows:                      our use of gain–shape is not a product-code construction
+                                                                   with separate gain and shape codebooks. Instead, we use
+   • We characterize an often-overlooked degradation mech-         gain–shape to explicitly separate direction and magnitude
+     anism of standard K-means that arises when clustering         within the K-means updates, retaining both factors while
+     high-dimensional, weakly structured vectors, and ex-          reducing the shrinkage–alignment coupling under the ℓ2
+     plain why multi-stage quantizers (e.g., RQ/AQ) can            objective in high dimensions. Empirically, this yields more
+     exacerbate it.                                                reliable directional matching while retaining magnitude in-
+                                                                   formation, unlike spherical clustering.
+   • We introduce GSKM, a drop-in replacement for stan-
+     dard K-means that better preserves direction while            3. Preliminaries
+     sometimes even reducing gain error and ℓ2 distor-
+     tion. Unlike many prior approaches that exploit struc-        The Curse of Dimensionality. A conventional vector
+     tured patterns, GSKM is most effective in the opposite        quantizer maps a D-dimensional vector x ∈ RD to the
+     regime—when representations are weakly structured or          nearest codeword in a codebook C. To maintain a target
+
+                                                               2
+                               GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+
+
+
+                                                                             (a) Key/Value (Original)        (b) Key/Value (1st Residual)
+                                                                         Figure 2. Centroid shrinkage in subspace K-means on LLaMA-
+                                                                         3-8B KV cache (Lower means stronger shrinkage). As the
+Figure 1. Illustration of a hypothesized vicious cycle in high-          subspace dimension D increases, shrinkage becomes progressively
+dimensional ℓ2 -based K-Means. Averaging cancellation induces            more severe; it is consistently stronger for values than keys, and is
+centroid shrinkage, which reduces angular sensitivity and leads to       most pronounced for residual values (right).
+poorer direction and assignment, further reinforcing cancellation.
+
+                                                                         ∥x∥2 ∥µ∥2 , so when ∥µ∥2 is small, improvements in cos θ
+bit-rate of b bits per dimension, the codebook size must
+                                                                         have a diminished effect on ℓ2 distortion. This structure also
+scale as K = 2bD , leading to a parameter complexity of
+                                                                         allows the objective to be reduced by shrinking ∥µ∥2 even
+PV Q ≈ D · 2bD . For high-dimensional vectors, this ex-
+                                                                         when directional alignment does not improve.
+ponential growth renders standard VQ computationally in-
+tractable and memory-prohibitive.                                        Centroid norms are smaller than the average norm of the
+                                                                         assigned vectors unless samples are perfectly aligned, and in
+Product Quantization. Product Quantization (PQ) ad-                      high dimensions they can become substantially smaller due
+dresses this intractability by decomposing the high-                     to mean cancellation under angular dispersion. Formally,
+dimensional space into M orthogonal subspaces and quan-                  for a cluster C, the ℓ2 -optimal centroid is the arithmetic
+tizing each sub-vector independently. This decomposition                 mean of the assigned points, µ⋆ = E[x | x ∈ C], which
+reduces the storage complexity to PP Q ≈ D·2bD/M . While                 satisfies
+computationally efficient, PQ inherently assumes indepen-
+dence between subspaces, thereby ignoring correlations and                      ∥µ⋆ ∥2 = ∥E[x | x ∈ C]∥2 ≤ E[∥x∥2 | x ∈ C],               (2)
+limiting reconstruction fidelity.
+                                                                         with equality only when samples are perfectly aligned. As
+Residual Quantization. Residual Quantization (RQ) re-                    dimensionality increases, within-cluster directions tend to
+fines the approximation by P  representing the vector x as a             be more dispersed and nearly orthogonal (Hall et al., 2005),
+                                 L
+sum of L codewords, x ≈ l=1 Cl [il ], where each stage                   making cancellation in the mean more likely and the result-
+sequentially quantizes the residual error of the previous                ing shrinkage more pronounced.
+stage. This iterative process expands the representational               While dispersion alone induces compromise directions
+capacity without increasing dimensionality, reducing the                 and shrinkage, we hypothesize that ℓ2 -driven centroid up-
+complexity to PRQ ≈ L · D · 2bD/L . Consequently, RQ                     dates can further reinforce directional degradation in the
+effectively mitigates the curse of dimensionality by reducing            high-dimensional, under-capacity regime. In particular, as
+the complexity exponent by a factor of L.                                ∥µ⋆ ∥2 → 0, the objective becomes less sensitive to improv-
+                                                                         ing cos θ because the angular term in (1) scales with ∥µ∥2 .
+4. Motivation: When ℓ2 -Optimal Centroids                                As a result, shrinkage weakens the pressure to maintain or
+   Lose Scale and Direction                                              correct directional alignment, allowing directional compro-
+                                                                         mise to persist and potentially amplify.
+VQ and K-means typically represent a data vector x ∈ RD
+                                                                         This hypothesized mechanism is particularly relevant in RQ
+using a centroid µ ∈ RD and minimize squared euclidean
+                                                                         pipelines. These methods typically encode full-dimensional
+distortion ∥x − µ∥22 . Although convenient, this objective
+                                                                         vectors at each stage (large D), and distribute a fixed overall
+implicitly couples two geometrically distinct factors: (i) the
+                                                                         budget across multiple stages. As a result, each stage often
+magnitude (norm) of the vector and (ii) its direction (angle).
+                                                                         operates with a relatively small codebook size, i.e., in an
+By the law of cosines,
+                                                                         under-capacity regime where a single centroid must cover
+      ∥x − µ∥22 = ∥x∥22 + ∥µ∥22 − 2∥x∥2 ∥µ∥2 cos θ,           (1)        a broad, high-dimensional residual distribution and may
+                                                                         implicitly average multiple nearly-orthogonal modes. This
+where θ is the angle between x and µ. Equation (1)                       setting amplifies centroid shrinkage and directional com-
+makes the coupling explicit: the angular term scales with                promise, motivating a clustering primitive that explicitly
+
+                                                                     3
+                             GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+preserves directional structure under high-dimensional an-          cluster directions, while still using a simple closed-form
+gular dispersion. Figure 1 illustrates the detrimental cycle.       update for the gain.
+Figure 2 shows an example of this regime in KV cache
+                                                                    Gain–shape parameterization. For each cluster k ∈
+quantization. We split per-layer key/value vectors into D-
+                                                                    {1, . . . , K}, we represent the centroid as
+dimensional subspaces and run K-means independently per
+subspace (shown for K ∈ {256, 1024}), then report the                          µk = gk sk ,      gk ≥ 0, ∥sk ∥2 = 1,            (3)
+layer-averaged shrinkage ratio E∥µ∥22 /E∥x∥22 (lower means
+stronger shrinkage). As D grows, each centroid must rep-            where gk is a scalar gain and sk is a unit-norm shape (direc-
+resent increasingly high-dimensional variation with a fixed         tion). We introduce gain–shape as a re-parameterization to
+(and thus effectively smaller) per-dimension capacity, mak-         stabilize optimization against the ℓ2 shrinkage–alignment
+ing mean cancellation more likely and exacerbating shrink-          coupling in high dimensions, not as a coding heuristic. Con-
+age. Values exhibit stronger shrinkage than keys, consis-           sequently, although gk and sk are optimized separately, they
+tent with findings in (Liu et al., 2024) that keys tend to be       jointly define a single centroid ck = gk sk and can be viewed
+more structured than values. Residuals exhibit even stronger        as an implicit single codebook.
+shrinkage, suggesting that their structure is largely dimin-
+ished relative to the original vectors.                             Assignment.     The squared distance decomposes as
+
+5. Methodology                                                               ∥x − gk sk ∥22 = ∥x∥22 + gk2 − 2gk (x⊤ sk ),       (4)
+
+5.1. Overview                                                       making explicit that angular alignment enters through the
+                                                                    projection x⊤ sk , while magnitude contributes a quadratic
+In Gain–Shape Residual Quantization (GSRQ), we com-                 penalty gk2 . Given current (gk , sk ), each xi is assigned by
+bine Product Quantization (PQ) and Residual Quantization
+                                                                    ki⋆ = arg min ∥xi − gk sk ∥22 = arg max 2gk x⊤              2
+                                                                                                                                  
+(RQ) to balance codebook tractability with reconstruction                                                               i sk − gk ,
+                                                                                k                               k
+fidelity. PQ partitions each vector into M disjoint sub-                                                                      (5)
+spaces, reducing the effective dimensionality per codebook,         dropping the constant ∥xi ∥22 . Let Ik = {i | ki⋆ = k} denote
+while RQ progressively refines the approximation by se-             the assigned set.
+quentially quantizing residuals over L stages within each
+subspace. The hyperparameters (M, L) provide a practical
+                                                                    Shape update (magnitude-invariant direction). We first
+knob for controlling codebook granularity and can be cho-
+                                                                    update the direction using per-sample normalized vectors
+sen to improve cache locality and reduce lookup overhead
+at decoding time.                                                                                     xi
+                                                                                              yi ←          ,                   (6)
+                                                                                                     ∥xi ∥2
+Most VQ methods, including PQ and RQ, rely on K-means
+(KM) as a core primitive for learning codebooks. In GSRQ,           and set the shape by normalizing the within-cluster mean:
+we replace every occurrence of KM used for codebook
+                                                                                               1
+                                                                                                   P
+learning with Gain–Shape K-means (GSKM), introduced                                          |Ik |   i∈Ik yi
+in Subsection 5.2. A common extension of KM is weighted                              sk ←                    .             (7)
+                                                                                              1
+                                                                                                   P
+K-means, which incorporates per-sample weights to em-                                       |Ik |   i∈Ik y i
+                                                                                                                    2
+phasize more important or reliable points when learning
+codebooks. We also extend GSKM in the same manner and               This update is the closed-form maximizer      of an angu-
+                                                                    lar alignment objective max∥s∥2 =1 i∈Ik yi⊤ s, yielding a
+                                                                                                      P
+use a weighted GSKM variant, with the weighting scheme
+introduced in Section 5.3.                                          parameter-free, magnitude-invariant estimate of the cluster
+                                                                    direction.
+5.2. Gain–Shape K-means (GSKM)
+                                                                    Gain update (mean projection). Given the updated direc-
+GSKM is motivated by a practical failure mode of stan-              tion sk , minimizing (4) over gk yields the mean projection
+dard ℓ2 K-means in high dimensions: when cluster means              onto sk ,
+shrink toward the origin due to averaging cancellation, the                                                     !
+inferred direction can become numerically fragile and less                                         1 X ⊤
+                                                                                 gk ← max 0,               xi sk ,           (8)
+angle-sensitive, which in turn degrades downstream use of                                        |Ik |
+                                                                                                         i∈Ik
+the prototypes. To mitigate this, we decouple direction and
+magnitude by maintaining an explicit unit-norm shape vari-          where the nonnegativity clamp enforces the gain–shape iden-
+able and updating it with a magnitude-invariant rule. This          tification (µk = gk sk with gk ≥ 0) and avoids degenerate
+design provides a robust, tuning-free default for estimating        sign flips in practice.
+
+                                                                4
+                             GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+Algorithm 1 Gain–Shape K-means (GSKM)
+Require: Data D = {xi }N     i=1 , number of clusters K, max
+    iterations T
+Ensure: Gains {gk }K                      K
+                       k=1 , shapes {sk }k=1 (centroids µk =
+    gk sk )
+ 1: Initialize: choose {sk }K  k=1 on the unit sphere.
+ 2: Initialize gains by (8).                                                (a) Key Gradient               (b) Value Gradient
+ 3: for t = 1 to T do
+                                                                     Figure 3. Distribution of Key and Value Gradients. We compare
+ 4:    // Assignment
+                                                                     the distributions of raw L2 norms (w̃ = ∥g∥2 , grey) and log-
+ 5:    for i = 1 to N do                                             processed norms (w̃ = log(1 + λ∥g∥2 ), red) for (a) Key and
+          ki ← arg maxk∈{1,...,K} 2gk x⊤              2
+                                                        
+ 6:                                           i sk − gk              (b) Value Gradients, where the maximum values are scaled to
+ 7:    end for                                                       1. Raw gradient norms are heavy-tailed, whereas log-smoothing
+ 8:    // Update                                                     compresses their dynamic range.
+ 9:    for k = 1 to K do
+10:       Ik ← {i | ki = k}
+11:       yi ← xi /∥xi ∥2 for alli.∈ Ik                            5.3. Gradient-Weighted GSKM
+          sk ← |I1k | i∈Ik yi             1
+                        P                     P
+12:                                     |Ik |    i∈I yi              Standard Euclidean clustering in KV cache compression
+                                                k        2
+                                                                     minimizes average distortion but ignores the varying sen-
+                     
+          gk ← max 0, |I1k | i∈Ik x⊤
+                                P
+13:                                      i ks
+                                                                     sitivity of the global loss L to quantization errors across
+14:    end for                                                       tokens. Following the sensitivity-based weighting of
+15:    if assignments {ki } unchanged then                           SqueezeLLM (Kim et al., 2023), we adapt this approach to
+16:       break                                                      our setup.
+17:    end if
+18: end for                                                          However, directly utilizing raw gradient magnitudes can be
+19: return {gk }K            K
+                  k=1 , {sk }k=1
+                                                                     suboptimal, as the weighting distribution is often dominated
+                                                                     by highly salient tokens that exhibit extremely large gradi-
+                                                                     ents (Xiao et al., 2024a). To make the weighting robust to
+                                                                     such outliers, we apply a logarithmic transform:
+Practical note on objective and convergence. Because
+the shape update (7) optimizes an angular criterion while
+the assignment and gain updates follow the raw ℓ2 distor-                            wi = log (1 + λ∥∇xi L∥2 ) ,                (9)
+tion structure, Algorithm 1 is not an exact block coordinate
+descent procedure for a single ℓ2 objective, and we do not           where λ normalizes gradient magnitudes relative to the sam-
+claim a monotonic decrease guarantee. We instead treat it            ple median. We apply this weighting consistently at every
+as a practical heuristic: empirically, the magnitude-invariant       residual stage, enforcing the same sensitivity prior through-
+direction update substantially improves robustness of direc-         out the hierarchy.
+tion estimation in high-dimensional regimes and translates
+to consistent improvements on downstream application met-            Figure 3 shows that raw gradient norms are heavy-tailed
+rics. Importantly, the method introduces no additional hy-           (max/median > 400× for both keys and values), whereas
+perparameters, providing a strong default that avoids tuning         log-smoothing reduces this ratio to below 10×. This sta-
+overhead while delivering reliable gains in practice. The            bilization yields lower perplexity than using raw gradient-
+full procedure is summarized in Algorithm 1.                         norm weighting. We provide an ablation for selecting λ in
+                                                                     Appendix B.
+
+Implementation details. In practice, we handle corner
+cases with standard safeguards: if Ik = ∅ we keep (gk , sk )
+                                                                     6. Experiments
+unchanged (or reinitialize the cluster), and we compute              6.1. GSKM Evaluation
+yi = xi /(∥xi ∥2 + ϵ) with a smallPϵ to avoid division by
+zero; if the mean direction |I1k | i∈Ik yi is numerically            Baselines and metrics. Across all evaluations, we com-
+close to zero, we also keep the previous sk .                        pare standard K-means (KM) against our GSKM. Given
+                                                                     a dataset of vectors {xi }N           D
+                                                                                               i=1 ⊂ R , each method learns
+                                                                     a codebook of size K and reconstructs each vector by
+Complexity. GSKM has the same asymptotic complexity                  its assigned prototype, yielding x̂i . We report: (i) mean-
+as K-means: assignment costs O(N KD) dot products per                squared
+                                                                             error MSE = E[||x − x̂||22 ], (ii) average gain error
+iteration, and the updates cost O(N D) accumulations.                E ∥x∥2 − ∥x̂∥2 , and (iii) cosine similarity E[cos(x, x̂)].
+
+                                                                 5
+                                                                                            GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+                                                                                                                                                                            Random
+                 Normal · D-sweep (K=2048)                                       Normal · D-sweep (K=2048)                                        Normal · D-sweep (K=2048)                                Normal · K-sweep (D=256)                                       Normal · K-sweep (D=256)                                         Normal · K-sweep (D=256)
+       0.8                                                           20                                                                1.0                                                     1.0                                                          15
+                     KM                                                              KM                                                                                    KM                                                        KM                                                             KM                           1.0         KM
+                     GSKM                                                            GSKM                                                                                  GSKM                0.8                                   GSKM                                                           GSKM                                     GSKM
+
+
+
+
+                                                                                                                   Cosine similarity
+                                                                                                                                                                                                                                                                                                                                 0.8
+
+
+
+
+                                                                                                                                                                                                                                                                                                             Cosine similarity
+       0.6                                                           15                                                                                                                                                                                     10
+                                                                                                                                       0.8
+
+
+
+
+                                                                                                                                                                                                                                               Gain error
+                                                        Gain error
+                                                                                                                                                                                               0.6                                                                                                                               0.6
+       0.4
+ MSE
+
+
+
+
+                                                                                                                                                                                         MSE
+                                                                     10
+                                                                                                                                       0.6                                                     0.4                                                           5                                                                   0.4
+       0.2                                                               5                                                                                                                     0.2
+                                                                                                                                                                                                                                                                                                                                 0.2
+       0.0                                                               0                                                             0.4                                                     0.0                                                           0
+             4   8    16 32 64 128 256 512 1024                              4   8     16 32 64 128 256 512 1024                              4   8   16 32 64 128 256 512 1024                       64 128 256 512 102420484096819216384                        64 128 256 512 102420484096819216384                                 64 128 256 512 102420484096819216384
+                                 D                                                                D                                                           D                                                        K                                                              K                                                                   K
+
+
+                 (a) MSE                                                     (b) Gain Error                        (c) Cosine Similarity                                                                   (d) MSE                                                (e) Gain Error                              (f) Cosine Similarity
+Figure 4. Random normal sweeps. (a-c): dimension sweep (vary D with fixed K=2048). (d-f): capacity sweep (vary K with fixed
+D=256). Across both sweeps, GSKM improves directional alignment (higher cosine similarity) and reduces gain error relative to KM,
+often translating into lower MSE. The gap is largest in the under-capacity regime.
+
+                                                                                                                                                         Original (Non-residual)
+                                 Key                                                             Key                                                          Key                                                     Value                                                          Value                                                               Value
+       0.7                                                                                                                             0.96                                                    0.06                                                                                                                              0.9
+                                                                     4               KM (K=256)                                                                     KM (K=256)                                                                              2.5             KM (K=256)                                                                           KM (K=256)
+       0.6                                                                           GSKM (K=256)                                                                   GSKM (K=256)                                                                                            GSKM (K=256)                                                                         GSKM (K=256)
+
+
+
+
+                                                                                                                                                                                                                                                                                                             Cosine similarity
+                                                                                                                                                                                               0.05
+                                                                                                                   Cosine similarity
+
+                                                                     3               KM (K=1024)                                       0.94                         KM (K=1024)                                                                             2.0             KM (K=1024)                                          0.8                             KM (K=1024)
+                                                        Gain error
+
+
+
+
+                                                                                                                                                                                                                                               Gain error
+       0.5                                                                           GSKM (K=1024)                                                                  GSKM (K=1024)                                                                                           GSKM (K=1024)                                                                        GSKM (K=1024)
+                                                                                                                                                                                               0.04                                                         1.5
+ MSE
+
+
+
+
+                                                                                                                                                                                         MSE
+       0.4                             KM (K=256)                    2                                                                                                                                                        KM (K=256)                                                                                         0.7
+                                       GSKM (K=256)                                                                                    0.92                                                    0.03                           GSKM (K=256)                  1.0
+       0.3                             KM (K=1024)                   1                                                                                                                                                        KM (K=1024)                   0.5
+                                       GSKM (K=1024)                                                                                                                                           0.02                           GSKM (K=1024)                                                                                      0.6
+       0.2                                                                                                                             0.90                                                                                                                 0.0
+             8              32         128        512                        8              32         128   512                              8          32         128        512                     8         32           128        512                          8         32           128       512                             8            32           128        512
+                                 D                                                               D                                                            D                                                        D                                                               D                                                                  D
+
+
+                 (a) MSE                                                     (b) Gain Error                        (c) Cosine Similarity                                                                   (d) MSE                                                (e) Gain Error                              (f) Cosine Similarity
+                                                                                                                                                                          1st Residual
+                       Key (1st Residual)                                               Key (1st Residual)                                            Key (1st Residual)                                      Value (1st Residual)                                           Value (1st Residual)                                              Value (1st Residual)
+                                                                     10               KM (K=256)                                                                    KM (K=256)                 0.05                                                                        KM (K=256)                                                                            KM (K=256)
+       0.5                                                                            GSKM (K=256)                                     0.8                          GSKM (K=256)                                                                            3              GSKM (K=256)                                          0.8                             GSKM (K=256)
+                                                                                                                   Cosine similarity
+
+
+
+
+                                                                                                                                                                                                                                                                                                             Cosine similarity
+                                                                      8               KM (K=1024)                                                                   KM (K=1024)                0.04                                                                        KM (K=1024)                                                                           KM (K=1024)
+       0.4
+
+
+
+
+                                                                                                                                                                                                                                               Gain error
+                                                                                                                                       0.7
+                                                        Gain error
+
+
+
+
+                                                                      6               GSKM (K=1024)                                                                 GSKM (K=1024)                                                                           2              GSKM (K=1024)                                                                         GSKM (K=1024)
+                                                                                                                                                                                               0.03                                                                                                                              0.6
+ MSE
+
+
+
+
+                                                                                                                                                                                         MSE
+
+
+       0.3                             KM (K=256)                                                                                      0.6                                                                                    KM (K=256)
+                                       GSKM (K=256)                   4                                                                                                                        0.02                           GSKM (K=256)
+       0.2                                                                                                                                                                                                                                                  1
+                                       KM (K=1024)                    2                                                                0.5                                                                                    KM (K=1024)                                                                                        0.4
+       0.1                             GSKM (K=1024)                                                                                                                                           0.01                           GSKM (K=1024)
+                                                                      0                                                                0.4                                                                                                                  0
+             8              32         128        512                        8              32         128   512                              8         32          128        512                     8         32           128        512                      8             32           128       512                             8            32           128        512
+                                 D                                                                D                                                           D                                                        D                                                              D                                                                   D
+
+
+                 (g) MSE                                                     (h) Gain Error                         (i) Cosine Similarity                                                                  (j) MSE                                                (k) Gain Error                              (l) Cosine Similarity
+Figure 5. KV cache reconstruction (LLaMA-3-8B, Wikitext-2). KM vs. GSKM on keys/values for original activations (top) and first
+residuals (bottom) at K ∈ {256, 1024}. GSKM improves cosine similarity and gain error (often, even MSE), with more pronounced on
+values; in residuals, K=256 GSKM can surpass K=1024 KM in directional alignment.
+
+
+Evaluation on Random Gaussian. We first evaluate KM                                                                                                                                      each of keys and values, we collect N =243,035 vectors
+and GSKM on a controlled synthetic distribution with i.i.d.                                                                                                                              across layers. We concatenate attention heads to form
+samples x ∼ N (0, ID ). For each setting, we quantize                                                                                                                                    1024-dimensional vectors, then partition each vector into
+N =10,000 samples with codebook size K and compute the                                                                                                                                   D-dimensional subspaces and run KM or GSKM indepen-
+metrics above. Figure 4(a-c), GSKM consistently improves                                                                                                                                 dently per subspace. We obtain the first residual by sub-
+the directional fidelity of the reconstruction, yielding higher                                                                                                                          tracting the KM reconstruction from the original activations.
+cosine similarity than KM. Notably, this directional advan-                                                                                                                              We report metrics averaged across layers and subspaces.
+tage does not come at the expense of magnitude: GSKM also                                                                                                                                Figure 5 shows a similar pattern on original KV activa-
+reduces gain error, which in turn translates into lower over-                                                                                                                            tions as in the random-data sweep: GSKM improves direc-
+all MSE. This trend becomes more apparent as D increases,                                                                                                                                tional alignment and gain preservation, often even reducing
+where vanilla KM is more prone to directional compromise                                                                                                                                 MSE. The effects are more pronounced for values, which
+under high-dimensional averaging, while GSKM preserves a                                                                                                                                 are less structured than keys. In the first-residual setting,
+better gain–shape decomposition. Figure 4(d-f ) further high-                                                                                                                            GSKM exhibits a more pronounced improvement than KM:
+lights the regime where the difference is most pronounced.                                                                                                                               at K=256, GSKM achieves better directional alignment
+When K is small (the under-capacity regime), KM exhibits                                                                                                                                 than KM with K=1024 for both keys and values.
+a sharp degradation in direction and gain, whereas GSKM
+remains substantially more stable, leading to a significantly                                                                                                                            6.2. KV Compression Evaluation
+larger gap in cosine similarity. As K increases and capacity
+becomes sufficient, the two methods converge, consistent                                                                                                                                 Models and Datasets. We evaluate the efficiency of
+with the expectation that the benefit of GSKM is strongest                                                                                                                               our proposed method, GSRQ on KV cache activations,
+when representational capacity is limited.                                                                                                                                               across a diverse set of large language models (LLMs) and
+                                                                                                                                                                                         benchmarks. For standard perplexity evaluations, we uti-
+                                                                                                                                                                                         lize the base versions of LLaMA-2-7B (Touvron et al.,
+Evaluation on KV cache. We next evaluate on real KV                                                                                                                                      2023), LLaMA-3-8B (Dubey et al., 2024), and Mistral-
+cache activations from LLaMA-3-8B using Wikitext-2. For
+
+                                                                                                                                                                                     6
+                                GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+Table 1. Perplexity comparison. Lower is better. FP16 denotes the full-precision baseline. GSRQ consistently achieves the lowest
+perplexity across three LLMs and both WikiText-2 and C4 at matched bit budgets.
+
+
+                                          LL A MA-2-7 B                 LL A MA-3-8B                   M ISTRAL -7B
+        M ETHOD          B IT       W IKITEXT-2           C4      W IKITEXT-2          C4        W IKITEXT-2          C4
+        FP16             16             5.12            6.63            5.54          7.10             4.73           5.66
+        CQ                2             5.42            7.23            6.09          18.71            5.11           6.17
+        A N TKV           2             5.51            7.45            6.10          16.96            5.08           6.18
+        GSRQ              2             5.34            6.88            5.91          7.43             4.98           5.80
+        CQ                1             7.75            12.49           9.56          81.74            7.25         9.89
+        A N TKV           1             7.92            13.01           9.62          74.47            7.32         10.51
+        GSRQ              1             6.11             7.93           7.20          8.92             6.11         6.53
+        CQ              0.75            8.39            14.32          11.18          72.05            7.64         11.72
+        A N TKV         0.75            8.21            14.27          10.41          66.28            7.41         11.72
+        GSRQ            0.75            6.81             8.99          8.46           10.73            7.14         7.38
+        CQ              0.375          14.82            33.59          22.80          103.5         13.20           26.34
+        A N TKV         0.375          13.37            30.51          17.70          103.5         11.65           23.98
+        GSRQ            0.375          9.42             14.19          12.77          20.17         10.07           11.08
+
+Table 2. Few-shot performance comparison on common sense reasoning and math benchmarks. Higher is better. GSRQ consistently
+outperforms VQLLM at matched bit budgets, and even at 0.75 bit it achieves higher average accuracy than VQLLM at 1 bit, highlighting
+strong sub-1-bit performance.
+
+    M ETHOD B IT ARC-C MMLU T RUTHFUL QA W INOGRANDE H ELLA S WAG PIQA M ATH QA AVERAGE
+    FP16         16    62.37      66.67         52.49             76.48             78.84      78.94      43.45        65.60
+    VQLLM         2    57.76      60.68         51.05             69.30             75.23      76.88      39.16        61.43
+    GSRQ          2    59.30      63.46         50.12             73.16             76.38      78.56      41.07        63.15
+    VQLLM         1    37.03      28.29         44.25             53.12             51.65      72.69      25.23        44.60
+    GSRQ          1    52.05      54.32         48.67             68.98             69.56      76.06      34.84        57.78
+    GSRQ        0.75   45.22      46.50         47.26             63.54             63.74      75.68      31.76        53.38
+
+
+7B-v0.1 (Jiang et al., 2023), measuring performance on                set the subspace dimension D and the number of residual
+the WikiText-2 (Merity et al., 2017) and C4 (Raffel et al.,           stages R as follows. For 2/1/0.75 BPA, we use D=128 with
+2020) datasets. To further assess the model’s capabilities            R=32/16/12, respectively. For 0.375 BPA, we use D=256
+in long-context understanding and mathematical reason-                and R=12. The average bitwidth is calculated as R logD2 (K) .
+ing, we evaluate LLaMA-3-8B-Instruct on LongBench (Bai                Codebooks are calibrated using 128 training samples with
+et al., 2023) and, alongside Mistral-7B-Instruct-v0.1, on the         a sequence length of 2048, while evaluation is performed
+GSM8K (Cobbe et al., 2021) benchmark. For calibration                 with a maximum sequence length of 8K on a single NVIDIA
+in these instruction-tuned tasks, we utilize the SlimPajama           A100 (80GB) GPU.
+dataset (Soboleva et al., 2023).
+
+Baselines. We benchmark our approach against state-                   Perplexity Evaluation. Table 1 reports perplexity (PPL;
+of-the-art KV cache quantization methods, including                   lower is better) on the Wikitext-2 and C4 validation sets
+CQ (Zhang et al., 2024), AnTKV (Li et al., 2025), KIVI (Liu           for three LLMs (LLaMA-2-7B, LLaMA-3-8B, and Mistral-
+et al., 2024), and VQLLM (Kumar, 2024). AnTKV-1% (Li                  7B). Across all models and bit-rates where baselines are
+et al., 2025) keeps a subset of important tokens in full preci-       available, GSRQ consistently achieves lower PPL than
+sion, and we do not include it as a baseline because anchor-          competing methods. The improvement becomes increas-
+token selection is an orthogonal technique that can be used           ingly pronounced as the bit-rate decreases: in the low-bit
+in conjunction with other KV-compression methods.                     regime (0.75 and 0.375 BPA), baselines often enter an under-
+                                                                      capacity setting where each stage must represent broad vari-
+Configurations. We evaluate 2, 1, 0.75, and 0.375 bits per            ation with a small codebook, leading to rapidly deteriorating
+activation (BPA). With a fixed codebook size K=256, we                PPL. In contrast, GSRQ degrades more gracefully, aligning
+
+                                                                  7
+                                   GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+Table 3. Performance comparison on LongBench tasks. GSRQ consistently attains higher accuracy compared to VQLLM and KIVI.
+
+    M ETHOD B IT N ARRATIVE QA Q ASPER M ULTIFIELD QA QMS UM M U S I Q UE T RIVIAQA SAM SUM AVERAGE
+    FP16         16             23.94            39.66           41.52        23.03      22.24       90.11       41.64       40.30
+    KIVI-2 2.25                 23.00            34.97           38.96        22.37      20.68       90.05       41.12       38.73
+    VQLLM 2.00                  17.41            32.65           38.55        22.07      19.22       87.42       39.52       36.69
+    GSRQ   2.00                 21.20            36.92           40.79        22.81      24.33       89.20       42.12       39.62
+    KIVI-1 1.25                 2.18             3.12            5.06          7.29      2.43        15.91        5.82       5.97
+    VQLLM 1.00                   1.26             4.04           8.76         16.17      2.12        35.40       11.69       11.34
+    GSRQ   1.00                 18.59            28.73           30.42        20.83      17.08       83.41       35.72       33.54
+    GSRQ        0.75            19.71            18.31           28.92        20.12      13.51        76.3       31.19       29.72
+
+Table 4. Performance comparison on GSM8K benchmark. The                      Table 6. Ablation study of GSRQ (Log-Weighted-GSKM). On
+exact match accuracy (%) for LLaMA-3-8B-Instruct and Mistral-                LLaMA-3-8B (0.375-bit) with WikiText-2, GSKM provides the
+7B-Instruct-v0.1.                                                            largest perplexity gain within GSRQ.
+
+                                                GSM8K                                                             P ERPLEXITY
+     Method       Avg. bit       LLaMA-3-8B          Mistral-7B                  M ETHOD                      B OTH   K EY   VALUE
+     FP16              16               76.19            33.43                   S TANDARD KM                 19.50   7.28    12.30
+                                                                                 U NWEIGHTED -GSKM            12.77   6.87    8.88
+     VQLLM            2.00              55.65            27.90
+                                                                                 R AW-W EIGHTED -GSKM         13.57   6.90    9.35
+     GSRQ             2.00              65.73            28.13
+                                                                                 L OG -W EIGHTED -GSKM        12.49   6.82     8.78
+     VQLLM            1.00               2.27             3.94
+     GSRQ             1.00              26.16            13.65
+                                                                             tasks. We conduct the evaluation on ARC-C (25-shot) (Clark
+Table 5. Performance comparison on MATH-500 and RULER                        et al., 2018), MMLU (5-shot) (Hendrycks et al., 2020),
+benchmarks for LLaMA-3-8B-Instruct. GSRQ preserves                           TruthfulQA (0-shot) (Lin et al., 2022), Winogrande (5-shot)
+stronger mathematical reasoning and long-context performance
+                                                                             (Sakaguchi et al., 2021), HellaSwag (10-shot) (Zellers et al.,
+than existing KV cache quantization baselines at matched bit bud-
+gets.                                                                        2019), PIQA (0-shot) (Bisk et al., 2020), MathQA (5-shot)
+                                                                             (Amini et al., 2019), and GSM8K (5-shot) (Cobbe et al.,
+        Method         BPA        MATH-500           RULER                   2021). Table 2 first compares GSRQ against VQLLM, a
+        FP16            16              20.4             96.0
+                                                                             recent RQ baseline that augments vanilla RQ with Exponen-
+                                                                             tial Moving Average (EMA) codebook learning and non-
+        KIVI                2           15.8             94.0                contiguous grouping. Despite using a simpler modification—
+        VQLLM               2           13.4             94.0                a drop-in substitution of K-means with a weighted GSKM
+        GSRQ                2           19.0             96.0
+                                                                             within the vanilla RQ pipeline—GSRQ substantially im-
+        KIVI                1           0.8              13.0                proves accuracy over VQLLM. Notably, GSRQ at 0.75-bit
+        VQLLM               1            0.2             20.0                already surpasses VQLLM at 1-bit. Table 3 reports re-
+        GSRQ                1           14.2             72.0                sults on LongBench. GSRQ at 0.75-bit outperforms both
+                                                                             VQLLM at 1-bit and KIVI-1, indicating strong robustness
+                                                                             as the quantization budget decreases. We further verify ar-
+with our earlier finding that GSKM is particularly effective                 chitectural generalization by extending our evaluation to
+under under-capacity and weakly structured representations.                  Mistral-7B-Instruct on the GSM8K benchmark, as reported
+Finally, the advantage of GSRQ is more evident on C4 than                    in Table 4. The results demonstrate consistent robustness
+on Wikitext-2. While both datasets show consistent gains,                    across models, notably mitigating the severe performance
+C4 exhibits substantially larger gaps between GSRQ and                       collapse observed in baselines in the 1-bit regime. Table 5
+prior methods, especially at 1-bit and below, suggesting that                further shows that GSRQ preserves stronger mathematical
+robustness to the low-bit under-capacity regime is critical                  reasoning and long-context performance on MATH-500 and
+for maintaining performance on more diverse corpora.                         RULER.
+
+                                                                             6.3. GSRQ Ablation
+Benchmarks Evaluation. We evaluate downstream qual-
+ity using the LM Evaluation Harness (Gao et al., 2024) on                    We analyze the contribution of each component using
+commonsense and math benchmarks, as well as LongBench                        LLaMA-3-8B evaluated on the WikiText-2 dataset, as de-
+
+                                                                         8
+                               GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+Table 7. Few-shot performance comparison on commonsense and math benchmarks for Qwen3-8B. GSRQ improves average
+accuracy over VQLLM at matched low-bit budgets.
+
+    M ETHOD B IT ARC-C MMLU T RUTHFUL QA W INOGRANDE H ELLA S WAG PIQA M ATH QA AVERAGE
+    FP16         16    26.79        26.37           45.79           50.43            31.94       62.02     24.46       38.26
+    VQLLM        2     22.18        25.88           51.64           50.67            25.47       56.86     22.35       36.44
+    GSRQ         2     23.89        29.91           45.65           53.91            29.47       73.23     29.18       40.75
+    VQLLM        1     22.70        24.11           51.09           50.04            25.72       53.92     20.30       35.41
+    GSRQ         1     21.50        26.19           48.82           54.14            27.47       66.38     24.52       38.43
+    GSRQ       0.75    22.95        25.87           50.51           51.85            26.86       65.40     22.48       37.99
+
+Table 8. Performance comparison on LongBench tasks for Qwen3-8B. GSRQ achieves stronger average long-context performance
+than VQLLM under aggressive KV cache compression.
+
+    M ETHOD B IT N ARRATIVE QA Q ASPER M ULTIFIELD QA QMS UM M U S I Q UE T RIVIAQA SAM SUM AVERAGE
+    FP16        16          22.90           47.39           54.22        22.60      30.31       88.04      39.67      43.59
+    VQLLM 2.00              23.38           42.20           46.46        22.14      21.14       77.12      36.85      38.47
+    GSRQ  2.00              21.96           44.88           48.24        22.67      24.42       75.30      38.27      39.39
+    VQLLM 1.00               6.99           15.73           24.41        18.35      3.73        11.43      4.96       12.23
+    GSRQ  1.00              18.56           30.28           40.77        21.48      11.88        8.17      10.35      20.21
+    GSRQ       0.75         12.39           17.42           29.70        21.11      5.46        7.91        8.83      14.96
+
+Table 9. Performance comparison on AIME24 and AIME25                    best performance, reaching a perplexity of 12.49.
+for Qwen3-8B. GSRQ better preserves competition-level mathe-
+matical reasoning than VQLLM at the same 2-BPA setting.
+                                                                        Robustness Across Models and Tasks. We further ex-
+      Method          BIT       AIME24              AIME25              amine whether the benefits of GSRQ extend beyond the
+                                                                        main LLaMA and Mistral settings. On Qwen3-8B, Tables 7
+      FP16            16            20.0             23.3
+                                                                        and 8 show stronger average performance than VQLLM on
+      VQLLM            2            13.3             13.3               few-shot commonsense/math benchmarks and LongBench,
+      GSRQ             2            20.0             16.7               while Table 9 shows that GSRQ remains effective on chal-
+                                                                        lenging competition-level math problems such as AIME24
+Table 10. Perplexity comparison on WikiText-2 and C4 for                and AIME25. Table 10 further confirms this trend in per-
+Qwen3-8B. Lower is better. GSRQ achieves lower perplexity than          plexity, where GSRQ achieves lower WikiText-2 and C4
+VQLLM at matched bit budgets.                                           perplexity than VQLLM at matched 2-BPA and 1-BPA set-
+                                                                        tings. Overall, these results support the robustness of GSRQ
+        Method        BIT       WikiText-2           C4                 across model families, task types, and evaluation metrics.
+        FP16           16            8.55            8.59
+        VQLLM          2             9.05            9.00               7. Conclusion
+        GSRQ           2             8.88            8.80
+                                                                        We introduced Gain–Shape K-means (GSKM), a drop-in re-
+        VQLLM          1            15.79           13.52
+                                                                        placement for standard ℓ2 K-means for learning vector quan-
+        GSRQ           1            10.22           9.84
+                                                                        tization codebooks. Across random sweeps and real KV
+                                                                        cache activations, GSKM improves directional fidelity while
+                                                                        maintaining competitive ℓ2 distortion. Gain-Shape Residual
+tailed in Table 6. The primary performance leap stems from              Quantization (GSRQ) built upon a gradient-weighted ex-
+replacing the standard Euclidean objective with our pro-                tension of GSKM obtains consistent perplexity reductions
+posed method, which drastically reduces perplexity from                 on Wikitext-2 and C4 across LLaMA-2-7B, LLaMA-3-8B,
+19.50 to 12.77 (Standard KM → Unweighted-GSKM).                         and Mistral-7B, with larger gains at lower bit-rates. GSRQ
+While naive gradient weighting (Raw-Weighted) suffers                   also improves downstream accuracy on commonsense/math
+from instability due to outlier gradients, applying our loga-           benchmarks and LongBench compared to recent quantiza-
+rithmic smoothing (Log-Weighted) effectively balances the               tion baselines, demonstrating that GSKM yields substantial
+optimization. Consequently, the full method achieves the                practical benefits for KV cache quantization.
+
+                                                                    9
+                              GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+Acknowledgements                                                        Cobbe, K. et al. Training verifiers to solve math word
+                                                                          problems. arXiv preprint arXiv:2110.14168, 2021.
+This work was supported by the Institute of Information &
+Communications Technology Planning & Evaluation (IITP)                  Dhillon, I. S. and Modha, D. S. Concept decompositions for
+grant funded by the Korea government (MSIT) (No. RS-                      large sparse text data using clustering. Machine Learning,
+2025-09942968, AI Semiconductor Innovation Lab, Yonsei                    42(1-2):143–175, 2001. doi: 10.1023/A:1007612920971.
+University).
+                                                                        Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle,
+                                                                         A., Letman, A., Mathur, A., Schelten, A., Yang, A., Fan,
+Impact Statement                                                         A., et al. The llama 3 herd of models. arXiv preprint
+Our work focuses on improving the efficiency of LLM in-                   arXiv:2407.21783, 2024.
+ference via advanced vector quantization. This research                 Gao, L., Tow, J., Abbasi, B., Biderman, S., Black, S., DiPofi,
+directly contributes to reducing the energy consumption of                A., Foster, C., Golding, L., Hsu, J., Le Noac’h, A., Li,
+AI systems and enabling the deployment of large models on                 H., McDonell, K., Muennighoff, N., Ociepa, C., Phang,
+resource-constrained edge devices. Ultimately, by lowering                J., Reynolds, L., Schoelkopf, H., Skowron, A., Sutawika,
+the computational energy burden, our method promotes en-                  L., Tang, E., Thite, A., Wang, B., Wang, K., and Zou, A.
+vironmentally sustainable AI practices and helps mitigate                 The language model evaluation harness, 07 2024. URL
+the growing carbon footprint of large-scale model serving.                https://zenodo.org/records/12608602.
+                                                                        Gersho, A. and Gray, R. M. Vector Quantization and Signal
+References                                                                Compression. Springer Science & Business Media, 1992.
+Aminabadi, R. Y., Rajbhandari, S., Zhang, M., Awan, A. A.,
+                                                                        Gray, R. Vector quantization. IEEE Assp Magazine, 1(2):
+ Li, C., Li, D., Zheng, E., Rasley, J., Smith, S., Ruwase,
+                                                                          4–29, 1984.
+ O., and He, Y. Deepspeed inference: Enabling efficient
+ inference of transformer models at unprecedented scale.                Gray, R. M. and Neuhoff, D. L. Quantization. IEEE trans-
+ arXiv preprint arXiv:2207.00032, 2022.                                   actions on information theory, 44(6):2325–2383, 2002.
+Amini, A., Gabriel, S., Lin, S., Koncel-Kedziorski, R., Choi,           Hall, P., Marron, J. S., and Neeman, A. Geometric represen-
+ Y., and Hajishirzi, H. Mathqa: Towards interpretable                     tation of high dimension, low sample size data. Journal of
+ math word problem solving with operation-based for-                      the Royal Statistical Society: Series B (Statistical Method-
+ malisms. In Proceedings of the 2019 conference of the                    ology), 67(3):427–444, 2005.
+ North American chapter of the association for computa-
+ tional linguistics: Human language technologies, volume                He, Y., Zhang, L., Wu, W., Liu, J., Zhou, H., and Zhuang,
+ 1 (long and short papers), pp. 2357–2367, 2019.                          B. Zipcache: Accurate and efficient kv cache quanti-
+                                                                          zation with salient token identification. arXiv preprint
+Bai, Y. et al. Longbench: A bilingual, multitask bench-                   arXiv:2405.14256, 2024.
+  mark for long context understanding. arXiv preprint
+  arXiv:2308.14508, 2023.                                               Hendrycks, D., Burns, C., Basart, S., Zou, A., Mazeika,
+                                                                          M., Song, D., and Steinhardt, J. Measuring mas-
+Banerjee, A., Merugu, S., Dhillon, I. S., and Ghosh, J. Clus-             sive multitask language understanding. arXiv preprint
+  tering with Bregman divergences. Journal of Machine                     arXiv:2009.03300, 2020.
+  Learning Research, 6:1705–1749, 2005.
+                                                                        Hooper, C., Kim, S., Mohammadzadeh, H., Mahoney,
+Bisk, Y., Zellers, R., Gao, J., Choi, Y., et al. Piqa: Reasoning          M. W., Shao, Y. S., Keutzer, K., and Gholami, A.
+  about physical commonsense in natural language. In Pro-                 Kvquant: Towards 10 million context length llm in-
+  ceedings of the AAAI conference on artificial intelligence,             ference with kv cache quantization. arXiv preprint
+  volume 34, pp. 7432–7439, 2020.                                         arXiv:2401.18079, 2024. NeurIPS 2024.
+Canta, M., Paura, L., and Poggi, G. Generalized gain-shape              Jégou, H., Douze, M., and Schmid, C. Product quantization
+  vector quantization for multispectral image coding. In                   for nearest neighbor search. IEEE Transactions on Pat-
+  Proceedings of the European Signal Processing Confer-                    tern Analysis and Machine Intelligence, 33(1):117–128,
+  ence (EUSIPCO), 1996.                                                    2011. doi: 10.1109/TPAMI.2010.57.
+Clark, P., Cowhey, I., Etzioni, O., Khot, T., Sabharwal, A.,            Jiang, A. Q., Sablayrolles, A., Mensch, A., Bamford, C.,
+  Schoenick, C., and Tafjord, O. Think you have solved                     Chaplot, D. S., de Las Casas, D., Bressand, F., Lengyel,
+  question answering? try arc, the ai2 reasoning challenge.                G., Lample, G., Saulnier, L., et al. Mistral 7b. arXiv
+  arXiv preprint arXiv:1803.05457, 2018.                                   preprint arXiv:2310.06825, 2023.
+
+                                                                   10
+                              GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+Kim, S., Hooper, C., Gholami, A., Dong, Z., Li,                          at scale. Communications of the ACM, 64(9):99–106,
+  X., Shen, S., Mahoney, M. W., and Keutzer, K.                          2021.
+  Squeezellm: Dense-and-sparse quantization. arXiv
+  preprint arXiv:2306.07629, 2023.                                     Sheng, Y., Zheng, L., Yuan, B., Li, Z., Ryabinin, M., Fu,
+                                                                         D. Y., Xie, Z., Chen, B., Barrett, C., Gonzalez, J. E.,
+Kumar, A. Residual vector quantization for kv cache                      Liang, P., Ré, C., Stoica, I., and Zhang, C. Flexgen: High-
+  compression in large language model. arXiv preprint                    throughput generative inference of large language mod-
+  arXiv:2410.15704, 2024. doi: 10.48550/arXiv.2410.                      els with a single gpu. arXiv preprint arXiv:2303.06865,
+ 15704.                                                                  2023.
+
+Li, Z., Xiao, C., Wang, Y., Liu, X., Tang, Z., Lu, B., Yang,           Soboleva, D., Al-Khateeb, F., Myers, R., Steinhardt,
+  M., Chen, X., and Chu, X. Antkv: Anchor token-aware                    J. R., Hubeen, M., and Reyna, R. SlimPajama: A
+  sub-bit vector quantization for kv cache in large language             627b token cleaned and deduplicated version of Red-
+  models. arXiv preprint arXiv:2506.19505, 2025.                         Pajama, 2023. URL https://huggingface.co/
+                                                                         datasets/cerebras/SlimPajama-627B. Hug-
+Lin, S., Hilton, J., and Evans, O. Truthfulqa: Measuring                 ging Face repository.
+  how models mimic human falsehoods. In Proceedings of
+  the 60th annual meeting of the association for computa-              Su, Z., Wei, H., Chen, Z., Shen, W., Li, L., Yu, H., and Yuan,
+  tional linguistics (volume 1: long papers), pp. 3214–3252,             K. Rotatekv: Accurate and robust 2-bit kv cache quan-
+  2022.                                                                  tization for llms via outlier-aware adaptive rotations. In
+                                                                         Proceedings of the Thirty-Fourth International Joint Con-
+Liu, Z., Desai, A., Liao, F., Wang, W., Xie, V., Xu, Z.,                 ference on Artificial Intelligence (IJCAI-25), pp. 6200–
+  Kyrillidis, A., and Shrivastava, A. Scissorhands: Ex-                  6208, 2025. doi: 10.24963/ijcai.2025/690.
+  ploiting the persistence of importance hypothesis for
+  llm kv cache compression at test time. arXiv preprint                Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi,
+  arXiv:2305.17118, 2023.                                                A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P.,
+                                                                         Bhosale, S., et al. Llama 2: Open foundation and fine-
+Liu, Z., Yuan, J., Jin, H., Zhong, S. H., Xu, Z., Braverman,             tuned chat models. arXiv preprint arXiv:2307.09288,
+  V., Chen, B., and Hu, X. Kivi: A tuning-free asymmetric                2023.
+  2bit quantization for kv cache. In Proceedings of the 41st
+  International Conference on Machine Learning (ICML),                 Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Effi-
+  2024. arXiv:2402.02750.                                                cient streaming language models with attention sinks. In
+                                                                         International Conference on Learning Representations,
+Makhoul, J., Roukos, S., and Gish, H. Vector quantization                2024a.
+ in speech coding. Proceedings of the IEEE, 73(11):1551–
+ 1588, 1985.                                                           Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Effi-
+                                                                         cient streaming language models with attention sinks. In
+Martinez, J., Hoos, H. H., and Little, J. J. Stacked quantizers          International Conference on Learning Representations
+ for compositional vector compression. arXiv preprint                    (ICLR), 2024b. arXiv:2309.17453.
+ arXiv:1411.2173, 2014.
+                                                                       Zellers, R., Holtzman, A., Bisk, Y., Farhadi, A., and Choi,
+Merity, S., Xiong, C., Bradbury, J., and Socher, R. Pointer              Y. Hellaswag: Can a machine really finish your sentence?
+ sentinel mixture models. In International Conference on                 arXiv preprint arXiv:1905.07830, 2019.
+ Learning Representations, 2017.
+                                                                       Zhang, T., Yi, J., Xu, Z., and Shrivastava, A. Kv cache
+Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S.,               is 1 bit per channel: Efficient large language model in-
+  Matena, M., Zhou, Y., Li, W., and Liu, P. J. Exploring                 ference with coupled quantization. Advances in Neural
+  the limits of transfer learning with a unified text-to-text            Information Processing Systems, 37:3304–3331, 2024.
+  transformer. Journal of Machine Learning Research, 21
+  (140):1–67, 2020.                                                    Zhang, Z. et al. H2 o: Heavy-hitter oracle for efficient gener-
+                                                                         ative inference of large language models. arXiv preprint
+Sabin, M. J. and Gray, R. M. Product code vector quantizers              arXiv:2306.14048, 2023.
+  for waveform and voice coding. IEEE Transactions on
+  Acoustics, Speech, and Signal Processing, 32(3):474–488,
+  June 1984. doi: 10.1109/TASSP.1984.1164367.
+
+Sakaguchi, K., Bras, R. L., Bhagavatula, C., and Choi, Y.
+  Winogrande: An adversarial winograd schema challenge
+
+                                                                  11
+                             GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+A. GSKM vs. Standard K-Means
+In this section, we provide a detailed quantitative comparison between the proposed Gain-Shape K-means (GSKM) and
+the standard Euclidean K-means baseline. As discussed in Section 4, standard K-means is prone to centroid shrinkage in
+high-dimensional subspaces, particularly when operating in the under-capacity regime (i.e., low bits per activation and high
+dimensionality per subspace). This phenomenon degrades the angular fidelity of the quantized vectors, leading to higher
+reconstruction errors.
+To empirically validate the efficacy of our proposed method, we compare the perplexity (PPL) of Llama-3-8B on the
+WikiText-2 validation set across various bit-rates. We sweep the Bits Per Activation (BPA) from 0.375 to 2.0, adjusting the
+subspace dimension D accordingly.
+The quantitative results are detailed in Table 11. We observe that RQ utilizing GSKM consistently achieves lower perplexity
+than the RQ utilizing standard K-Means across all configurations. Notably, the performance gap is significantly more
+pronounced for the Value cache compared to the Key cache. This finding empirically confirms that GSKM is particularly
+effective for representations that are weakly structured or random-like—a characteristic typical of Value vectors—where
+standard Euclidean clustering often fails to capture directional information due to severe centroid shrinkage.
+
+Table 11. Perplexity values. Comparison between Normal K-Means and GSKM evaluated on the WikiText-2 validation set. Note that
+this comparison employs unweighted clustering for both methods.
+
+                                           Both                       Key                   Value
+                     BPA (D)       Normal KM GSKM Normal KM GSKM Normal KM GSKM
+                     0.375 (256)      19.50       12.77        7.28         6.87       12.30        8.88
+                     0.750 (128)      9.49         8.46        6.51         6.36       7.43         6.95
+                     1.000 (128)      7.95         7.20        6.18         6.05       6.80         6.42
+                     2.000 (128)      6.21         5.91        5.75         5.68       5.94         5.73
+
+
+B. Ablation study on Lambda (λ)
+In this section, we investigate the impact of the λ hyperparameter on the model’s performance. As described in the main
+paper, we apply a logarithmic transformation to the weights to handle their high dynamic range. To ensure consistent
+behavior of the transformation, we scale the weights such that their median aligns with a specific target value before applying
+the log(1 + x) function. Specifically, the transformation is defined as:
+
+                                                                         τ
+                             w̃ = log(1 + λw),      where    λ=                  ,    w = ∥g∥2                            (10)
+                                                                   median(w) + ϵ
+
+Here, g denotes the original weights, w is the ℓ2 -norm of g, τ is the target median, and ϵ is a small constant for numerical
+stability.
+We evaluate candidate values of τ in 10−2 , 10−1 , 100 , 101 , and 102 across different BPA configurations of 0.375 and 0.75.
+Figure 6 illustrates the results. We observe a clear convex trend where deviation from τ = 1.0 leads to degradation in
+perplexity. When τ is too small, the values are compressed into the near-linear region of the log function, reducing its
+effectiveness. Conversely, when τ is too large, the saturation effect varies.
+
+C. Decoding Latency Analysis
+Our measurements are obtained from a fully custom PyTorch-based autoregressive decoding implementation utilizing
+high-performance custom Triton kernels to minimize HBM access overhead. Specifically, we use fused kernels for (i)
+residual quantization and bit-packing of newly generated KV vectors, and (ii) on-the-fly bit-unpacking, dequantization,
+RoPE, and attention computation during decoding without materializing intermediate FP16 tensors. All measurements in
+this section are conducted on a single NVIDIA A100 80GB GPU.
+By alleviating memory bandwidth bottlenecks, our method achieves significant layer-wise latency reductions, as shown
+in Table 12. To directly assess the end-to-end impact, we additionally measured the full autoregressive decoding latency
+
+                                                              12
+                                 GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+
+
+
+                              (a) BPA = 0.375                                             (b) BPA = 0.75
+Figure 6. Sweeping the target median (τ ). We report the perplexity on the validation set for different BPA configurations. The x-axis
+represents the target median value used for weight scaling prior to the logarithmic transformation. For comparison, ‘raw’ denotes the
+baseline performance where no log smoothing is applied to the weights. The red star (⋆) denotes the selected configuration (τ = 1.0),
+which achieves the best performance.
+
+
+on LLaMA-3-8B under BPA=0.75, using torch.cuda.Event timers with synchronization. As reported in Table 13, GSRQ
+achieves substantial latency reductions at long contexts, delivering a 1.59× to 3.40× speedup in per-token decoding latency
+over the evaluated range.
+Furthermore, as illustrated in Figure 7, our method dramatically reduces the memory footprint. While the FP16 baseline
+encounters OOM errors at larger batch sizes (Figure 7) and runs out of memory at a 128K context length (Table 13), our
+method scales efficiently even with limited resources. This substantial reduction in memory usage implies that our approach
+can effectively support memory-intensive scenarios, such as processing longer context lengths within the same memory
+budget.
+
+Table 12. Latency comparison. Layer-wise per-token           Table 13. End-to-end decoding latency per token. We report the end-to-
+latency (ms) of FP16 and GSRQ across different batch         end per-token decoding latency measured with a batch size of 1 over 100
+sizes, measured with a context length of 1024.               generated tokens.
+
+         Batch Size       8        16       32                     Context length      FP16 (ms)     GSRQ (ms)        Speedup
+         FP16            2.3       3.9     7.9                           8K              70.68           44.48         1.59×
+         GSRQ            1.2       1.7     2.3                          16K              122.50          54.47         2.25×
+                                                                        32K              253.69          83.96         3.02×
+         Speedup        1.9×      2.3×    3.4×
+                                                                        64K              486.73         143.29         3.40×
+                                                                        128K             OOM            262.12            –
+
+
+D. Convergence Analysis
+We empirically investigate the convergence behavior of GSKM with respect to the maximum number of iterations to
+determine the optimal trade-off between computational cost and reconstruction quality. As illustrated in Figure 8, the model
+demonstrates robust empirical convergence across different hyperparameter settings.
+Increasing the maximum iterations up to 40 yields a rapid and consistent reduction in perplexity across all evaluated BPAs.
+Beyond 40 iterations, the performance improvements become marginal, with the perplexity effectively plateauing in every
+case. This empirical evidence demonstrates that the algorithm converges efficiently without degradation at higher iterations,
+suggesting that setting the maximum iteration to around 100 is sufficient to achieve optimal performance while mitigating
+unnecessary computational overhead.
+
+
+
+
+                                                                 13
+                             GSRQ: Gain–Shape Residual Quantization for Sub-1-bit KV Cache
+
+
+
+
+Figure 7. Memory usage during decoding. Comparison between FP16 and GSKM-0.75bit on LLaMA-3-8B model with a context length
+of 1K across varying batch sizes. All experiments were performed on a single NVIDIA A100 80GB GPU.
+
+
+
+
+Figure 8. Max iteration sweep. Empirical convergence of perplexity as a function of the maximum number of iterations. Across all
+configurations, the algorithm demonstrates efficient convergence, with performance plateauing after 40 iterations.
+
+
+
+
+                                                              14
+

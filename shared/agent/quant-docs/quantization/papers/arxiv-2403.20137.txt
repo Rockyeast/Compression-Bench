@@ -1,0 +1,359 @@
+                                         Accurate Block Quantization in LLMs with Outliers
+                                                                       Nikita Trukhanov                                     Ilya Soloveychik
+                                                                           d-Matrix                                              d-Matrix
+                                                                     Santa Clara, CA, USA                                 Santa Clara, CA, USA
+                                                                    ntrukhanov@d-matrix.ai                                  ilyas@d-matrix.ai
+
+
+
+
+                                            Abstract—The demand for inference on extremely large scale       entire sequence on every generative step. When the sequences
+                                         LLMs has seen enormous growth in the recent months. It made         become too large, repetitive computations of the K and V
+                                         evident the colossal shortage of dedicated hardware capable of      matrices become prohibitively resource greedy. To avoid those
+                                         efficient and fast processing of the involved compute and memory
+arXiv:2403.20137v1 [cs.AI] 29 Mar 2024
+
+
+
+
+                                         movement. The problem is aggravated by the exploding raise in       redundant operations, one could exploit the fact that the keys
+                                         the lengths of the sequences being processed, since those require   and values of the already appended tokens never change and
+                                         efficient on-chip storage of the KV-cache of size proportional      can therefore be cached on chip.
+                                         to the sequence length. To make the required compute feasible          Caching K and V matrices is extremely helpful if the on-
+                                         and fit the involved data into available memory, numerous           chip storage allows it. However, the ever growing demand
+                                         quantization techniques have been proposed that allow accurate
+                                         quantization for both weights and activations. One of the main      for generation of longer sequence dwarfs any amount of on-
+                                         recent breakthroughs in this direction was introduction of the      chip storage [7], [8]. Hence, every possible technique must
+                                         family of Block Floating Point (BFP) formats characterized by       be exploited to reduce the memory footprint of the cached
+                                         a block of mantissas with a shared scale factor. These enable       tensors. The most promising approach consists in efficient
+                                         memory- power-, and compute- efficient hardware support of          quantization of keys and values. To this end such algorithms
+                                         the tensor operations and provide extremely good quantization
+                                         accuracy. The main issues preventing widespread application of      as GPTQ [9], SmoothQuant [10], and many others have been
+                                         block formats is caused by the presence of outliers in weights      proposed. For example, the GPTQ technique prescribes suc-
+                                         and activations since those affect the accuracy of the other        cessive quantization of the weight columns in such a way that
+                                         values in the same block. In this paper, we focus on the most       the rounding of every next column carefully takes into account
+                                         critical problem of limited KV-cache storage. We propose a          the accumulated error of the previously quantized columns.
+                                         novel approach enabling usage of low precision BFP formats
+                                         without compromising the resulting model accuracy. We exploit       The error is calculated on a small representative batch of data.
+                                         the common channel-wise patterns exhibited by the outliers to       In contrast, SmoothQuant is targeted to better quantization of
+                                         rearrange them in such a way, that their quantization quality is    activations. The authors notice that in the activations they were
+                                         significantly improved. The methodology yields 2x savings in the    observing, a few channels had consistently higher values on
+                                         memory footprint without significant degradation of the model’s     various tokens. They introduced per-channel scaling factors
+                                         accuracy. Importantly, the rearrangement of channels happens
+                                         at the compile time and thus has no impact on the inference         to carry the dynamic range of activations over into weights.
+                                         latency.                                                            This way they transferred part of quantization burden from
+                                            Index Terms—LLM inference; block formats, outliers, cache.       harder-to-quantize activations to easier-to-quantize weights. In
+                                                                                                             all quantization approaches, the goal is always to enable a
+                                                               I. I NTRODUCTION                              low-bit, e.g. 4 bits per element, storage for the tensors, with
+                                            Pretrained Large Language Models (LLMs) have become              a common scaling vector, and, in some cases, bias vectors.
+                                         enormously popular in the recent years [1]–[5]. Such popular-          Further refinements of the algorithmic and software solu-
+                                         ity has mostly been gained due to the extremely high quality        tions have only limited impact on the overall efficiency if not
+                                         of the text generated by the state-of-the-art models. However,      supported by hardware. Most of the modern LLM models are
+                                         such improvements often come at the cost of increased model         designed and run on Graphics Processing Unit (GPUs) which
+                                         sizes which makes training of these large models and using          exploit floating-point arithmetic [11], [12]. As mentioned ear-
+                                         them for inference highly challenging in terms of storage           lier, the computational load required by modern transformers
+                                         capacity, memory transfer, and compute. The architecture of         has reached such enormous volumes that traditional GPUs can-
+                                         the modern LLMs is typically based on the decoder part              not fully meet the growing demand, pushing both accelerators
+                                         of a transformer [6]. While the LLM training process can            and high performance GPUs towards narrow arithmetic. As
+                                         fully exploit parallelization across the input tokens, the infer-   a consequence, unmatched research efforts have been applied
+                                         ence must be performed sequentially. The generation process         by the engineering community to replace narrow floating-point
+                                         produces one token on every pass over the network given             with even denser fixed-point representations [13]–[16]. Despite
+                                         the prompt and all previously generated tokens. The core            the excellent gains in both speed and computational density
+                                         building block of the transformer architecture – the attention      achieved by fixed-point arithmetic, training using it or even
+                                         mechanism – requires computation of the so called keys              half-precision floating-point arithmetic has not provided clear
+                                         K and values V representing the information stored in the           evidence in its favor due to the limited dynamic range inherent
+in such formats [17].                                             so large and the amount of compute involved became so
+   Block Floating Point (BFP) numerical formats have received     enormous that efficient processing requires dedicated hardware
+renewed interest recently for LLM inference applications due      and specialized algorithms.
+to their combination of wide dynamic range, numerical accu-
+racy, and efficient hardware implementation of inner products     A. KV-cache
+using simple integer arithmetic [18]–[21]. BFP formats are
+                                                                     Inference on modern transformers essentially means sequen-
+characterized by a block of mantissas with a shared scale
+                                                                  tial generation of tokens one by one given the initial prompt.
+factor. The simplest implementation has the scale factor as
+                                                                  After every pass through the model’s stack of decoders, the
+a power of two, the so-called exponent, in which case the
+                                                                  newly generated token is appended to the growing sequence
+inner product between two blocks involves multiplying the
+                                                                  and the process repeats with the updated context. The very
+integer mantissas and adding the two block exponents. The
+                                                                  nature of the attention mechanism requires calculation of the
+industry has thus far mainly exploited BFP12 (with 4-bit
+                                                                  keys and values for the entire sequence generated up until
+element mantissas and 8 bit shared exponent) and BFP16 (with
+                                                                  current iteration. This leads to a lot of duplicated compute
+8-bit element mantissas and 8 bit shared exponent), both of
+                                                                  since every head inside every decoder block will repeatedly
+which can be used with different block sizes usually ranging
+                                                                  calculate the entire K and V tensors for all the tokes over and
+from 16 to 128 elements [18]–[21]. Alternative formats, using
+                                                                  over again. In order to avoid the expensive recomputations, one
+low-bit floating point elements, with a wider range common
+                                                                  usually stores the K and V values of the already generated
+exponent, are also considered [22].
+                                                                  tokens in the cache memory. Then on every following iteration
+   One of the main numerical issues faced by the ML engi-
+                                                                  the q, k, and v values only for the currently processed
+neers dealing with LLMs both from theoretical and practical
+                                                                  token are computed while the rest of K and V matrices
+perspectives is the sporadic emergence of so-called outliers in
+                                                                  are retrieved from the cache. With growing sequence length,
+weights and activations of the modern large-scale transformers
+                                                                  we can easily get out of on-chip memory. In this article,
+[7], [10]. Existence of outliers becomes especially challenging
+                                                                  we suggest a computationally efficient way to decrease the
+when it comes to block formats, since presence of even a
+                                                                  memory footprint of the K cache. Importantly, our approach
+single element with an extremely large magnitude in a block
+                                                                  leads to only very minor accuracy loss even when K contains
+can completely ruin the quantization accuracy of all the other
+                                                                  numerous outliers.
+elements in that same block.
+   Below, we address this problem. We demonstrate how the
+                                                                  B. Block Floating Point Formats
+advantages of the BFP quantization can be maintained when
+weights or activations contain numerous outliers. The key            The unprecedented and ever growing amount of compute
+observation behind our approach consists in the fact that the     and storage required by the modern LLMs has lead to the
+inner product is invariant to synchronized reshuffling of the     development of numerous new data formats and novel direc-
+tensors being multiplied. For instance, if we focus on the qK ⊤   tions and techniques involving quantization of weights and
+product we can easily see that permuting the channels of the      activations. New data formats are announced every few months
+keys and queries simultaneously in exactly same manner has        both by the computer science community training the models
+no impact on the product. Since the keys K are outputs of the     [23], [24] and by the manufacturers of hardware [18], [21],
+linear layer with weights Wk , the values of each channel are     [22], [25]. Different techniques are proposed separately for
+determined by the corresponding row of Wk and the relevant        storage and for compute [7], [23], [24].
+inputs. Now we can simply rearrange the channels (rows)              In this work, we focus on an extremely promising Block
+of Wk in such a way that will make its block quantization         Floating Point family of formats that has become very popular
+very accurate. This permutation must be compensated by the        in the recent months [18]–[21]. The idea is based on the
+reshuffling of Wq which does not affect the accuracy since        observation that quite often the elements of involved tensors
+q is anyway computed in high precision and is not stored in       have comparable amplitudes and thus can share the same or
+the cache. Note that the reordering of the channels in Wk and     close exponent value when written in floating-point notation.
+Wq happens at the compile time. It requires no calibration        As a consequence, we can store entire blocks of elements using
+data and has no effect on the inference latency.                  shared exponent and individual integer mantissas. Numerous
+   The rest of the paper is organized as follows. In section      companies design there hardware specifically to support this
+II we describe the setup in more detail and define the block      family of formats [18]–[20]. The main advantage enjoyed by
+formats. Section III features our novel K-sort algorithm that     the chips designed to support BFP formats consists in very
+allows accurate low-precision BFP-quantization of K cache         significant reduction of required storage and effectively integer
+containing outliers. Supporting empirical data is provided in     matrix multiplication, see [19], [20] for more details. This
+Section IV. We summarize our findings in Section V.               further leads to a huge reduction in consumed power and
+                                                                  energy.
+                  II. I NFERENCE IN LLM S                            More specifically, a Block Floating Point format is char-
+  In this paper, we focus on the problem of inference in          acterized by the block size n ∈ N, mantissa precision
+LLMs. The sizes of the up-to-date models have become              p ∈ N, and precision of its exponent b. All the elements
+{Mi }ni=1 of a block are stored as integers in the range of        As a consequence, we have
+[−(2p−1 − 1), 2p−1 − 1], and their values are computed as
+                                                                     q · k⊤ = xWq⊤ · Wk x⊤ = x[π(Wq )]⊤ · π(Wk )x⊤
+                      e             e
+                   {2 · M1 , . . . , 2 · Mn },               (1)                                        = [π(q ⊤ )]⊤ · π(k⊤ ). (3)
+
+where e is a b-bit integer.                                        Now that we have applied permutation π to the static weights
+   Blocks formats are extremely efficient for matrix operations,   Wk and Wq at the compile time, the permuted vectors π(q ⊤ )
+since dot product using this family of formats effective turns     and π(k⊤ ) will be automatically computed during inference
+into integer matrix multiplication and simple addition of the      and their product will be exactly equal to the original q · k⊤ .
+corresponding block exponents [18], [20], [21]. The typical        The idea is illustrated by Figure 1. The colors of the heat-map
+values of p are usually 4 and 8 bits per elements and the          reflect the absolute values of the elements, from lower (green)
+corresponding formats read as BFP12 and BFP16. The block           to larger (red). It is important to note that we do not store the
+sizes often range from 16 to 128 [18], [20], [21]. Casting         queries in the cache and they can therefore be cast to a higher
+an array into BFP format requires computation of the block         precision format. To enable application of this technique to
+exponent based on the largest absolute value element inside        any transformer, we need to show how it works when rotary
+the block, scaling the block elements based on this exponent       embeddings are applied to keys and queries.
+and then rounding the resulting values to the closest integers
+in the mantissa range [−(2p−1 − 1), 2p−1 − 1].                     D. Rotary Embeddings
+                                                                      Many modern LLMs use rotary positional embeddings
+                                                                   (RoPE) [26] to encode information about the order of tokens
+C. Sorting Channels of Wk                                          in the input sequence. Rotary embeddings are linear transfor-
+   To efficiently store matrix K in the cache and compute          mations applied to keys and queries defined as
+qK T faster, we propose to quantize the former into a low-                   
+                                                                               cos mθ1 − sin mθ1         ···            0
+                                                                                                                                
+precision block format. The definition of the BFP format,                     sin mθ1    cos mθ1        ···            0       
+says that the quantization range of a block is determined            dh
+                                                                             
+                                                                                   .         ..          ..              .
+                                                                                                                                
+                                                                   RΘ,m   =
+                                                                                  ..           .           .            ..     ,
+                                                                                                                                
+by its largest (in absolute value) element. If some blocks                                                                     
+contain outliers, their overall quantization accuracy will be                 0            ···     cos mθdh /2 − sin mθdh /2 
+poor because the smallest elements might be rounded to zero.                       0        ···      sin mθdh /2   cos mθdh /2
+Next we show how to resolve this problem.
+                                                                   where m is the token index, and θi , i ∈ 1..dh /2 are predefined
+   The natural approach would be to sort the elements of           constants with dh - the head dimension. Matrices RΘ,m       dh
+the tensor by their absolute values before quantization. In        define block-diagonal orthogonal transformations rotating 2-
+that case, each block will only contain elements of compa-         dimensional linear subspaces spanned by every consecutive
+rable magnitudes: there will be blocks with larger elements        pair of standard basis vectors. Due to the evident sparsity of
+and blocks with smaller elements, but we will avoid the              dh
+                                                                   RΘ,m  , the multiplication is more efficiently implemented as
+undesirable scenario of having numerous blocks containing          the following linear transformation of the the input vector x,
+mixtures of elements of wide dynamic range. However, we
+must note that sorting tensors on the fly would be prohibitively                 
+                                                                                     x1
+                                                                                           
+                                                                                                   cos mθ1
+                                                                                                             
+expensive. Also, if we need to keep the sorting order to restore                  x2   cos mθ1 
+the original one for every token for every attention layer, it                            
+                                                                                  x3   cos mθ2 
+                                                                                                             
+would outweigh any memory savings. Therefore, the brute-                                                  
+                                                                        dh
+                                                                     RΘ,m   x =  x4  ⊗  cos mθ2 
+                                                                                                          
+force sorting of elements will not work and we need a finer                       ..                ..    
+approach.                                                                         .                  .    
+                                                                                                          
+                                                                                 xdh −1  cos mθd /2 
+   As noted in [7], the keys tend to exhibit certain outlier                                              h
+
+patterns. Namely, the outliers often concentrate in particular                      xd h         cos mθdh /2
+                                                                                                                        
+channels, which are quite consistent both across tokens in input                                  −x2            sin mθ1
+sequences, and across different input sequences. Such behavior                                 x1   sin mθ1 
+                                                                                                                        
+is usually caused by higher norms of the corresponding rows                                    −x4   sin mθ2 
+                                                                                                                        
+of Wk projection matrices. We can, therefore, easily sort                                   +  x3  ⊗  sin mθ2  , (4)
+                                                                                                                        
+the channels of Wk by their Euclidean norms before the                                         ..                 ..    
+                                                                                               .                   .    
+inference starts. To compensate for this reshuffling, we also                                            
+                                                                                               −xdh  sin mθd /2 
+                                                                                                                           
+rearrange Wq in the same order. Lets denote the corresponding                                                           h
+                                                                                                 xdh −1        sin mθdh /2
+permutation by π, then due to the linearity of inner product
+we can say that                                                    where ⊗ is the element-wise product. Next we provide a
+                                                                   general version of our sorting algorithm that works well when
+              Wq⊤ · Wk = [π(Wq )]⊤ · π(Wk ).                 (2)   rotary embeddings are used.
+Fig. 1. Left: original Wk and k. Right: rows of Wk have been sorted by their Euclidean norms to yield π(Wk ) and the resulting π(k⊤ ); colors reflect
+the absolute values of the elements, from lower (green) to larger (red); BFP quantization of π(k⊤ ) is more accurate than that of k⊤ since the entries of the
+former ending up in same blocks are closer in their absolute values.
+
+
+
+                          III. K- SORT A LGORITHM                                               cache the correctly ordered rotary embedddings are applied
+                                                                                                to them and the product with π(q) is computed. Since on
+   The main idea of our K-sort algorithm is to sort the rows
+                                                                                                the generative stage the π(q) tensor is very small in size
+Wk according to their norms (increasing or decreasing order).
+                                                                                                and we dont need to store it, it can be easily computed in
+We called the required permutation of row indices π. This
+                                                                                                the higher precision BFP16 format with 8-bits per element
+same permutation is then used to reshuffle the rows of Wq
+                                                                                                mantissa without any significant effect on the performance.
+and both reorderings happen at the compile time. When rotary
+                                                                                                   While present work concentrates on the keys K, similar
+embeddings are used, we need to add two natural auxiliary
+                                                                      dh                        technique can be applied to the values V . Moreover, since
+steps to make sure the locations of the elements of RΘ,m
+                                                                                                there are no rotary embeddings involved there, permuting the
+are changed correctly. For that we need to correctly reorder
+                                                                                                rows of matrix Wv simultaneously with the columns of the
+the vector of frequencies Θ = [θ1 , θ1 , θ2 , θ2 , . . . , θdh /2 , θdh /2 ]
+                                                                                                following projection layer is much easier to implement and
+and keep track of the sine-signs. The original order of the
+                                                                                                that will not affect the output. Such approach will improve the
+sine-sign channel indices is given by equation (4), i =
+                                                                                                quantization quality of values V stored in the cache without
+[2, 1, 4, 3, . . . , dh , dh − 1], the corresponding signs read as
+                                                                                                any run-time overhead. For the lack of space, we postpone the
+s = [−1, 1, −1, 1, . . . , −1, 1]1 . We emphasize that since the
+                                                                                                details for further publications.
+reordering permutation π is known at the compile time, all the
+necessary permutations of the frequencies and signs needed for                                                       IV. E XPERIMENTS
+correct application of RoPE can be done then as well - this
+does not delay the inference.                                                                      Numerous recent publications have reported the issues of
+                                                                                                outliers in K-cache and their significant impact on the accu-
+Algorithm 1 K-sort algorithm for a head                                                         racy and storage requirements [7], [10], [27]. For the lack
+                                                                                                space, in this short contribution we focus on one of such
+   1: Ni ← ||Wk [i, :]||, ∀i ∈ {1, . . . , dh }
+   2: π ← argsort (N )                                                                          popular LLMs, Llama2-7B-hf model [2]. As shown in [7],
+   3: Wk ← π (Wk )                                                                              this network and its many relatives and variations exhibit
+   4: Wq ← π (Wq )                                                                              the K-outliers phenomenon very clearly. In this section, we
+   // the last step apply to models with rotary embeddings                                      demonstrate the advantages of our K-sort algorithm on this
+   5: Θ ← π (Θ) , i ← π(i), s ← π(s)
+                                                                                                model. Importantly, this network exploits the aforementioned
+                                                                                                rotary embeddings to encode positional information, which
+  In practice, we propose to use K-sort algorithm with BFP12                                    even better utilizes the flexibility of our technique. Llama-7B
+quantization of the keys. More specifically, matrix K inside                                    is a mid-size model but as shown below it can already benefit
+each head is stored in block format with 4 bits of precision                                    tremendously from the application of K-sort. This implies that
+per element and a shared exponent for a block of 32, 64                                         the gain on larger models will be even more remarkable.
+or 128 elements. This allows 2x compression of the cache                                           The experiments were carried out using the default Hug-
+versus the more common 8-bit storage without much loss of                                       ging Face checkpoint without extra fine-tuning. The baseline
+accuracy (see Section IV for empirical evidence). On every                                      perplexity of the model with FP16 weights on wikitext-2
+token generation pass, once the keys are retrieved from the                                     [28] dataset is 9.4881. We quantized all the keys K and
+                                                                                                queries q into the BFP format with rounding to the nearest.
+  1 We note that in the open-source implementations of models such as
+                                                                                                Two formats we used in this setup are BFP12 for the keys
+LLama2 [2], the order of channels is different, with the frequency vector being
+[θ1 , θ2 , . . . , θdh /2 , θ1 , θ2 , . . . , θdh /2 ]. It requires reordering of i and s but   and BFP16 for the queries. Both come with 8-bit shared
+does not affect our algorithm, hence we quote the original RoPE ordering.                       exponents per block and 4 or 8 bits per integer mantissa
+of the block elements, respectively. Importantly, on the auto-      [7]   C. Hooper, S. Kim, H. Mohammadzadeh, et al.,
+regressive stage of generation, the query tensors are usually             “KVquant: towards 10 million context length LLM
+small, thus their high-precision quantization makes no impact             inference with KV cache quantization,” arXiv preprint
+on performance. In addition, q-s are not stored in the cache              arXiv:2401.18079, 2024.
+so their compression is not required. For fair comparison, the      [8]   Y. Ding, L. L. Zhang, C. Zhang, et al., “LongRoPE:
+rest of the operations were performed exactly as in the baseline          Extending LLM context window beyond 2 million to-
+model - in FP16 format.                                                   kens,” arXiv preprint arXiv:2402.13753, 2024.
+   Table I demonstrates the obtained results. As a sanity check,    [9]   E. Frantar, S. Ashkboos, T. Hoefler, and D. Alis-
+we see that for the block size of 128, rearranging the channels           tarh, “GPTQ: accurate post-training quantization for
+does not help. This is because the head dimension of Llama2-              generative pre-trained transformers,” arXiv preprint
+7B is exactly 128 and sorting the rows cant help. However,                arXiv:2210.17323, 2023.
+when the block size decreases, the gain provided by K-sort         [10]   G. Xiao, J. Lin, M. Seznec, H. Wu, J. Demouth, and S.
+becomes evident. Already for the block size of 64 we can see              Han, “SmoothQuant: accurate and efficient post-training
+a significant improvement in the accuracy after reordering the            quantization for large language models,” arXiv preprint
+rows of Wk .                                                              arXiv:2211.10438, 2023.
+                                                                   [11]   Y. E. Wang, G.-Y. Wei, and D. Brooks, “Benchmarking
+                            TABLE I                                       TPU, GPU, and CPU platforms for deep learning,”
+             LL AMA 2-7B PERPLEXITY ON WIKITEXT-2                         arXiv preprint arXiv:1907.10701, 2019.
+                 format                  algorithm                 [12]   A. Srinivas, T.-Y. Lin, N. Parmar, J. Shlens, P. Abbeel,
+            Q            K         original K-sorted                      and A. Vaswani, “Bottleneck transformers for visual
+           FP16         FP16        9.4881       9.4881                   recognition,” IEEE/CVF Conference on Computer Vi-
+         BFP16 128 BFP12 128       10.0861      10.0861
+         BFP16 64     BFP12 64      9.9999       9.6061                   sion and Pattern Recognition, pp. 16 519–16 529, 2021.
+         BFP16 32     BFP12 32      9.8300       9.5196            [13]   A. H. Zadeh, I. Edo, O. M. Awad, and A.
+                                                                          Moshovos, “GOBO: quantizing attention-based NLP
+                                                                          models for low latency and energy efficient inference,”
+                      V. C ONCLUSION                                      IEEE/ACM International Symposium on Microarchitec-
+   In this paper, we demonstrate that simple reshuffling of the           ture, pp. 811–824, 2020.
+static weights in popular LLMs can make their quantization         [14]   O. Zafrir, G. Boudoukh, P. Izsak, and M. Wasserblat,
+quality much better. Specifically, we advocate for the use of             “Q8BERT: Quantized 8bit BERT,” Workshop on Energy
+Block Floating Point formats and show that BFP12 format                   Efficient Machine Learning and Cognitive Computing-
+with 4-bit mantissa storage and compute without any elaborate             NeurIPS Edition, pp. 36–39, 2019.
+quantization enables extremely accurate inference. Our K-sort      [15]   S. Shen, Z. Dong, J. Ye, et al., “Q-bert: hessian based
+algorithm together with BFP12 storage allows for 2x reduction             ultra low precision quantization of BERT,” Proceed-
+of the memory footprint of the K-cache and therefore allows               ings of the AAAI Conference on Artificial Intelligence,
+generation of much longer sequences on the same hardware.                 vol. 34, no. 05, pp. 8815–8821, 2020.
+                                                                   [16]   W. Zhang, L. Hou, Y. Yin, et al., “TernaryBERT:
+                        R EFERENCES                                       distillation-aware ultra-low bit BERT,” arXiv preprint
+ [1]   S. Zhang, S. Roller, N. Goyal, et al., “OPT: open pre-             arXiv:2009.12812, 2020.
+       trained transformer language models,” arXiv preprint        [17]   P. Micikevicius, S. Narang, J. Alben, et al., “Mixed
+       arXiv:2205.01068, 2022.                                            precision training,” arXiv preprint arXiv:1710.03740,
+ [2]   H. Touvron, L. Martin, K. Stone, et al., “Llama 2: open            2017.
+       foundation and fine-tuned chat models,” arXiv preprint      [18]   B. Darvish Rouhani, D. Lo, R. Zhao, et al., “Pushing
+       arXiv:2307.09288, 2023.                                            the limits of narrow precision inferencing at cloud scale
+ [3]   OpenAI, “GPT-4 technical report,” arXiv preprint                   with microsoft floating point,” Advances in neural infor-
+       arXiv:2303.08774, 2024.                                            mation processing systems, vol. 33, pp. 10 271–10 281,
+ [4]   A. Q. Jiang, A. Sablayrolles, A. Roux, et al., “Mixtral            2020.
+       of experts,” arXiv preprint arXiv:2401.04088, 2024.         [19]   I. Lyubomirsky and X. Wang, “Block floating point
+ [5]   G. Team, T. Mesnard, C. Hardin, et al., “Gemma:                    (BFP) for efficient deep neural net inference,” IEEE
+       open models based on Gemini research and technology,”              P3109 Working Group, June 6, 2022.
+       arXiv preprint arXiv:2403.08295, 2024.                      [20]   I. Soloveychik, I. Lyubomirsky, X. Wang, and S. Bhoja,
+ [6]   A. Vaswani, N. Shazeer, N. Parmar, et al., “Attention              “Block format error bounds and optimal block size
+       is all you need,” Advances in Neural Information Pro-              selection,” arXiv preprint arXiv:2210.05470, 2022.
+       cessing Systems, vol. 30, 2017.                             [21]   Microsoft,     “MX      pytorch    emulation     library,”
+                                                                          https://github.com/microsoft/microxcaling, 2023.
+[22] B. D. Rouhani, R. Zhao, A. More, et al., “Microscal-       [26] J. Su, M. Ahmed, Y. Lu, S. Pan, W. Bo, and Y. Liu,
+     ing data formats for deep learning,” arXiv preprint             “RoFormer: enhanced transformer with rotary position
+     arXiv:2310.10537, 2023.                                         embedding,” Neurocomputing, vol. 568, p. 127 063,
+[23] S. Ma, H. Wang, L. Ma, et al., “The era of 1-bit                2024.
+     LLMs: All large language lodels are in 1.58 bits,” arXiv   [27] T. Dettmers, M. Lewis, Y. Belkada, and L. Zettlemoyer,
+     preprint arXiv:2402.17764, 2024.                                “LLM.int8(): 8-bit matrix multiplication for transform-
+[24] H. Peng, K. Wu, Y. Wei, et al., “FP8-lm: Train-                 ers at scale,” arXiv preprint arXiv:2208.07339, 2022.
+     ing FP8 large language models,” arXiv preprint             [28] S. Merity, C. Xiong, J. Bradbury, and R. Socher,
+     arXiv:2310.18313, 2023.                                         “Pointer sentinel mixture models,” arXiv preprint
+[25] P. Micikevicius, D. Stosic, N. Burgess, et al.,                 arXiv:1609.07843, 2016.
+     “FP8 formats for deep learning,” arXiv preprint
+     arXiv:2209.05433, 2022.
+

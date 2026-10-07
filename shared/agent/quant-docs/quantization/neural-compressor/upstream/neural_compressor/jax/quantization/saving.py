@@ -1,0 +1,536 @@
+"""Serialization helpers for JAX quantized Keras models."""
+
+# Copyright (c) 2026 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections import defaultdict
+from importlib import metadata as importlib_metadata
+from typing import Optional, Union
+
+import keras
+import keras.src.utils.dtype_utils as dtype_utils
+from jax import numpy as jnp
+from keras_hub.models import Gemma3CausalLM, Gemma3Tokenizer, ViTImageClassifier
+from keras_hub.src.models.backbone import Backbone
+from keras_hub.src.utils.preset_utils import get_preset_saver
+
+from neural_compressor.common import logger
+from neural_compressor.common.utils import DYNAMIC_QUANT, STATIC_QUANT
+from neural_compressor.jax.quantization.config import (
+    JaxBaseConfig,
+    JaxComposableConfig,
+)
+from neural_compressor.jax.utils.utility import check_backend, dtype_mapping
+
+
+class VersionManager:
+    """Handle version metadata for serialized quantized models."""
+
+    _MODULES = ["neural_compressor", "keras", "keras_hub"]
+
+    @classmethod
+    def get_installed_neural_compressor_version(cls):
+        possible_names = ["neural_compressor", "neural_compressor_jax"]
+        for name in possible_names:
+            try:
+                return importlib_metadata.version(name)
+            except importlib_metadata.PackageNotFoundError:
+                continue
+
+        raise ModuleNotFoundError(f"Package of given name not found. Tried: {possible_names}")
+
+    @classmethod
+    def add_versions(cls, config):
+        """Insert package versions into the serialized config.
+
+        Args:
+            config (dict): Configuration dictionary to update in-place.
+
+        Returns:
+            None: Updates the config dictionary in-place.
+        """
+        config["_versions"] = {}
+        for package in cls._MODULES:
+            if "neural_compressor" in package:
+                config["_versions"][package] = VersionManager.get_installed_neural_compressor_version()
+            else:
+                config["_versions"][package] = importlib_metadata.version(package)
+
+    @classmethod
+    def check_versions_mismatch(cls, config):
+        """Check for version mismatches between saved and current packages.
+
+        Args:
+            config (dict): Configuration dictionary that may include version metadata.
+
+        Returns:
+            None: Logs warnings if mismatches are found.
+        """
+        versions = config.get("_versions")
+        if versions is None:
+            logger.error(
+                "No version information found in the saved model. Please save model with newer version of neural_compressor."
+            )
+            return
+        for package, version_in_config in versions.items():
+            if "neural_compressor" in package:
+                current_version = VersionManager.get_installed_neural_compressor_version()
+            else:
+                current_version = importlib_metadata.version(package)
+
+            if version_in_config != current_version:
+                logger.warning(
+                    f"{package}: version mismatch. Saved model: {version_in_config}, current version: {current_version}. "
+                    f"This could cause unexpected behavior."
+                )
+
+
+class SaveableLayerMixin:
+    """Mixin for saving and loading quantized layer variables."""
+
+    def save_own_variables(self, store):
+        """Save layer variables into the provided store.
+
+        Args:
+            store (dict): Mutable mapping to receive serialized variables.
+
+        Returns:
+            None: Updates the store mapping with serialized variables.
+        """
+        weight_dtype = getattr(self, "weight_dtype", None)
+        for var in self._trainable_variables + self._non_trainable_variables:
+            is_one_byte_format = dtype_utils.dtype_size(var.dtype) == 8
+            if is_one_byte_format and var.dtype == weight_dtype:
+                # Weights in 8 bit format will be stored as their int8 bit representation
+                value_to_save = jnp.asarray(var.value).view(jnp.int8)
+            else:
+                value_to_save = jnp.asarray(var.value)
+            store[var.name] = value_to_save
+
+        if hasattr(self, "_const_variables"):
+            for name in self._const_variables:
+                value = getattr(self, name)
+                is_one_byte_format = dtype_utils.dtype_size(value.dtype.name) == 8
+                if is_one_byte_format and value.dtype == weight_dtype:
+                    # Weights in 8 bit format will be stored as their int8 bit representation
+                    value_to_save = jnp.asarray(value).view(jnp.int8)
+                else:
+                    value_to_save = jnp.asarray(value)
+                store[name] = value_to_save
+
+    def load_own_variables(self, store):
+        """Load layer variables from the provided store.
+
+        Args:
+            store (dict): Mapping containing serialized variables.
+
+        Returns:
+            None: Loads variables into the layer.
+        """
+
+        # In some cases load_own_variables() may be called multiple times for the same layer.
+        # Since this function modifies weights and removes variables, this behaviour causes crashes during loading.
+        # To prevent that we can check if _is_quantized is None, since this should be initial value and is
+        # modified later in this function
+        if hasattr(self, "_is_quantized") and self._is_quantized is not None:
+            return
+
+        if self.__class__.__name__.startswith("Dynamic") or self.__class__.__name__.startswith("QDynamic"):
+            # Dynamic layers are always quantized
+            self._is_quantized = True
+        else:
+            # Static layers may not be quantized depending on calibration samples
+            # Quantized layers always have a_scale
+            self._is_quantized = "a_scale" in store
+        self.post_quantization_cleanup()
+
+        weight_dtype = getattr(self, "weight_dtype", None)
+        for var in self._trainable_variables + self._non_trainable_variables:
+            value_to_load = store[var.name]
+            if (value_to_load.dtype == jnp.int8) and (var.dtype == weight_dtype):
+                # Quantized weights are saved in int8 format, need to convert back to original dtype
+                value_to_load = value_to_load.view(var.dtype)
+            var.assign(value_to_load)
+
+        if hasattr(self, "_const_variables"):
+            for name in self._const_variables:
+                if name in store:
+                    value_to_load = store[name]
+                    var_dtype = getattr(self, name).dtype
+                    if (value_to_load.dtype == jnp.int8) and (var_dtype == weight_dtype):
+                        # Quantized weights are saved in int8 format, need to convert back to original dtype
+                        value_to_load = value_to_load.view(var_dtype)
+                    setattr(self, name, jnp.asarray(value_to_load))
+                else:
+                    raise ValueError(f"Constant variable '{name}' not found in the saved model for {self._path}.")
+
+
+@keras.saving.register_keras_serializable(package="INC", name=None)
+class KerasQuantizedModelBackboneWrapper(Backbone):
+    """Wrapper that preserves quantization config when saving Keras backbones."""
+
+    def __init__(self, model, quant_config: Optional[JaxBaseConfig] = None):
+        """Initialize the wrapper around a backbone model.
+
+        Args:
+            model (keras.Model): Backbone model to wrap.
+            quant_config (Optional[JaxBaseConfig]): Quantization configuration.
+
+        Returns:
+            None: Initializes the wrapper.
+        """
+        object.__setattr__(self, "_wrapped_model", model)
+        object.__setattr__(
+            self,
+            "fields",
+            {
+                "_wrapped_model",
+                "__class__",
+                "__getattribute__",
+                "__setattr__",
+                "get_config",
+                "save_to_preset",
+                "_quant_config",
+            },
+        )
+        # self.__class__ = model.__class__
+        if quant_config is None:
+            raise ValueError(f"quant_config must be provided for {self.__class__.__name__}.")
+        object.__setattr__(self, "_quant_config", quant_config)
+
+    def __getattribute__(self, name):
+        """Delegate attribute access to the wrapped model.
+
+        Args:
+            name (str): Attribute name to access.
+
+        Returns:
+            Any: Attribute value from the wrapper or wrapped model.
+        """
+        if name in object.__getattribute__(self, "fields"):
+            return object.__getattribute__(self, name)
+        return object.__getattribute__(self, "_wrapped_model").__getattribute__(name)
+
+    def __setattr__(self, name, value):
+        """Delegate attribute updates to the wrapped model.
+
+        Args:
+            name (str): Attribute name to update.
+            value (Any): Value to assign.
+
+        Returns:
+            None: Updates the attribute on the wrapper or wrapped model.
+        """
+        if name in object.__getattribute__(self, "fields"):
+            return object.__setattr__(self, name, value)
+        return object.__getattribute__(self, "_wrapped_model").__setattr__(name, value)
+
+    def get_config(self):
+        """Serialize the wrapper configuration for Keras saving.
+
+        Returns:
+            dict: Serialized configuration for the wrapper.
+        """
+        config = super().get_config()
+        config["_quant_config"] = self._quant_config.to_dict()
+        config["_wrapped_model"] = keras.saving.serialize_keras_object(self._wrapped_model)
+        return config
+
+    def __new__(cls, *args, **kwargs):
+        """Bypass BaseModel __new__ to allow manual initialization.
+
+        Args:
+            *args: Positional arguments for object creation.
+            **kwargs: Keyword arguments for object creation.
+
+        Returns:
+            KerasQuantizedModelBackboneWrapper: New wrapper instance.
+        """
+        return object.__new__(cls)
+
+    @classmethod
+    def from_config(cls, config):
+        """Recreate a wrapper from a serialized config dictionary.
+
+        Args:
+            config (dict): Serialized configuration dictionary.
+
+        Returns:
+            KerasQuantizedModelBackboneWrapper: Reconstructed quantized model backbone wrapper.
+        """
+        model = keras.saving.deserialize_keras_object(config["_wrapped_model"])
+        quant_config_json = config.get("_quant_config")
+        quant_config = JaxBaseConfig.from_dict(quant_config_json)
+        qmodel = prepare_deserialized_quantized_model(model, quant_config)
+        return qmodel
+
+    def save_to_preset(self, preset_dir, max_shard_size=10):
+        """Save backbone to a preset directory.
+
+        Args:
+            preset_dir: The path to the local model preset directory.
+            max_shard_size: `int` or `float`. Maximum size in GB for each
+                sharded file. If `None`, no sharding will be done. Defaults to
+                `10`.
+
+        Returns:
+            None: Writes the preset files to disk.
+        """
+        saver = get_preset_saver(preset_dir)
+        saver.save_backbone(self, max_shard_size=max_shard_size)
+
+
+@keras.saving.register_keras_serializable(package="INC", name=None)
+class KerasQuantizedModelWrapperMixin:
+    """Wrapper that preserves quantization config for Keras tasks."""
+
+    backbone_cls = KerasQuantizedModelBackboneWrapper
+
+    def __init__(self, model, quant_config: Optional[JaxBaseConfig] = None):
+        """Initialize the wrapper around a task model.
+
+        Args:
+            model (keras.Model): Task model to wrap.
+            quant_config (Optional[JaxBaseConfig]): Quantization configuration.
+
+        Returns:
+            None: Initializes the wrapper.
+        """
+        object.__setattr__(self, "_wrapped_model", model)
+        object.__setattr__(
+            self,
+            "fields",
+            {
+                "_wrapped_model",
+                "__class__",
+                "__getattribute__",
+                "__setattr__",
+                "get_config",
+                "_quant_config",
+                "save_to_preset",
+            },
+        )
+        if quant_config is None:
+            raise ValueError(f"quant_config must be provided for {self.__class__.__name__}.")
+        object.__setattr__(self, "_quant_config", quant_config)
+
+    def __getattribute__(self, name):
+        """Delegate attribute access to the wrapped model.
+
+        Args:
+            name (str): Attribute name to access.
+
+        Returns:
+            Any: Attribute value from the wrapper or wrapped model.
+        """
+        if name in object.__getattribute__(self, "fields"):
+            return object.__getattribute__(self, name)
+        return object.__getattribute__(self, "_wrapped_model").__getattribute__(name)
+
+    def __setattr__(self, name, value):
+        """Delegate attribute updates to the wrapped model.
+
+        Args:
+            name (str): Attribute name to update.
+            value (Any): Value to assign.
+
+        Returns:
+            None: Updates the attribute on the wrapper or wrapped model.
+        """
+        if name in object.__getattribute__(self, "fields"):
+            return object.__setattr__(self, name, value)
+        return object.__getattribute__(self, "_wrapped_model").__setattr__(name, value)
+
+    def get_config(self):
+        """Serialize the wrapper configuration for Keras saving.
+
+        Returns:
+            dict: Serialized configuration for the wrapper.
+        """
+        config = super().get_config()
+        VersionManager.add_versions(config)
+        config["_quant_config"] = self._quant_config.to_dict()
+        # Save backbone without wrapper for load/save_model <-> preset api compatibility
+        backbone_wrapper = None
+        if hasattr(self, "backbone"):
+            if self.backbone.__class__ == KerasQuantizedModelBackboneWrapper:
+                backbone_wrapper = self.backbone
+                self.backbone = self.backbone._wrapped_model
+        config["_wrapped_model"] = keras.saving.serialize_keras_object(self._wrapped_model)
+        if backbone_wrapper is not None:
+            self.backbone = backbone_wrapper
+        return config
+
+    def __new__(cls, *args, **kwargs):
+        """Bypass BaseModel __new__ to allow manual initialization.
+
+        Args:
+            *args: Positional arguments for object creation.
+            **kwargs: Keyword arguments for object creation.
+
+        Returns:
+            KerasQuantizedModelWrapperMixin: New wrapper instance.
+        """
+        return object.__new__(cls)
+
+    @classmethod
+    def from_config(cls, config):
+        """Recreate a wrapper from a serialized config dictionary.
+
+        Args:
+            config (dict): Serialized configuration dictionary.
+
+        Returns:
+            KerasQuantizedModelWrapperMixin: Reconstructed quantized model wrapper.
+        """
+        VersionManager.check_versions_mismatch(config)
+        model = keras.saving.deserialize_keras_object(config["_wrapped_model"])
+        quant_config_json = config.get("_quant_config")
+        quant_config = JaxBaseConfig.from_dict(quant_config_json)
+        qmodel = prepare_deserialized_quantized_model(model, quant_config)
+
+        return qmodel
+
+    def save_to_preset(self, preset_dir, max_shard_size=10):
+        """Save task to a preset directory.
+
+        Args:
+            preset_dir: The path to the local model preset directory.
+            max_shard_size: `int` or `float`. Maximum size in GB for each
+                sharded file. If `None`, no sharding will be done. Defaults to
+                `10`.
+
+        Returns:
+            None: Writes the preset files to disk.
+        """
+        saver = get_preset_saver(preset_dir)
+        saver.save_task(self, max_shard_size=max_shard_size)
+
+
+@keras.saving.register_keras_serializable(package="INC", name=None)
+class KerasQuantizedModelWrapper(KerasQuantizedModelWrapperMixin, keras.Model):
+    """Generic quantized model wrapper for Keras models without specific backbone or task structure."""
+
+    pass
+
+
+@keras.saving.register_keras_serializable(package="INC", name=None)
+class KerasQuantizedGemmaWrapper(KerasQuantizedModelWrapperMixin, Gemma3CausalLM):
+    """Quantized wrapper for Gemma3CausalLM models."""
+
+    backbone_cls = KerasQuantizedModelBackboneWrapper
+
+
+@keras.saving.register_keras_serializable(package="INC", name=None)
+class KerasQuantizedViTWrapper(KerasQuantizedModelWrapperMixin, ViTImageClassifier):
+    """Quantized wrapper for ViTImageClassifier models."""
+
+    backbone_cls = KerasQuantizedModelBackboneWrapper
+
+
+@keras.saving.register_keras_serializable(package="INC", name=None)
+class KerasQuantizedTokenizerWrapper(KerasQuantizedModelWrapperMixin, Gemma3Tokenizer):
+    """Quantized wrapper for Gemma3Tokenizer models."""
+
+    backbone_cls = KerasQuantizedModelBackboneWrapper
+
+
+WRAPPER_MAPPING = defaultdict(lambda: KerasQuantizedModelWrapper)
+WRAPPER_MAPPING.update(
+    {
+        Gemma3CausalLM: KerasQuantizedGemmaWrapper,
+        ViTImageClassifier: KerasQuantizedViTWrapper,
+        Gemma3Tokenizer: KerasQuantizedTokenizerWrapper,
+    }
+)
+
+
+def prepare_deserialized_quantized_model(
+    model: keras.Model,
+    quant_config: JaxBaseConfig,
+) -> Union[KerasQuantizedModelWrapperMixin, KerasQuantizedModelBackboneWrapper]:
+    """Transform a loaded quantized model.
+
+    It prepares the model for inference by preparing the quantized layers.
+    Args:
+        model (keras.Model): Loaded base keras model.
+        quant_config (JaxBaseConfig): Quantization configuration.
+    Returns:
+        Union[KerasQuantizedModelWrapperMixin, KerasQuantizedModelBackboneWrapper]: The transformed quantized model/backbone wrapper.
+    """
+    check_backend()
+
+    # Import here to avoid circular import with layers.py
+    from neural_compressor.jax.quantization.layers_dynamic import dynamic_quant_mapping
+    from neural_compressor.jax.quantization.layers_static import static_quant_mapping
+
+    # Determine per-config parameters for each sub-config in JaxComposableConfig
+    if isinstance(quant_config, JaxComposableConfig):
+        config_list = quant_config.config_list
+    else:
+        config_list = [quant_config]
+
+    # For deserialization, directly check layer class against layers_mapping
+    # (bypasses white_list class gating for layer types) while still respecting
+    # the white_list / exclude_list selection filters from the config.
+    qmodel = model
+    for layer in qmodel._flatten_layers():
+        # Resolve overlapping sub-configs with last-match-wins, consistent with
+        # the composed ``to_config_mapping`` used during quantization.
+        selected = None
+        for cfg in config_list:
+            if cfg.name == STATIC_QUANT and layer.__class__ in static_quant_mapping:
+                layers_mapping = static_quant_mapping
+            elif cfg.name == DYNAMIC_QUANT and layer.__class__ in dynamic_quant_mapping:
+                layers_mapping = dynamic_quant_mapping
+            else:
+                continue
+
+            # Apply the same white_list / exclude_list selection used during quantization.
+            layer_id = layer.path or layer.name
+            class_name = layer.__class__.__name__
+            if not cfg._layer_matches_filters(layer_id, class_name):
+                continue
+
+            selected = (layers_mapping, cfg)
+
+        if selected is None:
+            continue
+
+        layers_mapping, cfg = selected
+        weight_dtype = dtype_mapping[cfg.weight_dtype]
+        activation_dtype = dtype_mapping[cfg.activation_dtype]
+        additional_params = (
+            weight_dtype,
+            activation_dtype,
+            cfg.const_scale,
+            cfg.const_weight,
+            cfg.weight_scale_granularity,
+            cfg.dot_product_attention_enable,
+        )
+        layers_mapping[layer.__class__].prepare(layer, *additional_params)
+        layer.add_variables()
+        layer.post_quantization_cleanup()
+
+    if isinstance(qmodel, Backbone):
+        qmodel = KerasQuantizedModelBackboneWrapper(qmodel, quant_config)
+    else:
+        wrapper_cls = WRAPPER_MAPPING[qmodel.__class__]
+        qmodel = wrapper_cls(qmodel, quant_config)
+        if hasattr(qmodel, "backbone"):
+            qmodel._tracker.unlock()
+            qmodel.backbone = KerasQuantizedModelBackboneWrapper(qmodel.backbone, quant_config)
+            qmodel._tracker.lock()
+
+    return qmodel

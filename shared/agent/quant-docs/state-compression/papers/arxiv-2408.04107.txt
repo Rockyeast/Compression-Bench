@@ -1,0 +1,1134 @@
+                                                 FDC: Fast KV Dimensionality Compression for
+                                                            Efficient LLM Inference
+                                                                   Zeyu Zhang                                                        Haiying Shen
+                                                               University of Virginia                                             University of Virginia
+                                                                       USA                                                                USA
+                                        Abstract                                                                    The primary challenge of LLM inference is memory con-
+                                        In large-language models, memory constraints in the Key-                 straints within KVC, which limits GPU utilization and con-
+                                        Value Cache (KVC) pose a challenge during inference. In                  sequently decreases throughput. To address it, various KV
+                                        this work, we propose FDC, a fast KV dimensionality com-                 compression methods have been proposed and they can be di-
+                                        pression system that eliminates the decompression overhead               vided into two main categories: token eviction methods [17–
+                                                                                                                 26], quantization methods [27–31], and low-rank approxi-
+arXiv:2408.04107v3 [cs.LG] 8 Jun 2025
+
+
+
+
+                                        incurred in the existing KV dimensionality compression sys-
+                                        tem, Palu, and reduces attention time. Moreover, FDC em-                 mation methods [32]. Token eviction methods remove the
+                                        ploys adaptive compression, tailoring KV compression rates               KV values of unimportant tokens that have minimal impact
+                                        across heads and layers based on their contributions to in-              on the inference results. Quantization methods compress
+                                        ference to maximize overall compression while maintaining                KV values by reducing the bit width of each element in the
+                                        an accuracy loss constraint. Additionally, FDC enhances the              KV matrix from a higher bit width (e.g., float16) to a lower
+                                        attention kernel to balance the uneven workloads caused                  bit width (e.g., 4-bit, 2-bit). However, these methods over-
+                                        by the adaptive compression approach to further reduce at-               look the redundancy inherent in KV representations [32].
+                                        tention computation latency. Comprehensive experiments                   By leveraging this redundancy, it is possible to represent KV
+                                        demonstrate that compared to Palu, FDC can reduce Job                    using fewer hidden dimensions, thereby achieving compres-
+                                        Completion Time (JCT) by up to 64%, and delivers up to                   sion without incurring significant information loss. Recently,
+                                        1.97× throughput under the same latency, while maintaining               Palu [32] employs low-rank approximation to compress the
+                                        99% of the accuracy without compression. When state-of-the-              hidden dimensions of KV. This approach is complementary
+                                        art eviction and quantization methods are combined with                  to eviction and quantization methods and can be integrated
+                                        FDC, they exhibit similar improvements compared to those                 with them to enhance the KV compression rate further [32].
+                                        combined with Palu. We open-sourced the code.                            InfiniGen [24] uses low-rank approximation to analyze at-
+                                                                                                                 tention scores and identify unimportant tokens efficiently;
+                                        Keywords: KV cache, compression, inference, acceleration                 however, it is fundamentally an eviction method.
+                                        1    Introduction                                                           Currently, state-of-the-art LLMs adopt Rotary Positional
+                                        Generative large language models (LLMs) [1–6] have trans-                Embedding (RoPE) [33] to inject positional information into
+                                        formed natural language processing (NLP), showcasing re-                 tokens’ 𝑄 and 𝐾. However, as explained in §2, the pres-
+                                        markable performance across various tasks like text comple-              ence of RoPE necessitates that Palu first decompress the
+                                        tion [7], dialogue generation [8], code synthesis [9], language          compressed 𝐾 before RoPE, and only then can the RoPE-
+                                        translation [10], text summarization [11–13], and document               processed 𝐾 be fed into the attention. This leads to two main
+                                        classification [14, 15]. The LLM models are primarily in-                issues: 1) an unavoidable 𝐾-decompression overhead, and 2)
+                                        spired by the transformer architecture [16], which employs               the inability to directly use the compressed 𝐾 to accelerate
+                                        attention to capture long-range dependencies in sequences.               attention [32]. Because many LLM tasks, such as summa-
+                                           During LLM inference, text generation starts with pro-                rization, book generation, and Information Retrieval (IR),
+                                        viding a prompt. LLM generates the first token via prompt                involve long-sequence processing [34–36], the context win-
+                                        processing (a.k.a., prefill), followed by text generation (a.k.a.,       dow length of state-of-the-art LLMs now extends to 128K
+                                        decode) to generate new tokens. LLMs typically consist of                or even 1M tokens [37–41]. Long sequences amplify Palu’s
+                                        multiple transformer layers, where each layer receives an                𝐾-decompression overhead and the attention overhead. Ex-
+                                        embedding matrix 𝐸 for the entire input. These embeddings                perimental results in §3.1 show that for input lengths up to
+                                        are projected to produce Query (Q), Key (K), and Value (V)               100K, Palu’s attention computation can account for up to
+                                        components for each token, serving as inputs to the atten-               36.3% and 31.9% of the Job Completion Time (JCT) during the
+                                        tion layer. The KV values of newly generated tokens are                  prefill and decode phases, respectively, and decompressing
+                                        stored in the Key-Value Cache (KVC) to avoid redundant                   𝐾 during the decode phase can reach up to 19.7% of the JCT.
+                                        computations. During token generation, the KV values of                  For output lengths up to 100K, Palu’s attention computation
+                                        previous tokens are fetched from the KVC and fed into the                in the decode phase can climb to 74.6% of the JCT, while the
+                                        attention layer. The resulting attention output guides token             time to decompress 𝐾 can reach up to 29.5%.
+                                        generation.
+                                                                                                             1
+Submitted for review to EuroSys, 2026                                                                        Zeyu Zhang and Haiying Shen
+
+
+   We propose FDC to tackle these issues. FDC is a Fast                2     Background
+KV Dimensionality Compression system, which not only                   We explain how the current work compresses KV along the
+eliminates the 𝐾-decompression overhead but also reduces               hidden dimension. Table 1 lists notations used in the paper.
+attention time for KV dimensionality compression. FDC com-
+prises three key components as below.                                      𝑑 Model dimension size 𝑁ℎ The number of heads
+   Post-RoPE QK compression for decompression elim-                        𝑁𝑙 The number of layers 𝑑ℎ Head dimension size (= 𝑑/𝑁ℎ )
+ination and attention acceleration. Unlike Palu, which                     𝐸 Token embeddings      𝑄 Query matrix
+compresses QK before RoPE, FDC compresses QK after RoPE.                   𝐾 Key matrix            𝑉 Value matrix
+In §3.2, we observe that the post-RoPE QK is also compress-                𝑅 Rotation matrix       𝑝 Compression rate
+ible, which is determined by the model itself rather than                  𝑊 Parameter matrix      𝑠 Sequence length
+the input tokens. As a result, a rotation matrix 𝑅 suitable                         Table 1. Notations used in the paper.
+for compressing post-RoPE QK can be precomputed offline.
+During online inference, the post-RoPE QK is compressed
+using 𝑅, and the compressed QK is fed directly into attention,            The common way to compress the hidden dimension of KV
+eliminating the decompression of 𝐾. Attention is computed              is first applying Singular Value Decomposition (SVD) [43]
+on the compressed QK, reducing its computation time.                   to the parameter matrices that generate KV [32]. Because
+   Adaptive compression rate. Model layers contribute                  the procedures for 𝐾 and 𝑉 are identical, we describe the
+differently to the output [16], as do the attention heads within       process for 𝐾 only. Let 𝐾 = 𝐸𝑊 , where 𝑊 is the parameter
+each layer [18]. Thus, FDC applies different compression               matrix for 𝐾. The shapes of 𝐸 and 𝑊 are 𝑠 × 𝑑 and 𝑑 × 𝑑ℎ ,
+rates to QKV in different heads and layers to maximize the             respectively. Decomposing 𝑊 via SVD yields two matrices 𝐴
+overall KV compression rate given an accuracy constraint.              and 𝐵 such that 𝑊 = 𝐴𝐵, with shapes 𝑑 ×𝑘 and 𝑘 ×𝑑ℎ , where
+These compression rates are determined by the magnitude of             𝑘 < 𝑑ℎ . The original 𝐾 has shape 𝑠 ×𝑑ℎ . During compression,
+the components in each dimension of the compressed QKV                 the compressed 𝐾 ′ is generated via 𝐾 ′ = 𝐸𝐴, whose shape
+vectors.                                                               is 𝑠 × 𝑘. Because 𝑘 < 𝑑ℎ , 𝐾 ′ is smaller than 𝐾, achieving the
+   Attention kernel enhancement for adaptive com-                      desired compression. To reconstruct an approximation of the
+pression rate. The different compression rates on the hidden           original 𝐾, 𝐾 ′ and 𝐵 are multiplied, i.e., 𝐾 ′ 𝐵 ≈ 𝐾. Palu [32] is
+dimensions of QKV in FDC can lead to imbalanced execution              the state-of-the-art and representative method that employs
+times across a GPU’s Stream-Multiprocessors (SM). Thus,                this form of KV compression.
+FDC balances the uneven workloads across SMs for atten-                   Currently, the state-of-the-art transformer-based LLMs
+tion in the prefill and decode phases, respectively, to further        employ RoPE [33] to encode positional information for to-
+reduce attention computation latency.                                  kens. RoPE processes the generated 𝑄 and 𝐾. Specifically,
+   In summary, our work has the following contributions:               RoPE rotates each row vector q and k of 𝑄 and 𝐾 using a
+• We conduct extensive experiments with numerous state-                rotation matrix 𝐻𝑖 , where 𝑖 is the position of q and k in
+of-the-art models and complex-task datasets to demonstrate             the sequence. Without RoPE, the computation 𝑄𝐾 𝑇 in atten-
+the rationality and feasibility of FDC’s design principles and         tion can be rewritten as 𝐸𝑊𝑄 (𝐸𝑊𝐾 )𝑇 = 𝐸𝑊𝑄 (𝐸𝐴𝐾 𝐵𝐾 )𝑇 =
+provide geometric explanations for these observations.                 𝐸 (𝑊𝑄 𝐵𝑇𝐾 )𝐾 ′𝑇 , where 𝑊𝑄 and 𝐵𝐾 are merged together offline
+• We propose FDC, a fast KV dimensionality compression                 to remove the online decompression overhead for multi-
+system that eliminates the 𝐾-decompression overhead and                plying 𝐵𝐾 [32]. And 𝐾 ′ can be used directly in attention
+accelerates attention. It can complement existing token evic-          to reduce the computation time. However, the existence of
+tion based and quantization based KV compression methods.              RoPE prevents the integration of 𝐵𝐾 into 𝑊𝑄 because 𝑄𝐾 𝑇 in
+• Comprehensive experiments demonstrate that compared                  attention is changed to RoPE(𝑄)RoPE(𝐾)𝑇 [32]. Therefore,
+to Palu, FDC can reduce JCT by up to 64%, Time-To-First-               Palu keeps the decompression process 𝐾 ′ 𝐵𝐾 before RoPE,
+Token (TTFT) by up to 35%, and Time-Between-Token (TBT)                which introduces the decompression overhead for 𝐾 ′ . Be-
+by up to 64%, and delivers up to 1.97× throughput under                sides this, Palu’s attention takes RoPE(𝑄) and RoPE(𝐾) as
+the same latency, while maintaining 99% of the accuracy                inputs for computation. Hence, the attention cannot lever-
+without compression. When the state-of-the-art eviction and            age the compressed 𝐾 ′ for acceleration. Long sequences can
+quantization methods are combined with FDC, they exhibit               amplify this decompression overhead and attention time. We
+similar improvements compared to those combined with                   explain it in §3.
+Palu.
+   We open-sourced the code of FDC [42].                               3     Motivation
+                                                                       In this section, we analyze Palu’s 𝐾-decompression overhead
+                                                                       as well as the overhead associated with attention compu-
+                                                                       tation for RoPE-based models, and we highlight potential
+                                                                       opportunities for optimizing Palu.
+                                                                   2
+   FDC: Fast KV Dimensionality Compression for Efficient LLM Inference                                                                                       Submitted for review to EuroSys, 2026
+
+
+   3.1           Decompression and Attention Overhead of Palu                                                  7B to 70B, the attention computation time during the pre-
+   We first selected the largest model with 128K context win-                                                  fill and decode phases drops from 36.3% and 31.9% of JCT,
+   dow length, Llama-3.1 70B, from Table 5 to examine the                                                      respectively, to 26.3% and 29.5%. This is because a larger
+   percentage of each JCT component under different input                                                      model has a larger hidden dimension 𝑑, which causes the
+   and output lengths. The ranges for input and output lengths                                                 linear operations that scale quadratically with 𝑑 to occupy
+   were determined based on the dataset information in Table 6.                                                a greater portion of the total time (whereas attention scales
+   When varying input and output lengths, the corresponding                                                    linearly with 𝑑). Meanwhile, the time spent in decompress-
+   output length and input length were set to 256, which are the                                               ing 𝐾 during decode increases from 10.5% to 19.7% of the
+   common lengths in datasets in Table 6. Fig. 1 illustrates the                                               JCT, as a larger 𝑑 leads to a larger-sized 𝐾 and thus more
+   JCT decomposition of Palu under various input and output                                                    decompression time. During the prefill phase, the decom-
+   length settings for Llama-3.1 70B.                                                                          pression time remains under 2.2% of the JCT, for the same
+      Fig 1(a) shows that as the input length increases from                                                   reason described when discussing Fig. 1(a).
+   128 to 100K, the time spent in decompressing 𝐾 during the                                                       Fig. 2(b) illustrates the case where the input length is 256
+   decode phase grows from 5.6% to 19.7% of the JCT. The per-                                                  and the output length is 100K. As the model size increases
+   centage of attention time during the prefill phase rises from                                               from 7B to 70B, the attention time during decode decreases
+   0.4% to 26.3% of the JCT, and the percentage of attention                                                   from 74.6% to 55.7% of the JCT, while the decompression
+   time during the decode phase increases from 13.1% to 29.5%.                                                 time increases from 14.4% to 29.5%. This is the same reason
+   This is because, with longer input lengths, the overhead of                                                 as given for Fig. 2(a).
+   decompressing 𝐾 in the decode phase grows, and the atten-
+                                                                                                                         Prefill              Decode                       Prefill              Decode
+   tion computation overhead during both prefill and decode                                                              Prefill Decompress   Decode Decompress            Prefill Decompress   Decode Decompress
+                                                                                                                         Prefill Attn         Decode Attn                  Prefill Attn         Decode Attn
+   phases also increases. The decompression time during the                                                          100%
+                                                                                                            Percentage                                        100%
+
+
+
+
+                                                                                                                                                              Percentage
+                                                                                                                      80%                                      80%
+   prefill phase accounts for no more than 2% of the JCT, mainly                                                      60%                                      60%
+                                                                                                                      40%                                      40%
+   because the prefill phase has only one iteration (and thus                                                         20%                                      20%
+   decompresses 𝐾 only once), unlike the decode phase that                                                             0%              B      B       B     B   0%
+                                                                                                                                0 .3
+                                                                                                                       Mistral-v Phi-
+                                                                                                                                     7    1 4   i 3 4
+                                                                                                                                         3 Y lama-3.1   7 0              0.3 7B 3 14B Yi 3L4laB ma-3.1 70B
+   involves multiple iterations.                                                                                                                   L            Mistral-v Phi-
+      Fig. 1(b) shows that as the output length increases from                                                 (a) Input length 100K and output (b) Input length 256 and output
+                                                                                                               length 256.                      length 100K.
+   128 to 100K, the proportion of attention computation during
+   decode grows from 11.3% to 55.7% of the JCT, while the time                                                     Figure 2. Palu’s JCT decomposition for different models.
+   spent in decompressing 𝐾 increases from 4.4% to 29.5% of
+                                                                                                                  Overall, long sequences amplify both Palu’s attention over-
+   the JCT. This occurs because a longer output length leads to
+                                                                                                               head and the overhead associated with decompressing 𝐾. For
+   larger 𝐾, increasing both the attention computation time and
+                                                                                                               input lengths up to 100K, Palu’s attention computation can
+   the time required to decompress 𝐾. The prefill time remains
+                                                                                                               account for up to 36.3% and 31.9% of the JCT during the
+   under 2% of the JCT, which is due to the large number of
+                                                                                                               prefill and decode phases, respectively, and decompressing
+   decode iterations (associated with a long output), causing
+                                                                                                               𝐾 during the decode phase can reach up to 19.7% of the JCT.
+   the prefill phase to account for only a small fraction of JCT.
+                                                                                                               For output lengths up to 100K, Palu’s attention computation
+   Therefore, in the case of long output lengths, the main focus
+                                                                                                               in the decode phase can climb to 74.6% of the JCT, while the
+   should be on improving the decode phase.
+                                                                                                               time to decompress 𝐾 can reach up to 29.5%.
+             Prefill              Decode                       Prefill              Decode
+             Prefill Decompress   Decode Decompress            Prefill Decompress   Decode Decompress
+             Prefill Attn         Decode Attn                  Prefill Attn         Decode Attn                3.2           Opportunities
+         100%                                              100%
+Percentage
+
+
+
+
+                                                  Percentage
+
+
+
+
+          80%                                               80%                                                To reduce the attention overhead, it is desirable to perform
+          60%                                               60%
+          40%                                               40%                                                computation directly using the compressed 𝐾. Doing so also
+          20%                                               20%
+           0%                                                0%                                                avoids the computational cost of decompressing K prior to
+                  128 256 512 1K 4K 16K 64K 100K                    128 256 512 1K 4K 16K 64K 100K
+                             Input length                                     Output length                    the attention. Therefore, we may consider compressing 𝐾
+   (a) Output length 256 with varying (b) Input length 256 with varying out-                                   after it has been processed by RoPE. However, this approach
+   input lengths.                     put lengths.                                                             should not introduce additional overhead at the end of the
+                                                                                                               attention computation; otherwise, the benefits gained from
+   Figure 1. Palu’s JCT decomposition for Llama-3.1 70B with
+                                                                                                               removing 𝐾 decompression would be diminished.
+   different input and output lengths.
+      Additionally, we employed various models to investigate                                                     Let us denote the post-RoPE 𝑄 and 𝐾 as 𝑄 𝑝 and 𝐾𝑝 , re-
+   how a long input length and a long output length influence                                                  spectively. Suppose there is a rotation matrix 𝑅 with shape
+   the components of JCT. The models used are those in Ta-                                                     𝑑ℎ × 𝑑ℎ . Then, the attention computation 𝑄 𝑝 𝐾𝑝𝑇 is mathe-
+   ble 5 that support a context window length of 128K. Fig. 2(a)                                               matically equivalent to (𝑄 𝑝 𝑅) (𝐾𝑝 𝑅)𝑇 since (𝑄 𝑝 𝑅) (𝐾𝑝 𝑅)𝑇 =
+   illustrates the scenario where the input length is 100K and                                                 𝑄 𝑝 (𝑅𝑅𝑇 )𝐾𝑝𝑇 = 𝑄 𝑝 𝐾𝑝𝑇 . In other words, computing 𝑄 𝑝 𝐾𝑝𝑇 can
+   the output length is 256. As the model size increases from                                                  be reformulated as multiplying 𝑄 𝑝 𝑅 and 𝐾𝑝 𝑅. If the matrix
+                                                                                                        3
+Submitted for review to EuroSys, 2026                                                                                         Zeyu Zhang and Haiying Shen
+
+
+𝑅 rotates all row vectors of 𝑄 𝑝 and 𝐾𝑝 such that the result-                                      Mistra-v0.3 7B       Phi-3 14B       Llama-3.1 70B
+ing vectors contain many low-magnitude dimensions, those
+                                                                                                   Llama-3.1 8B         Yi 34B
+                                                                                                                         IMDb
+
+
+
+
+                                                                      Average singular value
+dimensions can be removed to compress 𝑄 𝑝 and 𝐾𝑝 without                                       700
+much information loss. This allows us to compute an approx-                                      0                       arXiv
+imate value of 𝑄 𝑝 𝐾𝑝𝑇 directly by multiplying the compressed                                  700
+                                                                                                 0                      Cocktail
+versions of 𝑄 𝑝 and 𝐾𝑝 . This approach will be detailed in §5.                                 700
+    However, achieving this objective requires satisfying two                                    0                  HumanEval
+conditions. First, 𝑄 𝑝 and 𝐾𝑝 must be compressible. That is,                                   700
+there must exist a common rotation matrix 𝑅 such that the ro-                                    0                      PG-19
+tated versions (𝑄 𝑝 𝑅 and 𝐾𝑝 𝑅) contain many low-magnitude                                     700
+dimensions whose removal does not significantly distort                                          0 0    20     40        60        80    100 120
+the data. Second, the common 𝑅 used for 𝑄 𝑝 and 𝐾𝑝 should                                                 Head dimension
+be model-specific and independent of the tokens. In other             Figure 3. The average singular value for the 𝑄 𝑝 -𝐾𝑝 pair.
+words, given a model, this common 𝑅 can be determined of-
+fline and will not vary with the dataset. These two conditions       generated tokens should also resemble these 𝑅 derived from
+raise two critical questions.                                        datasets. To validate this, we randomly generate a sequence
+1) Does there exist a common 𝑅 that can compress 𝑄 𝑝 and             of tokens from the vocabulary, with the total number of to-
+𝐾𝑝 without significantly distorting the data?                        kens matching that of a randomly selected dataset. Based
+2) Is the common 𝑅 that 𝑄 𝑝 and 𝐾𝑝 share model-specific and          on these random tokens, we compute a rotation matrix 𝑅𝑟 .
+independent of the tokens?                                           Each dataset yields its own 𝑅. We then measure the degree
+The answer to both questions is yes. We will address them            of difference between each dataset-specific 𝑅 and 𝑅𝑟 . This
+in the following observations, which give us opportunities           difference is quantified by the ratio of the deviation in each
+for optimizing Palu.                                                 element of 𝑅 to its magnitude, where smaller ratios indicate
+Does there exist a common 𝑅 that can compress 𝑄 𝑝 and                lower degrees of difference.
+𝐾𝑝 without significantly distorting the data? We observe                Specifically, given a model, each head ℎ in layer 𝑙 has an
+that the answer is yes. In the NLP domain, it is common to           𝑅𝑟ℎ,𝑙 generated from random tokens and an 𝑅𝑎ℎ,𝑙 from a dataset
+apply SVD directly to a matrix 𝑋 composed of row vectors             𝑎. We use AABS(𝑀) to denote the average absolute value
+(e.g., word embeddings). This decomposition yields singular          of all elements in matrix 𝑀 and SUB(𝑀1 ,𝑀2 ) to denote the
+values and an 𝑅, which can then be used to compress 𝑋 . This         element-wise subtraction of 𝑀2 from 𝑀1 . For a model and a
+                                                                     dataset 𝑎, we compute 𝜀 = 𝑁ℎ1𝑁𝑙 ℎ=1
+                                                                                                      Í 𝑁 ℎ Í 𝑁𝑙
+approach is detailed in §4.1. The magnitudes of the singular                                                  𝑙=1
+                                                                                                                  AABS(𝑅𝑎ℎ,𝑙 ) to eval-
+values reflect the magnitude of the row vectors of 𝑋 𝑅 along         uate the average magnitude of an individual element in 𝑅𝑎ℎ,𝑙 .
+each dimension. If many singular values approach zero, it            We also calculate 𝛿 = 𝑁ℎ1𝑁𝑙 ℎ=1
+                                                                                                     Í 𝑁 ℎ Í 𝑁𝑙
+                                                                                                                AABS(SUB(𝑅𝑟ℎ,𝑙 ,𝑅𝑎ℎ,𝑙 ))
+                                                                                                            𝑙=1
+indicates that 𝑋 𝑅 contains a large number of low-magnitude          to evaluate the average magnitude of the differences between
+dimensions that can be discarded without significantly dis-
+                                                                     the elements of 𝑅𝑟ℎ,𝑙 and 𝑅𝑎ℎ,𝑙 .
+torting the data.
+    Following this approach, we combine the row vectors of
+                                                                                         𝛿/𝜀           IMDb     arXiv      Cocktail HumanEval        PG-19
+𝑄 𝑝 and 𝐾𝑝 into a single matrix and calculate its singular
+values and 𝑅 for each attention head. Fig 3 shows the aver-                         8.3𝑒 − 5 1.8𝑒 − 4 7.1𝑒 − 5                          4.5𝑒 − 5    5.6𝑒 − 5
+                                                                     Mistral-v0.3 7B
+                                                                                    6.43𝑒 − 2 6.41𝑒 − 2 6.44𝑒 − 2                       6.43𝑒 − 2   6.39𝑒 − 2
+age singular values across all attention heads for different                        1.1𝑒 − 4 1.5𝑒 − 4 8𝑒 − 5                            1.7𝑒 − 4    1.4𝑒 − 4
+models in Table 5 and datasets in Table 6. We observe that            Llama-3.1 8B
+                                                                                    5.29𝑒 − 2 5.27𝑒 − 2 5.28𝑒 − 2                       5.3𝑒 − 2    5.25𝑒 − 2
+the average singular values in the leftmost dimensions are                          1.9𝑒 − 4 5.2𝑒 − 5 1.1𝑒 − 4                          4.6𝑒 − 5    1.3𝑒 − 4
+                                                                        Phi-3 14B
+significantly higher than those in other dimensions, indicat-                       5.41𝑒 − 2 5.43𝑒 − 2 5.44𝑒 − 2                       5.44𝑒 − 2   5.41𝑒 − 2
+                                                                                    1.7𝑒 − 4 4.9𝑒 − 5 7.6𝑒 − 5                          1.2𝑒 − 4    8.9𝑒 − 5
+ing that the row vectors of 𝑄 𝑝 𝑅 and 𝐾𝑝 𝑅 have many small-              Yi 34B
+                                                                                    5.05𝑒 − 2 5.08𝑒 − 2 5.06𝑒 − 2                       5.06𝑒 − 2   5.11𝑒 − 2
+magnitude dimensions whose removal does not change the                              9.5𝑒 − 5 1.3𝑒 − 4 8.4𝑒 − 5                          1.6𝑒 − 4    1.02𝑒 − 4
+                                                                      Llama-3.1 70B
+vectors much. The explanation for this observation will be                          5.54𝑒 − 2 5.53𝑒 − 2 5.54𝑒 − 2                       5.52𝑒 − 2   5.51𝑒 − 2
+detailed in §4.2.                                                                                 Table 2. 𝜀 and 𝛿 for the 𝑄 𝑝 -𝐾𝑝 pair.
+Is the common 𝑅 that 𝑄 𝑝 and 𝐾𝑝 share model-specific
+and independent of the tokens? We observe that the an-                  Table 2 presents 𝜀 and 𝛿, displayed in the format 𝛿/𝜀. We
+swer is yes. To investigate this question, we need to examine        observe that the average variation 𝛿 in the values of individ-
+whether the matrices 𝑅 generated from different datasets are         ual elements of 𝑅 is less than 0.34% of the average absolute
+similar. If 𝑅 is independent of the token, then the 𝑅 derived        value 𝜀 of a single element. This upper limit is derived from
+from different datasets should exhibit a certain degree of           the results for Yi 34B with IMDb. This indicates that the 𝑅𝑝
+similarity. Moreover, the 𝑅 computed based on randomly               derived from random tokens is highly similar to the 𝑅 derived
+                                                                     from a different dataset, with minimal variation. Therefore,
+                                                                 4
+FDC: Fast KV Dimensionality Compression for Efficient LLM Inference                                Submitted for review to EuroSys, 2026
+
+
+the 𝑅 is independent of tokens. In other words, the 𝑅𝑟 com-            why do 𝑄 𝑝 and 𝐾𝑝 exhibit this property? Prior work [24, 32]
+puted offline from random tokens can be applied to other               has demonstrated that the pre-RoPE 𝑄 and 𝐾 possess a low-
+datasets to compress 𝑄 𝑝 and 𝐾𝑝 online. The explanation for            rank property, meaning that their SVD decompositions yield
+this observation is detailed in §4.3.                                  many low-magnitude singular values. This suggests that
+To sum up, post-RoPE 𝑄 𝑝 and 𝐾𝑝 have a common rotation                 𝑄 and 𝐾 have many dimensions in the space where their
+matrix 𝑅 that can compress them without significantly dis-             magnitudes are very small.
+torting the data. The common 𝑅 is independent of the tokens               From a geometric perspective, the RoPE operation applied
+and only specific to the model. These two observations give            to 𝑄 and 𝐾 rotates each vector within the plane formed by
+us opportunities to accelerate attention and eliminate the             every pair of dimensions. Such rotational transformations
+𝐾-decompression overhead in Palu.                                      do not amplify the vector magnitudes along the two dimen-
+                                                                       sions that define each plane. Therefore, if a vector initially
+4 Understanding Observations                                           exhibits low magnitudes along the dimensions forming a
+In this section, we provide essential information and explana-         plane, the RoPE rotation will preserve these low magnitudes
+tions to facilitate a deeper understanding of the observations         post-transformation. Since 𝑄 and 𝐾 naturally possess many
+presented in the motivation.                                           dimensions with low magnitude, after RoPE, the correspond-
+                                                                       ing dimensions with low magnitude that can form a plane
+4.1 SVD for Data Compression in NLP                                    in RoPE will also retain low magnitudes. This geometric
+In NLP, SVD is                                     p        p          behavior explains why 𝑄 𝑝 and 𝐾𝑝 still have low-magnitude
+                                                R
+widely used to re-       X × R = XR            XAP       RP R
+                                                             P         dimensions and why the singular values of 𝑄 𝑝 and 𝐾𝑝 con-
+                                                          WQ
+duce data dimen-             Rotation                Compression       tinue to exhibit many small values.
+sionality with low           matrix                  matrix               Because 𝑄 𝑝 and 𝐾𝑝 both have many low-magnitude dimen-
+or even zero loss. Figure 4. SVD for data compression.                 sions, if they share many common low-magnitude dimen-
+Given a matrix 𝑋 where each rowprepresents an item’s vector            sions, then performing SVD decomposition on all vectors of
+to be compressed, 𝑋 can be decomposed    ^   into  𝑋 = 𝑈 Σ𝑅 𝑇.𝑈 T
+                                                                R        𝑝 and 𝐾𝑝 together will produce singular values with many
+                          E × RRTP = E                    T       T
+                                                                 Rp
+                                                                       𝑄
+                                                  R      R
+and 𝑅 are rotation matrices,Wwhile
+                                 Q      Σ is a diagonal matrix       p small values. Fig. 3 has already shown that these singular
+filled with zeros except for non-negative singular values      Decomp.values contain many small values, indicating that 𝑄 𝑝 and 𝐾𝑝
+sorted in descending order along the diagonal. This decom-     matrix have common low-magnitude dimensions and therefore can
+position, solvable using an SVD solver [44], has a unique              be compressed using a common 𝑅.
+solution. Singular values quantify the magnitude of vectors’
+components after rotation by 𝑅. Consequently, each row of              4.3 Why Is the Common 𝑅 for 𝑄 𝑝 and 𝐾𝑝
+𝑋 𝑅 = 𝑋 𝑅 is a rotated vector with elements decreasing from                  Independent of Tokens?
+left to right, and the right 𝑝 fraction of the columns of 𝑋 𝑅          The singular values and the common 𝑅 obtained by per-
+can be discarded with minimal impact on vector relation-               forming SVD decomposition on all vectors of 𝑄 𝑝 and 𝐾𝑝 are
+ships. This creates a compressed matrix 𝑋 𝑅𝑝 , with 𝑅𝑝 as the          correlated. The singular values represent the magnitudes of
+compression matrix, as depicted in Fig. 4. To decompress the           all dimensions of the vectors after rotation by 𝑅. To answer
+data, we only need to use the inverse of 𝑅, equivalent to 𝑅𝑇           why the common 𝑅 is independent of tokens is to answer
+for rotation matrices, to rotate the compressed vectors back           why the distribution of singular values is independent of
+to their original orientation. Since the deleted dimensions            tokens. Since the singular values reflect the dimension mag-
+can be considered zero-valued, we do not require the full 𝑅𝑇           nitudes of 𝑄 𝑝 and 𝐾𝑝 , this question can be further rephrased
+for decompression; instead, 𝑅𝑇𝑝 suffices.                              as why the low-magnitude dimensions of 𝑄 𝑝 and 𝐾𝑝 are
+    For any set of vectors we want to compress, such as all the        independent of tokens.
+row vectors of 𝑄 𝑝 and 𝐾𝑝 , we can arrange these vectors as               Existing work has shown that the pre-RoPE 𝑄 and 𝐾 have
+rows to form the matrix 𝑋 shown in Fig. 4. We then obtain              a low-rank property, and that the low-magnitude dimensions
+the singular values and the matrix 𝑅 used for compressing              of 𝑄 and 𝐾 are independent of tokens but related to model
+the vectors following the method described above. As long              parameters [24, 32]. We take 𝑄 as an example to explain the
+as the singular values contain many small values, it indicates         reason. Since 𝑄 = 𝐸𝑊 , we can perform SVD decomposition
+that the set of vectors can be compressed using 𝑅 without              on 𝑊 to obtain 𝑊 = 𝑈 Σ𝑅𝑇 , resulting in 𝑄 = 𝐸𝑈 Σ𝑅𝑇 . Here, Σ
+incurring significant loss.                                            and 𝑅 are the singular values and the rotation matrix used for
+                                                                       compression of 𝑄. Σ originates from the parameter 𝑊 and
+4.2 Why Are Post-RoPE 𝑄 𝑝 and 𝐾𝑝 Compressible?                         is unrelated to the token embedding 𝐸, so the distribution
+In §3.2, our experiments show that the post-RoPE 𝑄 𝑝 and               of dimension magnitudes in 𝑄 depends only on the model
+𝐾𝑝 exhibit many low-magnitude singular values after SVD                parameters and is independent of the tokens. The same holds
+decomposition, indicating that 𝑄 𝑝 and 𝐾𝑝 can be compressed            for K. Importantly, since the RoPE operation is also indepen-
+using a matrix 𝑅 without introducing significant loss. But             dent of the token embedding 𝐸, the distribution of dimension
+                                                                      5
+Submitted for review to EuroSys, 2026                                                                                         Zeyu Zhang and Haiying Shen
+
+
+                    Offline                                                                          Online
+ Random tokens                                     Layer 𝑙                                           KV cache            Enhanced
+                                                                                                                         attention kernel
+
+
+
+
+                                                                                                                                                                     Attention output
+                      Singular values
+
+
+
+
+                                                                                                                                                   merged with 𝐵%"
+    ① Model
+                      from 𝑊%",$                         𝐴"% with 𝑝%"       𝑉 "(
+
+
+
+
+                                                                                                                                                    Linear layer
+                                                                                                                            '!"# (&!"# )$
+      𝑄!",$ 𝐾!",$                        ",$                                                                           sm(       ) 𝑉 "(
+                    Determine           𝑝'&      E 𝑊&" 𝐾 "                  𝐾!"                           𝐾!"(      X       +"
+
+
+
+
+                                                                    RoPE
+    ② SVD        compression rates                        ⑤                                   "
+                                                                                   ⑥𝑅 " with 𝑝'&                   ⑦ sm: softmax
+                                        𝑝%",$     ④ 𝑊 " 𝑄"                  𝑄!"                           𝑄!"(      X
+          Singular         ③                         '
+     𝑅",$ values                                                                                                 X: no decompression
+                                                            Figure 5. Overview.
+
+magnitudes in the post-RoPE 𝑄 𝑝 and 𝐾𝑝 also depends only                      5.1       Post-RoPE QK Compression
+on the parameters and is independent of the tokens. There-                    Achieving 𝐾-decompression elimination and attention ac-
+fore, the singular values and 𝑅 obtained by decomposing 𝑄 𝑝                   celeration requires calculating the common 𝑅 for post-RoPE
+and 𝐾𝑝 are independent of tokens. This also explains why                      𝑄 𝑝 and 𝐾𝑝 as indicated in §3. We explain how to find the
+the 𝑅 obtained using different datasets (even random tokens)                  common 𝑅 and use it to compress post-RoPE 𝑄 𝑝 and 𝐾𝑝 .
+is highly similar.                                                               We begin by generating a series of random tokens and
+                                                                              feeding them into the model to extract the post-RoPE repre-
+                                                                              sentations 𝑄 𝑝ℎ,𝑙 and 𝐾𝑝ℎ,𝑙 from each head ℎ in every layer 𝑙. As
+5     Design                                                                  illustrated in Fig. 6, for each head ℎ in layer 𝑙, we concatenate
+We detail our design in this section. Fig. 5 gives an overview                all vectors from 𝑄 𝑝ℎ,𝑙 and 𝐾𝑝ℎ,𝑙 row-wise to form a matrix 𝑋 .
+of our approach, which consists of two stages: an offline                     The matrix 𝑋 is then decomposed using SVD as 𝑈 Σ(𝑅ℎ,𝑙 )𝑇
+stage and an online stage. The offline stage is responsible for               (step 1 in Fig. 6). The singular values are located on the
+obtaining the rotation matrix 𝑅 used to compress 𝑄 𝑝 and 𝐾𝑝 ,                 diagonal of Σ. The matrix 𝑅ℎ,𝑙 serves as the rotation matrix
+as well as the compression rate 𝑝 for 𝑄 𝑝 , 𝐾𝑝 , and 𝑉 under                  used to rotate the vectors in 𝑄 𝑝ℎ,𝑙 and 𝐾𝑝ℎ,𝑙 . After step 2 in
+different accuracy constraints. The online stage performs                     Fig. 6, the green rotated vectors obtained through 𝑅ℎ,𝑙 are still
+inference using the 𝑅 and 𝑝 obtained during the offline stage                 arranged row-wise, and each rotated vector has elements ar-
+under an accuracy constraint.                                                 ranged in descending order from left to right, a consequence
+    In the offline stage, we first randomly generate tokens and               of the singular values’ arrangement in Σ. In other words, the
+feed them into the model to extract 𝑄 𝑝ℎ,𝑙 and 𝐾𝑝ℎ,𝑙 from each                magnitude of the singular values on the diagonal determines
+head ℎ in layer 𝑙 (step 1 ). We then apply SVD to 𝑄 𝑝ℎ,𝑙 and                  the relative size of each element in the rotated vectors. The
+                                                                              larger the singular value, the greater the element value in
+𝐾𝑝ℎ,𝑙 to obtain their singular values and the rotation matrix
+                                                                              the corresponding dimension, and vice versa. If we want to
+𝑅ℎ,𝑙 (step 2 ), as explained in §5.1. Since different heads con-              remove the smallest 𝑁 elements from each rotated vector,
+tribute unequally to inference results [16, 18], we determine                 we simply need to delete the rightmost 𝑁 columns of 𝑅ℎ,𝑙
+the compression rate 𝑝 for 𝑄 𝑝 , 𝐾𝑝 , and 𝑉 based on the singu-               before performing step 2 in Fig. 6, as introduced in §4.1.
+lar values (step 3 ), with the goal of maximizing the overall                                                             ℎ,𝑙
+                                                                              Therefore, given a compression rate 𝑝𝑄𝐾         for 𝑄 𝑝ℎ,𝑙 and 𝐾𝑝ℎ,𝑙 ,
+KV compression rate under an accuracy constraint. Details
+are provided in §5.2. In the online stage, for each layer 𝑙,                  to compress 𝑄 𝑝ℎ,𝑙 and 𝐾𝑝ℎ,𝑙 , we need to delete the rightmost
+                                                                               ℎ,𝑙
+token embeddings 𝐸 are linearly transformed by parameters                     𝑝𝑄𝐾  𝑑ℎ columns of 𝑅ℎ,𝑙 before performing step 2 .
+𝑊𝑄ℎ and 𝑊𝐾ℎ to produce 𝑄 ℎ and 𝐾 ℎ (step 4 ), which are then                     If the model uses Group Query Attention (GQA), we pair
+processed by RoPE to generate 𝑄 𝑝ℎ and 𝐾𝑝ℎ (step 5 ). These are               each query head’s 𝑄 𝑝 with its key head’s 𝐾𝑝 to compute the
+subsequently compressed into 𝑄 𝑝ℎ ′ and 𝐾𝑝ℎ ′ using the rotation              singular values and the rotation matrix 𝑅.
+matrix 𝑅ℎ and compression rate 𝑝𝑄𝐾     ℎ shared by 𝑄 and 𝐾 (step
+                                                                                   All vectors of       Singular values in descending       A rotated vector with
+                                                                                   𝑄!",$ and 𝐾!",$      order from left to right            elements decreasing
+ 6 ), following the method shown in Fig. 4. The compressed                                                                                  from left to right
+                                                                              A 𝑄!",$
+
+                                                                                                         U×
+                                                                                              Decompose
+𝑄 𝑝ℎ ′ and 𝐾𝑝ℎ ′ are directly used in the attention without requir-                           by SVD ①
+ing decompression. The compression method for 𝑉 follows
+                                                                              vector                                  ×(𝑹𝒉,𝒍)𝑻
+                                                                              A 𝐾!",$                                                   × 𝑹𝒉,𝒍 =
+Palu but uses the compression rate 𝑝𝑉ℎ determined in step 3                   vector Matrix X to
+                                                                                                                                        ②
+to maximize overall KV compression rate. The compressed                              decompose                    Σ
+𝑉 ℎ ′ is also fed directly into attention. Since 𝑄 𝑝ℎ , 𝐾𝑝ℎ , and 𝑉 ℎ              Figure 6. An example of compressing 𝑄 𝑝ℎ,𝑙 and 𝐾𝑝ℎ,𝑙 .
+have different compression rates, the workload across SMs                     How many random tokens do we need? The experimen-
+of the GPU during attention computation may become im-                        tal results shown in Fig. 14 help us answer this question. For
+balanced. To address this, we design an enhanced attention                    a given model, we observe that at least 8K random tokens
+kernel that balances SM workloads to accelerate attention                     are required to ensure the accuracy of the computed rotation
+computation (step 7 ). Details are provided in §5.3.                          matrix 𝑅. This is because a larger number of random tokens
+                                                                        6
+FDC: Fast KV Dimensionality Compression for Efficient LLM Inference                                           Submitted for review to EuroSys, 2026
+
+
+allows for a more accurate identification of the common                                         IMDb arXiv Cocktail HumanEval PG-19
+low-magnitude dimensions in 𝑄 𝑝ℎ,𝑙 and 𝐾𝑝ℎ,𝑙 .                                  Mistral-v0.3 7B 49.76% 49.55% 49.93%  50.04%  54.5%
+Does the introduced compression overhead (step 6 in                              Llama-3.1 8B 51.13% 51.21% 51.07%    50.94%  52.1%
+                                                                                   Phi-3 14B    52.97% 53.38% 52.63%  52.53%  50.7%
+Fig. 5) compromise the benefits from decompression
+                                                                                    Yi 34B      55.21% 55.73% 54.95%  54.98%  54.9%
+elimination and attention acceleration? The answer to
+                                                                                Llama-3.1 70B 57.75% 58.03% 57.69%    57.51%  59.2%
+this question is negative. Experimental results in §6.8 show
+that the compression overhead is negligible compared to the                   Table 3. CV of the maximum singular values for 𝑄 𝑝ℎ,𝑙 -𝐾𝑝ℎ,𝑙 .
+overall JCT. We analyze why the introduced online compres-
+sion overhead is small by examining both the prefill and de-                                    IMDb arXiv Cocktail HumanEval PG-19
+code phases. In the prefill phase, the computational complex-                   Mistral-v0.3 7B 41.86% 42.37% 41.44%  41.31% 43.55%
+                                                                                 Llama-3.1 8B 43.59% 43.63% 43.56%    43.61% 42.92%
+ity of attention is 8𝑠𝑑 2 +4𝑠 2𝑑, while all other linear layers have
+                                                                                   Phi-3 14B    45.37% 44.82% 44.96%  45.69% 44.73%
+a complexity of 4𝑠𝑑𝑑 𝑓 𝑓 [16], where 𝑑 𝑓 𝑓 is the size of the feed-
+                                                                                    Yi 34B      44.48% 44.81% 44.96%  44.52% 45.25%
+forward neural network and larger than 𝑑. The compression
+                                                                                Llama-3.1 70B 45.16% 45.42% 45.38%    44.95% 45.58%
+of 𝑄 𝑝 and 𝐾𝑝 has a complexity of only 4𝑠𝑑𝑑ℎ . Since 𝑑ℎ = 128 is
+                                                                                 Table 4. CV of the maximum singular values for 𝑉 ℎ,𝑙 .
+typically 32 to 64 times smaller than 𝑑, 4𝑠𝑑𝑑ℎ is significantly
+smaller than (8𝑠𝑑 2 +4𝑠 2𝑑) + (4𝑠𝑑𝑑 𝑓 𝑓 ) = 8𝑠𝑑 2 +4𝑠 2𝑑 +4𝑠𝑑𝑑 𝑓 𝑓 . It
+can be even smaller when the sequence length 𝑠 is extremely                   fewer dimensions with relatively smaller values, we can use
+long. This explains why the compression overhead during                       a lower 𝑝 to remove fewer low-magnitude dimensions. This
+prefill is negligible. In the decode phase, the computational                 can achieve a higher overall compression rate 𝑝 with mini-
+complexity of attention is 8𝑑 2 + 4𝑠𝑑, while all other linear                 mal accuracy loss. How to determine 𝑝 for 𝑄 𝑝ℎ,𝑙 -𝐾𝑝ℎ,𝑙 and 𝑉 ℎ,𝑙
+layers have a complexity of 4𝑑𝑑 𝑓 𝑓 [16]. The compression of                  in each head? Since singular values represent the magnitude
+𝑄 𝑝 and 𝐾𝑝 has a complexity of only 4𝑑𝑑ℎ . 4𝑑𝑑ℎ is also signifi-              of the components of rotated vectors in their corresponding
+cantly smaller than (8𝑑 2 + 4𝑠𝑑) + (4𝑑𝑑 𝑓 𝑓 ) = 8𝑑 2 + 4𝑠𝑑 + 4𝑑𝑑 𝑓 𝑓 ,        dimensions, the proportion of the cumulative sum of the
+especially when the total sequence length 𝑠 is extremely long.                removed singular values to the total sum of singular values
+This explains why the compression overhead during decode                      determines the extent of information loss. We introduce a sin-
+is also negligible.                                                           gular value removal rate 𝑟 to control this proportion, which
+                                                                              is the ratio of the sum of the singular values in the removed
+5.2   Adaptive Compression Rate Determination                                 dimensions to the total sum of the singular values across all
+Model layers contribute differently to the output [16], as                    𝑑ℎ dimensions. In a head, given an 𝑟 , the corresponding 𝑝 for
+do the attention heads within each layer [18]. This implies                   𝑄 𝑝ℎ,𝑙 -𝐾𝑝ℎ,𝑙 and 𝑉 ℎ,𝑙 can be determined. Specifically, given an 𝑟 ,
+that different heads ℎ in each layer 𝑙 can have different com-                we only need to find 𝑝 that satisfies the following condition:
+pression rates. How to determine the compression rates for
+                                                                                Í𝑑ℎ −1             Í𝑑ℎ −1 𝑖
+post-RoPE 𝑄 𝑝ℎ,𝑙 and 𝐾𝑝ℎ,𝑙 , as well as 𝑉 ℎ,𝑙 when performing                    𝑖=𝑗+1 𝜃
+                                                                                         𝑖
+                                                                                                    𝑖=𝑗 𝜃
+hidden dimension compression remains a question. Since                          Í𝑑ℎ −1 𝑖     ≤ 𝑟 < Í𝑑 −1 AND 𝑗 = ⌊(1 − 𝑝) (𝑑ℎ − 1)⌋, (1)
+                                                                                                     ℎ    𝑖
+different heads contribute differently, we expect that the                       𝑖=0 𝜃              𝑖=0 𝜃
+distribution of singular values obtained through SVD for                      where 𝜃 𝑖 is the singular value at head dimension 𝑖. We set
+post-RoPE 𝑄 𝑝ℎ,𝑙 -𝐾𝑝ℎ,𝑙 and 𝑉 ℎ,𝑙 may vary across different heads             a shared 𝑟 for all heads across different layers, allowing us
+and layers. The singular values of 𝑉 ℎ,𝑙 are obtained by decom-               to directly determine the 𝑝 required for 𝑄 𝑝ℎ,𝑙 -𝐾𝑝ℎ,𝑙 and 𝑉 ℎ,𝑙 in
+posing the model parameter 𝑊𝑉ℎ,𝑙 through SVD [32]. Table 3                    each head, thus obtaining an overall KV compression rate,
+and Table 4 presents the coefficient of variation (CV) of the                 which corresponds to an accuracy constraint. This enables us
+maximum singular values (i.e., those in the first head dimen-                 to construct a function 𝐹𝑝 that takes an accuracy constraint
+sion) for 𝑄 𝑝ℎ,𝑙 -𝐾𝑝ℎ,𝑙 and 𝑉 ℎ,𝑙 across all heads of each model              as input and outputs a combination of 𝑝 needed for all heads
+with different datasets. The CV is the ratio of the standard de-              under this constraint. During inference, given an accuracy
+viation to the mean of the maximum singular values of heads.                  constraint, we use 𝐹𝑝 to directly obtain the 𝑝 needed for
+This CV for different models and datasets is around 40%-50%,                  𝑄 𝑝ℎ,𝑙 -𝐾𝑝ℎ,𝑙 and 𝑉 ℎ,𝑙 in each head.
+indicating variation in the maximum singular values among
+different heads.                                                              5.3   Kernel Enhancement for Adaptive Compression
+   Since the dominant maximum singular values vary across                           Rate
+heads, the compression rate 𝑝 for each head should also                       State-of-the-art memory-efficient attention kernel implemen-
+differ. For heads with larger maximum singular values and                     tations (e.g., FlashAttention-2 [45]) operate as shown in Fig. 7.
+more dimensions with relatively smaller values, we can use                    The attention computation of a batch of requests is divided
+a higher 𝑝 to remove more low-magnitude dimensions. Con-                      into 𝑏𝑎𝑡𝑐ℎ_𝑠𝑖𝑧𝑒 × 𝑁ℎ computation units, each corresponding
+versely, for heads with smaller maximum singular values and                   to a head of a request. Each unit further splits 𝑄 into blocks of
+                                                                          7
+Submitted for review to EuroSys, 2026                                                                                                    Zeyu Zhang and Haiying Shen
+
+
+shape (𝐵𝑟 = 64, 𝑑𝑞𝑘 = 𝑑ℎ ), where 𝐵𝑟 is the row block size and                                      tasks in a heuristic way to avoid heavy overhead. The exe-
+𝑑𝑞𝑘 is the head dimension size for 𝑄 and 𝐾. Each 𝑄 block is                                         cution time of each task 𝑘𝑖 is determined by 𝑠𝑘𝑣 × 𝑑𝑠𝑢𝑚 . All
+processed on one SM as an SM task. All SMs responsible for a                                        tasks are sorted in descending order of execution time and
+head share that head’s 𝐾 and 𝑉 to minimize data movement                                            then sequentially assigned to an SM with the smallest cumu-
+between SMs, thereby reducing memory access overhead.                                               lative assigned time one at a time. Fig. 8 provides an example
+When an SM processes a 𝑄 block, 𝐾, and 𝑉 , it further divides                                       where 7 tasks are distributed across 3 SMs. Tasks 𝑘 1 -𝑘 7 are
+𝐾 and 𝑉 into blocks of shape (𝐵𝑐 = 64, 𝑑 𝑣 = 𝑑ℎ ) to be pro-                                        sorted in descending order of execution time. Following our
+cessed sequentially in time order, where 𝐵𝑐 is the column                                           scheduling strategy, 𝑘 1 and 𝑘 6 are assigned to SM1, 𝑘 2 , 𝑘 5 ,
+block size and 𝑑 𝑣 is the head dimension size for 𝑉 . Without                                       and 𝑘 8 to SM2, and 𝑘 3 , 𝑘 4 , and 𝑘 7 to SM3.
+adaptive compression rates, all heads use the same 𝑑𝑞𝑘 and                                          6     Performance Evaluation
+the same 𝑑 𝑣 . However, with adaptive compression rates, dif-
+ferent heads have different 𝑑𝑞𝑘 and different 𝑑 𝑣 , resulting in                                    6.1   Implementation
+varying computational loads and uneven execution times for                                          We implemented FDC based on vLLM [46] and modified
+each SM. The kernel runtime is determined by the SM with                                            vLLM model classes to enable QKV compression and adap-
+the longest execution time. Therefore, it is necessary to en-                                       tive compression rates. We used NVIDIA CUTLASS [47] to
+hance the attention kernel with adaptive compression rates.                                         implement the on-device matrix multiplication for the atten-
+We propose different enhancements for prefill and decode.                                           tion kernel. A load balancer was implemented with a fast
+Prefill. During prefill,                         Bc       Bc                                        Python web framework Quart [48], which allocates each
+                                                               dv
+the computational work-                               K
+                                           dqk Shared by                                            request to a vLLM instance with the shortest queue length.
+                                       dqk
+                                                              Shared by SM1&2
+
+
+
+
+                                                         SM1&2
+                                                                                KV length skv
+
+load of an SM task                                                  Bc                              Kernel enhancement for prefill. For prefill-phase kernel
+                             Q length sq
+
+
+
+
+                                   B    Q1
+includes 2𝐵𝑟 𝑑𝑞𝑘 𝑠𝑘𝑣 for             r           Attention                                          enhancement (§5.3), a large 𝐵𝑟 can cause data to exceed the
+                                                           V
+
+
+
+
+                                       SM1
+                                                 score or                                           register capacity of a single SM. In such cases, we reduce 𝐵𝑐
+multiplying the 𝑄 block            Br Q 2        probability        Bc
+with 𝐾, 2𝐵𝑟 𝑠𝑘𝑣 for soft-              SM2                                                          to prevent this issue, which does not affect the total computa-
+                                                KV length skv
+max, and 2𝐵𝑟 𝑠𝑘𝑣 𝑑 𝑣 for            Figure 7. Attention kernel.                                     tional workload of an SM task since 𝑠𝑘𝑣 remains unchanged.
+multiplying attention probability with 𝑉 , resulting in a total                                     Limited by the tensor core interface used for matrix oper-
+of 2𝐵𝑟 𝑠𝑘𝑣 (𝑑𝑞𝑘 + 𝑑 𝑣 + 1), where 𝑠𝑘𝑣 is the sequence length                                        ations, the values of 𝑑𝑞𝑘 , 𝑑 𝑣 , 𝐵𝑟 , and 𝐵𝑐 must be multiples
+of 𝐾 and 𝑉 . Let 𝑑𝑠𝑢𝑚   𝑖     = 𝑑𝑞𝑘 + 𝑑 𝑣 + 1 for head 𝑖 and 𝑑𝑠𝑢𝑚   𝑚𝑎𝑥                             of 16. Therefore, these values are rounded up to the nearest
+be the maximum 𝑑𝑠𝑢𝑚 across all heads. As the compression
+                         𝑖                                                                          multiple of 16, and any padding required is filled with zeros.
+rate changes, 𝑑𝑠𝑢𝑚𝑖        changes accordingly. We increase 𝐵𝑟 to                                   For a given overall KV compression rate 𝑝, the 𝑑𝑠𝑢𝑚 and 𝐵𝑐
+  𝑚𝑎𝑥
+𝑑𝑠𝑢𝑚
+      𝐵   for head  𝑖, ensuring   that the computational workload                                   for each head are determined, and 𝐵𝑟 used by each head is
+  𝑖
+ 𝑑𝑠𝑢𝑚   𝑟
+                                                                                                    also determined except in the final round. In the last round,
+for each SM task is the same, preventing uneven execution
+                                                                                                    𝐵𝑟 can be enumerated among multiples of 16. For different
+times among SMs. By increasing 𝐵𝑟 , the number of 𝑄 blocks
+                                                                                                    overall KV compression rates, we pre-compile all kernels
+per head decreases, reducing the total number of SM tasks.
+                                                                                                    offline according to the required matrix shapes.
+As a result, the GPU can complete all SM tasks in fewer
+                                                                                                    Kernel enhancement for decode. For decode-phase ker-
+rounds, with each round using all SMs of the GPU. In the
+                                                                                                    nel enhancement, we fused the scheduling computations (a
+final round, not all SMs may be fully utilized. To maximize
+                                                                                                    significant portion of which involves sorting) to a CUDA
+the utilization, we redistribute the remaining SM tasks in
+                                                                                                    kernel, thereby minimizing the time overhead.
+the last round. Suppose the GPU has 𝑁𝑆𝑀 SMs and the last
+round has 𝑁𝑙𝑎𝑠𝑡 SM tasks. The workload assigned to each SM                                          6.2   Setup
+                       1 Í𝑁𝑙𝑎𝑠𝑡 𝑡𝑠𝑘 (𝑖 ) 𝑡𝑠𝑘 (𝑖 )
+should be 𝑤𝑙 = 𝑁𝑆𝑀            𝑖=1 𝐵𝑟        𝑑𝑠𝑢𝑚 , where 𝐵𝑟𝑡𝑠𝑘 (𝑖 ) and
+ 𝑡𝑠𝑘 (𝑖 )
+                                                                                                    In the evaluation, unless otherwise specified, we utilized
+𝑑𝑠𝑢𝑚      is 𝐵𝑟 and 𝑑𝑠𝑢𝑚 of the 𝑖-th SM task in the last round.                                     the following settings. Table 5 lists the state-of-the-art mod-
+Then, task 𝑖 should be split into smaller blocks using new                                          els we used with their Tensor Parallelism (TP) and Pipeline
+                       𝑡𝑠𝑘 (𝑖 )
+row block size 𝑤𝑙/𝑑𝑠𝑢𝑚          . All redistributed tasks in the last                               Parallelism (PP) size, following the setting in [49, 50]. We
+round are sequentially assigned to an SM with the smallest                                          used the datasets listed in Table 6. IMDb includes 27 genres
+allocated workloads one at a time.                                                                  of movies, TV shows, etc., collected on the Internet. It is
+Decode. In decode, the Q SM1                      k1      k6                                        operated by IMDb.com, Inc., a subsidiary of Amazon. The
+length 𝑠𝑞 for each head is
+                                   SM2        k2        k5 k8                                       arXiv summarization has a collection of scientific publica-
+only 1, meaning it cannot                     k      k       k7 Time                                tions and their summaries on arXiv.org [51]. Information
+be divided into multiple 𝑄 SM3
+                                                3      4
+                                                                                                    Retrieval (IR) is the process of retrieving relevant content
+blocks. Consequently, each             Figure 8. Task allocation.                                   from vast amounts of information based on a user query. The
+head corresponds to one SM task, and adjusting 𝐵𝑟 to en-                                            Cocktail is a benchmark for IR, including 8 different IR tasks
+hance the kernel is not feasible. Instead, we schedule these                                        such as question answering, fact checking, etc. HumanEval
+                                                                                                    evaluates the performance of code completion, including 164
+                                                                                                8
+FDC: Fast KV Dimensionality Compression for Efficient LLM Inference                                   Submitted for review to EuroSys, 2026
+
+
+programming problems. The Google PG-19 dataset provides                   dequantized. Subsequent steps remain the same as FDC and
+a description of a book passage and requires the model to                 Palu.
+generate a book of a specified length. For the summariza-
+tion and book generation tasks, we use ROUGE-1 [52] as the                                 FDC Palu KF-F KF-P KVQ-F KVQ-P
+accuracy metric; for the code completion task, we use Edit                 Mistral-v0.3 7B 0.61 0.55 0.71 0.68 0.90      0.88
+Similarity (normalized Levenshtein distance) [53, 54].                      Llama-3.1 8B 0.53 0.51 0.72 0.69 0.89        0.88
+                                                                              Phi-3 14B    0.58 0.50 0.80 0.75 0.92      0.90
+Mistral-v0.3 7B [37] no TP and PP Llama-3.1 8B [38] no TP and PP               Yi 34B      0.55 0.49 0.75 0.71 0.92      0.91
+  Phi-3 14B [39]     no TP and PP    Yi 34B [40]        TP=4               Llama-3.1 70B 0.63 0.57 0.74 0.72 0.91        0.89
+Llama-3.1 70B [38]       TP=4
+                                                                               Table 7. Overall KV compression rate (IMDb).
+             Table 5. Model size and TP/PP size.
+
+Trace                    Input length      Output length                                   FDC Palu KF-F KF-P KVQ-F KVQ-P
+                         avg min max avg min max                           Mistral-v0.3 7B 0.64 0.59 0.84 0.81 0.92       0.90
+IMDb classification [55] 315 106 821       37    16    87                   Llama-3.1 8B 0.65 0.55 0.84 0.82 0.90         0.88
+arXiv summarization [34] 6.3K 1.6K 14.1K 243 29        464                    Phi-3 14B    0.62 0.55 0.82 0.80 0.91       0.89
+Cocktail for IR [35]     49.7K 9.4K 104.9K 159 44      246                     Yi 34B      0.64 0.57 0.87 0.84 0.91       0.90
+HumanEval [56]           204 75 697        139 11      552
+                                                                           Llama-3.1 70B 0.67 0.58 0.86 0.82 0.92         0.90
+Google PG-19 [36]        277 138 419       61.5K 24.3K 97.5K
+                                                                               Table 8. Overall KV compression rate (arXiv).
+                   Table 6. Trace properties.
+
+   We employed four AWS p4de.24xlarge instances [57] lo-
+cated in four nodes. Each instance is equipped with 8 NVIDIA                               FDC Palu KF-F KF-P KVQ-F KVQ-P
+A100 GPUs (each with 80 GiB memory), 96 vCPUs, and 1152                    Mistral-v0.3 7B 0.58 0.51 0.79 0.75 0.90       0.89
+GiB host memory, connected with a 400 Gbps network. As in                   Llama-3.1 8B 0.56 0.50 0.75 0.70 0.91         0.89
+[58], we executed 16 concurrent clients to dispatch requests                  Phi-3 14B    0.67 0.59 0.82 0.77 0.92       0.90
+from a single dataset. We built our system atop vLLM [46]                      Yi 34B      0.60 0.55 0.83 0.78 0.92       0.91
+and scheduled each request to a vLLM instance (which holds                 Llama-3.1 70B 0.59 0.52 0.84 0.76 0.92         0.89
+one model replica) that has the shortest queue length [59],                   Table 9. Overall KV compression rate (Cocktail).
+defined by the number of tokens. By default, the request
+rate is set to the maximum processing capacity without in-
+creasing queuing time, based on a Poisson distribution. The                                FDC Palu KF-F KF-P KVQ-F KVQ-P
+batch size is automatically determined by vLLM based on                    Mistral-v0.3 7B 0.53 0.50 0.73 0.69 0.89    0.89
+the available space in the KV cache.                                        Llama-3.1 8B 0.54 0.48 0.76 0.72 0.87      0.89
+                                                                              Phi-3 14B    0.54 0.50 0.77 0.72 0.91    0.90
+6.3 Compared Methods                                                           Yi 34B      0.59 0.53 0.78 0.73 0.90    0.91
+We selected Palu as our comparison method. FDC and Palu                    Llama-3.1 70B 0.56 0.52 0.77 0.74 0.87      0.89
+compress the hidden dimension of KV data, which comple-                    Table 10. Overall KV compression rate (HumanEval).
+ments token eviction-based and quantization-based methods.
+Thus, both FDC and Palu can be combined with them to im-                  6.4 Comparison of Compression Rates
+prove compression rates further [32]. We selected the most                We study the overall KV compression rate 𝑝 given an accu-
+representative state-of-the-art eviction-based method, Key-               racy constraint for different methods. Specifically, we focus
+former [22], and quantization-based method, KVQuant [31].                 on the scenarios where the methods achieve 99% of the base-
+We combined FDC with Keyformer and KVQuant to create                      line accuracy that is achieved without compression [22]. For
+enhanced versions, referred to as KF-F and KVQ-F, respec-                 KF-F, we configure the FDC and Keyformer components to
+tively. We also combined Palu with Keyformer and KVQuant,                 contribute equally to the overall compression rate. KF-P fol-
+denoted by KF-P and KVQ-P, respectively.                                  lows the same way. Since KVQuant can only be configured
+KF-F and FK-P. KF-F and KF-P apply Keyformer to evict                     with 2-4 quantization bit widths, we use 4-bit quantization
+KV and then use FDC and Palu to obtain compressed KV,                     for KVQuant, KVQ-F, and KVQ-P to ensure the accuracy can
+respectively. Subsequent steps remain the same as FDC and                 reach 99% of the baseline accuracy without compression. We
+Palu.                                                                     use binary search to determine the maximum 𝑝 that achieves
+KVQ-F and KVQ-P. KVQ-F and KVQ-P first use FDC and                        99% of the baseline accuracy. Table 7-11 show the results for
+Palu to obtain compressed KV, respectively, and then ap-                  different datasets. FDC alone achieves 𝑝 of 0.53-0.67 across
+ply KVQuant to quantize the compressed KV. Before FDC’s                   all datasets, while Palu achieves around 0.06 smaller 𝑝 than
+attention and Palu decompressing 𝐾, the quantized KV is                   FDC. KF-F and KVQ-F have around 0.04 and 0.01 higher 𝑝
+                                                                      9
+Submitted for review to EuroSys, 2026                                                                                                                Zeyu Zhang and Haiying Shen
+
+
+                         FDC Palu KF-F KF-P KVQ-F KVQ-P                                                           and PG-19, FDC reduces TTFT by 17%-21%, 20%-35%, 8%-
+         Mistral-v0.3 7B 0.65 0.58 0.81 0.77 0.92       0.91                                                      13%, and 9%-12%, respectively, compared to Palu. This is
+          Llama-3.1 8B 0.63 0.56 0.83 0.80 0.91         0.89                                                      because FDC not only reduces the 𝐾-decompression over-
+            Phi-3 14B    0.66 0.59 0.79 0.74 0.91       0.90                                                      head but also computes on compressed data during attention,
+             Yi 34B      0.65 0.57 0.78 0.80 0.92       0.91                                                      accelerating the attention computation. Additionally, FDC
+         Llama-3.1 70B 0.67 0.59 0.83 0.79 0.91         0.89                                                      leverages adaptive compression rates and attention kernel
+             Table 11. Overall KV compression rate (PG-19).                                                       enhancement to further reduce the attention time. The im-
+                                                                                                                  provement is particularly significant for arXiv and Cocktail,
+than KF-P and KVQ-P, respectively. The improvement stems                                                          as these datasets have longer input lengths, meaning that
+from the adaptive compression rate introduced in FDC. KF-                                                         attention time constitutes a higher proportion of TTFT. Con-
+F, KVQ-F, KV-P, and KVQ-P all have higher compression                                                             sequently, the reduction in attention time contributes more
+rates than FDC and Palu, indicating the enhanced version                                                          to the overall TTFT reduction. We observe a similar trend
+of Keyformer and KVQuant can improve the compression                                                              between KF-F and KF-P and between KVQ-F and KVQ-P,
+rates further.                                                                                                    respectively. These improvements arise from the benefits
+6.5 Overall System Performance                                                                                    provided by FDC, as described before. For a larger model,
+We tested Mistral-v0.3 7B, Phi-3 14B, Yi 34B, and Llama-3.1                                                       the improvement of FDC tends to be smaller because the
+70B, denoted by M, P, Y, and L. Since IMDb and HumanEval                                                          proportion of attention time in TTFT tends to decrease.
+are both datasets with short sequences, we kept the popular                                                       TBT. Fig. 10 shows the average TBT over requests for dif-
+dataset, HumanEval, and excluded IMDb. The KV compres-                                                            ferent models and datasets. For arXiv, Cocktail, HumanEval,
+sion rates for them follow those in Table 8-11 under the same                                                     and PG-19, FDC reduces TBT by 16%-24%, 29%-54%, 11%-
+accuracy constraint.                                                                                              17%, and 46%-64%, respectively, compared to Palu. In addi-
+                                                                                                                  tion to decompression overhead and attention acceleration,
+                  FDC           Palu         KF-F                     FDC            Palu            KF-F
+                  KF-P          KVQ-F        KVQ-P                    KF-P           KVQ-F           KVQ-P        the improvement in TBT also stems from the reduced mem-
+                 900                                                   16                                         ory overhead due to the smaller KV size. There is a simi-
+Avg. TTFT (ms)
+
+
+
+
+                                                     Avg. TTFT (s)
+
+
+
+
+                                                                       12
+                 600
+                                                                        8
+                                                                                                                  lar trend between KF-F and KF-P and between KVQ-F and
+                 300                                                    4                                         KVQ-P, respectively. For a larger model, the improvement
+                      0                                                 0                                         of FDC regarding TBT tends to increase because the propor-
+                           M      P      Y       L                              M       P      Y        L
+                                                                                                                  tion of 𝐾-decompression overhead in decode time tends to
+                      (a) arXiv summarization.                               (b) Cocktail dataset.
+                                                                                                                  increase, which is eliminated by FDC. As shown in Fig. 1(b)
+                 FDC            Palu         KF-F                     FDC            Palu            KF-F
+                 KF-P           KVQ-F        KVQ-P                    KF-P           KVQ-F           KVQ-P        and Fig. 2(b), the JCT for sequences with long output lengths
+                 90                                                   90
+Avg. TTFT (ms)
+
+
+
+
+                                                     Avg. TTFT (ms)
+
+
+
+
+                                                                                                                  is predominantly determined by the decode time. Therefore,
+                 60                                                   60
+                                                                                                                  for the long-output dataset PG-19, FDC achieves up to a 64%
+                 30                                                   30
+                                                                                                                  reduction in JCT compared to Palu.
+                  0                                                    0
+                          M      P      Y        L                             M       P      Y         L
+                                                                                                                  Throughput study. We vary the overall throughput, Re-
+                                                                                                                  quest Per Second (RPS), and record the normalized latency
+                          (c) HumanEval.                                      (d) PG-19 dataset.
+                      Figure 9. Average TTFT under different datasets.                                            for each output token [46], calculated by dividing the end-to-
+                                                                                                                  end time (i.e., JCT) by the number of output tokens. Fig. 11
+                  FDC           Palu         KF-F                     FDC            Palu            KF-F         shows the normalized latency versus RPS for all models and
+                  KF-P          KVQ-F        KVQ-P                    KF-P           KVQ-F           KVQ-P
+                 30                                                                                               datasets. When the RPS exceeds capacity, the queue length
+                                                     Avg. TBT (ms)
+Avg. TBT (ms)
+
+
+
+
+                                                                      90
+                 20                                                   60                                          grows faster than the processing speed, leading to an infinite
+                 10                                                   30                                          increase in queuing time and latency. Compared to Palu, FDC
+                  0                                                    0                                          achieves 1.18-1.35×, 1.42-1.67×, 1.09-1.21×, and 1.53-1.97×
+                          M      P      Y        L                             M       P      Y         L
+                                                                                                                  RPS for arXiv, Cocktail, HumanEval, and PG-19, respectively,
+                      (a) arXiv summarization.                               (b) Cocktail dataset.                while preserving the same latency. The improvement is high
+                  FDC           Palu         KF-F                     FDC            Palu            KF-F
+                  KF-P          KVQ-F        KVQ-P                    KF-P           KVQ-F           KVQ-P
+                                                                                                                  for long-sequence datasets Cocktail and PG-19, because FDC
+                 30                                                   90                                          eliminates the amplified decompression overhead and re-
+                                                     Avg. TBT (ms)
+Avg. TBT (ms)
+
+
+
+
+                 20                                                   60                                          duces the attention time. Additionally, the higher the KV
+                 10                                                   30                                          compression rate, the higher the maximum RPS that can
+                  0                                                    0                                          maintain a constant low latency. FDC benefits from the adap-
+                          M      P      Y        L                             M       P      Y         L
+                                                                                                                  tive compression rates to have a higher overall compression
+                          (c) HumanEval.                                      (d) PG-19 dataset.                  rate and throughput. We observe a similar trend between
+                      Figure 10. Average TBT under different datasets.
+                                                                                                                  KF-F and KF-P and between KVQ-F and KVQ-P, respectively,
+TTFT. Fig. 9 shows the average TTFT over requests for dif-                                                        due to the same reason.
+ferent models and datasets. For arXiv, Cocktail, HumanEval,
+                                                                                                             10
+ FDC: Fast KV Dimensionality Compression for Efficient LLM Inference                                                                                                Submitted for review to EuroSys, 2026
+
+
+                                                           FDC             Palu          KF-F                     KF-P           KVQ-F         KVQ-P
+                     1          Mistral-v0.3 7B (arXiv)               Mistral-v0.3 7B (Cocktail)                   Mistral-v0.3 7B (HumanEval)       Mistral-v0.3 7B (PG-19)
+                     0
+                          1        2       3      4        5     0.50 0.75 1.00 1.25 1.50 30 40 50 60 70                                                             0.1                    0.2 0.3 0.4 0.5
+Normalized latency
+
+
+
+                     1             Phi-3 14B (arXiv)                 Phi-3 14B (Cocktail)    Phi-3 14B (HumanEval)                                                                           Phi-3 14B (PG-19)
+                     0
+                                  2.0          2.5             0.50      0.75 1.00 1.25                                  20           25 30 35                     40 0.1                          0.2     0.3          0.4
+                     1               Yi 34B (arXiv)                       Yi 34B (Cocktail)                                       Yi 34B (HumanEval)                                            Yi 34B (PG-19)
+                     0
+                              1.5     2.0       2.5        3.0 0.4          0.6       0.8      1.0 17.5 20.0 22.5 25.0 27.5 0.05 0.10 0.15 0.20
+                     1           Llama-3.1 70B (arXiv)                Llama-3.1 70B (Cocktail)       Llama-3.1 70B (HumanEval)  Llama-3.1 70B (PG-19)
+                     0
+                         0.75     1.00    1.25    1.50     1.75 0.2              0.4           0.6                       10              15              20                            0.05            0.10          0.15
+                                                                                       Throughput (RPS)
+                                                         Figure 11. Normalized latency under different throughput (RPS).
+
+ 6.6                     Ablation Study                                                                                   FDC            /PRC      /AC        /KE                       FDC           /PRC     /AC     /KE
+                                                                                                                                                                                       15
+
+
+
+
+                                                                                                        Avg. TTFT (ms)
+ We test the variants of FDC as follows to evaluate each indi-                                                           800
+
+
+
+
+                                                                                                                                                                      Avg. TTFT (s)
+ vidual method. 1) FDC/PRC is FDC without Post-RoPE QK                                                                                                                                 10
+                                                                                                                         400
+ Compression for decompression overhead elimination and                                                                                                                                 5
+
+ attention acceleration. It compresses 𝐾 before RoPE and uses                                                                 0                                                         0
+                                                                                                                                     M         P     Y         L                                 M       P      Y       L
+ uncompressed 𝐾 in attention, following Palu. 2) FDC/AC is
+ FDC without Adaptive Compression rate. It uses the same                                                                      (a) arXiv summarization.                                         (b) Cocktail dataset.
+ compression rate for all heads to achieve 99% of the accu-                                                               FDC            /PRC      /AC        /KE                        FDC          /PRC     /AC     /KE
+                                                                                                                         80                                                            80
+                                                                                                        Avg. TTFT (ms)
+
+
+
+
+                                                                                                                                                                      Avg. TTFT (ms)
+ racy without compression. 3) FDC/KE is FDC without the
+                                                                                                                         60                                                            60
+ attention Kernel Enhancement.                                                                                           40                                                            40
+    Fig. 12 and Fig. 13 show the average TTFT and TBT over                                                               20                                                            20
+                                                                                                                          0                                                             0
+ requests for individual methods with different models and
+                                                                                                                                    M         P     Y          L                                M       P       Y       L
+ datasets. As shown in Fig. 12, /PRC has 5%-9%, 6%-17%, 4%-
+ 5%, and 4%-6% higher TTFT than FDC for arXiv, Cocktail, Hu-                                                                        (c) HumanEval.                                              (d) PG-19 dataset.
+                                                                                                                              Figure 12. Average TTFT for individual methods.
+ manEval, and PG-19 because /PRC performs 𝐾-decompression
+                                                                                                                           FDC           /PRC      /AC        /KE                        FDC          /PRC     /AC     /KE
+ online and uses uncompressed data for attention computa-                                                                30                                                            90
+                                                                                                        Avg. TBT (ms)
+
+
+
+
+                                                                                                                                                                      Avg. TBT (ms)
+ tion. /AC has 3%-8%, 4%-10%, 3%-5%, and 3%-5% higher TTFT
+                                                                                                                         20                                                            60
+ than FDC because, without the adaptive compression rate,
+                                                                                                                         10                                                            30
+ the overall KV compression rate required to achieve 99%
+                                                                                                                          0                                                             0
+ of the accuracy without compression is lower, thereby in-                                                                          M      P        Y          L                                M       P       Y       L
+ creasing attention time. /KE has 3%-9%, 4%-11%, 3%-6%, and
+                                                                                                                              (a) arXiv summarization.                                         (b) Cocktail dataset.
+ 4%-5% higher TTFT than FDC due to the uneven computa-
+                                                                                                                           FDC           /PRC      /AC        /KE                        FDC          /PRC     /AC     /KE
+ tion times of SMs. In Fig. 13, /PRC has 11%-18%, 29%-34%,                                                               25                                                            80
+                                                                                                        Avg. TBT (ms)
+
+
+
+
+                                                                                                                                                                      Avg. TBT (ms)
+
+
+
+
+ 4%-9%, and 31%-46% higher TBT than FDC for arXiv, Cock-                                                                 20                                                            60
+                                                                                                                         15
+ tail, HumanEval, and PG-19. /AC has 6%-9%, 8%-18%, 5%-7%,                                                                                                                             40
+                                                                                                                         10
+                                                                                                                          5                                                            20
+ and 11%-19% higher TBT than FDC. /KE has 7%-13%, 10%-
+                                                                                                                          0                                                             0
+ 21%, 7%-8%, and 13%-22% higher TBT than FDC. The reasons                                                                           M      P        Y          L                                M       P       Y       L
+ for the TBT degradation of /AC and /KE are the same as
+                                                                                                                                    (c) HumanEval.                                              (d) PG-19 dataset.
+ explained for TTFT. /PRC has a higher TBT degradation                                                                        Figure 13. Average TBT for individual methods.
+ compared to /AC and /KE because it has 𝐾-decompression
+                                                                                                        ratio across datasets for the 𝑄 𝑝 -𝐾𝑝 pair of each model. The re-
+ overhead.
+                                                                                                        sults show that when the number of random tokens is greater
+ 6.7                     Sensitivity Testing                                                            than 8K, the average ratio 𝛿/𝜀 across datasets for all models
+ We vary the total number of random tokens used for the                                                 is below 0.5%, ensuring the accuracy of the offline-computed
+ offline computation of 𝑅 to study its impact on 𝑅. Given                                               𝑅. The rationale for this has already been explained in §4.3
+ a specific number of randomly generated tokens, for each                                               to support the conclusion in that section.
+ model’s 𝑄 𝑝 -𝐾𝑝 pair, we calculate the ratio 𝛿/𝜀 in §3.2 for                                           6.8 Time Overhead
+ each dataset and calculate their average across datasets. The                                          We study the compression time overhead for multiplying 𝑅
+ smaller 𝛿/𝜀, the more accurate 𝑅 is. Fig. 14 shows this average                                        online and the time overhead introduced by SM scheduling
+                                                                                                   11
+Submitted for review to EuroSys, 2026                                                                                                      Zeyu Zhang and Haiying Shen
+
+                                     Mistra-v0.3 7B            Llama-3.1 8B
+                                     Phi-3 14B                 Yi 34B
+                                                                                                 8   Related Work
+
+
+                 Avg. ratio (%)
+                                     Llama-3.1 70B
+                                  100
+                                                                                                 Low-rank approximation. Recently, Palu [32] has been
+                                   50
+                                                                                                 proposed to use low-rank approximations to reduce the hid-
+                                    0
+                                                                                                 den size of KV. However, it still requires decompressing KV
+
+                                        100
+                                              500
+                                                    1K
+                                                         4K
+                                                              8K
+                                                                   16K
+                                                                         32K
+                                                                               64K
+                                                                                     128K
+                                              Number of tokens                                   during attention and cannot compute on the compressed 𝑄
+      Figure 14. The average ratio 𝛿/𝜀 across datasets.                                          and 𝐾 to reduce computation time for RoPE-based models.
+                                                                                                 FDC not only eliminates decompression overhead but also
+in the attention kernel. We record the number of GPU cy-                                         reduces attention computation time by performing compu-
+cles occupied by the scheduling computation and use this                                         tation on the compressed 𝑄 and 𝐾.
+to estimate scheduling time. Finally, we calculate the pro-                                      Eviction. Many KV compression methods are based on to-
+portion of time overhead relative to JCT. Table 12 presents                                      ken eviction [17–26], also known as pruning. The main idea
+the 99th percentile (P99) compression time overhead ratio                                        is to remove unimportant tokens’ KV that have minimal im-
+for different models and datasets. The P99 compression time                                      pact on inference results. The methods in [17–24] determine
+overhead is no more than 0.7% of JCT for all models and                                          token importance based on attention scores. Tokens with
+datasets, indicating that the compression time overhead is                                       lower scores are considered less important, and their KV
+negligible compared to JCT. The reason has been explained                                        can be discarded. InfiniGen [24] leverages low-rank approxi-
+in §5.1. Table 13 presents the P99 scheduling time overhead                                      mation for QK to identify low-score tokens efficiently. The
+ratio for different models and datasets. As the model size                                       methods in [25, 26] achieve sparse attention by identifying
+increases and the input length becomes longer, the P99 time                                      low-score regions in the attention score matrix and remov-
+overhead ratio tends to decrease. This is because larger mod-                                    ing KV in those regions. Eviction-based methods reduce KV
+els and longer sequences spend more time on computation,                                         along the sequence dimension, while FDC reduces KV along
+thereby reducing the proportion of the overhead. The P99                                         the hidden dimension.
+time overhead does not exceed 4.13% of the end-to-end la-                                        Quantization. Many methods use quantization to compress
+tency, making the scheduling overhead acceptable.                                                KV [27–31]. The basic idea is to compress each element of
+                                                                                                 KV by reducing high-bit representations, such as float16,
+                      arXiv Cocktail HumanEval PG-19                                             to lower-bit representations, such as 4-bit or even 2-bit. It
+        Llama-3.1 8B 0.07% 0.09%       0.3%    0.05%                                             reduces the number of bits required to store KV. However,
+          Phi-3 14B 0.08% 0.04%        0.5%    0.02%                                             during attention computation, the quantized KV must first be
+           Yi 34B     0.07% 0.01%      0.7%    0.09%                                             dequantized to recover the original data, introducing decom-
+        Llama-3.1 70B 0.05% 0.08%      0.4%    0.04%                                             pression overhead. FDC, on the other hand, reduces the total
+    Table 12. P99 compression overhead compared to JCT.                                          number of elements of 𝐾 and 𝑉 . As such, it can complement
+                                                                                                 quantization methods. FDC can first compress the dimension-
+                                                                                                 ality of KV to reduce the total number of elements, followed
+                      arXiv Cocktail HumanEval PG-19                                             by quantization to compress the individual elements.
+        Llama-3.1 8B 2.74% 2.37%       3.81%   1.27%
+          Phi-3 14B 2.37% 2.27%        3.54%   0.94%
+                                                                                                 9   Conclusion
+           Yi 34B     1.85% 1.64%      3.52%   0.85%                                             In this paper, we introduce FDC, a fast KV dimensionality
+        Llama-3.1 70B 2.39% 1.98%      3.75%   0.99%                                             compression system that eliminates the 𝐾-decompression
+Table 13. P99 kernel scheduling overhead compared to JCT.                                        overhead in Palu and accelerates attention. It can serve as a
+                                                                                                 complementary approach to existing eviction and quantiza-
+                                                                                                 tion methods. FDC also adopts adaptive compression rates
+7     Limitations and Discussion                                                                 to maximize the overall KV compression rate under an accu-
+Kernel enhancement. The enhancement of the attention                                             racy constraint and leverages an enhanced attention kernel
+kernel with adaptive compression rates relies on a simple                                        that balances SM workloads to improve attention latency.
+heuristic method for workload scheduling. In the future, we                                      Comprehensive experiments show that FDC reduces JCT
+will optimize this approach to minimize attention latency.                                       by up to 64% compared to Palu. When the state-of-the-art
+Storage of 𝑅. The rotation matrices 𝑅 computed offline need                                      eviction and quantization methods are combined with FDC,
+to be stored in GPU memory, which incurs additional mem-                                         they also outperform those combined with Palu.
+ory overhead. Fortunately, each attention head only requires
+a single 𝑅, and its shape is merely 𝑑ℎ ×𝑑ℎ . The total number of                                 References
+parameters for all the matrices 𝑅 typically accounts for less                                    [1] Alec Radford, Karthik Narasimhan, Tim Salimans, Ilya Sutskever, et al.
+than 1% of the total parameter count of the model. Therefore,                                        Improving language understanding by generative pre-training. 2018.
+although storing 𝑅 introduces some memory overhead, it is                                        [2] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova.
+                                                                                                     BERT: pre-training of deep bidirectional transformers for language
+negligible compared to the overall model size.
+                                                                                            12
+FDC: Fast KV Dimensionality Compression for Efficient LLM Inference                                                     Submitted for review to EuroSys, 2026
+
+
+     understanding. CoRR, abs/1810.04805, 2018.                                          Information Processing Systems, volume 36, pages 52342–52364. Curran
+ [3] Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei,                    Associates, Inc., 2023.
+     Ilya Sutskever, et al. Language models are unsupervised multitask              [20] Dongjie Yang, XiaoDong Han, Yan Gao, Yao Hu, Shilin Zhang, and
+     learners. OpenAI blog, 1(8):9, 2019.                                                Hai Zhao. Pyramidinfer: Pyramid kv cache compression for high-
+ [4] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D                      throughput llm inference, 2024.
+     Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam,                   [21] Alessio Devoto, Yu Zhao, Simone Scardapane, and Pasquale Minervini.
+     Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel Herbert-Voss,                 A simple and effective 𝑙_2 norm-based strategy for KV cache com-
+     Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh,                         pression. In Yaser Al-Onaizan, Mohit Bansal, and Yun-Nung Chen,
+     Daniel Ziegler, Jeffrey Wu, Clemens Winter, Chris Hesse, Mark Chen,                 editors, Proceedings of the 2024 Conference on Empirical Methods in
+     Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack Clark,                Natural Language Processing, pages 18476–18499, Miami, Florida, USA,
+     Christopher Berner, Sam McCandlish, Alec Radford, Ilya Sutskever,                   November 2024. Association for Computational Linguistics.
+     and Dario Amodei. Language models are few-shot learners. In                    [22] Muhammad Adnan, Akhil Arunkumar, Gaurav Jain, Prashant Nair,
+     H. Larochelle, M. Ranzato, R. Hadsell, M.F. Balcan, and H. Lin, ed-                 Ilya Soloveychik, and Purushotham Kamath. Keyformer: Kv cache re-
+     itors, Advances in Neural Information Processing Systems, volume 33,                duction through key tokens selection for efficient generative inference.
+     pages 1877–1901. Curran Associates, Inc., 2020.                                     In P. Gibbons, G. Pekhimenko, and C. De Sa, editors, Proceedings of
+ [5] Timo Schick, Jane Dwivedi-Yu, Roberto Dessi, Roberta Raileanu, Maria                Machine Learning and Systems, volume 6, pages 114–127, 2024.
+     Lomeli, Luke Zettlemoyer, Nicola Cancedda, and Thomas Scialom.                 [23] Sotiris Anagnostidis, Dario Pavllo, Luca Biggio, Lorenzo Noci, Aurelien
+     Toolformer: Language models can teach themselves to use tools, 2023.                Lucchi, and Thomas Hofmann. Dynamic context pruning for efficient
+ [6] Meta llama-2 models.             https://huggingface.co/models?sort=                and interpretable autoregressive transformers. In A. Oh, T. Naumann,
+     trending&search=meta+Llama-2, 2024.                                                 A. Globerson, K. Saenko, M. Hardt, and S. Levine, editors, Advances in
+ [7] Textsynth: Text completion. https://textsynth.com/completion.html.                  Neural Information Processing Systems, volume 36, pages 65202–65223.
+ [8] Openai: ChatGPT. https://chat.openai.com/, [Accessed in Aug. 2023].                 Curran Associates, Inc., 2023.
+ [9] GitHub Copilot. https://github.com/features/copilot/, 2025.                    [24] Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. InfiniGen:
+[10] Speaking your language: The transformer in machine transla-                         Efficient generative inference of large language models with dynamic
+     tion. https://blog.huawei.com/2022/02/01/speaking-your-language-                    KV cache management. In 18th USENIX Symposium on Operating
+     transformer-machine-translation/.                                                   Systems Design and Implementation (OSDI 24), pages 155–172, Santa
+[11] Elozino Egonmwan and Yllias Chali. Transformer-based model for                      Clara, CA, July 2024. USENIX Association.
+     single documents neural summarization. In Proceedings of the 3rd               [25] Chaoran Zhang, Lixin Zou, Dan Luo, Min Tang, Xiangyang Luo, Zihao
+     Workshop on Neural Generation and Translation, pages 70–79, Hong                    Li, and Chenliang Li. Efficient sparse attention needs adaptive token
+     Kong, November 2019. Association for Computational Linguistics.                     release, 2024.
+[12] Zi Gong, Cuiyun Gao, Yasheng Wang, Wenchao Gu, Yun Peng, and                   [26] Huiqiang Jiang, YUCHENG LI, Chengruidong Zhang, Qianhui Wu,
+     Zenglin Xu. Source code summarization with structural relative po-                  Xufang Luo, Surin Ahn, Zhenhua Han, Amir H. Abdi, Dongsheng Li,
+     sition guided transformer. In 2022 IEEE International Conference on                 Chin-Yew Lin, Yuqing Yang, and Lili Qiu. MInference 1.0: Accelerating
+     Software Analysis, Evolution and Reengineering (SANER), pages 13–24,                pre-filling for long-context LLMs via dynamic sparse attention. In
+     2022.                                                                               The Thirty-eighth Annual Conference on Neural Information Processing
+[13] Haopeng Zhang, Xiao Liu, and Jiawei Zhang. HEGEL: Hypergraph                        Systems, 2024.
+     transformer for long document summarization, 2022.                             [27] Yefei He, Luoming Zhang, Weijia Wu, Jing Liu, Hong Zhou, and Bohan
+[14] Ashutosh Adhikari, Achyudh Ram, Raphael Tang, and Jimmy Lin.                        Zhuang. Zipcache: Accurate and efficient kv cache quantization with
+     Docbert: BERT for document classification. CoRR, abs/1904.08398,                    salient token identification, 2024.
+     2019.                                                                          [28] Hao Kang, Qingru Zhang, Souvik Kundu, Geonhwa Jeong, Zaoxing
+[15] Xiang Dai, Ilias Chalkidis, Sune Darkner, and Desmond Elliott. Re-                  Liu, Tushar Krishna, and Tuo Zhao. GEAR: An efficient KV cache
+     visiting transformer-based models for long document classification,                 compression recipe for near-lossless generative inference of LLM.
+     2022.                                                                               arXiv preprint arXiv:2403.05527, 2024.
+[16] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion              [29] Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu,
+     Jones, Aidan N Gomez, Ł ukasz Kaiser, and Illia Polosukhin. Attention               Vladimir Braverman, Beidi Chen, and Xia Hu. KIVI: A tuning-free
+     is all you need. In I. Guyon, U. Von Luxburg, S. Bengio, H. Wallach,                asymmetric 2bit quantization for KV cache. In Ruslan Salakhutdinov,
+     R. Fergus, S. Vishwanathan, and R. Garnett, editors, Advances in Neural             Zico Kolter, Katherine Heller, Adrian Weller, Nuria Oliver, Jonathan
+     Information Processing Systems, volume 30. Curran Associates, Inc.,                 Scarlett, and Felix Berkenkamp, editors, Proceedings of the 41st Inter-
+     2017.                                                                               national Conference on Machine Learning, volume 235 of Proceedings of
+[17] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin                       Machine Learning Research, pages 32332–32344. PMLR, 21–27 Jul 2024.
+     Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Ré, Clark              [30] Yuhan Liu, Hanchen Li, Yihua Cheng, Siddhant Ray, Yuyang Huang,
+     Barrett, Zhangyang "Atlas" Wang, and Beidi Chen. H2o: Heavy-hitter                  Qizheng Zhang, Kuntai Du, Jiayi Yao, Shan Lu, Ganesh Anantha-
+     oracle for efficient generative inference of large language models. In              narayanan, Michael Maire, Henry Hoffmann, Ari Holtzman, and
+     A. Oh, T. Neumann, A. Globerson, K. Saenko, M. Hardt, and S. Levine,                Junchen Jiang. Cachegen: Kv cache compression and streaming for fast
+     editors, Advances in Neural Information Processing Systems, volume 36,              large language model serving. In Proceedings of the ACM SIGCOMM
+     pages 34661–34710. Curran Associates, Inc., 2023.                                   2024 Conference, ACM SIGCOMM ’24, page 38–56, New York, NY, USA,
+[18] Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Jiawei Han, and                     2024. Association for Computing Machinery.
+     Jianfeng Gao. Model tells you what to discard: Adaptive kv cache               [31] Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W. Ma-
+     compression for llms. arXiv preprint arXiv:2310.01801, 2023.                        honey, Yakun Sophia Shao, Kurt Keutzer, and Amir Gholami. Kvquant:
+[19] Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie,                  Towards 10 million context length llm inference with kv cache quanti-
+     Zhaozhuo Xu, Anastasios Kyrillidis, and Anshumali Shrivastava. Scis-                zation, 2024.
+     sorhands: Exploiting the persistence of importance hypothesis for llm          [32] Chi-Chih Chang, Wei-Cheng Lin, Chien-Yu Lin, Chong-Yan Chen, Yu-
+     kv cache compression at test time. In A. Oh, T. Neumann, A. Glober-                 Fang Hu, Pei-Shuo Wang, Ning-Chi Huang, Luis Ceze, Mohamed S.
+     son, K. Saenko, M. Hardt, and S. Levine, editors, Advances in Neural                Abdelfattah, and Kai-Chiang Wu. Palu: KV-cache compression with
+
+                                                                               13
+Submitted for review to EuroSys, 2026                                                                                           Zeyu Zhang and Haiying Shen
+
+
+     low-rank projection. In The Thirteenth International Conference on                  Michael Petrov, Heidy Khlaaf, Girish Sastry, Pamela Mishkin, Brooke
+     Learning Representations, 2025.                                                     Chan, Scott Gray, Nick Ryder, Mikhail Pavlov, Alethea Power, Lukasz
+[33] Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and                       Kaiser, Mohammad Bavarian, Clemens Winter, Philippe Tillet, Fe-
+     Yunfeng Liu. Roformer: Enhanced transformer with rotary position                    lipe Petroski Such, Dave Cummings, Matthias Plappert, Fotios
+     embedding. Neurocomput., 568(C), March 2024.                                        Chantzis, Elizabeth Barnes, Ariel Herbert-Voss, William Hebgen Guss,
+[34] Arman Cohan, Franck Dernoncourt, Doo Soon Kim, Trung Bui,                           Alex Nichol, Alex Paino, Nikolas Tezak, Jie Tang, Igor Babuschkin,
+     Seokhwan Kim, Walter Chang, and Nazli Goharian. A discourse-aware                   Suchir Balaji, Shantanu Jain, William Saunders, Christopher Hesse, An-
+     attention model for abstractive summarization of long documents,                    drew N. Carr, Jan Leike, Josh Achiam, Vedant Misra, Evan Morikawa,
+     2018.                                                                               Alec Radford, Matthew Knight, Miles Brundage, Mira Murati, Katie
+[35] Sunhao Dai, Weihao Liu, Yuqi Zhou, Liang Pang, Rongju Ruan, Gang                    Mayer, Peter Welinder, Bob McGrew, Dario Amodei, Sam McCandlish,
+     Wang, Zhenhua Dong, Jun Xu, and Ji-Rong Wen. Cocktail: A compre-                    Ilya Sutskever, and Wojciech Zaremba. Evaluating large language
+     hensive information retrieval benchmark with llm-generated docu-                    models trained on code, 2021.
+     ments integration, 2024.                                                       [57] Amazon EC2 P4 instances. https://aws.amazon.com/ec2/instance-
+[36] Google PG-19. https://github.com/google-deepmind/pg19.                              types/p4/.
+[37] Mistral-v0.3. https://huggingface.co/mistralai/Mistral-7B-Instruct-            [58] Connor Holmes, Masahiro Tanaka, Michael Wyatt, Ammar Ah-
+     v0.3, 2024.                                                                         mad Awan, Jeff Rasley, Samyam Rajbhandari, Reza Yazdani Am-
+[38] Meta Llama-3.1. https://llama.meta.com/, 2024.                                      inabadi, Heyang Qin, Arash Bakhtiari, Lev Kurilenko, and Yuxiong
+[39] Microsoft Phi-3. https://huggingface.co/microsoft/Phi-3-medium-                     He. Deepspeed-fastgen: High-throughput text generation for llms via
+     128k-instruct, 2024.                                                                mii and deepspeed-inference. arXiv preprint arXiv:2401.08671, 2024.
+[40] 01-ai model Yi. https://huggingface.co/01-ai/Yi-34B-200K, 2024.                [59] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo
+[41] Gemma Team. Gemma 2: Improving open language models at a prac-                      Goiri, Saeed Maleki, and Ricardo Bianchini. Splitwise: Efficient genera-
+     tical size, 2024.                                                                   tive llm inference using phase splitting. In 2024 ACM/IEEE 51st Annual
+[42] FDC code. https://anonymous.4open.science/r/FastDC, 2025.                           International Symposium on Computer Architecture (ISCA), pages 118–
+[43] V. Klema and A. Laub. The singular value decomposition: Its compu-                  132, 2024.
+     tation and some applications. IEEE Transactions on Automatic Control,
+     25(2):164–176, 1980.
+[44] Singular value decomposition solver from scipy. https://docs.scipy.org/
+     doc/scipy/reference/generated/scipy.linalg.svd.html, 2024.
+[45] Tri Dao. Flashattention-2: Faster attention with better parallelism and
+     work partitioning, 2023.
+[46] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+     Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica.
+     Efficient memory management for large language model serving with
+     pagedattention. In Proceedings of the 29th Symposium on Operating
+     Systems Principles, SOSP ’23, page 611–626, New York, NY, USA, 2023.
+     Association for Computing Machinery.
+[47] NVIDIA CUTLASS. https://github.com/NVIDIA/cutlass.
+[48] Quart. https://quart.palletsprojects.com/en/latest/.
+[49] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun
+     Kwatra, Bhargav Gulavani, Alexey Tumanov, and Ramachandran Ram-
+     jee. Taming Throughput-Latency tradeoff in LLM inference with
+     Sarathi-Serve. In 18th USENIX Symposium on Operating Systems De-
+     sign and Implementation (OSDI 24), pages 117–134, Santa Clara, CA,
+     July 2024. USENIX Association.
+[50] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xu-
+     anzhe Liu, Xin Jin, and Hao Zhang. DistServe: Disaggregating prefill
+     and decoding for goodput-optimized large language model serving. In
+     18th USENIX Symposium on Operating Systems Design and Implemen-
+     tation (OSDI 24), pages 193–210, Santa Clara, CA, July 2024. USENIX
+     Association.
+[51] arxiv. https://arxiv.org.
+[52] Chin-Yew Lin. Rouge: A package for automatic evaluation of sum-
+     maries. In Text summarization branches out, pages 74–81, 2004.
+[53] Lei Zhang, Yunshui Li, Jiaming Li, Xiaobo Xia, Jiaxi Yang, Run Luo,
+     Minzheng Wang, Longze Chen, Junhao Liu, and Min Yang. Hierar-
+     chical context pruning: Optimizing real-world code completion with
+     repository-level pretrained code llms, 2024.
+[54] Gang Wu. String similarity metrics – edit distance. https://
+     www.baeldung.com/cs/string-similarity-edit-distance, 2024.
+[55] Genre classification dataset imdb. https://www.kaggle.com/datasets/
+     hijest/genre-classification-dataset-imdb.
+[56] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde
+     de Oliveira Pinto, Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas
+     Joseph, Greg Brockman, Alex Ray, Raul Puri, Gretchen Krueger,
+
+                                                                               14
+

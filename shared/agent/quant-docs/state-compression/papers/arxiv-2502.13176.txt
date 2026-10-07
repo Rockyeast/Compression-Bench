@@ -1,0 +1,1222 @@
+                                             BaKlaVa - Budgeted Allocation of KV cache for Long-context
+                                                                     Inference
+                                                  Ahmed Burak Gulhan                        Krishna Teja Chitty-Venkata                                  Murali Emani
+                                              The Pennsylvania State University                Argonne National Laboratory                      Argonne National Laboratory
+                                                   State College, PA, USA                            Lemont, IL, USA                                 Lemont, IL, USA
+                                                      gulhan@psu.edu                             schittyvenkata@anl.gov                              memani@anl.gov
+
+                                                                           Mahmut Kandemir                          Venkatram Vishwanath
+                                                                     The Pennsylvania State University             Argonne National Laboratory
+arXiv:2502.13176v2 [cs.LG] 24 Feb 2025
+
+
+
+
+                                                                          State College, PA, USA                        Lemont, IL, USA
+                                                                              mtk2@psu.edu                              venkat@anl.gov
+
+                                         ABSTRACT                                                               employ Key-Value (KV) caches to store previous calculations –
+                                         In Large Language Model (LLM) inference, Key-Value (KV) caches         key and value tokens for each attention head1 – and remove these
+                                         (KV-caches) are essential for reducing time complexity. However,       unnecessary computations. Yet, this comes at the cost of substantial
+                                         they result in a linear increase in GPU memory as the context          GPU memory to hold these tokens, limiting how many tokens can
+                                         length grows. While recent work explores KV-cache eviction and         be stored and, thus, a limit to how much an LLM can remember.
+                                         compression policies to reduce memory usage, they often consider       This is currently one of the major bottlenecks in LLM scaling for
+                                         uniform KV-caches across all attention heads, leading to subop-        long-context inference.
+                                         timal performance. We introduce BaKlaVa, a method to allocate             Recent works have tried to address this challenge mainly by
+                                         optimal memory for individual KV-caches across the model by            reducing the amount of data that an LLM needs to cache. How-
+                                         estimating the importance of each KV-cache. Our empirical anal-        ever, many of these compression-based policies allocate memory
+                                         ysis demonstrates that not all KV-caches are equally critical for      uniformly across all KV caches, which is suboptimal. Recent re-
+                                         LLM performance. Using a one-time profiling approach, BaKlaVa          search [19, 21, 6], has begun to explore the benefits of assigning
+                                         assigns optimal memory budgets to each KV-cache. We evaluated          heterogeneous memory budgets to different KV-caches. The key
+                                         our method on LLaMA-3-8B, and Qwen2.5-7B models, achieving             challenge in this approach lies in determining the optimal alloca-
+                                         up to a 70% compression ratio while keeping baseline performance       tion of KV-cache memory, that is, which KV-caches in an LLM are
+                                         and delivering up to an order-of-magnitude accuracy improvement        more or less critical than the others to model performance.
+                                         at higher compression levels.                                             In our work, BaKlaVa, we demonstrate that different attention
+                                                                                                                heads in an LLM have varying levels of importance, and therefore
+                                         CCS CONCEPTS                                                           KV-cache memory should be allocated accordingly– more impor-
+                                                                                                                tant heads receiving larger (space for) KV-caches and less important
+                                         • Computing methodologies → Machine learning approaches.
+                                                                                                                ones receiving smaller allocations. To achieve this, we introduce
+                                         KEYWORDS                                                               a one-time ‘profiling’ method, which does not require fine-tuning
+                                                                                                                of the LLM. Using a simple heuristic, our method estimates the
+                                         LLM, KV-cache, inference, GPU memory                                   importance of each attention head and optimally distributes a given
+                                                                                                                KV-cache budget to maximize inference performance. We run multi-
+                                         1   INTRODUCTION                                                       ple benchmarks with different KV-cache eviction and compression
+                                         Large Language Models (LLMs) have achieved great success in            policies and show that our method can increase the inference qual-
+                                         recent years and have been successfully used in several natural        ity up to an order of magnitude, without using additional memory or
+                                         language processing tasks such as chatbots, search engines, sum-       computation, and allows for near-baseline (a cache with maximum
+                                         marization, and customer service. This success has led to the devel-   context length) performance for lower compression ratios.
+                                         opment of LLMs with exponentially increasing parameter counts             BakLaVa is complementary to most existing KV-cache manage-
+                                         and context lengths (how much previous text an LLM can remem-          ment and optimization methods, such as FlashAttention [3] and
+                                         ber), with the latest models having more than a trillion parameters    vLLM [11], as well as various KV-cache compression, eviction, and
+                                         with more than a million context lengths [16, 14]. Although larger     offloading policies. We emphasize that our proposed method is not
+                                         models with longer context lengths have improved performance,          a policy for managing KV-cache memory or optimizing KV-cache
+                                         they come at the cost of significantly higher GPU memory usage         calculations; rather, it is a method for allocating memory budgets
+                                         during inference, posing challenges for efficient deployment.          among existing KV-caches in an LLM.
+                                            LLMs generate text in an autoregressive manner – given an              Contributions: The main contributions of this paper can be
+                                         input of any length, the model generates only a single token (word).   summarized as follows:
+                                         To generate multiple tokens, the previously generated token is
+                                         appended to the input, and the process repeats. This method of         1 An attention head is a key component of LLMs [17], which allows the capture of the
+                                         inference leads to significant ‘redundant computations’, leading       relationships between words. LLMs can have up to thousands of attention heads, each
+                                         to quadratic time complexity. To mitigate this inefficiency, LLMs      with their own KV-cache.
+                                                    Ahmed Burak Gulhan, Krishna Teja Chitty-Venkata, Murali Emani, Mahmut Kandemir, and Venkatram Vishwanath
+
+
+      • We introduce a heuristic to determine the relative impor-               where [; ] denotes concatenation along the sequence axis, and
+        tance of attention heads and KV caches in LLMs.                         cached values K1 : 𝑡 − 1, V1:𝑡 −1 are loaded from memory. Although
+      • We empirically show that the results of this heuristic remain           KV caching reduces redundant computation, storing cached projec-
+        consistent across various prompts for a given LLM.                      tions for each token demands substantial memory, growing linearly
+      • We empirically validate that our heuristic near optimally               with sequence length. For a transformer with 𝐿 layers, 𝐻 heads, and
+        ranks how important each KV cache is.                                   sequence length 𝑇 , memory consumption scales as 2×𝑇 ×𝐿 ×𝐻 ×16-
+      • We evaluate our proposed methodology on LongBench [2]                   bit.
+        and compare it against other KV-cache memory allocation
+        strategies.                                                             2.3     KV-Cache Eviction
+      • Finally, we implement our method in HuggingFace as a                    KV-Cache eviction aims to eliminate less significant tokens from
+        custom KV-cache object.                                                 K1 : 𝑡 − 1 and V1 : 𝑡 − 1 using a function 𝑓𝑒𝑣𝑖𝑐𝑡 that identifies and
+   Our empirical evaluations demonstrate that KV-cache and layer                removes redundant elements. The eviction mechanism is depicted
+importance can be effectively estimated using heuristics with a high            in Eqs. 5 and 6, where the 𝑚𝑡ℎ token is removed from the cache.
+degree of accuracy. However, even with accurately identified impor-
+tance values, determining the optimal memory allocation remains                     𝑓𝑒𝑣𝑖𝑐𝑡 (K1 : 𝑡 − 1) = K′ 1 : 𝑡 − 1
+non-trivial, as the ideal strategy varies across different compression                                           = [𝑘 1, . . . , 𝑘𝑚−1, 𝑘𝑚+1, . . . , 𝑘𝑡 −1 ]    (5)
+ratios. To address this challenge, we introduce a straightforward yet
+effective memory allocation approach that enables rapid parameter                   𝑓𝑒𝑣𝑖𝑐𝑡 (V1 : 𝑡 − 1) = V′ 1 : 𝑡 − 1
+search, allowing us to efficiently determine the optimal memory                                                  = [𝑣 1, . . . , 𝑣𝑚−1, 𝑣𝑚+1, . . . , 𝑣𝑡 −1 ].   (6)
+distribution for various model architectures and compression ra-
+tios.                                                                           After eviction, attention is computed using the reduced cache, as
+                                                                                shown in Eq. 7:
+2 BACKGROUND
+                                                                                                                            !
+                                                                                                    Q𝑡 [K′ 1 : 𝑡 − 1; K𝑡] ⊤
+                                                                                         softmax                              [V′ 1 : 𝑡 − 1; V𝑡 ]. (7)
+2.1 Self-Attention
+                                                                                                            √︁
+                                                                                                               𝐷ℎ
+Consider an input matrix Z ∈ R𝑇 ×𝐷 , where 𝑇 represents the se-
+quence length and 𝐷 is the feature dimension. The multi-head                    3     THE BAKLAVA METHOD
+self-attention mechanism facilitates learning from different rep-               Our method for optimizing KV-cache memory allocation consists
+resentational subspaces by executing multiple attention compu-                  of 3 main steps for a given LLM: (i) A one-time collection of profil-
+tations in parallel. Query (Q), Key (K), and Value (V) are derived              ing data for a given prompt(s) (Algorithm 1 – step 1); (ii) Using a
+from linear projections: Q = ZM𝑄 , K = ZM𝐾 , and V = ZM𝑉 ,                      heuristic to estimate the ‘importance’ of KV caches, which is also a
+where M𝑄 , M𝐾 , M𝑉 ∈ R𝐷 ×𝐷ℎ are trainable weight matrices. The                  one-time calculation (Algorithm 1 – step 2); and (iii) Performing
+attention weights are computed via scaled dot-product attention,                a parameter search to allocate memory accordingly (Algorithms 2
+as given in Eq. 1:                                                              and 3).
+                                                 !                                 All three steps in BaKlaVa only need to be run once. The most
+                                             QK⊤                                time-consuming part currently is Step (iii), where a parameter
+             Attention(Q, K, V) = softmax √︁       V.           (1)
+                                              𝐷ℎ                                search is performed for the target compression level. For this pa-
+                                                                                rameter search, we quickly evaluate each parameter combination
+This process is repeated over 𝐻 heads, each utilizing distinct weight           using ‘perplexity’, rather than running a long-context evaluation
+           (ℎ)    (ℎ)   (ℎ)
+matrices M𝑄 , M𝐾 , M𝑉 . The concatenated outputs from all heads                 benchmark, since perplexity does not require autoregressive token
+are projected back to the original dimension 𝐷 using a learned                  generation and consequently is much faster and gives a good ap-
+weight matrix M𝑂 ∈ R𝐻 𝐷ℎ ×𝐷 :                                                   proximation of actual performance. This parameter search, for the
+                                                                                models we evaluated (which contain 7 to 8 billion parameters), takes
+       MultiHead(Q, K, V) = Concat(head1, . . . , head𝐻 )M𝑂 ,         (2)
+                                                                                10 to 20 minutes on 8x A100 GPUs for around 200 combinations
+where each attention head is defined as follows:                                of parameters on 98k tokens for a chosen compression ratio. The
+                                                                                number of tokens can be decreased for a proportional decrease in
+               headℎ = Attention(Q (ℎ) , K (ℎ) , V (ℎ) ).             (3)
+                                                                                runtime, though they should be at least as much as the maximum
+                                                                                context length being evaluated.
+2.2    Key-Value (KV) Cache
+                                                                                   Once the ideal parameters for an LLM are obtained, no addi-
+During autoregressive LLM inference, the tokens are generated                   tional computation is required. To begin inference, we initialize
+sequentially. Without caching, Key (K) and Value (V) matrices are               our custom huggingface transformers’ KV-cache object to use in
+recomputed at each generation step for all preceding tokens. KV                 inference.
+caching mitigates this inefficiency by storing computed K and V
+projections. Rather than recomputing these values, the model re-                3.1     Determining KV-cache Importances
+trieves and appends the cached matrices to the current token’s
+                                                                                3.1.1 Head Importance Heuristic. To determine the significance
+projections. The updated attention computation follows Eq. 4:
+                                                                                of an individual attention head, we used several key observations
+          Attention(Q𝑡, [K1 : 𝑡 − 1; K𝑡], [V1 : 𝑡 − 1; V𝑡]),          (4)       to come up with a heuristic. The first is that the more change
+BaKlaVa - Budgeted Allocation of KV cache for Long-context Inference
+
+
+Algorithm 1 One-Time Profiling for KV-Cache Importance
+Input: LLM model M, one or more prompts P of varying lengths
+Output: Values indicating relative KV-cache importance
+  1: Step 1: Collect profiling data from prompts P                   =
+     {𝑝 1, 𝑝 2, . . . , 𝑝𝑛 } of different lengths
+  2: for each prompt 𝑝𝑖 ∈ P do
+  3:     Run inference on M with 𝑝𝑖
+  4:     for each layer 𝑙 ∈ L do
+  5:          for each attention head ℎ in layer 𝑙 do
+  6:             Compute token-wise cosine similarity between atten-
+     tion head input 𝑉 and output 𝑆𝑜 𝑓 𝑡𝑀𝑎𝑥 (𝑄𝐾𝑇 )𝑉
+  7:             Compute the average across all cosine similarities to
+     obtain a single similarity value 𝑠𝑖𝑙 ∈ S
+  8:          end for
+  9:     end for
+ 10: end for
+ 11: Step 2: Convert attention head similarities to KV-cache impor-
+     tance using the number of attention heads per KV-cache group
+     𝑔
+ 12: for each layer 𝑙 ∈ L do
+ 13:     for each group of 𝑔 heads, denoted by
+     𝑠𝑖𝑙 , 𝑠 (𝑖+1)𝑙 , . . . , 𝑠 (𝑖+𝑔−1)𝑙 ∈ S do
+ 14:          Obtain similarity for the current KV cache, 𝐾𝑉 𝑠𝑖𝑚 ←
+     𝑚𝑒𝑎𝑛(𝑠𝑖𝑙 , . . . , 𝑠 (𝑖+𝑔−1)𝑙 )
+ 15:          KV cache importance 𝐼𝑙𝑖 ← 1 − 𝐾𝑉 𝑠𝑖𝑚
+ 16:     end for
+ 17: end for
+
+
+        Q
+
+                 Scale         Mask          Softmax
+
+
+        K
+                                                                          Figure 2: Cosine similarity heatmap for input and output of
+        V                                                          Attn   attention heads for two different prompts in LLaMA3-8B and
+                                                                          Qwen2.5-7B. We chose three representative layers to illus-
+                                                                          trate that attention head consistency holds across different
+                            Cosine Similarity                             prompts. The X-axis shows the attention heads in a layer,
+Figure 1: The attention-head similarity heuristic used in                 Y-axis represents each token position in the prompt. Green
+BaKlaVa. By taking the cosine similarity between the input                and red outlines show the highest and lowest column simi-
+and output, we can calculate how much change there is. The                larity means per layer, that is, the most and least important
+more change between the input and output of the attention                 attention heads respectively. The order of average attention
+head, the more important we assume it is.                                 head similarities (the mean of each column, see Algorithm 1)
+                                                                          stays highly consistent even across different prompts of dif-
+                                                                          ferent lengths, indicating that profiling an LLM one time is
+there is between the input and output of a structure in an LLM,           sufficient to make KV-cache importance estimations.
+the more important it is, as used in [7] to determine the type of
+tokens the individual attention heads focus on and in [19, 21] to
+determine the importance of LLM layers. Second, the attention ma-            As shown in Algorithm 1, to do this, we compare the input 𝑉
+trix 𝑠𝑜 𝑓 𝑡𝑚𝑎𝑥 (𝑄𝐾𝑇 ) has been shown to be a high-quality heuristic       tokens (each token is a multidimensional vector) with the output
+that can determine individual token importances [25, 13, 1] for KV-       of the attention head, 𝑠𝑜 𝑓 𝑡𝑚𝑎𝑥 (𝑄𝐾𝑇 )𝑉 , using cosine similarity, as
+cache eviction. Lastly, the 𝑉 tensor contains key information about       shown in Figure 1.
+the tokens, which is not found in the attention score matrix [8,             Each input and output token are individually compared using a
+4]. Based on these observations, we propose the idea that                 cosine similarity value to determine the change in vector direction.
+the greater the change between the input 𝑉 and the output                 To obtain a single value for each attention head, we first (i) get the
+𝑠𝑜 𝑓 𝑡𝑚𝑎𝑥 (𝑄𝐾𝑇 )𝑉 of this attention head, the more critical this          mean of all tokens’ cosine similarities within that head. The result
+attention head is for inference.                                          of cosine similarity ranges from -1 to 1 and the maximum value
+                                                    Ahmed Burak Gulhan, Krishna Teja Chitty-Venkata, Murali Emani, Mahmut Kandemir, and Venkatram Vishwanath
+
+
+is obtained when the two compared token vectors are identical                   since our KV-cache importance heuristic is agnostic to several other
+(i.e., the attention score matrix is an identity matrix). We then               important structures in an LLM (e.g., the feed-forward networks,
+(ii) normalize these values from range 0 to 1 to obtain a single                layer normalization, etc). Based on our empirical testing results
+similarity value, such that a value of 1 means identical input and              (see Section 3.3), we found that SqueezeAttention [19] is a sim-
+outputs for all tokens in the attention head. Lastly, (iii) to obtain the       ple and low-overhead heuristic that closely, though not perfectly,
+‘importance value’, we take the complement of each mean similarity              matches the ‘ground truth’ layer importances and use this heuristic
+(1 − 𝑠𝑖𝑚𝑖𝑙𝑎𝑟𝑖𝑡𝑦). An importance value closer to 1 means a bigger                to determine the layer-wise importance values in BaKlaVa. The
+difference between the input and output tokens, thus it has more                SqueezeAttention heuristic takes the cosine similarity between the
+importance and vice versa.                                                      input and output of each LLM layer, thus capturing the total effect
+    We tested multiple token comparison methods, such as dot-                   of all structures within the layer.
+product and KL divergence, and found that cosine similarity and
+dot-product both give similar results. However, cosine similarity               3.2     Assigning Memory Budgets to KV-Caches
+guarantees an output between -1 and 1, leading to simpler calcula-
+tions. Therefore, we chose cosine-similarity for BaKlaVa. Note that
+                                                                                Algorithm 2 KV-Cache Memory Reallocation Based on Attention
+cosine similarity measures the change in angle, but not magnitude,
+                                                                                Head Importance
+and thus another method that incorporates both magnitude and
+direction change may give better results. We left this for future               Input: Importance scores I = {𝐼 1, 𝐼 2, ..., 𝐼𝑚 } for 𝑚 KV-caches,
+work.                                                                                threshold 𝑡, reduction amount 𝑟
+                                                                                Output: Adjusted KV-cache allocations
+3.1.2 One-Time Profiling. To determine the frequency of profil-                   1: L ← {𝑖 | 𝐼𝑖 < 𝑡 } {Identify KV-caches with low importance}
+ing needed, considering that attention head behavior can vary                     2: if |L| > 𝑚 − 1 then
+between inference steps and different prompts, we ran several ex-                 3:    RETURN UNCHANGED KV-cache allocations {If all KV-
+periments. We found that while the importance of individual tokens                   caches are low importance then do not do anything}
+may change throughout inference, overall the importance value                     4: end if
+(calculated by taking the average of all token cosine similarities, see           5: for EACH 𝑖 ∈ L do
+Algorithm 1, step 1) remains consistent, across different prompts.                6:    REDUCE KV-cache size of 𝑖 by 𝑟
+This is illustrated in Figure 2, where for two models, LlaMA3-8B                  7: end for
+and Qwen2.5-7B-Instruct, we profile two prompts of lengths around                 8: 𝑛 ← |L| {Number of KV-caches reduced}
+350 and 2000 tokens from a text (XSum) and coding (LCC) dataset                   9: 𝑘 ← min(𝑛, 𝑚 − 𝑛) {Limit reallocation up to the top n available
+respectively, for three layers in both LLMs (not just to highlight                   high-importance caches}
+these specific layers, but to illustrate that the consistency the at-            10: H ← TOP-𝑘 ELEMENTS OF H BASED ON 𝐼𝑖
+                                                                                 11: Δ𝑟 ←
+tention head behavior holds across different layers). Each tile (in                         𝑛×𝑟 {Compute adjusted increase per cache}
+                                                                                             𝑘
+the heatmaps) represents the cosine similarity difference for a sin-             12: for EACH 𝑗 ∈ H ′ do
+gle token with the top 5 and bottom 5 importance heads outlined                  13:    INCREASE KV-cache size of 𝑗 BY Δ𝑟
+in green and red, respectively. We can observe that the highest-                 14: end for
+and lowest-ranking attention heads stay highly consistent across                 15: RETURN updated KV-cache allocations
+prompts of different lengths and different types (i.e. text vs code).
+This suggests that, for a given LLM, a single profiling run with a
+sufficiently large prompt (i.e. few hundred tokens) is sufficient to            3.2.1 Memory Allocation. Once the importance values for each
+determine the attention head importance values that can be applied              KV-cache and layer are obtained, the next step is to determine how
+for all future inferences.                                                      to allocate memory budgets.
+                                                                                    Based on our observation of token similarities as shown in Fig-
+3.1.3 Grouped Query Attention. If the LLM employs Grouped Query                 ure 2, we find that low-importance attention heads are more con-
+Attention (GQA), an additional step is required before determin-                sistent with how they change each individual token in a prompt
+ing the KV cache memory budgets. Since our measurements as-                     (that is, the dot-product between input and output of the attention
+sess changes at the level of individual attention heads rather than             head has low variance), while other attention heads can display
+KV-caches, a direct assignment is not possible. In GQA, multiple                significant changes across tokens (that is, high variance in the token
+attention heads share the same KV-cache, meaning that memory                    cosine similarity). Thus, to reduce the chances for decreasing the
+budgets cannot be allocated separately for each head within the                 memory of KV-caches belonging to potentially critical attention
+same group. To address this, we compute the mean of similarities                heads, we take a conservative approach and only target KV-caches
+across all attention heads within a group, obtaining a single sim-              with an importance score below a threshold 𝑡 by a predetermined
+ilarity value per GQA group. This process is detailed in Step 2 of              amount 𝑟 , as shown in Algorithm 2. The freed memory is then
+Algorithm 1                                                                     assigned to up to top 𝑛 KV caches of highest importance (where 𝑛
+                                                                                is the number of low-importance KV-caches selected), in order to
+3.1.4 Layer Importance Heuristic. The KV-cache importances we
+                                                                                prioritize increasing memory for the most important KV-caches.
+have found so far are used to allocate the GPU memory budget
+within a single layer in an LLM. Simply taking the average of all               3.2.2 Parameter Search. To determine the optimal values for 𝑟 and
+KV-cache importances does not find the correct layer importance,                𝑡, we performed a parameter search over different compression
+BaKlaVa - Budgeted Allocation of KV cache for Long-context Inference
+
+
+Algorithm 3 Parameter Search Using Perplexity                              each layer in isolation (i.e., using a window size of 1) yielded er-
+Input: Evaluation prompt P, model 𝑀, context length 𝐿, list of             ratic results, indicating that individual layer evaluations do not
+     parameter configurations C, compression ratio 𝑐𝑚𝑝                     capture meaningful patterns of layer importance. By considering
+Output: Optimal parameters 𝑝 ∗                                             contiguous groups, we aim to better approximate the true structure
+  1: 𝑏𝑒𝑠𝑡_𝑝𝑎𝑟𝑎𝑚𝑠 ← ∅                                                       of importance within the model.
+  2: 𝑚𝑖𝑛_𝑙𝑜𝑠𝑠 ← ∞
+  3: for params ∈ C do                                                     Algorithm 4 Empirical Evaluation of Layer Heuristic
+  4:   CACHE = MAKE_CACHE(params, 𝑐𝑚𝑝)
+                                                                           Input: LLM 𝑀, window size 𝑊 , benchmark 𝐵𝐸𝑁𝐶𝐻
+  5:   𝑙𝑜𝑠𝑠𝑒𝑠 ← []
+                                                                           Output: Scores for each layer 𝑆, compression ratio 𝑐𝑚𝑝
+  6:   for chunk ∈ STEP(P, 𝐿) do {Get chunks of tokens from
+                                                                            1: 𝑆 ← [ ] {Initialize empty list for scores}
+     prompt}
+                                                                            2: for 𝐿 ∈ {0, . . . , last_layer(𝑀)} do
+  7:      𝑙𝑜𝑠𝑠 ← PERPLEXITY(𝑀, chunk, 𝐶𝐴𝐶𝐻𝐸)
+                                                                            3:    𝐿min ← max(0, 𝐿 − ⌊𝑊 /2⌋)
+  8:      𝑙𝑜𝑠𝑠𝑒𝑠.append(𝑙𝑜𝑠𝑠)
+                                                                            4:    𝐿max ← min(last_layer(𝑀), 𝐿 + ⌊𝑊 /2⌋)
+  9:      CACHE ← RESET_CACHE(𝐶𝐴𝐶𝐻𝐸)
+                                                                            5:    reduce_kv_cache(𝑀, 𝐿min, 𝐿max, 𝑐𝑚𝑝) {Reduce KV-cache
+ 10:   end for       Í
+                       losses                                                  sizes for layers in window}
+ 11:   𝑎𝑣𝑔_𝑙𝑜𝑠𝑠 ← len(losses)
+                                                                            6:    score ← 𝐵𝐸𝑁𝐶𝐻 (𝑀) {Run LLM and obtain benchmark
+ 12:   if 𝑎𝑣𝑔_𝑙𝑜𝑠𝑠 < 𝑚𝑖𝑛_𝑙𝑜𝑠𝑠 then                                             score}
+ 13:      𝑚𝑖𝑛_𝑙𝑜𝑠𝑠 ← 𝑎𝑣𝑔_𝑙𝑜𝑠𝑠                                               7:    𝑆.append(score)
+ 14:      𝑏𝑒𝑠𝑡_𝑝𝑎𝑟𝑎𝑚𝑠 ← params                                              8: end for
+ 15:   end if                                                               9: RETURN 𝑆
+ 16: end for
+ 17: RETURN 𝑏𝑒𝑠𝑡_𝑝𝑎𝑟𝑎𝑚𝑠
+
+
+                                                                           4     RESULTS
+values, as shown in Algorithm 3. We found that the ideal parame-           In this section, we report the results of BaKlaVa for KV-cache
+ter ‘area’ varies across different compressions. These results were        compression on the models LLaMA-3-8B and Qwen2.5-7B. Qwen
+calculated using perplexity, as it is much faster to find compared to      weights are quantized to 8 bits due to hardware limitations. Sec-
+LongBench and it is a good indicator of actual performance. Based          tion 4.1 shows the results of LongBench on different KV-cache
+on these observations, we chose the best-performing parameter              reduction methods for different compression ratios. Section 4.2 re-
+pair for a given compression value when evaluating on LongBench.           ports the results of empirically evaluating how well the heuristics
+                                                                           used in BaKlaVa reflect actual layer and KV-cache importances.
+3.3     Empirical Evaluation of Heuristics
+To evaluate the effectiveness of our layer and KV-cache importance         4.1    LongBench
+heuristics in comparison to the ‘true’ importance, we conducted            We used the LongBench [2] evaluation suite to test how our pro-
+computationally intensive experiments. These tests empirically             posed approach works with real-life scenarios with significant
+assessed the impact of individual layers on model performance              KV-cache memory usage. LongBench contains 14 English (qmsum,
+by measuring the variation in benchmark scores resulting from              multifieldqa_en, triviaqa, hotpotqa, samsum, musique, multi_news,
+modifications to each component. The underlying principle is that          2wikimqa, gov_report, trec,narrativeqa, passage_count, passage _re-
+the greater the performance degradation caused by a change (e.g.,          trieval_en, and qasper) and 2 coding tasks (lcc and repobench-p),
+memory reduction) in a layer or KV-cache, the more critical that           with average contexts for these tasks ranging between 5000 and
+component is to the model’s overall functionality.                         15000 tokens – though the longest contexts exceed 32000 tokens.
+    To evaluate the layer importance heuristic (see Section 3.1.4) we         Note that LongBench’s default prediction script allows truncat-
+tested our LLM on the triviaqa LongBench dataset after reducing            ing prompts longer than a user-defined threshold (the 𝑚𝑎𝑥_𝑙𝑒𝑛𝑔𝑡ℎ
+the memory allocated to different groups of layers. We selected a          parameter) before being input into the LLM model, so that the in-
+single dataset to minimize the computational cost of our empirical         structions at the beginning or end of the prompt are not removed.
+evaluation. triviaqa was specifically chosen because it exhibits the       We used the default LongBench configuration, where the prompt
+widest range of scores, making it more sensitive to performance            is truncated to a size below the maximum context length of the
+variations and thus a better candidate for detecting changes in            LLM. For our results, this equals a 𝑚𝑎𝑥_𝑙𝑒𝑛𝑔𝑡ℎ of 7500 tokens if the
+output.                                                                    context length is 8196 (LlaMA-3 8B) and 31500 tokens for a context
+    As described in algorithm 4, we systematically reduced the mem-        length of 32768 (qwen-2.5 7B)
+ory budgets of layers within a sliding window of size 5, running a            LongBench results for triviaqa, samsum (few-shot learning),
+separate benchmark for each window position. Rather than eval-             repobench-p (coding), 2wikimqa, hotpotqa (multi-document Q&A),
+uating individual layers in isolation, we compressed groups of 5           multifieldqa_en (single-document Q&A), gov_report (summariza-
+adjacent layers at a time. If crucial layers were arbitrarily scattered,   tion) and the total aggregate scores of all 16 English and coding
+rather than forming coherent clusters, it would suggest an unintu-         tasks are plotted in Figure 3. Higher values indicate better perfor-
+itive and unlikely distribution of importance. Additionally, testing       mance.
+                                                                              Ahmed Burak Gulhan, Krishna Teja Chitty-Venkata, Murali Emani, Mahmut Kandemir, and Venkatram Vishwanath
+
+
+                                                                                                            0 R G H O   / O D 0 $    %
+                      P X O W L I L H O G T D B H Q                                      W U L Y L D T D                                         
+                                                                                                                                                                                    K R W S R W T D                                                                   U H S R E H Q F K  S
+                                                                                                                                                                                                                                                         
+                                                                                                                                                  
+                                                                                                                                                                                                                                                           
+                                                                                                                                                
+ 6 F R U H
+
+
+
+
+                                                       6 F R U H
+
+
+
+
+                                                                                                                                   6 F R U H
+
+
+
+
+                                                                                                                                                                                                                                 6 F R U H
+                                                                                                                                                                                                                                                             
+                                                                   
+                                                                                                                                                                                                                                                            
+                                                                    
+                                                                                                                                                                                                                                                            
+                                                                     
+                          & R P S U H V V L R Q                                    & R P S U H V V L R Q                                                                       & R P S U H V V L R Q                                                                   & R P S U H V V L R Q
+                            V D P V X P                              
+                                                                                       Z L N L P T D                                                                          J R Y B U H S R U W                                                                         7 2 7 $ /
+                                                                                                                                                 
+                                                                                                                                                                                                                                                           
+                                                                     
+
+
+
+
+                                                                                                                                                                                                                        $ J J U H J D W H G  6 F R U H
+                                                                                                                                                                                                                                                         
+                                                                     
+ 6 F R U H
+
+
+
+
+                                                       6 F R U H
+
+
+
+
+                                                                                                                                   6 F R U H
+                                                                                                                                                                                                                                                             
+                                                                   
+                                                                                                                                                                                                                                                           
+                                                                   
+                                                                                                                                                                                                                                                             
+                                                                    
+                         
+                        
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+
+
+
+                                                                               
+                                                                              
+                                                                               
+                                                                               
+                                                                               
+                                                                               
+                                                                               
+                                                                               
+                                                                               
+                                                                               
+                                                                               
+
+
+
+                                                                                                                                                           
+                                                                                                                                                          
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+
+
+
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                       
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                          & R P S U H V V L R Q                                    & R P S U H V V L R Q                                                                       & R P S U H V V L R Q                                                                   & R P S U H V V L R Q
+                                                                            % D V H O L Q H             % D . O D 9 D              6 W U H D P L Q J / / 0                           6 T X H H ] H $ W W H Q W L R Q
+
+                                                                                               0 R G H O   T Z H Q      %  L Q V W U X F W
+                      P X O W L I L H O G T D B H Q                                      W U L Y L D T D                                                                            K R W S R W T D                                                                   U H S R E H Q F K  S
+                                                                                                                                               
+                                                                                                                                                                                                                                                           
+                                                                                                                                                  
+                                                                     
+                                                                                                                                                                                                                                                          
+ 6 F R U H
+
+
+
+
+                                                       6 F R U H
+
+
+
+
+                                                                                                                                   6 F R U H
+
+
+
+
+                                                                                                                                                                                                                                 6 F R U H
+                                                                     
+                                                                                                                                                  
+                                                                                                                                                                                                                                                         
+                                                                                                                                                  
+                                                                                                                                                 
+                          & R P S U H V V L R Q                                    & R P S U H V V L R Q                                                                       & R P S U H V V L R Q                                                                   & R P S U H V V L R Q
+                            V D P V X P                                                Z L N L P T D                                                                          J R Y B U H S R U W                                                                         7 2 7 $ /
+                                                                                                                                               
+                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                        $ J J U H J D W H G  6 F R U H
+
+
+
+
+                                                                     
+                                                                                                                                                                                                                                                           
+                                                                                                                                                 
+ 6 F R U H
+
+
+
+
+                                                       6 F R U H
+
+
+
+
+                                                                                                                                   6 F R U H
+
+
+
+
+                                                                     
+                                                                                                                                                                                                                                                             
+                                                                   
+                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                          
+                         
+                        
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+
+
+
+                                                                               
+                                                                              
+                                                                               
+                                                                               
+                                                                               
+                                                                               
+                                                                               
+                                                                               
+                                                                               
+                                                                               
+                                                                               
+
+
+
+                                                                                                                                                           
+                                                                                                                                                          
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+                                                                                                                                                           
+
+
+
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                       
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+                                                                                                                                                                                                                                                                        
+
+
+
+                          & R P S U H V V L R Q                                    & R P S U H V V L R Q                                                                       & R P S U H V V L R Q                                                                   & R P S U H V V L R Q
+                                                                            E D V H O L Q H             6 W U H D P L Q J / / 0                  6 T X H H ] H $ W W H Q W L R Q                     % D . O D 9 D
+
+
+ Figure 3: Comparison of BaKlaVa (varying memory budgets for both layers and KV-caches), SqueezeAttention (varying memory
+ budgets for layers), and StreamingLLM (uniform memory budget for all KV-caches) on different LongBench tasks under
+ various compression settings. The LongBench datasets shown include few-shot learning(triviaqa), coding (repobench-p), multi-
+ document question answering (2wikimqa), and summarization (gov_report). For BaKlaVa and SqueezeAttention, we conducted
+ a parameter search using perplexity as a benchmark to determine the optimal settings for each compression ratio (detailed in
+ Section 3.2.2).
+BaKlaVa - Budgeted Allocation of KV cache for Long-context Inference
+
+
+                                                                                  LlaMA3-7B                        Qwen2.5-7b-Instruct                      Mistral-7B-v0.1
+We evaluate three KV-cache eviction and memory allocation strate-         Layer   Similarity   Layer   LB Score    Layer   Similarity   Layer   LB Score    Layer   Similarity   Layer   LB Score
+                                                                            0         0.648      0         11.44     0          0.703     0         43.83     0         0.154      0         62.78
+gies: StreamingLLM [20], SqueezeAttention [19], and BaKlaVa. Strea-         1         0.847      1          9.02     1          0.933     1         43.89     1         0.578      1         62.78
+                                                                            2         0.871      2          8.61     2          0.953     2          43.6     2         0.789      2         62.89
+mingLLM applies a token eviction policy once a KV-cache reaches             3         0.906      3          7.94     3          0.949     3         46.08     3         0.812      3         62.84
+                                                                            4         0.910      4         11.49     4          0.953     4         48.34     4         0.839      4         63.67
+capacity but assigns equal memory to all caches. SqueezeAtten-              5         0.921      5         14.68     5          0.953     5         61.21     5         0.859      5         64.00
+                                                                            6         0.921      6         12.07     6          0.953     6         65.06     6         0.843      6         66.72
+                                                                            7         0.906      7         12.42     7          0.953     7         72.76     7         0.835      7         66.61
+tion extends this approach by varying memory allocation across              8         0.914      8         11.72     8          0.957     8         72.71     8         0.851      8         63.63
+                                                                            9         0.917      9         11.41     9          0.945     9         74.44     9         0.871      9         62.89
+layers, while BaKlaVa further refines memory distribution by ad-           10         0.933     10         12.87    10          0.972    10         74.67    10         0.835     10         66.32
+                                                                           11         0.937     11         12.81    11          0.968    11         72.72    11         0.851     11         64.71
+justing allocations for both layers and individual KV-caches. Note         12         0.925     12         13.06    12          0.968    12         70.45    12         0.859     12         63.81
+                                                                           13         0.921     13         13.47    13          0.960    13         59.05    13         0.871     13         66.49
+that other token eviction or compression policies can be used with         14         0.929     14         14.24    14          0.960    14          60.4    14         0.878     14         69.93
+                                                                           15         0.949     15         14.83    15          0.968    15         64.34    15         0.890     15         73.49
+SqueezeAttention and BaKlaVa; we chose StreamingLLM for ease               16         0.949     16         15.51    16          0.972    16         62.25    16         0.898     16         72.33
+                                                                           17         0.964     17         15.89    17          0.980    17         71.05    17         0.910     17         73.49
+                                                                           18         0.980     18         15.83    18          0.972    18         69.39    18         0.914     18         73.89
+of implementation.                                                         19         0.988     19         15.81    19          0.949    19         70.16    19         0.925     19         73.76
+                                                                           20         0.988     20         15.85    20          0.972    20         71.17    20         0.929     20         71.87
+   In Figure 3 the total aggregate score shows that BaKlaVa outper-        21         0.984     21         16.04    21          0.964    21         69.88    21         0.933     21         75.93
+                                                                           22         0.988     22         15.89    22          0.976    22         71.04    22         0.929     22         76.86
+forms other KV-cache memory allocation methods (StreamingLLM               23         0.992     23         16.45    23          0.980    23         70.89    23         0.933     23         77.45
+                                                                           24         0.992     24         16.45    24          0.976    24         72.92    24         0.921     24         77.61
+and SqueezeAttention) on average; however, the results show dis-           25         0.992     25         15.92    25          0.988    25         73.49    25         0.914     25         77.74
+                                                                           26         0.988     26         16.29    26          0.972    26         74.55    26         0.898     26         77.70
+tinctly different behaviors for LlaMA3-8B and Qwen2.5-7B models.           27         0.988     27         16.14    27          0.910    27         76.15    27         0.917     27         77.70
+                                                                           28         0.988     28         16.53                                             28         0.878     28         77.62
+                                                                           29         0.980     29         16.25                                             29         0.886     29         76.90
+This is due to the different context lengths of both models (8196          30         0.972     30         16.02                                             30         0.839     30         76.88
+                                                                           31         0.953     31         16.15                                             31         0.800     31         76.79
+tokens for LlaMA3-8B and 32768 for Qwen2.5-7B) along with the
+prompt truncation behavior of LongBench we discussed above. In            Heuristic             Empirical Heuristic Empirical                               Heuristic             Empirical
+                                                                                               Test Results         Test Results                                                 Test Results
+Qwen2.5-7B, at compression ratio 1.0 we start with the default con-
+text length of 32k tokens, which is significantly more than most
+                                                                          Figure 4: Comparison of layer importance heuristics with em-
+prompts in LongBench. Thus, increasing KV-cache compression
+                                                                          pirical evaluation results. Layers identified as least important
+does not affect results up to a certain point (e.g., 0.5 compression
+                                                                          by both heuristic and empirical test scores are highlighted
+ratio in multifieldqa_en for Qwen). Afterward, there is a gradual de-
+                                                                          in green, while critical layers are marked in red. LlaMA3-8B
+crease in the score as long-context prompts lose critical information
+                                                                          and Mistral-7B-v0.1 exhibit strong alignment between heuris-
+upon compression.
+                                                                          tic predictions and empirical findings, whereas Qwen2.5-
+   On the other hand, for LlaMA3, at compression ratio 1.0 we
+                                                                          7B shows significant discrepancies. Consequently, applying
+start at the model’s maximum context length of 8192 tokens. Since
+                                                                          layer-wise KV-cache memory allocation based on the heuris-
+most prompts in LongBench are more than 8192 tokens, they get
+                                                                          tic to Qwen2.5-7B may result in performance degradation.
+truncated in the middle, leaving the critical instructions at the be-
+ginning and/or end of the now shorter prompt. Thus, in LlaMA,
+the score starts decreasing rapidly upon increasing the KV com-
+                                                                          critical layers (i.e., those with high similarity scores or high empiri-
+pression, as the critical instructions at the beginning of the prompt
+                                                                          cal performance) are highlighted in green. It is important to note
+get quickly evicted with the StreamingLLM window-based eviction
+                                                                          that the first and last two empirical test results exhibit a bias toward
+policy. With BaKlaVa, we observe that these critical instructions are
+                                                                          higher scores due to the sliding window approach. This overlap at
+remembered until a much higher compression ratio. For example,
+                                                                          the layer boundaries results in less cumulative compression across
+0.6 compression for all results in Figure 3 for LlaMA. This behavior
+                                                                          layers, thereby preserving more KV-cache memory overall.
+is also observed in Qwen, but for higher compression rations of 0.1
+                                                                             Accounting for this bias, we observe that LlaMA3-8B and Mistral-
+and 0.2, where BaKlaVa retains an order of magnitude larger score
+                                                                          7B exhibit highly similar layer importance patterns, as indicated
+compared to the other methods. This can be seen in multifieldqa_en,
+                                                                          by the alignment of green and red-shaded regions. In contrast,
+samsum, 2wikimqa, etc. for Qwen.
+                                                                          Qwen2.5-7B demonstrates a markedly different layer importance
+   Finally, we see that on average SqueezeAttention performs better
+                                                                          distribution. Consequently, applying layer-wise KV-cache mem-
+than StreamingLLM in LlaMA, but worse in Qwen. This is due to
+                                                                          ory allocation to Qwen leads to poorer performance compared to
+the layer importance heuristic used in SqueezeAttention closely
+                                                                          equal memory allocation, as evidenced by the Qwen results for
+matching the ‘true’ importance values in LlaMA, but not in Qwen.
+                                                                          SqueezeAttention and StreamingLLM in Figure 3.
+See Section 4.2 for details.
+                                                                          5       RELATED WORKS
+                                                                          In this section, we discuss previous work relevant to BaKlaVa in
+4.2     Empirical Evaluation of Heuristics                                five main areas: KV-cache eviction policy, profiling for determining
+Figure 4 presents the empirical test results (detailed in Section 3.3)    memory budget, KV-cache quantization, cache merge, and system-
+for the LlaMA3-8B, Qwen2.5-7B, and Mistral-7B models, compared            level optimizations.
+against the layer importance heuristics used in BaKlaVa and SqueezeAt-
+tention for estimation of layer importance with low computational         5.1          KV Cache Eviction Policy
+cost. The heuristic results are expressed as similarity scores, as        StreamingLLM [20] discovered the ’attention sink’ effect, where
+defined in Section 3.1, while the empirical results are reported as av-   early sequence tokens play a crucial role in maintaining model
+erage LongBench scores on the triviaqa dataset across compression         performance through asymmetric attention weight accumulation.
+ratios ranging from 0.5 to 0.95. Both heuristic and empirical results     H2O [25] introduces an eviction strategy based on cumulative at-
+are visualized using a red-yellow-green color gradient, where less        tention, retaining ’heavy-hitter’ key-value pairs while allowing
+                                                 Ahmed Burak Gulhan, Krishna Teja Chitty-Venkata, Murali Emani, Mahmut Kandemir, and Venkatram Vishwanath
+
+
+token positions to vary. Similarly, Scissorhands [13] develops an            KV cache scheduling framework that combines algorithmic sparsity
+approach that evicts based on a ’pivotal’ metric, adjusting evic-            with system-level optimization. At the algorithmic level, ALISA
+tion rates across layers using a persistence ratio. Keyformer [1]            employs a Sparse Window Attention mechanism to identify and pri-
+addresses the issue of token removal distorting softmax probability          oritize crucial tokens for attention computation, while at the system
+distributions by implementing regularization techniques to mitigate          level, it implements a three-phase token-level dynamic scheduler
+these perturbations.                                                         to manage KV tensor allocation and balance caching and recompu-
+                                                                             tation.
+5.2    Profiling for Determining Memory Budget
+Squeezeattention [19] employs a dynamic approach, measuring                  6      CONCLUSION AND FUTURE WORK
+layer importance through cosine similarity of input prompt dif-              In this work, we introduce BaKlaVa, a simple yet effective approach
+ferences pre- and post-self-attention, subsequently categorizing             to optimize LLM inference through intelligent KV-cache memory
+layers and adjusting their KV budgets. PyramidInfer [21] intro-              allocation. By leveraging a heuristic-based method to estimate layer
+duces a pyramid-shaped allocation strategy, prioritizing tokens              and KV-cache importance, BaKlaVa significantly improves memory
+with high attention values and maintaining a set of significant              efficiency while maintaining model performance across a range of
+tokens through attention-driven updates during decoding. In com-             compression ratios. Our empirical evaluations demonstrate that
+parison, Ada-KV [6] offers an adaptive budget allocation method              BaKlaVa outperforms existing KV-cache allocation strategies, such
+that improves utilization across individual attention heads, result-         as uniform allocation (StreamingLLM) and allocating KV-cache
+ing in more effective cache eviction strategies.                             memory with layer-wise granularity (SqueezeAttention), particu-
+                                                                             larly in tasks where preserving long-range dependencies is cru-
+5.3    KV-Cache Quantization                                                 cial. Notably, BaKlaVa maintains near-baseline performance up to
+GEAR [10] takes a different approach by compressing less impor-              70% compression, surpassing alternative methods on long-context
+tant entries to ultra-low precision, using a low-rank matrix for             datasets by preserving essential information and achieving higher
+residual error approximation, and utilizing a sparse matrix for out-         accuracy under high compression across multiple tasks
+lier correction. MiKV [22] introduces a mixed-precision KV-cache                A key advantage of our method is its ability to adapt to different
+quantization method, allocating precision based on token impor-              model architectures by dynamically adjusting memory allocation
+tance. QAQ [5] proposes a dynamic, quality-adaptive quantization             based on computationally inexpensive heuristics. Unlike prior ap-
+approach that determines bit allocation based on token importance            proaches that apply uniform compression or coarse layer-wise
+and sensitivity. KVQuant [9] offers strategies for smooth quan-              compression, BaKlaVa efficiently distributes KV-cache memory to
+tization of keys and values, including pre-RoPE quantization for             maximize performance under constrained budgets. These improve-
+keys, per-token quantization for values, and isolation of outliers in        ments highlight the potential of fine-grained memory allocation
+a sparse format. These diverse techniques collectively contribute            in enhancing the efficiency of LLM inference without requiring
+to significant improvements in model compression and efficiency              modifications to model architecture or training procedures.
+while maintaining performance.                                                  In future work, our aim is to develop a generalized framework for
+                                                                             adaptive KV-cache memory allocation, reducing the need for man-
+5.4    Cache Merge                                                           ual parameter tuning. Additionally, extending BaKlaVa to support
+                                                                             additional KV eviction policies and dynamically adjusting mem-
+MiniCache [12] leverages the high angular similarity observed in
+                                                                             ory budgets at runtime could further enhance its applicability to
+middle-to-deep layer KV caches, merging key and value pairs from
+                                                                             real-world deployments.
+adjacent similar layers into shared representations. KVSharer [23],
+on the other hand, exploits the counterintuitive finding that sharing        7      ACKNOWLEDGMENTS
+KV caches between significantly different layers during inference
+does not substantially impact performance, prioritizing dissimilar           This research used resources of the Argonne Leadership Comput-
+layers for sharing based on Euclidean distance calculations. In com-         ing Facility, a U.S. Department of Energy (DOE) Office of Science
+parison, CaM [24] focuses on merging keys or values of multiple              user facility at Argonne National Laboratory and is based on re-
+evicted tokens with retained tokens using attention scores, while            search supported by the U.S. DOE Office of Science-Advanced Sci-
+KVMerger [18] employs a two-step process: first clustering con-              entific Computing Research Program, under Contract No. DE-AC02-
+secutive tokens with high cosine similarity, then merging tokens             06CH11357.
+within each set into a pivotal token chosen by the attention score,
+using Gaussian kernel weights to emphasize contextual relevance.
+                                                                             REFERENCES
+                                                                              [1]   Muhammad Adnan, Akhil Arunkumar, Gaurav Jain, Prashant Nair, Ilya Solovey-
+                                                                                    chik, and Purushotham Kamath. 2024. Keyformer: kv cache reduction through
+5.5    System-Level Optimizations                                                   key tokens selection for efficient generative inference. Proceedings of Machine
+                                                                                    Learning and Systems, 6, 114–127.
+FlexGen [15] proposes an SSD-based method for managing key-                   [2]   Yushi Bai et al. 2023. Longbench: a bilingual, multitask benchmark for long
+value (KV) caches, effectively expanding the memory hierarchy                       context understanding. arXiv preprint arXiv:2308.14508.
+                                                                              [3]   Tri Dao. 2024. FlashAttention-2: faster attention with better parallelism and
+across GPU, CPU, and disk storage. This approach utilizes linear                    work partitioning. In International Conference on Learning Representations
+programming to optimize tensor storage and access patterns, en-                     (ICLR).
+abling high-throughput LLM inference on hardware with limited
+resources. Complementing this, ALISA [26] introduces a dual-level
+BaKlaVa - Budgeted Allocation of KV cache for Long-context Inference
+
+
+ [4]   Alessio Devoto, Yu Zhao, Simone Scardapane, and Pasquale Minervini. 2024. A                 (Eds.) Vol. 36. Curran Associates, Inc., 34661–34710. https://proceedings.neurip
+       simple and effective 𝐿 _2 norm-based strategy for kv cache compression. arXiv               s.cc/paper_files/paper/2023/file/6ceefa7b15572587b78ecfcebb2827f8-Paper-
+       preprint arXiv:2406.11430.                                                                  Conference.pdf.
+ [5]   Shichen Dong, Wen Cheng, Jiayu Qin, and Wei Wang. 2024. Qaq: quality                 [26]   Youpeng Zhao, Di Wu, and Jun Wang. 2024. Alisa: accelerating large language
+       adaptive quantization for llm kv cache. arXiv preprint arXiv:2403.04643.                    model inference via sparsity-aware kv caching. In 2024 ACM/IEEE 51st Annual
+ [6]   Yuan Feng, Junlin Lv, Yukun Cao, Xike Xie, and S Kevin Zhou. 2024. Ada-kv:                  International Symposium on Computer Architecture (ISCA). IEEE Computer
+       optimizing kv cache eviction by adaptive budget allocation for efficient llm                Society, Los Alamitos, CA, USA, (July 2024), 1005–1017. doi: 10.1109/ISCA590
+       inference. arXiv preprint arXiv:2407.11550.                                                 77.2024.00077.
+ [7]   Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Jiawei Han, and Jianfeng
+       Gao. 2024. Model tells you what to discard: adaptive KV cache compression
+       for LLMs. In The Twelfth International Conference on Learning Representations.       8 APPENDIX
+       https://openreview.net/forum?id=uNrFpDPMyo.
+ [8]   Zhiyu Guo, Hidetaka Kamigaito, and Taro Watanabe. 2024. Attention score is           A FULL LONGBENCH RESULTS
+       not all you need for token importance indicator in kv cache reduction: value
+       also matters. arXiv preprint arXiv:2406.12335.                                       B PARAMETER SEARCH RESULTS
+ [9]   Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W Mahoney,
+       Yakun Sophia Shao, Kurt Keutzer, and Amir Gholami. 2024. Kvquant: towards
+       10 million context length llm inference with kv cache quantization. arXiv
+       preprint arXiv:2401.18079.
+[10]   Hao Kang, Qingru Zhang, Souvik Kundu, Geonhwa Jeong, Zaoxing Liu, Tushar
+       Krishna, and Tuo Zhao. 2024. Gear: an efficient kv cache compression recipefor
+       near-lossless generative inference of llm. arXiv preprint arXiv:2403.05527.
+[11]   Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng,
+       Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica. 2023. Efficient
+       memory management for large language model serving with pagedattention.
+       In Proceedings of the 29th Symposium on Operating Systems Principles (SOSP
+       ’23). Association for Computing Machinery, Koblenz, Germany, 611–626. isbn:
+       9798400702297. doi: 10.1145/3600006.3613165.
+[12]   Akide Liu, Jing Liu, Zizheng Pan, Yefei He, Gholamreza Haffari, and Bohan
+       Zhuang. 2024. Minicache: kv cache compression in depth dimension for large
+       language models. arXiv preprint arXiv:2405.14366.
+[13]   Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie, Zhaozhuo
+       Xu, Anastasios Kyrillidis, and Anshumali Shrivastava. 2024. Scissorhands: ex-
+       ploiting the persistence of importance hypothesis for llm kv cache compression
+       at test time. In Proceedings of the 37th International Conference on Neural Infor-
+       mation Processing Systems (NIPS ’23) Article 2279. Curran Associates Inc., New
+       Orleans, LA, USA, 23 pages.
+[14]   Xiaozhe Ren et al. 2023. Pangu-$
+       sum$: towards trillion parameter language model with sparse heterogeneous
+       computing. arXiv preprint arXiv:2303.10845, 10, 11–15.
+[15]   Ying Sheng et al. 2023. Flexgen: high-throughput generative inference of large
+       language models with a single gpu. In Proceedings of the 40th International
+       Conference on Machine Learning (ICML’23) Article 1288. JMLR.org, Honolulu,
+       Hawaii, USA, 23 pages.
+[16]   Gemini Team et al. 2024. Gemini 1.5: unlocking multimodal understanding
+       across millions of tokens of context. (2024). https://arxiv.org/abs/2403.05530
+       arXiv: 2403.05530 [cs.CL].
+[17]   Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+       Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. 2023. Attention is all you
+       need. (2023). https://arxiv.org/abs/1706.03762 arXiv: 1706.03762 [cs.CL].
+[18]   Zheng Wang, Boxiao Jin, Zhongzhi Yu, and Minjia Zhang. 2024. Model tells
+       you where to merge: adaptive kv cache merging for llms on long-context tasks.
+       arXiv preprint arXiv:2407.08454.
+[19]   Zihao Wang, Bin Cui, and Shaoduo Gan. 2024. Squeezeattention: 2d manage-
+       ment of kv-cache in llm inference via layer-wise optimal budget. arXiv preprint
+       arXiv:2404.04793.
+[20]   Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. 2023.
+       Efficient streaming language models with attention sinks. arXiv.
+[21]   Dongjie Yang, XiaoDong Han, Yan Gao, Yao Hu, Shilin Zhang, and Hai Zhao.
+       2024. Pyramidinfer: pyramid kv cache compression for high-throughput llm
+       inference. arXiv preprint arXiv:2405.12532.
+[22]   June Yong Yang, Byeongwook Kim, Jeongin Bae, Beomseok Kwon, Gunho Park,
+       Eunho Yang, Se Jung Kwon, and Dongsoo Lee. 2024. No token left behind: reli-
+       able kv cache compression via importance-aware mixed precision quantization.
+       arXiv preprint arXiv:2402.18096.
+[23]   Yifei Yang, Zouying Cao, Qiguang Chen, Libo Qin, Dongjie Yang, Hai Zhao,
+       and Zhi Chen. 2024. Kvsharer: efficient inference via layer-wise dissimilar kv
+       cache sharing. arXiv preprint arXiv:2410.18517.
+[24]   Yuxin Zhang, Yuxuan Du, Gen Luo, Yunshan Zhong, Zhenyu Zhang, Shi-
+       wei Liu, and Rongrong Ji. 2024. CaM: cache merging for memory-efficient
+       LLMs inference. In Proceedings of the 41st International Conference on Machine
+       Learning (Proceedings of Machine Learning Research). Ruslan Salakhutdinov,
+       Zico Kolter, Katherine Heller, Adrian Weller, Nuria Oliver, Jonathan Scarlett,
+       and Felix Berkenkamp, (Eds.) Vol. 235. PMLR, (21–27 Jul 2024), 58840–58850.
+       https://proceedings.mlr.press/v235/zhang24n.html.
+[25]   Zhenyu Zhang et al. 2023. H2o: heavy-hitter oracle for efficient generative in-
+       ference of large language models. In Advances in Neural Information Processing
+       Systems. A. Oh, T. Naumann, A. Globerson, K. Saenko, M. Hardt, and S. Levine,
+                                                                        Ahmed Burak Gulhan, Krishna Teja Chitty-Venkata, Murali Emani, Mahmut Kandemir, and Venkatram Vishwanath
+
+
+                                                                                             0 R G H O   / O D 0 $    %
+
+                          T P V X P                                   P X O W L I L H O G T D B H Q                                               W U L Y L D T D                                                 O F F
+                                                                                                                                                                                            
+ 6 F R U H
+
+
+
+
+                                                6 F R U H
+
+
+
+
+                                                                                                               6 F R U H
+
+
+
+
+                                                                                                                                                                                    6 F R U H
+                                                                                                                                                                                                
+                                                            
+                                                                                                                             
+                                                                                                                                                                                                  
+                                                                                                                              
+                       & R P S U H V V L R Q                                & R P S U H V V L R Q                                             & R P S U H V V L R Q                                       & R P S U H V V L R Q
+               
+                         K R W S R W T D                                  U H S R E H Q F K  S                                                  V D P V X P                                                P X V L T X H
+                                                                                                                                                                                               
+ 6 F R U H
+
+
+
+
+                                                6 F R U H
+
+
+
+
+                                                                                                               6 F R U H
+
+
+
+
+                                                                                                                                                                                      6 F R U H
+                                                                                                                                                                                                
+                                                                                                                             
+                                                                                                                                                                                                   
+                                                              
+                                                                                                                                                                                                  
+                       & R P S U H V V L R Q                                & R P S U H V V L R Q                                             & R P S U H V V L R Q                                       & R P S U H V V L R Q
+                       P X O W L B Q H Z V                                      Z L N L P T D                                                J R Y B U H S R U W                                                W U H F
+                                                                                                                            
+                                                                                                                                                                                                
+                                                                                                                            
+   6 F R U H
+
+
+
+
+                                                6 F R U H
+
+
+
+
+                                                                                                               6 F R U H
+
+
+
+
+                                                                                                                                                                                    6 F R U H
+                                                                                                                                                                                                  
+                                                                                                                                                                                              
+                                                                                                                                                                                                  
+                       & R P S U H V V L R Q                                & R P S U H V V L R Q                                             & R P S U H V V L R Q                                       & R P S U H V V L R Q
+               
+                       Q D U U D W L Y H T D                          S D V V D J H B F R X Q W                                      S D V V D J H B U H W U L H Y D O B H Q                                  T D V S H U
+                                                                                                                            
+                                                                                                                                                                                             
+ 6 F R U H
+
+
+
+
+                                                  6 F R U H
+
+
+
+
+                                                                                                              6 F R U H
+
+
+
+
+                                                                                                                                                                                    6 F R U H
+                                                               
+                                                                                                                                                                                               
+                                                                                                                           
+                         
+                        
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+
+
+
+                                                                        
+                                                                       
+                                                                        
+                                                                        
+                                                                        
+                                                                        
+                                                                        
+                                                                        
+                                                                        
+                                                                        
+                                                                        
+
+
+
+                                                                                                                                        
+                                                                                                                                       
+                                                                                                                                        
+                                                                                                                                        
+                                                                                                                                        
+                                                                                                                                        
+                                                                                                                                        
+                                                                                                                                        
+                                                                                                                                        
+                                                                                                                                        
+                                                                                                                                        
+
+
+
+                                                                                                                                                                                                            
+                                                                                                                                                                                                           
+                                                                                                                                                                                                            
+                                                                                                                                                                                                            
+                                                                                                                                                                                                            
+                                                                                                                                                                                                            
+                                                                                                                                                                                                            
+                                                                                                                                                                                                            
+                                                                                                                                                                                                            
+                                                                                                                                                                                                            
+                                                                                                                                                                                                            
+                       & R P S U H V V L R Q                                & R P S U H V V L R Q                                             & R P S U H V V L R Q                                       & R P S U H V V L R Q
+
+                                                                     % D V H O L Q H         % D . O D 9 D     6 W U H D P L Q J / / 0           6 T X H H ] H $ W W H Q W L R Q
+
+
+             Figure 5: Comparison of BaKlaVa and other cache methods on LlaMA3-8B using LongBench for different compressions.
+ BaKlaVa - Budgeted Allocation of KV cache for Long-context Inference
+
+
+                                                                                        0 R G H O   T Z H Q      %  L Q V W U X F W
+
+                          T P V X P                                  P X O W L I L H O G T D B H Q                                                                           W U L Y L D T D                                           O F F
+                                                                                                                                                                                                                   
+                                                                                                                                           
+                                                              
+ 6 F R U H
+
+
+
+
+                                                6 F R U H
+
+
+
+
+                                                                                                                             6 F R U H
+
+
+
+
+                                                                                                                                                                                                         6 F R U H
+                                                                                                                                                                                                                     
+               
+                                                                                                                                         
+                                                                                                                                                                                                                      
+                       & R P S U H V V L R Q                                & R P S U H V V L R Q                                                                      & R P S U H V V L R Q                                   & R P S U H V V L R Q
+                         K R W S R W T D                                  U H S R E H Q F K  S                                                                              V D P V X P                                         P X V L T X H
+                                                                                                                                                                                                                  
+ 6 F R U H
+
+
+
+
+                                                6 F R U H
+
+
+
+
+                                                                                                                             6 F R U H
+
+
+
+
+                                                                                                                                                                                                           6 F R U H
+                                                                                                                                                                                                                      
+                                                                                                                                          
+                                                                                                                                                                                                                      
+                                                                                                                                                                                                                       
+                       & R P S U H V V L R Q                                & R P S U H V V L R Q                                                                      & R P S U H V V L R Q                                   & R P S U H V V L R Q
+                       P X O W L B Q H Z V                                      Z L N L P T D                                                                          J R Y B U H S R U W                                           W U H F
+                                                                                                                                       
+                                                                                                                                                                                                                       
+                                                                                                                                         
+ 6 F R U H
+
+
+
+
+                                                6 F R U H
+
+
+
+
+                                                                                                                             6 F R U H
+
+
+
+
+                                                                                                                                                                                                         6 F R U H
+                                                                                                                                                                                                                       
+                                                             
+                                                                                                                                                                                                                     
+               
+                                                                                                                                                                                                                        
+                       & R P S U H V V L R Q                                & R P S U H V V L R Q                                                                      & R P S U H V V L R Q                                   & R P S U H V V L R Q
+                       Q D U U D W L Y H T D                          S D V V D J H B F R X Q W                                                         S D V V D J H B U H W U L H Y D O B H Q                                    T D V S H U
+                                                                                                                                        
+                                                               
+                                                                                                                                                                                                                       
+                                                               
+ 6 F R U H
+
+
+
+
+                                                  6 F R U H
+
+
+
+
+                                                                                                                           6 F R U H
+
+
+
+
+                                                                                                                                                                                                         6 F R U H
+                                                                                                                                          
+                                                                                                                                                                                                                       
+
+                                                                                                                                         
+                         
+                        
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+                         
+
+
+
+                                                                        
+                                                                       
+                                                                        
+                                                                        
+                                                                        
+                                                                        
+                                                                        
+                                                                        
+                                                                        
+                                                                        
+                                                                        
+
+
+
+                                                                                                                                                     
+                                                                                                                                                    
+                                                                                                                                                     
+                                                                                                                                                     
+                                                                                                                                                     
+                                                                                                                                                     
+                                                                                                                                                     
+                                                                                                                                                     
+                                                                                                                                                     
+                                                                                                                                                     
+                                                                                                                                                     
+
+
+
+                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                
+                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                 
+                       & R P S U H V V L R Q                                & R P S U H V V L R Q                                                                      & R P S U H V V L R Q                                   & R P S U H V V L R Q
+
+                                                                     E D V H O L Q H            6 W U H D P L Q J / / 0                   6 T X H H ] H $ W W H Q W L R Q               % D . O D 9 D
+
+
+        Figure 6: Comparison of BaKlaVa and other cache methods on Qwen2.5-7B using LongBench for different compressions.
+                                                                         Ahmed Burak Gulhan, Krishna Teja Chitty-Venkata, Murali Emani, Mahmut Kandemir, and Venkatram Vishwanath
+
+
+Cmp      1                                        15                     Cmp    0.9                                        13                      Cmp    0.8                                        12
+Evict% 0.5 0.55    0.6 0.65    0.7 0.75    0.8 0.85    0.9 0.95          Evict% 0.5 0.55    0.6 0.65    0.7 0.75    0.8 0.85    0.9 0.95           Evict% 0.5 0.55    0.6 0.65    0.7 0.75    0.8 0.85    0.9 0.95
+  5% 95.04 18.34 17.83 91.7 33.91 31.62 34.79 23.35 25.03 13.45            5% 94.44 18.31 17.82 90.65 33.9 31.56 34.77 23.33 24.97 13.43             5% 93.7 18.29 17.81 89.83 33.96 31.5 34.75 23.31 24.94 13.41
+ 10% 84.03 17.61 17.57 68.56 34.46 30.76 34.4 22.9 24.09 13.2             10% 83.36 17.59 17.61 67.59 34.47 30.7 34.4 22.89 24.04 13.19             10% 81.99 17.52 17.57 66.05 34.46 30.68 34.34 22.83 23.96 13.16
+ 15% 77.25 17.31 17.58 56.48 34.18 30.51 34.32 22.54 23.51 13.08          15% 77.16 17.35 17.62 55.52 34.09 30.43 34.13 22.47 23.42 13.08           15% 75.86 17.26 17.57 54.14 34.06 30.49 34.23 22.46 23.41 13.07
+ 20% 73.86 16.94 17.59 48.65 33.51 30.29 34.11 22.23 23.07 13.02          20% 73.71 16.85 17.51 47.39 33.43 30.27 34.15 22.23 23.05    13           20% 72.17 16.83 17.53 45.58 33.18 30.27 34.15 22.13 22.98 13.01
+ 25% 70.32 16.6 17.4 42.77 32.91 30.09 34.02 21.97 22.7 12.97             25% 69.42 16.6 17.39 41.67 32.62 30.02 33.96 21.91 22.6 12.96             25% 67.46 16.38 17.36 39.69 32.22 29.9 33.73 21.7 22.4 12.93
+ 30% 66.09 16.19 17.26 38.24 31.99 29.83 33.61 21.61 22.21 12.89          30% 65.7 16.16 17.28 37.21 31.74 29.75 33.48 21.48 22.05 12.86            30% 64.22 15.98 17.08 35.15 31.56 29.7 33.28 21.29 21.7 12.75
+ 35% 63.86 15.87 17.07 34.57 31.72 29.79 33.46 21.43 21.7 12.75           35% 63.06 15.75 16.98 33.45 31.49 29.78 33.26 21.17 21.5 12.72            35% 60.25 15.57 16.93 31.63 31.33 29.77 33.27 21.09 21.27 12.67
+ 40% 60.47 15.55 16.94 31.63 31.27 29.82 33.37 21.17 21.3 12.67           40% 60.11 15.41 16.98 30.75 30.8 29.79 33.42 21.1 21.12 12.63             40% 57.89 15.22 16.84 29.06 30.18 29.64 33.19 20.67 20.66 12.51
+ 45% 57.84 15.17 16.86 29.31 30.31 29.69 33.3 20.79 20.76 12.53           45% 56.93    15 16.72 28.15 30.88 30.17 33.92 21.05 20.73 12.47           45% 55.69 14.59 16.36 26.07 31.85 31.96 35.07 21.94    21 12.36
+ 50% 56.76 14.59 16.46    27 29.99 29.95 33.6 20.52 20.4 12.36            50% 54.63 14.55 16.39 25.97 30.65 30.76 34.49 21.36 20.71 12.33           50% 48.97 13.61 16.05 25.07 28.7 29.73 34.17 21.28 20.75 12.29
+ 55% 54.07 14.07 16.28 25.46 28.95 29.44 33.44 20.48 20.32 12.29          55% 48.04 13.59 16.06 24.91 28.82    30 34.09 21.12 20.69 12.29           55% 44.88 12.71 15.53 23.72 27.45 29.1 33.05 20.51 20.39 12.15
+ 60% 46.77 13.39 15.86 24.51 28.39 29.71 33.89 21.01 20.7 12.26           60% 44.39 12.65 15.46 23.75 27.49 29.44 33.38 21.07 20.79 12.16           60% 44.2 12.03 15.03 22.73 26.09 29.38 31.76 20.58 20.76 12.07
+ 65% 44.61 12.56 15.47 23.48 26.89 28.45 32.27 19.78 19.86 12.12          65% 44.43 12.23 15.15 22.87 26.22 29.04 31.69 20.42 20.55 12.09           65% 37.51 10.92 14.13 21.12 23.55 27.47 28.7 20.32 20.85 11.74
+ 70% 43.87 11.73 14.84 22.52 25.88 29.36 31.57 20.86 20.91 12.02          70% 38.89 11.17 14.44 21.3 24.27 27.4 28.61 19.33 19.97 11.77             70% 33.13 9.87 13.41 18.78 20.32 23.42 25.14 17.67 18.89 11.37
+ 75% 37.18 10.84 14.17 20.69 23.4 26.88 27.94 19.2 19.91 11.7             75% 34.16 10.03 13.35 19.11 20.59 23.73 25.64 17.79 19.01 11.4            75% 29.41 8.65 12.19 16.37 16.68 19.21 20.95 14.79 16.61 10.89
+ 80% 32.98 9.89 13.38 19.02 20.44 23.29 25.17 17.68 18.86 11.38           80% 30.33 8.85 12.21 16.65 16.2 20.15 22.44 16.58 18.38 11.04             80% 27.16 7.33 10.36 14.07 11.9 14.58 17.03 15.44 17.25 10.28
+ 85% 30.42 8.78 12.12 16.47 16.27 19.46 21.72 15.85 17.63 10.92           85% 28.51 7.86 11.06 14.71 13.06 16.48 18.92 15.81 17.75 10.61            85% 23.35 6.33 8.75 11.13 8.98 11.44 14.52 13.28 14.83 9.58
+ 90% 28.45 7.93 11.23 14.6 13.42 16.38 18.61 14.37 16.28 10.57            90% 26.01 7.15 9.82 12.39 10.76 13.12 16.49 14.06 15.64 10.04             90% 16.25 5.35 6.95 6.75 5.34 9.21 12.66 12.38 12.44 8.46
+ 95% 26.47 7.18 9.88 12.45 10.86 13.2 16.44 13.82 15.42 10.05             95% 22.48 6.23 8.48 9.96      7.9 10.03 12.75 11.84 13.01 9.22            95% 5.55 5.55 5.55 5.55 5.55 5.55 5.55 5.55 5.55 5.55
+
+Cmp    0.7                                        11                     Cmp    0.6                                        10                      Cmp    0.5                                                9
+Evict% 0.5 0.55    0.6 0.65    0.7 0.75    0.8 0.85    0.9 0.95          Evict% 0.5 0.55    0.6 0.65    0.7 0.75    0.8 0.85    0.9 0.95           Evict% 0.5 0.55    0.6     0.65    0.7   0.75    0.8   0.85   0.9 0.95
+  5% 94.36 18.3 17.81 90.43 33.91 31.51 34.72 23.31 24.95 13.42            5% 94.62 18.3 17.82 91.22 33.93 31.63 34.76 23.32 24.98 13.44             5% 994.9 987.9 1132      2783   1888   1546   1910   1267 961.2 459
+ 10% 83.73 17.56 17.61 67.41 34.48 30.67 34.38 22.86 24.02 13.19          10% 83.94 17.61 17.58 68.21 34.45 30.73 34.41 22.89 24.06 13.19           10% 959.7 978.7 1130      2277   2118   1568   1740   1269 990.8 473.5
+ 15% 77.15 17.34 17.61 55.29 34.07 30.43 34.12 22.41 23.4 13.09           15% 77.26 17.37 17.57 56.07 34.12 30.47 34.24 22.51 23.48 13.09           15% 946 969.1 1146        2105   2122   1563   1582   1226 977 488.9
+ 20% 73.75 16.84 17.51 47.2 33.43 30.23 34.12 22.19 23.02     13          20% 74.11 16.94 17.54 48.1 33.46 30.21 34.06 22.2 23.05 13.01             20% 940.1 962.3 1174      2042   2100   1540   1488   1185 981.2 497.4
+ 25% 69.74 16.58 17.41 41.39 32.56 29.96 33.93 21.86 22.55 12.95          25% 70.05 16.62 17.4 42.33 32.68 30.07 33.92 21.89 22.64 12.97            25% 940 956.2 1212        2025   2087   1541   1434   1165 989.7 505.5
+ 30% 65.4 16.13 17.26 36.96 31.7 29.83 33.58 21.52 22.04 12.86            30% 65.93 16.21 17.26 37.83 31.89 29.83 33.61 21.56 22.13 12.88           30% 929.3 946.2 1249      2025   2059   1543   1383   1130 977.2 513.6
+ 35% 62.48 15.73 16.99 33.35 31.3 29.66 33.13 21.1 21.47 12.73            35% 63.63 15.82 17.09 34.2 31.45 29.77 33.3 21.26 21.64 12.77             35% 909.6 935.7 1248      2022   1965   1534   1336   1101 956.2 520.8
+ 40% 59.97 15.37 16.95 30.51 30.63 29.72 33.22 20.9 21.01 12.6            40% 59.85 15.5 16.96 31.08 31.33 29.9 33.57 21.21 21.25 12.66             40% 878.1 922.9 1248      2019   1937   1512   1300   1092 938.7 527.1
+ 45% 57.04 14.88 16.63 27.92 30.81 30.2 33.99 21.07 20.71 12.46           45% 57.53 15.19 16.85 28.94 30.32 29.68 33.28 20.72 20.66 12.52           45% 845.5 904.7 1225      1968   1844   1459   1262   1062 921.9 529
+ 50% 54.32 14.4 16.37 25.94 30.03 30.33 34.32 21.22 20.65 12.31           50% 55.77 14.55 16.34 26.26 31.57 31.84 35.23 22.01 21.02 12.36           50% 812.9 885.4 1202      1896   1800   1406   1214   1036 909.4 522.9
+ 55% 47.51 13.58 16.04 24.89 28.93 30.04 34.12 21.24 20.79 12.28          55% 50.46 13.78 16.13 25.23 28.75 29.36 33.97 21.01 20.58 12.31           55% 821.3 853.6 1131      1679   1772   1334   1236   1033 912.5 508.9
+ 60% 44.54 12.61 15.48 23.54 27.18 28.88 32.79 20.28 20.24 12.12          60% 45.76 13.25 15.68 24.53 29.31 31.87 35.29 23.02 22.23 12.27           60% 899.7 836.3 1022      1469   1707   1274   1455   1304 1184 320.4
+ 65% 43.99 11.88 14.86 23.01 26.47 30.99 32.87 22.6 22.32 12.1            65% 44.62 12.45 15.33 23.23 26.96 29.16 32.52 20.39 20.44 12.14           65% 944 821.4 1017        1360   1670   1204   1368   1281 1179 340
+ 70% 37.58 10.95 14.27 20.98 23.74 27.28 28.34 19.58 20.23 11.71          70% 43.21 11.52 14.68 22.01 24.85 28.26 30.55 19.97 20.27 11.92           70% 968.3 812 1031        1322   1625   1149   1286   1237 1141 311.1
+ 75% 32.76 9.87 13.34 18.86 20.4 22.94 24.89 17.35 18.56 11.36            75% 35.74 10.5 13.92 19.97 21.87 25.51 26.75 18.35 19.29 11.58            75% 970.2 805.2 1025      1296   1616   1116   1230   1203 1104 325
+ 80% 29.98 8.86 12.28 16.42 16.84 19.39 21.45 15.03 16.89 10.89           80% 32.27 9.57 13.11 17.89 19.01 21.53 23.21 16.05 17.63 11.18            80% 960.8 780.7 965.3     1237   1551   1154   1200   1175 1077 286.9
+ 85% 27.87 7.91 10.97 14.01 12.74 15.93 18.28 14.25 16.22 10.54           85% 30.08 8.62 11.96 16.09 16.3 18.76 20.77 14.73 16.62 10.84             85% 948.9 779.7 930.8     1192   1429   1092   1097   1075 997.9 270.9
+ 90% 24.92 6.86 9.44 11.83 9.61 11.93 15.08 13.66 15.41 9.92              90% 26.8    7.5 10.49 13.83 11.69 14.42 17.06 14.86 16.84 10.3            90% 938.6 762.7 1020      1278   1391   1098   1104   1079 938.5 933.1
+ 95% 20.82     6 8.19 9.77 7.56 10.17 12.89 11.93 12.78 9.07              95% 24.23 6.82    9.4 11.01 9.45 11.26 14.28 11.68 13.35 9.71             95% 1009 757.8 993.3      1223   1210   1036   1096   1024 868.1 892.6
+
+Cmp    0.4                                               8               Cmp    0.3                                               7                Cmp    0.2                                                6
+Evict% 0.5 0.55     0.6   0.65    0.7   0.75    0.8   0.85   0.9 0.95    Evict% 0.5 0.55     0.6   0.65    0.7   0.75    0.8   0.85    0.9 0.95    Evict% 0.5   0.55    0.6   0.65    0.7   0.75    0.8   0.85    0.9   0.95
+  5% 1116 961      1671   3182   2068   1762   2012   1462 1046 533.2      5% 1178 890.3    4027   4126   2485   2350   3018   2284   1565 756.4     5% 974.5   1073   6634   6429   6095   5206   6858   7640   4699   4689
+ 10% 1084 962.9    1691   2527   2167   1763   1839   1411 1054 555.1     10% 1159 891.1    3486   3301   2406   2332   2931   2109   1479 797.6    10% 982     1072   6077   6410   5762   5561   6909   7087   4732   4942
+ 15% 1062 963.8    1687   2346   2067   1741   1667   1367 1028 570.1     15% 1124 892.9    3433   2999   2384   2351   2768   2038   1432 812.7    15% 993.1   1076   5770   6409   5464   5445   6813   6957   4682   5029
+ 20% 1048 963.7    1663   2224   1959   1680   1586   1328 1015 583.1     20% 1081 893.7    3299   2780   2341   2392   3050   2476   1896 368.2    20% 1006    1077   5490   6229   5230   5235   6600   6834   4673   4989
+ 25% 1045 965.3    1623   2176   1932   1649   1550   1308 1001 592.2     25% 1035 920      3590   2767   2510   2449   3046   2582   1978 430.4    25% 1008    1078   5544   6262   5165   4998   6468   6882   4651   5025
+ 30% 1037 961.9    1596   2128   1959   1665   1523   1307 993.5 598.3    30% 992.8 935.3   3636   2807   2549   2479   2966   2603   1995 416.5    30% 1007    1079   5409   6170   5078   4786   6373   6889   4637   4941
+ 35% 1019 957.1    1563   2077   1965   1671   1493   1301 989 604.3      35% 957.9 954.6   3670   2868   2614   2546   2872   2606   1980 391.4    35% 1019    1084   5433   6145   5059   4671   6285   6856   4613   4885
+ 40% 995.9 948.9   1521   2038   1934   1634   1460   1307 985.7 607.5    40% 933.1 964.5   3604   2859   2710   2580   2816   2614   1961 420      40% 1023    1081   5388   6035   4953   4553   6229   6859   4589   4777
+ 45% 972.6 936.1   1499   2004   1922   1606   1429   1275 984.9 610.8    45% 914.5 979.8   3485   2795   2767   2568   2756   2608   1944 359.7    45% 1034    1086   5391   6026   4903   4486   6154   6736   4546   4746
+ 50% 952.5 923.3   1468   1893   1940   1659   1673   1633 1346 416.5     50% 905.2 986.8   3331   2736   2870   2541   2698   2568   1914 374.5    50% 1112    1097   5390   5897   4868   4461   6101   6660   4507   4692
+ 55% 919.1 920.2   1404   1801   1960   1623   1596   1596 1337 434.5     55% 896.5 995.6   3181   2681   2998   2804   2650   2533   1893 375.9    55% 1107    1095   5330   5638   4779   4455   5980   6486   4475   4551
+ 60% 900.5 915.8   1365   1639   1921   1562   1524   1563 1304 411       60% 883.7 1003    3000   2566   3014   2732   2494   2498   1861 348.4    60% 1109    1114   5371   5394   4695   4475   5797   6286   4528   4496
+ 65% 875.5 895.7   1284   1462   1826   1450   1492   1492 1248 415.8     65% 887.2 998.1   2771   2510   3069   2657   2313   2435   1804 374.4    65% 1099    1109   5444   5191   4654   4576   5583   6235   4580   4478
+ 70% 927.5 886.9   1206   1392   1768   1531   1427   1401 1175 381       70% 886.3 992.4   2516   2439   3023   2567   2189   2370   1755 348.6    70% 1094    1103   5317   4927   4541   4523   5446   6073   4558   4318
+ 75% 968.5 880.9   1197   1398   1748   1432   1378   1304 1123 370.8     75% 889.3 975.6   2359   2381   2984   2545   2123   2304   1742 353.8    75% 1097    1103   5056   4642   4402   4398   5331   5905   4529   4304
+ 80% 1003 883.2    1179   1387   1677   1352   1272   1237 1069 339.6     80% 951.4 951.3   2568   2794   3176   2523   2159   2295   1762 1792     80% 1073    1114   4777   4419   4251   4279   5146   5657   4469   4246
+ 85% 1005 877.5    1143   1381   1585   1311   1246   1240 1055 346.7     85% 955.5 934.3   2475   2749   2957   2506   2196   2280   1823 1781     85% 1047    1129   4438   4137   4079   4113   4927   5383   4398   4148
+ 90% 1140 861.5    1233   1497   1546   1378   1322   1226 1019 1042      90% 958.5 934.1   2437   2673   2763   2413   2190   2220   1781 1707     90% 1028    1127   4188   3763   3872   3937   4674   5074   4333   4182
+ 95% 1298 853.8    1192   1419   1349   1334   1289   1163 982.9 1020     95% 1042 1013     2218   2349   2576   2397   2080   2138   1707 1620     95% 1025    1171   3921   3373   3697   3742   4351   4674   4166   4157
+
+
+
+
+Figure 7: Parameter search results for BaKlaVa method on LlaMA3-8B model. Each compression ratio from 1.0 to 0.2 is shown
+as a separate heat-map. The X axis is the similarity threshold to select high-similarity/low-importance KV-caches. The Y
+axis is the low importance/high similarity KV-cache reduction %. Green regions indicate optimal (low perplexity) parameter
+configurations, whereas red regions indicate non-optimal (high perplexity) regions.
+

@@ -1,0 +1,1010 @@
+                                                Fast Matrix Multiplications for Lookup Table-Quantized LLMs
+                                                           Han Guo⋆            William Brandon⋆                Radostin Cholakov†
+                                                          Jonathan Ragan-Kelley⋆                Eric P. Xing⋄             Yoon Kim⋆
+                                                  ⋆
+                                                      Massachusetts Institute of Technology, † High School of Mathematics Plovdiv
+                                                                ⋄
+                                                                  Carnegie Mellon University, MBZUAI, Petuum Inc.
+                                                             {hanguo,wbrandon,radi_cho,jrk,yoonkim}@mit.edu, epxing@cs.cmu.edu
+
+                                                                          https://github.com/HanGuo97/flute
+
+                                                              Abstract                              are compressed to lower precision (e.g., 4 or 8
+                                             The deployment of large language models                bits) than the precision in which they were trained
+                                             (LLMs) is often constrained by memory band-            (typically 16 bits). In addition to latency improve-
+                                             width, where the primary bottleneck is the             ments, weight quantization can also drastically re-
+arXiv:2407.10960v4 [cs.LG] 17 Jan 2025
+
+
+
+
+                                             cost of transferring model parameters from the         duce GPU memory required for deployment.
+                                             GPU’s global memory to its registers. When                Realizing practical speed-ups with weight-only
+                                             coupled with custom kernels that fuse the de-
+                                                                                                    quantization requires custom mixed-type matrix-
+                                             quantization and matmul operations, weight-
+                                             only quantization can thus enable faster infer-        matrix multiply (matmul) kernels which must (1)
+                                             ence by reducing the amount of memory move-            move a layer’s quantized weights from GPU off-
+                                             ment. However, developing high-performance             chip DRAM to on-chip SRAM, (2) dequantize the
+                                             kernels for weight-quantized LLMs presents             weights to floating-point (FP) format (on chip),
+                                             substantial challenges, especially when the            (3) perform the FP matmul, and (4) write the re-
+                                             weights are compressed to non-evenly-divisible         sults back to DRAM. Existing kernels such as
+                                             bit widths (e.g., 3 bits) with non-uniform,            bitsandbytes (Dettmers et al., 2023), Marlin
+                                             lookup table (LUT) quantization. This paper
+                                                                                                    (Frantar et al., 2024), and BitBLAS (Wang et al.,
+                                             describes FLUTE, a flexible lookup table engine
+                                             for LUT-quantized LLMs, which uses offline             2024) demonstrate that this strategy can result in
+                                             restructuring of the quantized weight matrix           significant matmul speed-ups, e.g. up to four times
+                                             to minimize bit manipulations associated with          faster when going from W16A16 to W4A16. How-
+                                             unpacking, and vectorization and duplication           ever, these kernels are typically specialized to 4-bit
+                                             of the lookup table to mitigate shared memory          quantization, and while some kernels support non-
+                                             bandwidth constraints. At batch sizes < 32 and         uniform, lookup table (LUT) quantization, they
+                                             quantization group size of 128 (typical in LLM
+                                                                                                    are generally slower than the uniform counterparts.
+                                             inference), the FLUTE kernel can be 2-4× faster
+                                             than existing GEMM kernels. As an applica-             Given the recent promising results with odd-bit
+                                             tion of FLUTE, we explore a simple extension to        (Shao et al., 2023; Ma et al., 2024b,a) and non-
+                                             lookup table-based NormalFloat quantization            uniform (Guo et al., 2024; Kim et al., 2023) quan-
+                                             and apply it to quantize LLaMA3 to various             tization methods, there is thus a need to develop
+                                             configurations, obtaining competitive quantiza-        flexible kernels that can support mixed-type mat-
+                                             tion performance against strong baselines while        muls with a wider range of settings.
+                                             obtaining an end-to-end throughput increase of            This paper describes FLUTE, a flexible lookup-
+                                             1.5 to 2 times.
+                                                                                                    table engine for deploying weight-quantized LLMs,
+                                         1   Introduction                                           with a focus on the low-bit and non-uniform quan-
+                                         Large language model (LLM) deployment faces                tization setting. This setting raises several chal-
+                                         significant latency challenges due to the memory           lenges. First, going beyond 8-bit quantization in-
+                                         bandwidth constraints inherent in generative (token-       volves packing sub-8-bit matrices into supported
+                                         by-token) inference. The primary bottleneck is             data types, followed by unpacking during dequan-
+                                         the cost of transferring model parameters from the         tization. Structuring the unpacked data to match
+                                         GPU’s global memory to the registers, i.e., LLM            GPU-native matmul formats is especially challeng-
+                                         inference is memory-bound. To overcome this                ing when the weights are quantized to non-standard
+                                         “memory wall” (Gholami et al., 2024), practitioners        bit-widths. Second, while uniformly-quantized
+                                         have increasingly adopted weight-only quantiza-            models can rely on assembly-level optimizations to
+                                         tion methods, wherein the parameters of an LLM             convert from INT to FP through bit-level manipula-
+
+                                                                                                1
+tions, lookup table-based dequantization involves             secutive threads are implicitly organized together
+dynamic indexing, and a naïve implementation can              into a single warp, corresponding to the GPU hard-
+lead to substantial overhead. Finally, typical mat-           ware’s actual native unit of instruction execution.
+mul implementations which distribute the work-                   Although GPUs are able to execute large num-
+load across a grid of parallel thread blocks become           bers of instructions in parallel across the warp
+inefficient with small batches and low bit-width              schedulers of their many SMs, the rate at which
+weights; this necessitates more sophisticated par-            instructions can be executed is not always the bot-
+titioning strategies to optimize hardware resource            tleneck in realistic GPU workloads. Instead, the
+utilization.                                                  maximum achievable throughput of a GPU work-
+    FLUTE addresses these challenges through a com-           load is often constrained by the speed of data move-
+bination of (1) offline weight restructuring, (2) a           ment between levels of the GPU’s memory hierar-
+shared-memory lookup table for efficient dequanti-            chy. The memory resources of modern NVIDIA
+zation, and (3) Stream-K partitioning for optimized           server-class GPUs consist of (roughly): (1) Tens of
+workload distribution. We compare FLUTE against               gigabytes of off-chip DRAM, referred to here as
+existing kernels on standard LLM mixed-precision              global memory; (2) Tens of megabytes of on-chip
+matmul settings where weights are quantized to                SRAM acting as a shared L2 cache accessible to all
+4 bits in groups of 128, and find that it outper-             SMs; (3) Hundreds of kilobytes of local SRAM per
+forms existing non-uniform quantization kernels,              SM, split into two configurably-sized portions, one
+and even matches the simpler uniform-quantization             acting as an L1 cache and the other an explicitly-
+kernels in some cases. As an application of FLUTE,            addressed local scratchpad; and (4) Hundreds of
+we experiment with quantizing LLaMA3—which                    kilobytes of local SRAM per SM, acting as regis-
+has been found to be difficult to quantize (Huang             ters for the threads running on that SM.
+et al., 2024)—using a variant of normal float (NF)               The read/write bandwidth of resources in this
+quantization (Dettmers et al., 2023) which learns             memory hierarchy can easily become the limit-
+the quantization parameters based on calibration              ing factor for realistic GPU workloads. For ex-
+data. We find that we can achieve a 1.5 to 2 times            ample, an A100-80GB GPU supports a nominal
+increase in end-to-end throughput when integrated             peak throughput for 16-bit matrix-multiply instruc-
+with frameworks such as vLLM (Kwon et al., 2023).             tions of ≈ 3 × 1014 FLOP/s (aggregated across
+                                                              all SMs), but its main memory supports a nominal
+2     Background and Related Work
+                                                              peak bandwidth of only ≈ 1.5 × 1012 byte/s. This
+2.1   GPU Architecture and Memory                             means that the speed of any kernel which performs
+      Bandwidth Bottlenecks                                   fewer than roughly (3 × 1014 )/(1.5 × 1012 ) = 200
+GPUs are massively-parallel processors designed               matrix-multiply FLOPs per byte of data accessed
+for throughput-oriented workloads containing large            will necessarily be limited by the GPU’s memory
+amounts of independent work. The hardware of a                bandwidth, not by its compute throughput. Maxi-
+current-generation NVIDIA GPU consists of an ar-              mizing the ratio of FLOPs to bytes transferred, a
+ray of many individual streaming multiprocessors              quantity known as arithmetic intensity, is often the
+(“SMs”), each consisting of 4 separate warp sched-            single most important consideration when design-
+ulers together with a single shared memory scratch-           ing high-performance kernels.
+pad accessible to all 4 warp schedulers. Each warp
+scheduler executes instructions on its own func-              2.2   LLM Deployment Characteristics
+tional units, and is able to issue at most one instruc-       Depending on the context, inference can be bottle-
+tion per cycle, which may then take multiple subse-           necked by compute throughput or memory band-
+quent cycles to complete while the warp scheduler             width. For LLMs, training, large-prefill, and large-
+moves on to concurrently issue other instructions.            batch inference enjoy high arithmetic intensity as
+At the hardware level, the instructions executed by           the sizes of matrices involved in the matmuls are
+a warp scheduler typically operate in a SIMD fash-            large enough to saturate compute. Small-batch,
+ion over vectors of 32 data elements at a time. At            token-by-token inference on the other hand in-
+the software level, CUDA asks the programmer to               volves narrower matmuls due to the smaller batch
+program at the level of individual logical threads            dimension, resulting in low arithmetic intensity.
+executing scalar operations; threads are assigned             Reducing the amount of memory operations in
+sequential integer IDs, and every group of 32 con-            this case can thus enable practical speed-ups, even
+
+                                                          2
+if the number of FLOPs remains the same (or is               tization needs to trade off the size of the lookup
+even slightly increased). This has led to much               table and the granularity of the groups at which the
+recent work on customized kernels which move                 weights are quantized. For example, SqueezeLLM
+the weights from main memory to on-chip SRAM                 (Kim et al., 2023) applies K-means clustering at the
+while keeping them quantized/sparse (Dettmers                column (output channel) level to obtain the lookup
+et al., 2023; Kim et al., 2023; Frantar et al., 2024;        table, while NormalFloat quantization (Dettmers
+Wang et al., 2024; Xia et al., 2024a), and then per-         et al., 2023) uses a tensor-level lookup table ob-
+forming the actual matmuls in higher precision af-           tained from the quantiles of a Normal distribution
+ter dequantizing to FP on chip. Marlin implements            that is multiplicatively modified through group-
+this strategy for 4-bit uniform quantization and re-         level parameters. While it is possible to perform
+ports significant (up to 4×) matmul speed-ups even           matmuls with activations/weights that are quan-
+in moderate batch (16-32) settings. bitsandbytes             tized non-uniformly (e.g., through LUT-based mat-
+(Dettmers et al., 2023) and BitBLAS (Wang et al.,            muls (Xu et al., 2021; Park et al., 2022)), these
+2024) extend this to LUT-quantized LLMs, but do              methods cannot leverage specialized accelerators
+not allow for 3 bit-quantized weights. Moreover,             on modern GPUs which are typically optimized
+existing LUT-quantization kernels generally under-           for FP matmuls. We thus seek efficient kernels
+perform uniform-quantization kernels.                        which can simultaneously make use of quantized
+                                                             representations (to minimize memory movement)
+2.3   Weight-only Quantization in LLMs
+                                                             as well as GPU-native matrix multiplications in FP.
+Uniform quantization converts a group of full
+precision weights to lower-precision intervals of            3   FLUTE: A Fast and Flexible Kernel for
+equal size through rounding. For example min-                    Mixed-Type Matrix Multiplications
+max quantization maps a group of weights u to                Let Q ∈ Zk×n be a quantized matrix obtained from
+integers {−2b−1 , . . . , 2b−1 − 1} via the function        quantizing the weight matrix W ∈ Rk×n using a
+clamp round( 1s u); −2b−1 , 2b−1 − 1 , where s =             lookup table T. Concretely, given a lookup table
+max(|u|)
+ 2b−1 −1
+          is a scaling factor. Recent methods im-            T = [v0 , . . . , v2b −1 ] where b is the number of bits
+prove upon min-max quantization by using cali-               and each vi is a floating-point number, each entry
+bration data (Frantar et al., 2022; Lin et al., 2023;        of Q is given by,
+Shao et al., 2023; Ma et al., 2024b). When both the
+weights and activations are quantized uniformly, it          Qij = quantize(Wij ; T) = arg min |Wij − vc |,
+                                                                                                  c
+is possible to use INT matmuls to enable speed-ups
+beyond the savings from reduced memory move-                 where Qij ∈ {0, . . . , 2b −1}. Now let W
+                                                                                                     c ∈ Rk×n
+ment. However, activation quantization remains               be the dequantized matrix where
+difficult due to the presence of outlier channels,
+which necessitate sophisticated mitigation strate-                W
+                                                                  c ij = dequantize(Qij , T) = T[Qij ].
+gies (Wei et al., 2022; Dettmers et al., 2022; Xiao
+et al., 2022; Zhao et al., 2023; Ashkboos et al.,            Our objective is to perform a fast matrix multi-
+2023, 2024; Nrusimha et al., 2024; Lin et al., 2024).        plication between a dense input activation matrix
+Weight-only quantization thus remains a popular              X ∈ Rm×k (typically stored in FP16) and W.c
+choice for LLMs. Moreover, if only the weights                  A straightforward implementation of such
+are quantized, it is possible to reduce quantization         mixed-type matrix multiplication uses separate ker-
+error further by applying quantization at a more             nels. The first kernel loads the quantized matrix
+fine-grained levels (e.g., a block of 128 weight val-        Q from the GPU’s off-chip global memory into
+ues) than at row- or column-level.                           its on-chip memory, performs dequantization, and
+   Non-uniform quantization generalizes uniform              writes back the dequantized matrix W
+                                                                                                c back to the
+quantization by mapping weights to potentially               DRAM. The second kernel is a standard FP matmul
+unequal intervals (Miyashita et al., 2016; Zhou              kernel over X and W.c This separate-kernel can
+et al., 2017; Zhang et al., 2018; Yang et al., 2019).        introduce substantial overhead since W
+                                                                                                  c is moved
+Lookup table (LUT) quantization is a flexible vari-          back and forth. We can achieve faster matmuls
+ant of non-uniform quantization which can map                by fusing the dequantization and matmul kernels,
+intervals to arbitrary values via a lookup table (Car-       where we dequantize on chip and immediately use
+dinaux et al., 2020; Wang et al., 2022). LUT quan-           the dequantized values for the matmul.
+
+                                                         3
+Algorithm 1 FLUTE (Simplified)                                                                                             Quantized
+            g
+Require: X : inputs in HBM                                                                               1                 Weight
+                                                                                  asynchronous global memory
+         Qg : quantized weight in HBM
+                                                                                       to shared memory copy                        scales
+         Sg : scales in HBM
+         Tg : lookup table in HBM
+         Y g : outputs in HBM                                                                                               table
+  # ————— Terminology and Shapes (of X only for brevity) —————                                             cyclic shared
+                                                                                                          memory buffer
+  # tile: a block of matrix entries that fits into shared memory                                  2                                      Registers
+  # fragment: a block of tile entries that fit into registers                        shared memory
+  # g(lobal), s(shared), r(egisters) denotes where data reside                      to registers copy
+  # Xg : [M tiles, K tiles, fragments per tile, fragment size]
+  # Xs : [fragments per tile, fragment size]                                     Inputs                                                          3
+  # Xr : [fragment size]                                                                                                             de-quantization
+  # ————— Offline Preprocessing and Host-side Code —————
+  Qg1 , Qg2 ← reorder_and_split(Qg )                         ▷ Section 3.1
+  Tgv ← make_vectorized_LUT(Tg )                             ▷ Section 3.2                                                                       4
+  tile_scheduler ← StreamKTileScheduler(NSMs )               ▷ Section 3.3                        5                                 TensorCore MMA
+  # launching blocks proportional to SMs                                           registers to global
+                                                                                       memory copy                                   Shared Memory
+  Nblocks ← tile_scheduler.num_blocks()
+  # ————— Kernel Launches and Device-side Code —————                                                  Outputs                         Global Memory
+  parallel for block index b ← 1 to Nblocks do
+      # partitioning works for this block
+      tile_scheduler.initialize(b)                                               Figure 1: A simplified view of a kernel that fuses the de-
+      # copy lookup table from global to shared memory                           quantization and matmul steps. Each threadblock (group of
+      copyg→s (Tgv , Tsv )
+      # initialize the register-backed accumulator
+                                                                                 threads) is responsible for computing one or more output tiles
+      Yr ← 0                                                                     by performing the matrix product between specific rows of
+      # main loop (pipelined in practice, not shown here)                        inputs and columns of weights. (1) The threadblock issues
+      while ¬tile_scheduler.done() do                                            asynchronous copy instructions to fetch small chunks of input
+          # copy data tile from global to shared memory
+          # (X is shown but the same applies to Q1 , Q2 , S)
+                                                                                 data (tiles) from global memory to shared memory. (2) As
+          itile , jtile , ktile ← tile_scheduler.get_tile_index()                soon as a tile arrives in shared memory, it is further sliced into
+          copyg→s (Xg [itile , ktile , :, :], Xs )                               smaller chunks (fragments) and copied into registers. (3) Once
+          for fragment index tfragment ← 1 to Nfragments do                      all necessary components are in the registers, the quantized
+              # copy data fragment from shared memory to registers
+              # (X is shown but the same applies to Q1 , Q2 , S)
+                                                                                 matrix undergoes dequantization. (4) The dequantized matrix
+              copys→r (Xs [tfragment , :], Xr )                                  and inputs are then processed by Tensor Cores using MMA
+              # combine two bit-slices in registers (3-bit)                      (Matrix Multiply Accumulate) instructions. (5) Finally, the
+              Qr1+2 ← combine(Qr1 , Qr2 )                    ▷ Section 3.1       accumulated results are written back from the registers to the
+              # vectorized dequantization in registers
+                   r                          r       r  s
+                                                                                 outputs in global memory.
+              W ← vec_dequantize(Q1+2 , S , T )
+              c                                              ▷ Section 3.2
+              # i.e., Y r ← Y r + Xr W       cr
+              Y r ← tensor_core_mma(Y r , Xr , W        c r)                     width constraints (§3.2), and Stream-K workload
+          end for
+          if tile_scheduler.end_of_output_tile() then                            partitioning to minimize wave quantization (§3.3).
+              b r ← to_fp16(Y r )
+              Y                                              ▷ Section 3.3
+              # write output tile from Registers to HBM
+                                                                                 Alg. 1 gives a simplified version of the FLUTE ker-
+              copy   r→g b r     g
+                          (Y , Y [itile , jtile , :])                            nel, while Fig. 1 shows a high-level overview. (See
+          end if
+          # update the internal counter of scheduler                             Alg. 2 in the Appendix for more details).
+          tile_scheduler.step()
+      end while
+  end parallel for                                                               3.1      Offline Matrix Restructuring
+                                                                                 Modern GPUs feature specialized primitives (Ten-
+   However, implementing a fused weight-only                                     sor Cores)—distinct from general-purpose vector
+LUT-quantized matmul that leads to speed-ups                                     ALUs—which can substantially accelerate dense
+presents several challenges. For one, high-                                      matrix multiplications. For example, A100’s FP16
+performance matmul necessitates the use of special-                              tensor core matmuls are 16× faster than FP32 vec-
+ized primitives, such as Tensor Cores, which have                                tor matmuls. However, this acceleration comes
+strict requirements regarding the types, shapes, and                             at the expense of generality and programmability.
+layout of data. Second, efficient dynamic indexing                               Tensor Core MMA (matrix-multiply-accumulate) op-
+is crucial for LUT-based dequantization; however,                                erations require the input matrices to adhere to
+GPUs do not natively support dynamic indexing of                                 specific layout specifications within the registers
+a lookup table in their fastest on-chip registers. Fi-                           of 32 threads. The fused kernel needs to first load
+nally, with smaller input matrices arising from low-                             fragments of the quantized weight into registers, de-
+bit and low-batch deployment, achieving workload                                 quantize the matrix, and then perform the MMA oper-
+balance across SMs is vital for maintaining speed,                               ation between the input fragments and dequantized
+thus necessitating sophisticated partitioning strate-                            matrix fragments. This necessitates that the post-
+gies. FLUTE addresses these challenges through a                                 dequantization matrix layout meets the required
+combination of offline restructuring of the quan-                                specifications. While runtime data reordering is
+tized weight matrix (§3.1), vectorization and dupli-                             one approach, it introduces a substantial number
+cation of the lookup table to mitigate shared band-                              of operations. Instead, we leverage the fact that Q
+
+                                                                             4
+                                Quantized Weights
+         int-4       int-4
+                                                                                 Slice-K (2D View)      Slice-K (3D View)             Stream-K (3D View)
+                                                                                        N
+
+                                      int16    int16
+                    unpacking
+
+                                                                                                                SM0   SM1   SM2             SM0   SM1   SM2
+                 (shift + mask)                              lookup table
+
+                    vectorized
+
+                  table lookup                                                   K
+                                                                                                       K                          K
+                                                                   write
+
+vectorized
+
+                                                                   results
+   scaling
+
+                                              Dequantized
+
+                             Scales                                          M                   M                           M
+                                                 Weights                                                   N                          N
+
+
+
+Figure 2: Vectorized Lookup Table Design (Left). Instead of dequantizing one element at a time, we vectorize the lookup
+table by creating another table that holds the values of all possible pairs of indices. This can look up two values simultaneously,
+followed by efficient vectorized scaling operations. Stream-K Work Decomposition (Right). In classic work decomposition,
+output tile production is independently assigned to threadblocks. Each threadblock processes one (or more) rows of the left
+operand and one (or more) columns of the right operand, slicing down the inner K dimension to compute the corresponding
+output tile (Slice-K). However, when the weight matrix is heavily quantized, the reduced size can lead to “stragglers” in Slice-K
+due to uneven workload assignment. Stream-K (Osama et al., 2023) addresses this by decomposing work at a finer granularity,
+enabling multiple threadblocks to collaboratively compute a single output tile.
+
+(the quantized weights) are static during inference,                                             is minimal compared to the rest of memory usage.
+allowing for offline weight reordering such that af-                                             For example, for 4-bit LUT the table has only 24
+ter dequantization, the weights are already laid out                                             elements of 16-bit values, and thus the vectorized
+exactly in the expected format (Frantar et al., 2024;                                            table has only 28 elements of 32-bit values, slightly
+Xia et al., 2024b; Lin et al., 2024).                                                            more than 1KB of storage. This is a fraction of the
+   The above strategy is difficult to straightfor-                                               48KB-163KB of shared memory on modern GPUs.
+wardly extend to the case of non-evenly-divisible                                                Reducing bank conflicts. Shared memory is or-
+bit widths (e.g., 3 bits). Kernels employ vector-                                                ganized such that each successive 32-bit segment
+ized data access when loading data from global                                                   corresponds to a “bank”, and there are 32 such
+to shared memory. Hence each thread should ac-                                                   banks. Each memory address in shared memory
+cess the quantized weight in granularity of 128 bits                                             corresponds to the ⌊ addr
+                                                                                                                        32 ⌋ mod 32 bank. If threads
+(or at least in powers of 2). While this could be                                                in a warp access data from different banks, access
+addressed by padding, this would be inefficient.                                                 is parallelized. However, if two threads access data
+We instead split the (3-bit) quantized weight into                                               from the same bank (but not the same address),
+two partitions (Xia et al., 2024b), or bit-slices: one                                           the access is serialized. For the 4-bit and 3-bit
+containing the 1-bit portion and the other the 2-bit                                             vectorized tables, a simple implementation could
+portion, and issue two separate vectorized (asyn-                                                thus cause up to 8-way bank conflicts (4-bit) or
+chronous) data copy instructions. Once the two                                                   2-way bank conflicts (3-bit). To mitigate this, we
+bit-slices are loaded into the registers, we combine                                             duplicate the 4-bit vectorized lookup table multiple
+them before dequantization.                                                                      times, placing copies in different memory banks,
+3.2 Vectorized Lookup in Shared Memory                                                           which allows threads to access values from differ-
+During dequantiation each element c in the quan-                                                 ent banks with reduced bank conflicts.
+tized array needs to access a 16-bit element T[c]                                                3.3 Stream-K Workload Partitioning
+from the lookup table. Each thread needs to access                                               For high SM occupancy, standard matmul imple-
+the lookup table using different indices, and such                                               mentations block the computation using a data-
+“non-uniform access” can degrade runtime perfor-                                                 parallel tiling of the output matrix, where a group
+mance when implemented naïvely. While storing                                                    of threads ( “thread block”) is assigned to com-
+the lookup table in on-chip shared memory can re-                                                pute the work on one output tile. This is shown
+duce expensive off-chip memory access, this still                                                on the left of Figure 2. As each thread block can
+introduces significant traffic to shared memory. To                                              only occupy one SM, it is important to avoid “wave
+reduce memory access instructions we “vectorize”                                                 quantization”, which happens when the number of
+the lookup operation by accessing two elements at                                                output tiles is not an even multiple of the number
+a time (Fig. 2, left). We build an alternative lookup                                            of processor cores. In this case the last wave uses
+table for every possible pair of values, with each                                               only a subset of the cores, leaving the rest idle.
+element containing a tuple of 16-bit values. The                                                    Wave quantization and workload imbalance are
+storage overhead from the vectorized lookup table                                                especially problematic in low-bit and low-batch
+
+                                                                                             5
+                                        Marlin (4-bit, integer)     BitBlas (4-bit, integer)
+                                                                                                        FLUTE (4-bit, LUT)
+                                        BitsandBytes (4-bit, LUT)   BitBlas (4-bit, LUT)
+
+                                    4
+                                    3
+                            A6000
+
+                                    2
+                                    1
+Speedups against torch.mm
+
+
+
+
+                                    0
+                                    4
+                                    3
+                            A6000
+
+
+
+
+                                    2
+                                    1
+                                    0
+                                    4
+                                    3
+                            A100
+
+
+
+
+                                    2
+                                    1
+                                    0
+                                    4
+                                    3
+                            A100
+
+
+
+
+                                    2
+                                    1
+                                    0
+                                        1 2 4 8 16 32 1 2 4 8 16 32 1 2 4 8 16 32 1 2 4 8 16 32 1 2 4 8 16 32
+                                                                    Batch Size
+ Figure 3: Runtime performance of FLUTE in the standard W4G128 setting where, the weights are quantized to 4 bits in groups
+ of 128. We show speedup against 16-bit torch.mm. The matrix shapes for our benchmarks are selected based on those used
+ in Llama-3-8B (top row) and Llama-3-70B (bottom row) models. For each M-N-K shape tuple, we generate three random
+ sets of data, run each kernel on the data 100 times, and average. While our main comparisons are against other LUT kernels
+ (bitsandbytes, BitBLAS-NF4), for reference we also include comparisons with kernels that only support uniform (integer)
+ dequantization (Marlin, BitBLAS). These results are represented with dashed lines in our figures.
+
+ scenarios, which result in smaller input matrices                        and write back these sums. For numerical stability,
+ (activations and quantized weights), thus making                         most kernels perform multiplications in FP16 but
+ the effect of wave quantization more pronounced.                         accumulate results in FP32. However, writing to
+ To mitigate this, we implement a method known as                         global memory in FP32 results in significant traf-
+ Stream-K workload decomposition (Osama et al.,                           fic. We thus implement in-register accumulation in
+ 2023), which distributes the tiles such that each                        FP32 and globally reduce partial sums in FP16.
+ SM’s computations can span beyond specific rows
+                                                                          4   Experiments
+ or columns. This method is depicted on in Fig. 2
+ (Right). Here, the 35 M-N-K tiles are more evenly                        Our experiments consist of two settings: kernel-
+ divided among the 3 SMs than in the simpler Slice-                       level experiments which compare FLUTE matmuls
+ K partitioning (Figure 2, middle), in which SM’s                         standalone against existing mixed-input matmul
+ computations do not span beyond rows/columns.                            kernels (§4.1), and end-to-end experiments which
+                                                                          assess whether practicals speed-ups are obtainable
+  Mixed precision accumulation and global reduc-                          on realistic LLM workloads (§4.2).
+  tion. In Stream-K, when multiple SMs compute
+  the same M-N dimension across different K tiles,                        4.1 Kernel Benchmarks
+  they must reconcile their partial sums in off-chip                      For each matrix size, we compile multiple instan-
+  global memory. SMs that complete their share of                         tiations of the kernel with various configurations,
+  K tiles write their partial sums to a global scratch                    including different tile sizes, pipeline stages, and
+  space, allowing subsequent SMs to read, reduce,                         the number of lookup table duplicates, selecting
+
+                                                                      6
+                                           group size = 32    group size = 32       group size = 32
+
+                            A6000          group size = 64
+                                           group size = 128
+                                                              group size = 64
+                                                              group size = 128
+                                                                                    group size = 64
+                                                                                    group size = 128                A100
+                                           group size = 256   group size = 256      group size = 256
+Speedups against torch.mm
+
+
+
+
+                                    Batch Size (M)                                          Batch Size (M)
+
+
+Figure 4: Runtime performance at various bit-widths and group sizes with N=K=8192. FLUTE consistently achieves speedups
+across different settings, including the in the 3-bit configuration.
+
+the best-performing configuration based on bench-                      4x (modulo the overhead coming from scales).
+marking.1 We compare FLUTE against a collec-                           FLUTE achieves favorable performance across a
+tion of weight-quantized matrix multiplication ker-                    wide range of matrix shapes on both A6000 and
+nels, including those capable of flexible LUT-based                    A100, occasionally nearing the peak theoretical
+dequantization such as bitsandbytes (Dettmers                          speedup (of 4x) on A6000. Other LUT-compatible
+et al., 2023)2 and BitBLAS (Wang et al., 2024).                        kernels achieve similar speedups only with a batch
+LUT quantization method. There are many                                size of 1, and their performance quickly degrades.
+methods for LUT quantization; we follow the                            FLUTE also compares favorably to Marlin, which
+popular NormalFloat LUT quantization scheme                            is highly specialized for cases where the input is
+(Dettmers et al., 2023), where a tensor-level table                    FP16 and the weight is uniform-quantized to INT4.
+T is modified to be a group-level table via a scaling                     We further showcase the flexibility of FLUTE
+factor sg for each group g, resulting in a group-                      by experimenting with different group sizes not
+level table Tg = [sg · v0 , . . . , sg · v2b −1 ]. Here                just in terms of its lookup-table design but also in
+sg ∈ R+ is a scalar that varies per group. This ap-                    supporting various bit-widths and group sizes. In
+proach requires maintaining a tensor-level lookup                      particular, FLUTE can perform multiplications with
+                                         d2 /g                         3-bit matrices (§3.1), a capability that the afore-
+table T and group-level scalars {sg }g=1 , and thus
+incur almost the same memory overhead as uni-                          mentioned alternatives do not support. The results
+form quantization (which also requires maintaining                     in Figure 4 demonstrate consistent speed-ups over
+the group-level scalars). While we primarily focus                     torch.mm across across a wide rage of settings.
+on LUT kernels, for completeness we also com-                          4.2   End-to-End LLM Benchmarks
+pare against high-performance kernels specialized
+                                                                       As an application of FLUTE, we experiment with
+for uniformly quantized weights (BitBLAS3 and
+                                                                       quantizing LLaMA3-8B and LLaMA3-70B. The
+Marlin4 (Frantar et al., 2024)). These kernels do
+                                                                       LLaMA3 family of models has been found to be
+not require dynamic indexing into a lookup table
+                                                                       more difficult to quantize than other open source
+and can perform dequantization in registers using
+                                                                       models (Chen et al., 2024), and thus presents a
+highly tuned PTX assembly instructions that are
+                                                                       testing ground for different quantization strategies.
+not applicable to LUT-based dequantization.
+                                                                            For the LUT quantization method, we use a sim-
+Results. Figure 3 presents the results with the
+                                                                       ple extension of NormalFloat (NF) quantization
+standard setting of 4-bit quantization and a group
+                                                                       (Dettmers et al., 2023). Standard NF quantiza-
+size of 128, where memory traffic is reduced by
+                                                                       tion calculates 2b−1 evenly-spaced values from
+    1
+      Concretely, we randomly generate three sets of input data        [δ, 21 ], and 2b−1 + 1 evenly-spaced values from
+based on the matrix shapes for 8B/70B LLMs, run the kernel             [ 21 , 1 − δ], where δ = 12 ( 30   1
+                                                                                                            + 32 1
+                                                                                                                    ). This re-
+on the data 100 times, and report the average performance on                         b
+both A100 and A6000 GPUs.                                              sults in 2 probability values [p0 , . . . , p2b −1 ] where
+    2
+      For most of the kernels, we pre-allocate the output mem-         p0 = δ, p2b−1 −1 = 21 , and p2b −1 = 1 − δ.
+ory buffer and use the out keyword to exclude the memory               These probabilities are converted into quantiles
+allocation time from our measurements. However, as of this
+writing, bitsandbytes still allocates memory in some cases.            [q0 , . . . , q2b −1 ] where qi = Φ−1 (pi ) is the Gaus-
+Our preliminary experiments indicate that this introduces an           sian quantile for pi . The quantiles are then normal-
+overhead of approximately 2.5%.
+    3                                                                  ized to [−1, 1] by q̃i = q qbi . Then, given a group
+      https://github.com/microsoft/BitBLAS                                                         2 −1
+    4
+      https://github.com/IST-DASLab/marlin                             of weights u = [u1 , . . . , uB ] and the absmax value
+
+                                                                   7
+s = max(|u|) for that group, the weights uj in                                 output length, and batch size to assess perfor-
+this group are quantized to the nearest quantile,                              mance under different conditions.
+                                            u
+i.e., cj = arg mini∈{0,...,2b −1} q˜i − sj . Given
+                                                                           For the 70B model, the unquantized model does
+an NF-quantized matrix Q ∈ {0, . . . , 2b − 1}k×n ,
+                                                                        not fit into a single GPU. Consequently, we ap-
+the matmul kernel loads the tensor-level lookup
+                                                                        ply tensor parallelism across 4xA6000 or 2xA100
+table T = [q̃0 , . . . q̃2b −1 ], as well as the group-
+                                                                        GPUs. Since the quantized model fits into a single
+level scales s1 , . . . s kn , and then dequantizes via
+                          B                                             GPU, we report two sets of numbers (single- and
+T[Qij ] · s(i×j) mod B .                                                multi-GPUs) to represent different use cases.
+   Our simple extension builds upon the above
+                                                                        Results. We first compare our “learned NF quan-
+by using calibration data to refine the scales,
+                                                                        tization” approach against standard 4- and 3-bit
+which has been found to be beneficial for uni-
+                                                                        setting with group size 128 against other quanti-
+form quantization (Shao et al., 2023). Since the
+                                                                        zation methods. The results are shown in Table 2,
+lookup table consists of quantiles from N 0, σ 2
+                                         1                              where we find that this variant of LUT quantiza-
+with standard deviation σ = Φ−1 (1−δ)          , we can
+                                                                        tion improves upon ordinary NF quantization and
+reformulate the quantization function as cj =
+                                                                        compares favorably against existing baselines. See
+arg mini∈{0,...,2b −1} |sσ̃qi − uj |. For learning, we
+                      1
+                                                                        Tables 3 and 4 of the appendix for the full results.
+initialize σ̃ = Φ−1 (1−δ)     and optimize this with gra-               We also find that combining NF with AWQ (Lin
+dient descent against the negative log-likelihood                       et al., 2023) to be beneficial, although a learned
+of calibration samples, where we use the straight-                      NF+AWQ did not help. (However we emphasize
+through estimator.5 After learning, we can save sσ̃    σ                that the quantization method itself is not the main
+as the new scale, and hence the number of scalar                        contribution of the present work.) We next exploit
+values to be loaded for dequantization remains un-                      the flexibility of FLUTE and conduct end-to-end ex-
+changed. We use use 128 examples of length 2048                         periments with various bit- and group-size settings.
+from WikiText-2 training as our calibration dataset.                    This is shown in Table 1. With small enough group
+   We conducted end-to-end evaluations by inte-                         sizes, our approach is able to almost approach the
+grating the FLUTE kernels into two libraries:                           16 bit baseline in terms of WikiText2 perplexity.8
+                                                                        We are able to observe meaningful speedups even
+  1. GPT-Fast6 is a simple yet performant                               in the end-to-end case over an optimized baseline.
+     PyTorch-native implementation for trans-                              Finally, we evaluated end-to-end latency using
+     former text generation. We follow most                             the popular model service framework vLLM (Kwon
+     of its default settings, running benchmarks                        et al., 2023). Based on our earlier experiments, we
+     with a batch size of 1.7 We additionally                           selected a group size of 64, which strikes a good
+     use torch.compile to optimize the model,                           balance between quality and speed. We conducted
+     which, in early experiments, nearly tripled the                    experiments across various configurations, includ-
+     throughput of the 16-bit unquantized model.                        ing bit precision, model sizes, number of GPUs,
+                                                                        input lengths, output lengths, and batch sizes. Addi-
+  2. vLLM (Kwon et al., 2023) is a high-throughput                      tionally, we conducted experiments with the newly
+     and memory-efficient inference and serving                         released Gemma-2 models (9B and 27B). For the
+     engine for LLMs widely used in practice. We                        largest open-sourced Gemma-2 27B model, which
+     benchmarked the latency of processing a sin-                       fits into a 2xA6000 and 1xA100 setup, we adjusted
+     gle batch of requests, following most of its                       the tensor parallelism settings accordingly. The
+     default settings, but varied the input length,                     results, presented in Fig. 5, further showcase the
+   5
+                                                                        end-to-end performance of the kernel.
+      We also experimented with a variant of this approach
+where each value of the tensor-level lookup table is updated
+                                                                           To demonstrate the scalability of our approach,
+to be the average of all the weights that were bucketed to that         we evaluated FLUTE on the LLaMA-3.1 (405B)
+value (as in K-means). We did not find meaningful improve-              model (Dubey et al., 2024), shown in Fig. 6. It is
+ments with this approach.
+    6
+      https://github.com/pytorch-labs/gpt-fast
+                                                                        worth noting that, without quantization, the 405B
+    7
+      This configuration makes the reported tokens per second           model’s parameters alone would require multiple
+(tokens/s) equivalent to “tokens/s/user.” We set the prompt             GPU nodes. However, with FLUTE, we were able
+length to just 1, focusing our measurements on the decoding
+                                                                           8
+step in text generation rather than the prefill stage. We also do            Note that the WikiText-2 validation data is different from
+not use CUDA Graphs due to its incompatibility with FLUTE.              the calibration data.
+
+
+                                                                    8
+     Model                   Configuration               Perplexity                       Tokens / Second
+                     Bits Group Bits / Param        GB WikiText2 C4           1xA6000    4xA6000    1xA100      2xA100
+     LLaMA-3 8B        16    N/A         16.00     15.1            6.1 8.9 44.8 1.0x                90.2 1.0x
+                        4     32          4.50      5.7            6.1 9.4 91.3 2.0x               113.7 1.3x
+                        4     64          4.25      5.5            6.1 9.4 95.9 2.1x               119.4 1.3x
+                        4    128          4.13      5.4            6.2 9.5 98.1 2.2x               121.6 1.3x
+                        4    256          4.06      5.4            6.3 9.5 99.8 2.2x        -      121.7 1.3x     -
+                        3     32          3.50      4.9            6.9 11.0 91.9 2.1x              117.7 1.3x
+                        3     64          3.25      4.7            7.2 11.3 104.1 2.3x             128.5 1.4x
+                        3    128          3.13      4.6            7.5 11.7 108.1 2.4x             133.5 1.5x
+                        3    256          3.06      4.6            7.9 12.2 110.0 2.5x             135.5 1.5x
+     LLaMA-3 70B       16    N/A         16.00 131.7               2.9 6.7     OOM OOM 17.2 1.0x     OOM OOM 19.9 1.0x
+                        4     32          4.50 40.1                3.0 7.0    12.6 - 33.0 1.9x      17.4 - 28.3 1.4x
+                        4     64          4.25 38.1                3.0 7.1    13.5 - 33.1 1.9x      18.0 - 29.5 1.5x
+                        4    128          4.13 37.1                3.1 7.2    14.7 - 33.1 1.9x      18.6 - 30.3 1.5x
+                        4    256          4.06 36.6                3.5 7.8    15.2 - 32.9 1.9x      19.0 - 31.0 1.6x
+                        3     32          3.50 32.1                3.9 8.0    13.3 - 32.8 1.9x      20.0 - 30.8 1.5x
+                        3     64          3.25 30.1                4.1 8.4    16.3 - 33.3 1.9x      22.4 - 33.8 1.7x
+                        3    128          3.13 29.1                5.2 10.1   17.7 - 32.7 1.9x      23.9 - 34.5 1.7x
+                        3    256          3.06 28.6               15.4 26.4   18.6 - 33.6 2.0x      24.9 - 34.8 1.7x
+
+Table 1: Perplexity and decoding speed of LLaMA-3 with learned NF quantization using various quantization configurations.
+Decoding speedup is measured in tokens per second. The unquantized LLaMA-3 70B model requires multiple GPUs with Tensor
+Parallelism. Therefore, we report the speed with one GPU, and with Tensor Parallelism applied (labeled as x4 and x2). For the
+8B models, since all models fit into one GPU, we report only single GPU results.
+
+
+#P    Method
+                     Wiki PPL ↓ C4 PPL ↓ LLM Eval ↑                   zation functions, our hope is that FLUTE can enable
+                     4-bit   3-bit 4-bit 3-bit 4-bit      3-bit       researchers and practitioners to explore new quanti-
+8B    Unquantized        6.1        8.9        68.6                   zation algorithms that can learn better lookup tables
+      RTN             6.7    9.7 12.2 16.6 67.8    58.7               (Yamamoto, 2021; Cardinaux et al., 2020; Wang
+      GPTQ            6.5    9.6 9.4 11.7 67.8     60.6               et al., 2022). For example, recent work has found
+      AWQ             6.6    8.2 9.4 11.5 68.2     64.8
+      OmniQuant       6.6    8.4 10.1 13.5 68.3    62.4               that codebook-based quantization schemes—which
+      NF              6.6     9.2   9.5 13.0 68.0         62.3
+                                                                      generalize lookup tables to vector-valued values—
+      NF + AWQ        6.5     8.0   9.3 11.5 67.8         65.1        can enable even lower-bit (e.g., 2-bit) LLM quan-
+      NF (learned)    6.2     7.5   9.5 11.7 67.9         63.7        tization without significant performance degrada-
+70B Unquantized          2.9          6.7            75.3             tions (Tseng et al., 2024; Egiazarian et al., 2024).
+    RTN               3.6 11.6      7.9 17.1     74.0    65.3         We anticipate that ideas from this work can aid in
+    GPTQ              3.4    5.3    7.0 8.6      74.8    71.3
+    AWQ               3.3    4.7    7.0 7.9      74.8    73.7         developing kernels for such methods.
+    OmniQuant         3.3    5.4    7.5 9.3      74.2    70.2            Algorithmic considerations aside, one of the
+      NF              3.4     8.7   7.6 16.7 74.0         64.3        main challenges in developing fused quantized ma-
+      NF + AWQ        3.2     4.6   6.9 7.8 75.2          73.8
+      NF (learned)    3.1     5.2   7.2 10.1 74.4         66.4
+                                                                      trix multiplication kernels stems from the lack of
+                                                                      hardware support for “mixed-type” instructions,
+Table 2: Evaluation of post-training quantization on LLaMA3-          necessitating software-level implementations. Ex-
+8B and LLaMA3-70B. The RTN, GPTQ (Frantar et al., 2022),              isting Tensor Core instructions support scenarios
+AWQ (Lin et al., 2023) results are from Chen et al. (2024);
+the rest are from our implementations. All non-NF methods             where the input and output/accumulation data have
+use uniform weight quantization.                                      different types (e.g., compute in FP16 and out-
+                                                                      put/accumulate in FP32). However, they do not
+to perform inference on a single node, highlighting
+                                                                      support cases where the input operands themselves
+the efficiency and scalability of our solution.
+                                                                      are of different types (e.g., FP16 inputs and INT4
+5    Discussion and Conclusion                                        weights). As weight-only quantization becomes in-
+Early work on LLM quantization generally worked                       creasingly common in LLM inference applications,
+with uniform quantization methods (Frantar et al.,                    native support for such instructions in future hard-
+2022; Dettmers et al., 2022; Xiao et al., 2022).                      ware could be beneficial. Additionally, the lack of
+More recent work has shown the benefits of LUT-                       in-register dynamic indexing means that develop-
+quantization, both from PTQ (Kim et al., 2023) and                    ers must devise software solutions. Enhanced hard-
+finetuning (Dettmers et al., 2023) perspectives. In-                  ware acceleration for indexing into small lookup
+sofar as lookup tables can represent flexible quanti-                 tables could also prove beneficial in the upcoming
+
+                                                                  9
+                          LLaMA-3 (A6000)   LLaMA-3 (A100)              Gemma-2 (A6000)             Gemma-2 (A100)
+Single GPU
+
+             (8B, 9B)
+
+
+
+
+                                                                          NA NA NA NA
+Single GPU
+
+             (70B, 27B)
+Tensor Parallel
+
+             (70B, 27B)
+
+
+
+
+                                                                                                         Unquantized
+                                                                                                         4-bit
+                                                                                                         3-bit
+
+
+
+
+  Figure 5: End-to-end latency benchmark for processing a single batch of requests using vLLM. We evaluated LLaMA-3 (8B and
+  70B) and Gemma-2 (9B and 27B) models with various configurations, including different bits, model sizes, number of GPUs,
+  input lengths, output lengths, and batch sizes. The models were quantized using a group size of 64 to achieve a good balance
+  between quality and speed.
+
+                                                                    does not take advantage of the newer hardware
+                                                                    features available in subsequent generations, such
+                                                                    as Hopper GPUs (H100). However, the majority
+                                                                    of the methods discussed could still be applica-
+                                                                    ble to the newer hardware. For Ampere genera-
+                                                                    tion GPUs, the latest tensor cores support perform-
+                                                                    ing MMA operations on matrix fragments of shape
+                                                                    [16,16]x[16,8]. When the batch size is smaller
+                                                                    than 16, input data needs to be padded within
+  Figure 6: End-to-end vLLM latency benchmark for processing
+  a single batch of requests using LLaMA-3.1 (405B, W4G64).         shared memory. Although this padding increases
+                                                                    on-chip data movements (between shared mem-
+  generations of AI accelerator hardware.
+                                                                    ory and registers) and computations, it does not
+  6                Conclusion                                       increase data movement between off-chip and on-
+                                                                    chip memory, allowing us to achieve speed-ups in
+  This work introduces FLUTE, a CUDA kernel de-                     memory-bound cases. In such scenarios, switching
+  signed for fused quantized matrix multiplications                 to SIMT cores could further enhance performance.
+  to accelerate LLM inference. FLUTE offers flexi-                  FLUTE is designed for memory-bound scenarios
+  bility, supporting flexible mappings between quan-                such as LLM decoding. Its performance tends to
+  tized and dequantized values through a lookup ta-                 degrade with larger batch sizes, which are more
+  ble, and accommodating a wide range of bit widths                 common during training when the workload be-
+  and group sizes. We demonstrate its performance                   comes more compute-bound. Finally, while FLUTE
+  through both kernel-level benchmarks and end-to-                  demonstrates strong performance among kernels
+  end evaluations on state-of-the-art LLMs.                         that support LUT-based dequantization, its perfor-
+                                                                    mance on A100s still falls short of the peak per-
+  Limitations                                                       formance that kernels specialized for uniformly
+  FLUTE has several limitations. For one, it is mostly              quantized matrices can achieve.
+  optimized for Ampere-generation GPUs, and it
+
+                                                               10
+Acknowledgements                                                 models via additive quantization. arXiv preprint
+                                                                 arXiv:2401.06118.
+We thank Yijie Bei and Dmytro Ivchenko for help-
+ful discussion. HG was supported by a Microsoft                Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and
+                                                                  Dan Alistarh. 2022. GPTQ: Accurate post-training
+PhD Fellowship. EX acknowledges the support
+                                                                  compression for generative pretrained transformers.
+of NGA HM04762010002, NSF IIS1955532,                             arXiv preprint arXiv:2210.17323.
+NSF CNS2008248, NIGMS R01GM140467,
+NSF IIS2123952, NSF DMS2027737, NSF                            Elias Frantar, Roberto L Castro, Jiale Chen, Torsten
+                                                                  Hoefler, and Dan Alistarh. 2024. Marlin: Mixed-
+BCS2040381,       NSF DMS2112273,          NSF
+                                                                  precision auto-regressive parallel inference on large
+IIS2311990, Semiconductor Research Cor-                           language models. arXiv preprint arXiv:2408.11743.
+poration (SRC) AIHW award 2024AH3210, and
+DARPA ECOLE HR00112390063. This study was                      Amir Gholami, Zhewei Yao, Sehoon Kim, Coleman
+                                                                Hooper, Michael W Mahoney, and Kurt Keutzer.
+additionally supported by MIT-IBM Watson AI                     2024. AI and memory wall. IEEE Micro.
+Lab and the MLA@CSAIL initiative.
+                                                               Han Guo, Philip Greengard, Eric P Xing, and Yoon
+                                                                 Kim. 2024. LQ-LoRA: Low-rank plus quantized
+References                                                       matrix decomposition for efficient language model
+                                                                 finetuning. In Proceedings of ICLR.
+Saleh Ashkboos, Ilia Markov, Elias Frantar, Tingxuan
+  Zhong, Xincheng Wang, Jie Ren, Torsten Hoefler,              Wei Huang, Xudong Ma, Haotong Qin, Xingyu Zheng,
+  and Dan Alistarh. 2023. Towards end-to-end 4-bit               Chengtao Lv, Hong Chen, Jie Luo, Xiaojuan Qi, Xi-
+  inference on generative large language models. arXiv           anglong Liu, and Michele Magno. 2024. How good
+  preprint arXiv:2310.09259.                                     are low-bit quantized LLaMA3 models? an empirical
+                                                                 study. arXiv preprint arXiv:2404.14047.
+Saleh Ashkboos, Amirkeivan Mohtashami, Maximil-
+  ian L Croci, Bo Li, Martin Jaggi, Dan Alistarh,              Sehoon Kim, Coleman Hooper, Amir Gholami, Zhen
+  Torsten Hoefler, and James Hensman. 2024. Quarot:              Dong, Xiuyu Li, Sheng Shen, Michael W Ma-
+  Outlier-free 4-bit inference in rotated LLMs. arXiv            honey, and Kurt Keutzer. 2023. SqueezeLLM:
+  preprint arXiv:2404.00456.                                     Dense-and-sparse quantization. arXiv preprint
+                                                                 arXiv:2306.07629.
+Fabien Cardinaux, Stefan Uhlich, Kazuki Yoshiyama,
+  Javier Alonso García, Lukas Mauch, Stephen Tiede-            Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+  mann, Thomas Kemp, and Akira Nakamura. 2020.                  Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E.
+  Iteratively training look-up tables for network quan-         Gonzalez, Hao Zhang, and Ion Stoica. 2023. Effi-
+  tization. IEEE Journal of Selected Topics in Signal           cient memory management for large language model
+  Processing, 14(4):860–870.                                    serving with pagedattention. In Proceedings of the
+Mengzhao Chen, Wenqi Shao, Peng Xu, Jiahao                      ACM SIGOPS 29th Symposium on Operating Systems
+ Wang, Peng Gao, Kaipeng Zhang, and Ping Luo.                   Principles.
+ 2024. Efficientqat: Efficient quantization-aware
+                                                               Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang,
+ training for large language models. arXiv preprint
+                                                                  Xingyu Dang, and Song Han. 2023.        AWQ:
+ arXiv:2407.11062.
+                                                                  Activation-aware weight quantization for LLM
+Tim Dettmers, Mike Lewis, Younes Belkada, and Luke                compression and acceleration.   arXiv preprint
+  Zettlemoyer. 2022. LLM.int8(): 8-bit matrix mul-                arXiv:2306.00978.
+  tiplication for transformers at scale. Advances in
+  Neural Information Processing Systems, 35:30318–             Yujun Lin, Haotian Tang, Shang Yang, Zhekai Zhang,
+  30332.                                                         Guangxuan Xiao, Chuang Gan, and Song Han. 2024.
+                                                                 QServe: W4A8KV4 quantization and system co-
+Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and                design for efficient LLM serving. arXiv preprint
+  Luke Zettlemoyer. 2023. QLoRA: Efficient finetun-              arXiv:2405.04532.
+  ing of quantized LLMs. Advances in Neural Infor-
+  mation Processing Systems, 36.                               Shuming Ma, Hongyu Wang, Lingxiao Ma, Lei Wang,
+                                                                 Wenhui Wang, Shaohan Huang, Li Dong, Ruiping
+Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey,                 Wang, Jilong Xue, and Furu Wei. 2024a. The era of
+  Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman,                1-bit LLMs: All large language models are in 1.58
+  Akhil Mathur, Alan Schelten, Amy Yang, Angela                  bits. arXiv preprint arXiv:2402.17764.
+  Fan, et al. 2024. The llama 3 herd of models. arXiv
+  preprint arXiv:2407.21783.                                   Yuexiao Ma, Huixia Li, Xiawu Zheng, Feng Ling, Xue-
+                                                                 feng Xiao, Rui Wang, Shilei Wen, Fei Chao, and
+Vage Egiazarian, Andrei Panferov, Denis Kuznedelev,              Rongrong Ji. 2024b. AffineQuant: Affine transfor-
+  Elias Frantar, Artem Babenko, and Dan Alistarh.                mation quantization for large language models. arXiv
+  2024. Extreme compression of large language                    preprint arXiv:2403.12544.
+
+
+                                                          11
+Daisuke Miyashita, Edward H Lee, and Boris Mur-                Haojun Xia, Zhen Zheng, Xiaoxia Wu, Shiyang Chen,
+  mann. 2016. Convolutional neural networks us-                  Zhewei Yao, Stephen Youn, Arash Bakhtiari, Michael
+  ing logarithmic data representation. arXiv preprint            Wyatt, Donglin Zhuang, Zhongzhu Zhou, et al. 2024b.
+  arXiv:1603.01025.                                              FP6-LLM: Efficiently serving large language mod-
+                                                                 els through FP6-centric algorithm-system co-design.
+Aniruddha Nrusimha, Mayank Mishra, Naigang Wang,                 arXiv preprint arXiv:2401.14112.
+  Dan Alistarh, Rameswar Panda, and Yoon Kim. 2024.
+  Mitigating the impact of outlier channels for lan-           Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu,
+  guage model quantization with activation regulariza-           Julien Demouth, and Song Han. 2022. SmoothQuant:
+  tion. arXiv preprint arXiv:2404.03605.                         Accurate and efficient post-training quantization for
+                                                                 large language models. arXiv:2211.10438.
+Muhammad Osama, Duane Merrill, Cris Cecka,
+ Michael Garland, and John D Owens. 2023. Stream-              Shiyu Xu, Qi Wang, Xingbo Wang, Shihang Wang, and
+ K: Work-centric parallel decomposition for dense                Terry Tao Ye. 2021. Multiplication through a single
+ matrix-matrix multiplication on the GPU. In Pro-                look-up-table (LUT) in CNN inference computation.
+ ceedings of the 28th ACM SIGPLAN Annual Sympo-                  IEEE Transactions on Computer-Aided Design of
+ sium on Principles and Practice of Parallel Program-            Integrated Circuits and Systems, 41(6):1916–1928.
+ ming, pages 429–431.
+                                                               Kohei Yamamoto. 2021. Learnable companding quanti-
+Gunho Park, Baeseong Park, Minsub Kim, Sungjae Lee,              zation for accurate low-bit neural networks. In Pro-
+  Jeonghoon Kim, Beomseok Kwon, Se Jung Kwon,                    ceedings of th e IEEE/CVF conference on computer
+  Byeongwook Kim, Youngjoo Lee, and Dongsoo Lee.                 vision and pattern recognition, pages 5029–5038.
+  2022. LUT-GEMM: Quantized matrix multiplica-
+  tion based on luts for efficient inference in large-         Jiwei Yang, Xu Shen, Jun Xing, Xinmei Tian, Houqiang
+  scale generative language models. arXiv preprint                Li, Bing Deng, Jianqiang Huang, and Xian-sheng
+  arXiv:2206.09557.                                               Hua. 2019. Quantization networks. In Proceedings
+Wenqi Shao, Mengzhao Chen, Zhaoyang Zhang, Peng                   of the IEEE/CVF conference on computer vision and
+ Xu, Lirui Zhao, Zhiqian Li, Kaipeng Zhang, Peng                  pattern recognition, pages 7308–7316.
+ Gao, Yu Qiao, and Ping Luo. 2023. OmniQuant:                  Dongqing Zhang, Jiaolong Yang, Dongqiangzi Ye, and
+ Omnidirectionally calibrated quantization for large             Gang Hua. 2018. LQ-Nets: Learned quantization for
+ language models. arXiv preprint arXiv:2308.13137.               highly accurate and compact deep neural networks.
+Albert Tseng, Jerry Chee, Qingyao Sun, Volodymyr                 In Proceedings of the European conference on com-
+  Kuleshov, and Christopher De Sa. 2024. Quip#:                  puter vision (ECCV), pages 365–382.
+  Even better LLM quantization with hadamard in-
+  coherence and lattice codebooks. arXiv preprint              Yilong Zhao, Chien-Yu Lin, Kan Zhu, Zihao Ye, Lequn
+  arXiv:2402.04396.                                               Chen, Size Zheng, Luis Ceze, Arvind Krishnamurthy,
+                                                                 Tianqi Chen, and Baris Kasikci. 2023. Atom: Low-
+Lei Wang, Lingxiao Ma, Shijie Cao, Quanlu Zhang, Ji-              bit quantization for efficient and accurate LLM serv-
+  long Xue, Yining Shi, Ningxin Zheng, Ziming Miao,               ing. arXiv preprint arXiv:2310.19102.
+  Fan Yang, Ting Cao, Yuqing Yang, and Mao Yang.
+  2024. Ladder: Enabling efficient low-precision deep          Aojun Zhou, Anbang Yao, Yiwen Guo, Lin Xu, and
+  learning computing through hardware-aware tensor               Yurong Chen. 2017. Incremental network quanti-
+  transformation. In 18th USENIX Symposium on Op-                zation: Towards lossless CNNs with low-precision
+  erating Systems Design and Implementation (OSDI                weights. arXiv preprint arXiv:1702.03044.
+  24).
+                                                               A    Appendix
+Longguang Wang, Xiaoyu Dong, Yingqian Wang,
+  Li Liu, Wei An, and Yulan Guo. 2022. Learnable               Please see Algorithm 2 for a detailed version of the
+  lookup table for neural network quantization. In Pro-        algorithm, and Tables 3, 4 for detailed experimental
+  ceedings of the IEEE/CVF conference on computer
+  vision and pattern recognition, pages 12423–12433.           results.
+
+Xiuying Wei, Yunchen Zhang, Xiangguo Zhang, Ruihao
+  Gong, Shanghang Zhang, Qi Zhang, Fengwei Yu, and
+  Xianglong Liu. 2022. Outlier suppression: Pushing
+  the limit of low-bit transformer language models.
+  Advances in Neural Information Processing Systems,
+  35:17402–17414.
+Haojun Xia, Zhen Zheng, Yuchao Li, Donglin Zhuang,
+  Zhongzhu Zhou, Xiafei Qiu, Yong Li, Wei Lin, and
+  Shuaiwen Leon Song. 2024a. Flash-LLM: Enabling
+  cost-effective and highly-efficient large generative
+  model inference with unstructured sparsity. In Pro-
+  ceedings of VLDB.
+
+
+                                                          12
+Algorithm 2 FLUTE
+Require: Xg : inputs in HBM
+         Qg : quantized weight in HBM
+         Sg : scales in HBM
+         Tg : lookup table in HBM
+         Y g : outputs in HBM
+         Ssemaphore : scratch space for semaphore in HBM
+         Spartials : scratch space for partials in HBM
+
+  # ————— Offline Preprocessing and Host-side Code —————
+  Qg1 , Qg2 ← reorder_and_split(Qg )                                                                                          ▷ Section 3.1
+  Tgv ← make_vectorized_LUT(Tg )                                                                                              ▷ Section 3.2
+  tile_scheduler ← StreamKTileScheduler(NSMs )                                                                                ▷ Section 3.3
+  Nblocks ← tile_scheduler.num_blocks()                                                              ▷ launching blocks proportional to SMs
+
+  # ————— Kernel Launches —————
+  parallel for block index b ← 1 to Nblocks do
+     tile_scheduler.initialize(b)                                                                        ▷ partitioning works for this block
+     allocates (Xs , Qs1 , Qs2 , Ss , Tsv )                                                      ▷ allocate circular buffer in shared memory
+     allocater (Xr , Qr1 , Qr2 , Qr1+2 , Sr , W
+                                              c r , Yr , Y
+                                                         b r)                                               ▷ allocate fragments in register
+     isread ← 0, iswrite ← 0                                                                                  ▷ shared memory pipeline index
+     ircurrent ← 0, irnext ← 0                                                                                     ▷ register pipeline index
+
+     # ————— Global Memory to Shared Memory Prefetch —————
+     copyg→s (Tgv , Tsv )
+     for prefetch stage tprefetch ← 0 to Nstages−1 do
+        igread ← tile_scheduler.get_tile_index()
+        copyg→s (Xg [b, :, igread ], Xs [:, iswrite ]) # and the same for Q1 , Q2 , S
+        iswrite = (iswrite + 1) mod Nstages
+        tile_scheduler.step()
+     end for
+
+     # ————— Shared to Registers Prefetch —————
+     wait_for_one_tile()
+     copys→r (Xs [ircurrent , isread ], Xr [ircurrent ]) # and the same for Q1 , Q2 , S
+
+     # ————— Pipelined Main Loop —————
+     Yr ← 0
+     while ¬tile_scheduler.done() do
+        for fragment index tfragment ← 1 to Nfragments do
+           if tfragment == Nfragments then
+                wait_for_one_tile()                                                                   ▷ Wait until the next prefetched tile
+                iread = (iread + 1) mod Nstages
+           end if
+           inext ← ircurr + 1
+            r
+                                                                                                      ▷ overlap MMA with next register load
+           copys→r (Xs [irnext , isread ], Xr [irnext ])   # and the same for Q1 , Q2 , S
+           if tfragment == 0 then
+                 g
+                iread ← tile_scheduler.get_tile_index()                                                        ▷ overlap MMA with SMEM load
+                copyg→s (Xg [b, :, igread ], Xs [:, iswrite ])  # and the same for Q1 , Q2 , S
+                iswrite = (iswrite + 1) mod Nstages
+                tile_scheduler.step()
+           end if
+           Q1+2 ← combine(Qr1 , Qr2 )
+              r
+                                                                                                                              ▷ Section 3.1
+           c r ← vectorized_dequantization(Qr , Sr , Ts )
+           W                                                                                                                  ▷ Section 3.2
+                                                            1+2
+           Y r ← tensor_core_mma(Y r , Xr , W         c r)
+        end for
+
+        # ————— StreamK Fixup (partial sums reductions) —————
+        if tile_scheduler.end_of_output_tile() then
+           ifixup ← tile_scheduler.get_fixup_index()
+           b r ← to_fp16(Y r )
+           Y                                                                                                                  ▷ Section 3.3
+           if ¬tile_scheduler.finished_output_tile() then                                              ▷ share partial sums through scratch
+               accumulate_and_store_partials(Y b r , Spartials [ifixup ])
+               signal(Ssemaphore [ifixup ])
+           else
+               if ¬tile_scheduler.started_output_tile() then                                                       ▷ aggregate partial sums
+                   wait(Ssemaphore [ifixup ])
+                   br ← Y
+                   Y      b r + load_partials(Spartials [ifixup ])
+               end if
+               ioutput ← tile_scheduler.get_output_tile_index()
+               epilogue(Yb r , Y g [ioutput ])                                                    ▷ Write output tile from Registers to HBM
+           end if
+        end if
+     end while
+  end parallel for
+
+
+
+
+                                                                            13
+                                                PPL↓                            LLM Eval↑
+              Method        Bits Group
+                                           WikiText2    C4 PIQA ARC-e ARC-c HellaSwag Wino Avg.
+              Unquantized 16      N/A             6.1   8.9    79.6     80.1    50.4         60.2    72.6 68.6
+                            4     128             6.7 9.7      79.1     79.3    48.4         59.0    73.2 67.8
+              RTN
+                            3     128            12.2 16.6     74.2     65.4    36.7         50.9    66.5 58.7
+                            4     128             6.5 9.4      78.9     79.4    47.7         59.2    73.7 67.8
+              GPTQ
+                            3     128             9.6 11.7     73.8     65.2    37.8         55.1    70.8 60.6
+                            4     128             6.6 9.4      79.2     79.6    50.0         59.4    73.0 68.2
+              AWQ
+                            3     128             8.2 11.5     77.7     75.8    44.2         55.4    71.0 64.8
+                            4     128             6.6 10.1     79.1     80.0    49.7         59.4    73.2 68.3
+              OmniQuant
+                            3     128             8.4 13.5     76.4     70.0    40.9         55.1    69.5 62.4
+                            4     128             6.6 9.5      78.6     79.6    49.6         59.0    73.5 68.0
+              NormalFloat
+                            3     128             9.2 13.0     75.4     72.0    40.5         54.4    69.4 62.3
+              NormalFloat 4       128             6.2 9.5      79.0     79.6    49.0         59.4    72.6 67.9
+              learned σ   3       128             7.5 11.7     77.1     74.1    41.7         55.8    69.7 63.7
+              NormalFloat 4       128             6.5 9.3      79.6     78.0    48.5         59.0    73.8 67.8
+              + AWQ       3       128             8.0 11.5     77.0     75.5    44.6         55.9    72.3 65.1
+
+Table 3: Detailed evaluation of post-training quantization on LLaMA3-8B. The RTN, GPTQ (Frantar et al., 2022), AWQ (Lin
+et al., 2023) results are from Chen et al. (2024); the rest are from our implementations. All non-NormalFloat methods use
+uniform weight quantization.
+
+
+
+
+                                                PPL↓                            LLM Eval↑
+              Method        Bits Group
+                                           WikiText2    C4 PIQA ARC-e ARC-c HellaSwag Wino Avg.
+              Unquantized 16      N/A             2.9   6.7    82.4     87.0    60.4         66.4    80.5 75.3
+                            4     128             3.6 7.9      82.3     85.7    57.3         65.8    78.8 74.0
+              RTN
+                            3     128            11.6 17.1     79.1     78.7    48.5         54.2    65.9 65.3
+                            4     128             3.4   7.0    82.3     85.7    59.0         66.1    80.5 74.8
+              GPTQ
+                            3     128             5.3   8.6    80.6     82.1    53.0         62.6    78.1 71.3
+                            4     128             3.3   7.0    82.2     86.4    59.1         65.8    80.4 74.8
+              AWQ
+                            3     128             4.7   7.9    82.3     84.5    58.4         64.3    78.9 73.7
+                            4     128             3.3   7.5    82.0     85.6    58.0         66.0    79.6 74.2
+              OmniQuant
+                            3     128             5.4   9.3    80.8     80.6    50.9         63.7    75.2 70.2
+                            4     128             3.4 7.6      82.0     85.6    56.7         66.1    79.5 74.0
+              NormalFloat
+                            3     128             8.7 16.7     76.6     76.9    42.7         55.8    69.3 64.3
+              NormalFloat 4       128             3.1 7.2      82.3     85.7    58.2         66.4    79.6 74.4
+              learned σ   3       128             5.2 10.1     77.3     76.7    44.3         62.4    71.2 66.4
+              NormalFloat 4       128             3.2   6.9    82.6     86.8    60.1         65.9    80.5 75.2
+              + AWQ       3       128             4.6   7.8    81.4     85.3    58.5         64.6    79.2 73.8
+
+Table 4: Detailed evaluation of post-training quantization on LLaMA3-70B. The RTN, GPTQ (Frantar et al., 2022), AWQ
+(Lin et al., 2023) results are from Chen et al. (2024); the rest are from our implementations. All non-NormalFloat methods use
+uniform weight quantization.
+
+
+
+
+                                                              14
+

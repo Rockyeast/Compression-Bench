@@ -1,0 +1,1089 @@
+                                         ExaGEMM: Exploration Framework for CPU-Driven ML Inference
+                                            via Associative In-Register Computing for Low-Bit GEMM
+                                             Hyunwoo Oh, Suyeon Jang, Hanning Chen, Sanggeon Yun, Ryozo Masukawa, and Mohsen Imani
+                                                                                               University of California, Irvine
+                                                                                               {hyunwooo,m.imani}@uci.edu
+
+                                         Abstract                                                                over-specialized, or infeasible in another. A single fixed kernel or
+                                         Low-bit GEMM is increasingly central to efficient ML inference, yet     narrowly tuned ISA extension struggles to cover this fragmented
+                                         very-low-bit execution remains a poor fit for conventional CPUs.        space, and selecting which CPU support points to design and im-
+                                         Practical deployment spans fragmented regimes—from 1/2/4-bit            plement has not been treated as a first-class design problem.
+                                         weights to varying activation precision—whose feasibility, reuse           Existing approaches leave this support-selection problem unad-
+                                         opportunity, and support cost differ under fixed SIMD and register-     dressed in complementary ways. Software SIMD kernel methods
+                                         file budgets, making lightweight CPU support selection a first-class    such as T-MAC [22] and Vec-LUT [14] execute on stock CPUs
+                                         design problem. We present ExaGEMM, a workload-aware co-                without ISA changes and target fixed precisions, so the hardware
+                                         design and exploration framework for CPU-native low-bit GEMM            support itself is not a design variable. SIMD ISA-extension methods
+                                         via register-resident LUT execution. The key insight is that existing   such as T-SAR [16] do propose microarchitectural support, but com-
+                                         SIMD datapaths already cover table generation and accumulation;         mit to a single regime—ternary LLM—leaving broader 1/2/4-bit and
+arXiv:2607.14622v1 [cs.AR] 16 Jul 2026
+
+
+
+
+                                         the only new hardware is an in-register select/feed mechanism           mixed-precision ML workloads unsupported. Neither category an-
+                                         with explicitly modeled cost. ExaGEMM co-explores parameterized         swers the question a hardware designer faces before tapeout: across
+                                         kernels and lightweight SIMD ISA support using analytical models        a fragmented workload spanning multiple quantization regimes and
+                                         of register feasibility, compute cost, memory traffic, and hardware     implementation-cost constraints, which support points are worth
+                                         overhead, pruning the candidate space by 99.2% before simulation.       implementing in vector CPU designs, and when is one aggres-
+                                         It then identifies non-dominated support points and generates ISA       sive fixed design no longer enough?
+                                         specs, gem5 patches, and GEMM kernels for validation. Across               We present ExaGEMM, a workload-/budget-aware RTL/ISA/ker-
+                                         representative ML models and CPU targets, ExaGEMM improves              nel co-design and exploration framework for register-resident LUT-
+                                         latency by 13.29× over software-only baselines, while showing           based low-bit GEMM on CPUs. The key insight is that table-driven
+                                         that workload-aware frontier selection is especially important for      GEMM can largely reuse existing SIMD addition, dot-product, and
+                                         mixed-precision LLM workloads.                                          accumulation datapaths [1, 13]; the main new hardware is an in-
+                                                                                                                 register select mechanism that applies lookup tables to staged
+                                                                                                                 weight blocks. Because its cost varies with precision, packing gran-
+                                         1   Introduction                                                        ularity, fan-in, tile shape, and mapping style, support cost becomes
+                                         Machine learning (ML) inference is increasingly shaped by low-          an explicit and rankable co-design objective.
+                                         precision matrix multiplication. Across language, vision, and mul-         ExaGEMM analytically co-explores parameterized GEMM ker-
+                                         timodal workloads, quantization reduces model size [6, 9], mem-         nels and lightweight ISA support using models of register feasibility,
+                                         ory traffic [15, 25], and arithmetic cost, making low-bit GEMM a        instruction count, memory traffic, compute cost, and hardware over-
+                                         central deployment kernel. Once weights are pushed to 4-, 2-, or        head. This exploration prunes the candidate support space by 99.2%
+                                         1-bit precision, efficient execution depends on how low-bit sym-        prior to gem5-based evaluation, since detailed cache- and system-
+                                         bols are packed, indexed, accumulated, and mapped onto the target       level effects are too costly to resolve across the full search space.
+                                         processor—a problem compounded by growing demand for private,           ExaGEMM then identifies feasible non-dominated support points
+                                         offline, and cost-sensitive on-device inference [21, 26]. For many      and materializes them as RTL datapath designs, ISA specifications,
+                                         such systems the target is a CPU [16, 24]: separate GPUs, NPUs, or      gem5 ISA-model patches, and GEMM kernels for system-level vali-
+                                         FPGAs introduce area, power, and integration costs that CPU-first       dation. In evaluation across representative vision transformer (ViT)
+                                         or tightly integrated deployments cannot absorb [17].                   and LLM models and vector CPU targets, ExaGEMM improves
+                                            Very-low-bit GEMM is, however, a poor fit for conventional CPU       latency by 1.92–13.29× over software-only SIMD baselines, and
+                                         execution. Table-driven SIMD methods reduce arithmetic cost by          shows that workload-aware frontier selection is especially impor-
+                                         replacing explicit low-bit MACs with a compact activation-derived       tant for mixed-precision LLM workloads.
+                                         lookup [22], but shift the bottleneck to table construction and re-        The contributions of this paper are as follows:
+                                         peated movement through the memory hierarchy [14]. A deeper             • We formulate low-bit CPU GEMM acceleration as a support-
+                                         difficulty is that low-bit deployment is no longer concentrated            selection problem and propose a parameterized execution space
+                                         around a single operating point [14, 18]: practical inference spans        that unifies mapping choices across multiple weight and activa-
+                                         W1A8 [19], W2A8 [10, 20], W4A8 [8], W4A16 [7], and mixed layer-            tion precisions, covering both uniform quantization and inter-
+                                         wise configurations [3, 4, 12, 23], each imposing different pressures      layer mixed-precision models.
+                                         on table size, accumulation structure, register usage, and implemen-    • We define a lightweight SIMD-slice support abstraction in which
+                                         tation cost. Under a fixed SIMD and register-file budget, support          the key new hardware is an in-register select mechanism whose
+                                         that is feasible and effective for one regime can become wasteful,
+                                                                 Hyunwoo Oh, Suyeon Jang, Hanning Chen, Sanggeon Yun, Ryozo Masukawa, and Mohsen Imani
+
+
+                                                                                  ViT W1A8                                         Activation Weight
+  cost scales with precision, packing, fan-in, and tile shape, making                                         Compact              (INT4/8/16) (INT1/2/4)                         Σ
+  hardware overhead an explicit and rankable co-design objective                  ×                       small state
+                                                                                                                                     [:e]  [:b×e×q]
+                                                                                                          low HW cost                        TBL Gen.
+  alongside compute cost and memory traffic.                                     LLM W4A16
+                                                                                                          limited reuse                                        [:2q×e]      Vector
+                                                                                                                                    CPU Support                             RegFile
+• We present an end-to-end analytical exploration flow that prunes                                             Balanced
+  the candidate support space, identifies the non-dominated sup-                        ×                 moderate state   Workload-
+                                                                                                                                                                      Selected
+                                                                                                          moderate HW cost   aware
+  port frontier, and generates ISA specifications, gem5 ISA-model                                                                                                     subset
+
+
+
+
+                                                                                                                                                     Compute Eff.
+                                                                                                          moderate reuse   exploration
+  patches, and GEMM kernels, validated through microarchitec-                    LLM W2A16
+                                                                                                               Aggressive             Candidate
+  tural simulation across CPU targets based on x86 and ARM ISAs.                                          large state                 support pts.
+                                                                                                                                      Constraint
+                                                                                            ×             high HW cost                boundary
+                                                                                                          higher reuse                  Selected
+2   Background and Motivation                                                                                                           frontier                       HW overhead
+                                                                              (a) Diverse low-bit         (b) Diﬀerent CPU            (c) Select Implementation-
+Consider a dot product between low-bit weights and activations. In              ML Workloads              support tradeoﬀs              worthy support subset
+a table-driven block of size 𝑒, the 𝑒 weights are encoded as a symbol
+𝛾 ∈ [0, 2𝑞𝑒 ), while the current activation group generates a LUT           Figure 1: Background and motivation for ExaGEMM. Top right block: light-
+                                                                            weight CPU support for table-driven low-bit GEMM, where current activa-
+                                                                            tion groups generate in-register LUT state that is applied to staged low-bit
+                                𝑒 −1
+                                ∑︁                                          weight blocks while reusing the SIMD datapath. (a) Diverse low-bit workloads
+                     𝑇a [𝛾] =          dec𝑞 (𝛾, 𝑗) 𝑎 𝑗 ,          (1)       and quantization regimes impose different pressures on table size, reuse, and
+                                𝑗=0                                         register-resident state. (b) These pressures lead to different CPU-support trade-
+                                                                            offs, ranging from compact to more aggressive support with higher reuse and
+                                                                            higher hardware cost. (c) ExaGEMM therefore performs workload-aware sup-
+where dec𝑞 (𝛾, 𝑗) is the 𝑗-th 𝑞-bit weight encoded in 𝛾. Instead of         port exploration and selects an implementation-worthy subset of lightweight
+issuing 𝑒 explicit low-bit MACs, the block contribution is produced         CPU support points rather than relying on one fixed design point.
+by lookup and accumulation. LUT-based low-bit execution trades
+repeated low-bit arithmetic for a compact activation-derived table.
+   As sketched by the inset of Fig. 1, this execution style can remain             Model and ISA Inputs                          Analytical Explorer
+CPU-native. Table generation and application reuse the existing
+                                                                                    antized ML Model                          Candidate Generation
+SIMD datapath, while lightweight additional support keeps LUT                     q = Weight bitwidth                       Objective: Explore feasible param. sets
+state in-register and applies it to staged weight blocks. This makes              a = Activation bitwidth                      k=( ,e,b,r,c,u)
+                                                                                   Layer 1      Layer 2                           ISA                               Feasibility
+table-driven execution attractive for CPUs, but also introduces                    N×K×M        N×K×M
+                                                                                                                    1
+                                                                                                                               Parameters                             Check
+tradeoffs absent in conventional dense GEMM.                                                                                Evaluation for each param set
+   The first tradeoff is table size. Increasing 𝑒 improves arithmetic             Target CPU ISA Param.s
+                                                                                  l = Vector register width                   Instr. Count           Compute Cycles
+compression, but also grows the table as 2𝑞𝑒 . The second is reuse:               v = Vector register count                  Mem. Traﬃc              HW Overhead
+reusing a LUT across more rows, columns, or inner products amor-
+                                                                                                                    2
+tizes table-generation cost, but increases register-resident state,
+aggregation overhead, and pressure on intermediate-result move-                   Design Selection              Artifact Generation                                  System
+                                                                                                                                                                    Designer
+ment. The third is implementation cost: more aggressive support                       Pareto Frontier              Custom ISA specs                         gem5
+can improve compute efficiency, but requires more hardware state                                                                                         simulation
+                                                                                         Feasible                      gem5 ISA
+and more specialized logic. Low-bit execution is not merely a lower-                  parameter sets       3        extension patch          4             Design
+precision version of standard SIMD MAC; it is a mapping problem                                                                                         custom CPU
+                                                                                      Selected custom             Generated RTLs and                    Design-space
+that trades off compression, reuse, state, and hardware cost.                          instruction set           GEMM kernel runtime
+                                                                                                                                                          iteration
+   Figure 1 shows why these tradeoffs become a support-selection
+problem. Practical deployment spans multiple quantization regimes           Figure 2: Framework overview of ExaGEMM. Given a quantized ML model and
+and model mixes, imposing different pressures on reuse, state, and          target CPU parameters, ExaGEMM explores feasible parameterized kernels
+implementation cost. Consequently, no single support point is uni-          𝑘 = (𝑒, 𝑏, 𝑟, 𝑐, 𝑢 ) and evaluates them analytically in terms of instruction count,
+                                                                            compute cycles, memory traffic, and hardware overhead. The framework
+formly best across changing bitwidths, activation precision, and            then identifies feasible custom instruction support points, reports the non-
+target resource budgets. Figure 1(b) summarizes this through com-           dominated support frontier, generates implementation artifacts including
+                                                                            ISA specifications, gem5 ISA model patches, and GEMM kernels, and enables
+pact, balanced, and aggressive support classes, while Figure 1(c)           designer-guided system-level design-space iteration.
+emphasizes the design goal of selecting an implementation-worthy
+subset from a larger constrained design space.                                 This observation motivates the formulation used in ExaGEMM.
+   Prior CPU-oriented methods demonstrate useful operating points           Let Ω denote the candidate space of lightweight CPU support
+[5, 16, 22, 24], but mostly as regime-specific solutions. They show         points together with their associated kernel mappings. Rather than
+that table-driven or register-resident low-bit execution can be effec-      searching for one best low-bit kernel, ExaGEMM evaluates feasible
+tive on CPUs, yet they do not answer the broader design question            points 𝑥 ∈ Ω under workload and hardware constraints, prunes
+raised by the figure: when the target workload spans multiple low-          the space analytically, and identifies an implementation-worthy
+bit GEMM regimes under explicit implementation-cost constraints,            non-dominated subset that balances compute efficiency against
+which lightweight CPU support points should actually be imple-              hardware overhead, as illustrated by the rightmost panel of Fig. 1.
+mented? As highlighted in Fig. 1, the candidate support space is            The next section makes this concrete by defining the parameterized
+too large for exhaustive system-level evaluation, making support            execution space and analytical models for workload-aware support
+selection itself a first-class design problem.                              exploration and selection.
+ExaGEMM: Exploration Framework for CPU-Driven ML Inference via Associative In-Register Computing for Low-Bit GEMM
+
+
+3     Lightweight ISA Support and Analytical                                       across packed groups but raises aggregation overhead. Increasing
+      Co-Exploration                                                               𝑐 and 𝑟 extends reuse across output columns and rows, but also
+                                                                                   increases the amount of register-resident table state and the com-
+Figure 2 summarizes the overall ExaGEMM flow. Given the light-
+                                                                                   plexity of the select network. Accordingly, no single structural
+weight SIMD support point and parameterized execution space,
+                                                                                   mapping dominates across all bitwidths, layer shapes, and CPU
+ExaGEMM uses an analytical surrogate to estimate register feasibil-
+                                                                                   resource envelopes. Compact mappings reduce aggregation and
+ity, instruction count, memory traffic, compute cost, and hardware
+                                                                                   register pressure, whereas larger GEMM layers can better amortize
+overhead for each candidate kernel. These estimates are used to
+                                                                                   aggressive tiling.
+prune infeasible candidates, select layer-wise kernels, and report a
+                                                                                      Figure 3 captures only the structural part of the execution space.
+non-dominated support frontier before system-level validation.
+                                                                                   Beyond (𝑒, 𝑏, 𝑟, 𝑐), ExaGEMM also includes the ILM factor 𝑢, a
+                                                                                   schedule-level parameter. While (𝑒, 𝑏, 𝑟, 𝑐) determine how the table-
+3.1    ISA Support and Execution Space
+                                                                                   driven operator is blocked across the GEMM dimensions, 𝑢 deter-
+ExaGEMM is built on two ideas: lightweight ISA support and param-                  mines how many K-subblocks are merged into one scheduled block.
+eterized execution. Low-bit table-driven GEMM can be supported                     The (𝑒, 𝑏, 𝑟, 𝑐) define the structural shape of the kernel, while 𝑢
+on vector CPUs by reusing most of the existing SIMD datapath and                   controls software-visible instruction grouping and register reuse.
+adding only minimal support for in-register table computation. At
+the same time, this execution style should not be tied to a single                 3.1.3 Hardware Mapping to a SIMD Slice. Given the structural
+kernel organization. Instead, ExaGEMM exposes a parameterized                      execution space above, ExaGEMM adopts a lightweight SIMD-slice
+execution space so that different quantized models and CPU tar-                    support point shown in Figure 4. The key idea is to realize table-
+gets can select appropriate operating points. We next describe the                 driven low-bit GEMM using register-resident data structures and
+framework flow, structural execution space, SIMD-slice support,                    existing SIMD arithmetic datapaths, while introducing only a light-
+and software-visible primitives used by the generated kernels.                     weight select network to perform table application. This choice
+                                                                                   is motivated by the desire to keep the required hardware support
+3.1.1 Framework Overview. Figure 2 illustrates the model-                          CPU-native and practical for edge-oriented deployments.
+specific CPU support generation flow in ExaGEMM. The framework                        As shown in Figure 4(a), the vector register file (VRF) stores
+takes as input a quantized ML model, including per-layer bitwidth                  the live state of execution, including the staged weight block, the
+and GEMM dimensions, together with target CPU parameters such                      register-resident table entries, and the output register. The table is
+as vector-register width and register-file capacity. With per-layer                generated and consumed entirely within the SIMD slice, so table
+modeling, the same flow applies to both uniform and inter-layer                    application no longer depends on repeated accesses to memory-
+mixed precision models. The analytical explorer then enumerates                    resident LUTs. Figure 4(b) summarizes the target hardware envelope
+candidate execution instances of the form                                          in terms of vector-register (VR) count, VR width, and the available
+                            𝑘 = (𝑒, 𝑏, 𝑟, 𝑐, 𝑢),                         (2)       SIMD lane counts for the reused arithmetic units. These parameters
+                                                                                   define the constraints under which candidate kernels must operate.
+where (𝑒, 𝑏, 𝑟, 𝑐) specify the structural mapping of the table-driven                 Figure 4(c) then shows the key architectural property of Ex-
+GEMM—packing factor, fan-in, row tile, and column tile, respec-                    aGEMM: The major new hardware support is a select network, while
+tively—and u denotes the instruction-level merge factor. The ana-                  the existing SIMD_ADD, SIMD_DOTP, and SIMD_ACC circuits are
+lytical explorer evaluates candidate kernels 𝑘 = (𝑒, 𝑏, 𝑟, 𝑐, 𝑢) using             reused for table generation, table-driven compute, and accumula-
+estimates of feasibility, instruction count, memory traffic, compute               tion, respectively. If the required computation for each instruction
+cost, and hardware overhead. It then uses these estimates under                    exceeds the existing circuits, a multi-cycle counter controls the
+candidate support points to select layer-wise kernels, identify fea-               data feeding. This mapping keeps the support point lightweight
+sible support points, and report the resulting support frontier to                 and makes hardware overhead explicit: the select network scales
+the designer. These points are materialized as implementation arti-                with the amount of table-driven indirection that a candidate kernel
+facts, including custom ISA specs, gem5 ISA patches, and generated                 requires, while the remaining computation is serviced by the exist-
+GEMM kernels, for subsequent system-level design-space iteration.                  ing SIMD execution pipeline. In other words, ExaGEMM does not
+                                                                                   propose a new accelerator array; it exposes a CPU-native support
+3.1.2 Parameterized Execution Space. Figure 3 summarizes
+                                                                                   point that extends the SIMD slice just enough to make in-register
+the structural execution space exposed by ExaGEMM. The packing
+                                                                                   table-driven low-bit GEMM practical.
+factor 𝑒 determines how many low-bit symbols are packed into
+                                                                                      This hardware organization naturally induces two execution
+one table index, the fan-in 𝑏 determines how many packed groups
+                                                                                   primitives in ExaGEMM. The VRF-resident table is generated from
+are aggregated within one table-driven block, the column tile 𝑐
+                                                                                   packed activation state and then consumed together with a weight
+determines how many output columns are produced per block, and
+                                                                                   block to update an output tile. Table 1 summarizes the resulting
+the row tile 𝑟 determines how many output rows are generated
+                                                                                   table-generation and table-driven GEMM primitives.
+simultaneously. Together, these parameters control the size of the
+register-resident table, the complexity of the select network, and                 3.1.4 Instruction Primitives and Instruction-Level Merging.
+the amount of aggregation work required after table application.                   The logical primitives in Table 1 provide the interface between the
+   The progression in Figure 3 makes the main structural tradeoff                  lightweight SIMD ISA extension and the generated GEMM/GEMV
+explicit. Increasing 𝑒 improves packing efficiency but enlarges ta-                kernels. In the baseline case, one TBL_r×be instruction generates a
+ble cardinality through the 2𝑞𝑒 term. Increasing 𝑏 improves reuse                  table for one K-subblock, and one or more GEMM_r×be×c instances
+                                                                                                                    Hyunwoo Oh, Suyeon Jang, Hanning Chen, Sanggeon Yun, Ryozo Masukawa, and Mohsen Imani
+
+
+  Parameter                                 Output                    Parameter                               Output             Parameter                        Output           Parameter                                  Output
+ element size                                1×e×1                    block size                             1×(b⋅e)×1          column size                      1×(b⋅e)×c          row size                                 r×(b⋅e)×c
+    ex) e = 2                               GEMV                       ex) b = 4                              GEMV                ex) c = 2                       GEMV              ex) r = 2                                 GEMM
+  e             1                           1                           b⋅e               1                   1                    b⋅e          c                 c                   b⋅e             c                       c
+1             e                         1                         1                 b⋅e                     1                 1             b⋅e                 1              r                b⋅e                      r
+               ×                    =                                            ×                  =                                        ×              =                                 ×                     =
+
+    e q-bit                                                             b⋅e q-bit               b⋅2qe-item table                  c⋅b⋅e q-bit        b⋅2qe-item table               r⋅c⋅b⋅e q-bit          r⋅b⋅2qe-item table
+    weights                      2qe-item table                         weights                +b 2qe-to-1 MUXs                    weights          +c⋅b 2qe-to-1 MUXs                weights             +r⋅c⋅b 2qe-to-1 MUXs
+                                                                         1 2 3 4                                                    1    2                                               1                Block 1
+                                                                                                1       2       3       4                            1 2 1 2 1 2 1 2                     2                                   Block 2
+                                                                                                    +               +
+ HW Requisites                                                     HW Requisites                                               HW Requisites            Σ          Σ            HW Requisites
+                                                                                                            +
+MUX: O(2qe)                                                       MUX: O(b2qe)                                                MUX: O(cb2qe)                                    MUX: O(rcb2qe)
+Table: O(2qe)                                                     Table: O(b2qe)                                              Table: O(b2qe)                                   Table: O(rb2qe)             Intm.
+ SW Overhead                                                       SW Overhead                                                 SW Overhead                                      SW Overhead                Oi, j:j+c-1
+                                 Intermediate                                                    Intermediate                                         Intm.      Intm.                                                        Intm.
+agg_add: O(1)                      Σ Ii,j⋅Wj,k                    agg_add: O(b)                    Σ Ii,j⋅Wj,k                agg_add: O(cb)           Oi, j     Oi, j+1       agg_add: O(rcb)                               Oi+1, j:j+c-1
+    Pack elements, no aggregation                                        Increase tables and aggregate                               Vectorize columns                                    Vectorize rows
+   →Limited compute compression                                            →HW& SW scale with b                                 →MUX & Aggregation scale with c                         →HW & SW scale with r
+                   (a) Packing                                                       (b) Fan-in                                              (c) Columns                                            (d) Rows
+
+Figure 3: Design-space progression for in-register table-driven computation from GEMV to GEMM. Panels (a)–(d) expand the output dimensionality under
+quantization bitwidth 𝑞 , by varying (a) packing 𝑒 , (b) fan-in 𝑏 , (c) column tile 𝑐 , and (d) row tile 𝑟 . Each panel reports how MUX/select logic and register-resident
+table entries scale, along with the extra aggregation-add software overhead (agg_add) introduced by the decomposition.
+
+
+        Mapping              Block 1               Block 2                                                                     Table 1: Logical ISA primitives induced by the lightweight SIMD support point.
+        Instantiation                       qe
+                                       frb2 -bit                                    Parameters
+                                         table                            f=16(-bit) TableItem Bitwidth
+                                                                          o=32(-bit) Output Bitwidth                              Primitive         Logical effect
+                                                                                                                                  TBL_r×be          Consumes a packed activation block and generates an in-register table
+                                                                                 HW Constraints                                                     in the VRF for subsequent table-driven computation.
+                                  VRF                                                                                             GEMM_r×be×c       Consumes one in-register table and one weight block to update an 𝑟 ×𝑐
+      rcbe q-bit                                                          v    Vector RegFile Item Count
+       weights                                           0                l    Vector Register Bit-width                                            output tile through the select network and reused SIMD datapaths.
+                                                                         pa    SIMD_ADD Lane Count
+                                                         1               pdp   SIMD_DOTP Lane Count
+                                                                         pac   SIMD_ACC Lane Count                             Relative to the baseline case 𝑢 = 1, the merged schedule keeps
+                                                         v-1                                                                   activation-derived table state live for a longer window, while reusing
+                            Vector RegFile[0:v-1][l-1:0]                    (b) Parameters and
+                                                                                                                               the same output VR across multiple GEMM_r×be×c instances. As
+           (a) Mapping Weights and Table                                        Constraints                                    shown in Figure 5, this reduces redundant output LD/ST activ-
+                    VRF data                      New HW                                  Required Cycles
+                                                                                                                               ity and loop overhead while increasing live activation/table and
+                    → Fed for block compute,
+                    ← writebacked to VRF
+                                                  Required
+                                                  Use existing
+                                                                                          z=max(                               weight register demand. The output-register requirement remains
+                                                                                          ⌈(rcb/2)÷pa⌉ ,
+           Block #1
+           Block #n       Instantiation /         HW circuit
+                                                                                          ⌈(rcb/2)÷pdp⌉ )                      unchanged because all merged K-subblocks still accumulate into
+                             Mapping
+                                           Select Network                                                                      the same output tile.
+                                           ∝ O(frcb2qe )÷z                                 Available HW
+       +       +    +       +               + + + + SIMD_ADD                              pa=l÷f
+                                                                                                                                  This distinction between structural and schedule-level parame-
+                                                                                          pdp=4⋅l÷(f⋅b)                        ters is important for ExaGEMM. The tuple (𝑒, 𝑏, 𝑟, 𝑐) determines the
+           +            +                    Σ       Σ         SIMD_DOTP
+                                                                                          (b÷2)-to-1 Sum                       table-driven block shape and associated hardware requirements,
+           +            +                    +       +         SIMD_ACC                   pac=l÷o
+                                                                                                                               while 𝑢 controls how aggressively the generated kernel amortizes
+                                            Vector Reg.
+                                                               Always use one VR                                               output traffic and loop overhead. Together, they define the full
+                                                               to store the output
+                                                                                                                               execution candidate 𝑘 = (𝑒, 𝑏, 𝑟, 𝑐, 𝑢) evaluated by the analytical
+                                 (c) Mapping Computation Block
+                                                                                                                               explorer in the following subsection.
+Figure 4: Mapping ExaGEMM’s table-driven block computation onto a vector-
+CPU SIMD slice. (a) Quantized weights and the 𝑟𝑏2𝑞𝑒 -entry table are staged                                                    3.2       Analytical Exploration Framework
+in the vector register file (VRF). (b) Parameters and hardware constraints
+define the available lane parallelism. (c) The computation block is realized by                                                Given the lightweight SIMD support point and parameterized execu-
+instantiating a select network while reusing existing SIMD ADD/DOTP/ACC                                                        tion space in subsection 3.1, ExaGEMM evaluates which candidate
+units; intermediate results are reduced and written back to the VRF.                                                           kernels are feasible and worth supporting for a target quantized
+use that table to update the corresponding output tiles. However,                                                              model. For each candidate, the analytical explorer models register
+executing these primitives naively can introduce redundant out-                                                                feasibility, logical instruction count, memory traffic, arithmetic/-
+put load/store traffic and loop overhead, especially when multiple                                                             control cost, and hardware overhead. These quantities are used
+neighboring K-subblocks contribute to the same output tile.                                                                    to prune infeasible candidates, rank feasible kernels, and report a
+   To address this, ExaGEMM introduces an instruction-level merge                                                              non-dominated support frontier before system-level validation.
+(ILM) factor 𝑢 (Figure 5). Increasing 𝑢 merges multiple K-subblocks
+                                                                                                                               3.2.1 Feasibility and Cost Models. For a quantized GEMM layer
+into one scheduled block, so that
+                                                                                                                               ℓ of shape (𝑁 ℓ , 𝐾ℓ , 𝑀ℓ ) and bitwidth 𝑞 ℓ , ExaGEMM evaluates each
+                        𝐾𝑏 = 𝑏 · 𝑒 · 𝑢,                      𝑁𝑏 = 𝑟,            𝑀𝑏 = 𝑐.                                 (3)    candidate 𝑘 = (𝑒, 𝑏, 𝑟, 𝑐, 𝑢) in Equation 2. Modeling 𝑞 ℓ per layer
+ExaGEMM: Exploration Framework for CPU-Driven ML Inference via Associative In-Register Computing for Low-Bit GEMM
+
+
+                                                                                          GEMM/V Kernel
+                          Eﬀect of Instruction-Merge Factor u                             Traversal Order        where 𝛼 CTL is the platform-dependent control-overhead cost per
+                                                                                      1   1       2         3
+           Kb=b⋅e⋅u                        Mb=c
+                                                                       Nb
+                                                                            Mb                                   scheduled block.
+    Nb=r
+                                                    1                                                               ExaGEMM models schedule-level memory traffic without at-
+                                          Kb
+                          3                                                                                      tempting to model the full cache hierarchy. At fixed (𝑒, 𝑏, 𝑟, 𝑐), ac-
+             2                      ×                              =              2                   3
+                                                                                                                 tivation and weight traffic are invariant with respect to 𝑢, while
+                                                        3
+                                                                                                                 output traffic decreases as output LD/ST is amortized across merged
+         Activation (N,K)           × Weight (K,M) = Output (N,M)                                                K-subblocks:
+                                                                                                                                                     𝑜             𝑜        
+# Batch Size for K-N-M
+K_b = b*e; N_b = r; M_b = c;                      Unroll
+                                                            # Batch Size for K-N-M
+                                                            K_b = b*e*u; N_b = r; M_b = c;
+                                                                                                                                 𝐵𝑜 (ℓ, 𝑘) = 𝑜 𝑟 𝑐 𝐼 LD (ℓ, 𝑘) + 𝐼 ST (ℓ, 𝑘) ,    (11)
+                                                    u×
+for (k = 0; k < K; k += K_b) {                    LD Act.   for (k = 0; k < K; k += K_b) {
+ for (n = 0; n < N; n += N_b) {                      +       for (n = 0; n < N; n += N_b) {
+                                                                                                                             𝐵 mem (ℓ, 𝑘) = 𝐵𝑎 (ℓ, 𝑘) + 𝐵 𝑤 (ℓ, 𝑘) + 𝐵𝑜 (ℓ, 𝑘),     (12)
+  LD                Reg0 ← &act[n*K+k];            TBL        LD                Reg0 ← &act[n*K+k+b*e*0];
+  TBL_r×be          Reg1 ← Reg0;                              LD                Reg1 ← &act[n*K+k+b*e*1];        where 𝐵𝑎 and 𝐵 𝑤 denote activation and weight traffic under the
+  for (m = 0; m < M; m += M_b) {                              TBL_r×be          Reg2 ← Reg0;
+   LD               Reg2 ← &wgt[M*k+m];            Unroll     TBL_r×be          Reg3 ← Reg1;                     selected structural mapping.
+   LD
+   GEMM_r×be×c
+                    Reg3 ← &out[n*m];
+                    Reg3 ← Reg1, Reg2;
+                                                    u×
+                                                  LD Wgt.
+                                                              for (m = 0; m < M; m += M_b) {
+                                                               LD               Reg4 ← &wgt[M*(k+b*e*0)+m];      Execution cost and hardware overhead. Let 𝜏TBL (𝑘) and 𝜏GEMM (𝑘)
+   ST               &out[n*m] ← Reg3;                          LD               Reg5 ← &wgt[M*(k+b*e*1)+m];
+  }}}                                             Unroll       LD               Reg3 ← &out[n*m];                denote the per-instruction costs of the two logical primitives. Be-
+                                                   u×
+              Parameter                           GEMM
+                                                               GEMM_r×be×c
+                                                               GEMM_r×be×c
+                                                                                Reg6 ← Reg2, Reg4;
+                                                                                Reg6 ← Reg3, Reg5;
+                                                                                                                 cause GEMM reuses the SIMD_ADD, SIMD_DOTP, and SIMD_ACC
+     instruction merge. ex) u = 2                              ST
+                                                              }}}
+                                                                                &out[n*m] ← Reg6;                datapaths, its per-instruction cost is bounded by the slowest reused
+                                                                                                                 arithmetic component:
+     Memory Traﬃc Amount                                           Register Utilization
+ Activation                            Same
+                                                            Act./Table                        Increases                    𝜏GEMM (𝑘) = max(𝜏ADD (𝑘), 𝜏DOTP (𝑘), 𝜏ACC (𝑘)) .         (13)
+                                      amount                                                   with u
+  Weight                               Output                Weight
+                                       LD/ST                                              Output register        The arithmetic/control-side estimate is
+                                      reduced                                              requirements
+  Output                                by u×
+                                                             Output                         unchanged                𝐶 cmp (ℓ, 𝑘) = 𝐼 TBL (ℓ, 𝑘)𝜏TBL (𝑘) + 𝐼 GEMM (ℓ, 𝑘)𝜏GEMM (𝑘)
+                                                                                                                                                                                    (14)
+                                                                                                                                     + 𝐼 agg (ℓ, 𝑘)𝜏ADD (𝑘) + 𝐶 CTL (ℓ, 𝑘),
+Figure 5: Effect of instruction-level merge (ILM) factor 𝑢 on scheduled table-
+driven GEMM execution. Increasing 𝑢 merges multiple K-subblocks into                                             where 𝐼 agg denotes the aggregation-add work by the structural
+one scheduled block, reducing redundant output load/store traffic and loop                                       mapping in Figure 3. 𝐶 cmp captures arithmetic/control work only,
+overhead while increasing live activation/table and weight register demand.
+The output-register requirement remains unchanged because all merged K-                                          while memory-side effects enter the final ranking objective by 𝐵 mem .
+subblocks accumulate into the same output object.                                                                  To rank candidates, ExaGEMM combines arithmetic/control cost
+                                                                                                                 and schedule-level traffic into a single analytical execution cost:
+allows the same framework to cover both uniform- and mixed-
+quantization settings.                                                                                                        𝐶 exe (ℓ, 𝑘) = 𝐶 cmp (ℓ, 𝑘) + 𝛼 mem 𝐵 mem (ℓ, 𝑘),     (15)
+Register feasibility. For candidate 𝑘, the modeled VRF-resident
+                                                                                                                 where 𝛼 mem is a platform-dependent traffic-to-cost factor that maps
+live state consists of the register-resident table, weight block, and
+                                                                                                                 the schedule-level traffic proxy 𝐵 mem to an effective execution-cost
+output tile:
+           l               m            l              m                                                         penalty. 𝛼 mem is obtained by calibrating the analytical score against
+             𝑓 𝑟 𝑏 2𝑞ℓ 𝑒 𝑢                𝑞ℓ 𝑟 𝑐 𝑏 𝑒 𝑢                   
+                                                                                                                 vectorized load/store microbenchmarks that sweep working-set
+  𝑅𝑇 (𝑘) =         𝑙         , 𝑅𝑊 (𝑘) =        𝑙         , 𝑅𝑂 (𝑘) = 𝑜 𝑟𝑙 𝑐 , (4)
+                                                                                                                 sizes across the cache and memory hierarchy. 𝐶 exe is the final
+where 𝑙 is the vector-register width, 𝑓 is the table-entry width, and                                            execution-side ranking objective used during exploration. It is not
+𝑜 is the output / accumulation width. The factor 𝑢 appears because                                               intended to predict the full memory hierarchy exactly; rather, it
+ILM increases simultaneously live table and weight state. We define                                              provides a consistent efficiency ordering before detailed simulation.
+                                𝑅𝑇 (𝑘) + 𝑅𝑊 (𝑘) + 𝑅𝑂 (𝑘)                                                            Finally, hardware overhead is modeled per supported primitive
+                𝑈 VRF (𝑘) =                                   ,              (5)
+                                             𝑣                                                                   configuration 𝑝 = (𝑒, 𝑏, 𝑟, 𝑐, 𝑞) as
+and require
+                                                                                                                                     𝐻 sel (𝑝) = 𝛼 sel 𝑆 sel (𝑒, 𝑏, 𝑟, 𝑐, 𝑞),       (16)
+                       𝑈 VRF (𝑘) ≤ 1,       𝑅𝑂 (𝑘) ≤ 1.                      (6)
+The first constraint enforces total VRF capacity; the second enforces                                            where 𝑆 sel is the select-network scaling term corresponding to
+the single-destination-VR execution model assumed by ExaGEMM.                                                    Figure 3, and 𝛼 sel is a technology-dependent factor that maps 𝑆 sel
+Instruction and traffic models. For compactness, define                                                          to normalized selector overhead using ASIC synthesis under the
+                                                                                                         target process design kit.
+            𝑁ℓ                 𝐾ℓ              𝑀ℓ                     𝐾ℓ
+ 𝜈 ℓ (𝑘) =      , 𝜅 ℓ (𝑘) =        , 𝜇ℓ (𝑘) =      , 𝜅 ℓ(𝑢 ) (𝑘) =         . (7)                                    Taken together, Equation 6–Equation 16 define a compact an-
+            𝑟                  𝑏𝑒               𝑐                    𝑏𝑒𝑢                                         alytical surrogate for model-specific ISA support exploration. Ex-
+The dominant logical instruction counts are                                                                      aGEMM uses this surrogate both to rank candidate kernels and to
+  𝐼 TBL (ℓ, 𝑘) = 𝜈 ℓ (𝑘)𝜅 ℓ (𝑘),                  𝐼 GEMM (ℓ, 𝑘) = 𝜈 ℓ (𝑘)𝜅 ℓ (𝑘)𝜇ℓ (𝑘). (8)                      identify lightweight support points worth materializing for subse-
+                                                                                                                 quent gem5-based evaluation.
+ILM changes the schedule rather than the logical work decomposi-
+tion, so 𝑢 does not reduce the number of TBL or GEMM primitives.                                                 3.2.2 Kernel Selection and Support Ranking. Using the mod-
+Instead, it amortizes output load/store activity and loop overhead:                                              els above, ExaGEMM performs exploration at two levels: (i) layer-
+                                                                                                                 wise kernel selection and (ii) model-level support-point ranking.
+                      𝑜
+                    𝐼 LD            𝑜
+                         (ℓ, 𝑘) = 𝐼 ST (ℓ, 𝑘) = 𝜈 ℓ (𝑘)𝜅 ℓ(𝑢 ) (𝑘)𝜇ℓ (𝑘),                                  (9)
+                                                                                                                 Layer-wise kernel selection. For each support point 𝜎 and layer ℓ,
+                       𝐶 CTL (ℓ, 𝑘) = 𝛼 CTL 𝜈 ℓ (𝑘)𝜅 ℓ(𝑢 ) (𝑘)𝜇ℓ (𝑘),                                     (10)   ExaGEMM enumerates the candidate set Kℓ (𝜎) over the supported
+                                                                 Hyunwoo Oh, Suyeon Jang, Hanning Chen, Sanggeon Yun, Ryozo Masukawa, and Mohsen Imani
+
+
+ranges of (𝑒, 𝑏, 𝑟, 𝑐, 𝑢). Candidates violating Equation 6 are pruned.      Algorithm 1 Model-level support exploration in ExaGEMM
+Among the remaining candidates, ExaGEMM selects                             Require: Quantized model L, target CPU parameters, support-point set Σ
+           𝑘 ℓ★ (𝜎) = arg min 𝐶 exe (ℓ, 𝑘)                                  Ensure: Non-dominated feasible support points
+                        𝑘 ∈ Kℓ (𝜎 )
+                                                                 (17)        1: for each 𝜎 ∈ Σ do
+                              s.t. 𝑈 VRF (𝑘) ≤ 1, 𝑅𝑂 (𝑘) ≤ 1,                2:   feasible ← true
+                                                                             3:   for each layer ℓ ∈ L do
+where 𝐶 exe is defined in Equation 15. Hardware overhead is a prop-          4:      Enumerate Kℓ (𝜎 )
+erty of the support point rather than of an individual layer mapping,        5:      Prune candidates violating Equation 6
+so layer-wise selection minimizes execution-side cost under feasibil-        6:      if Kℓ (𝜎 ) = ∅ then
+ity constraints, while the efficiency–hardware tradeoff is resolved          7:          feasible ← false
+at the support-point level.                                                  8:          break
+Support-point frontier. A custom ISA support point 𝜎 is de-                  9:      end if
+fined as a set of distinct supported primitive configurations 𝑝 =           10:      Select 𝑘 ℓ★ (𝜎 ) using Equation 17
+                                                                            11:   end for
+(𝑒, 𝑏, 𝑟, 𝑐, 𝑞). The ILM factor 𝑢 is not part of 𝜎 because it changes
+                                                                            12:   if feasible then
+the software schedule but does not require a different primitive. For
+                                                                            13:      Aggregate 𝐶 model (𝜎 ) and 𝐻 model (𝜎 )
+each 𝜎, ExaGEMM restricts layer-wise selection to compatible can-           14:      Optionally record 𝐵 model (𝜎 )
+didates and discards the support point if any layer has no feasible         15:   end if
+mapping. Otherwise, the selected per-layer kernels are aggregated           16: end for
+into model-level execution cost and hardware overhead:                      17: Extract the non-dominated feasible points over (𝐶 model , 𝐻 model )
+                                                                            18: Return the resulting support frontier to the designer
+                                    ∑︁
+                      𝐶 model (𝜎) =    𝐶 exe (ℓ, 𝑘 ℓ★ (𝜎)),       (18)
+                                      ℓ
+                                                                               Table 2: Representative target vector-CPU configurations used in gem5.
+                                          ∑︁
+                      𝐻 model (𝜎) =              𝐻 sel (𝑝),      (19)
+                                          𝑝 ∈𝜎                                       Attribute       Workstation            Laptop         Mobile
+
+where 𝑝 denotes one supported configuration in the support point.                   CPU model        Ryzen 9 9950X       Ryzen 7 6800U    Cortex-A78
+Equation 19 uses an additive support-cost model; if multiple config-              Simulation mode                        DerivO3CPU
+                                                                                        ISA              x86-64              x86-64        ARMv8-A
+urations share hardware, it should be interpreted as a conservative
+                                                                                       Cores               16                   8                4
+ranking proxy. For completeness, ExaGEMM may still report                            Frequency          5.7 GHz             4.7 GHz          3.0 GHz
+                               ∑︁
+                                                                                      L1 I / D       32 KB / 48 KB       32 KB / 32 KB   64 KB / 64 KB
+                 𝐵 model (𝜎) =    𝐵 mem (ℓ, 𝑘 ℓ★ (𝜎)),          (20)
+                                                                                      L2 cache        1 MB/core           512 KB/core     512 KB/core
+                                      ℓ
+                                                                                      L3 cache       64 MB shared        16 MB shared     4 MB shared
+but 𝐵 model is diagnostic only, since traffic is already incorporated                  DRAM           DDR5-6400           DDR5-4800      LPDDR5-6400
+into 𝐶 model through Equation 15.                                                 VR param.s 𝑙 / 𝑣     512 b / 32          256 b / 16       128 b / 16
+   ExaGEMM reports the non-dominated feasible support points                                Table 3: Model targets used in the evaluation.
+over the efficiency–hardware tradeoff, leaving the final choice to
+the designer. Shortlisted points are then materialized as ISA specifi-                  Model        Modality    Label      Quantization setting
+cations, gem5 ISA-model patches, and generated GEMM kernels for                         DeiT-B    Vision             A      W1A8 uniform
+system-level validation. Algorithm 1 summarizes the model-level                         Llama2-7B Language           B      W2A16 uniform
+exploration procedure.                                                                  Llama2-7B Language           C      W{1,2,4}A16 mixed
+   This procedure reduces the model-specific support space to a
+small set of feasible, non-dominated candidates for designer-guided         since each core’s in-register table is generated and consumed lo-
+selection and subsequent gem5-based evaluation.                             cally, inter-core coherence overhead is minimized. The workloads
+                                                                            span two uniform-quantization cases (DeiT-B W1A8, Llama2-7B
+4     Evaluation                                                            W2A16), and one mixed-precision configuration (Llama2-7B with
+We evaluate ExaGEMM from both CAD and system perspectives by                AMQ-style inter-layer W1,2,4A16 [12]), exploring workload-aware
+asking: (1) whether the analytical explorer prunes the search space         support selection across quantization regimes. For each target, Ex-
+while preserving strong candidates, (2) whether realistic workloads         aGEMM explores candidate kernels 𝑘 = (𝑒, 𝑏, 𝑟, 𝑐, 𝑢), materializes
+induce different feasible and execution-favorable primitive-side            selected frontier points, and evaluates them via model-level support-
+landscapes under fixed target constraints, (3) whether frontier-            tradeoff analysis and end-to-end comparison against representative
+selected support points and kernel schedules improve end-to-end             baselines. The analytical surrogate is calibrated per target/process
+performance under modest hardware overhead.                                 node: 𝛼 mem is obtained from gem5 microbenchmarks, and 𝛼 sel is
+                                                                            derived from ASIC synthesis of the selector-network and full SIMD-
+4.1    Experimental Setup                                                   datapath RTL designs in a TSMC 28 nm process at 1 GHz using
+Table 2 and 3 summarize the target platforms and evaluated work-            Cadence Genus 21.10. Area and power are reported at tt0p9v25c.
+loads. We study representative x86 and ARM vector CPU targets
+on gem5-AVX [2, 11] v20.1.0.0, spanning 128/256/512-bit SIMD                4.2      Explorer Effectiveness and Fidelity
+configurations with different register budgets. GEMM tiles are dis-         We evaluate the analytical explorer along two axes: (1) how aggres-
+tributed across all available cores along the output-row dimension;         sively ExaGEMM reduces the candidate space before simulation,
+ExaGEMM: Exploration Framework for CPU-Driven ML Inference via Associative In-Register Computing for Low-Bit GEMM
+
+
+        Enumerated                           Feasible                      Selected Sets by                       Selected Sets by model                                                                                                                                            Pareto-efficient support points                                 Random-sampled support points
+        Support Sets                         Support Sets                  Quantization Type                      (Mixed-precision only)
+          ×102                                                                     ×102                                                                       ×105                                 ×106
+                                                                                                                                                                                                                                                          Ryzen 9950x                                                        Ryzen 6800U                                                                  Cortex-A78
+  100                                                       99.5%            100                                             99.5%                100000                                                    1000
+                                                                                                                                                                                                                                                          (16T, 512-bit)                                                       (8T, 256-bit)                                                             (4T, 128-bit)
+
+
+                                                                Reduction (%)
+
+
+
+
+                                                                                                                                 Reduction (%)
+
+
+
+
+                                                                                                                                                                                                               Reduction (%)
+    10                                                                              10                                       99.3%                   1000                                                   100
+                                                                                                                                                                                                                                                             ρspearman=0.945                                                     ρspearman=0.982                                                           ρspearman=0.969
+
+
+
+
+                                                                                                                                                                                             2934579375
+                                                            99.0%
+
+
+
+
+                                                                                                                                                                              869505000
+Count
+
+
+
+
+                                                                                Count
+
+
+
+
+                                                                                                                                                 Count
+
+
+                                                                                                                                                               187813080
+                                                                                                                             99.1%                      10                                                  10                                         2000                                                               5000                                                                       10000
+
+
+
+
+                                                                                                                                                                                                                                                                                                      gem5 latency (µs)
+                                                                                                                                                                                                                                   gem5 latency (ms)
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                                 gem5 latency (ms)
+        1                                                                               1
+
+
+
+
+                                                                                                                                                                                                 4621344
+                                                 1638
+
+
+
+
+                                                                                                                  1575
+                        1170
+
+
+
+
+                                                                                                     1050
+                                                                                                                             98.9%                      0.1                                                 1
+             780
+
+
+
+
+                                                                                                                                                                                  336000
+                                                                                            630
+                                                  466
+
+
+
+                                                            98.5%
+
+
+
+
+                                                                                                                                                                    40320
+                          243
+
+
+
+
+                                                                                                                    184
+              140
+
+
+
+
+    0.1                                                                            0.1
+
+
+
+
+                                                                                                        80
+
+
+
+
+                                                                                                                                                                                                     1560
+                                                                                                                             98.7%                   0.001                                                  0.1
+
+
+
+
+                                                                                               40
+
+
+
+
+                                                                                                                                                                                      490
+                                                                                                                                                                       280
+                                                       14
+
+
+
+
+                                                                                                                       12
+                             11
+                 10
+
+
+
+
+                                                                                                 7
+
+
+                                                                                                         9
+
+
+
+
+                                                                                                                                                                         15
+
+
+
+                                                                                                                                                                                        15
+
+
+
+                                                                                                                                                                                                       16
+  0.01                                                      98.0%                0.01                                        98.5%                0.00001                                                   0.01                                        200                                                               500                                                                         1000
+              128           256                   512                                        128      256          512                                            128            256            512
+                SIMD Bitwidth                                                                  SIMD Bitwidth                                                         SIMD Bitwidth
+            (a) DeiT-Base, W1A8                                                         (b) Llama2-7B, W2A16                                             (c) Llama2-7B, W{1/2/4}A16                                                                      20
+                                                                                                                                                                                                                                                                                      ×106
+                                                                                                                                                                                                                                                                                                                           50
+                                                                                                                                                                                                                                                                                                                                                                     ×106
+                                                                                                                                                                                                                                                                                                                                                                                                      100
+                                                                                                                                                                                                                                                                                                                                                                                                                              ×106
+                                                                                                                                                                                                                                                               3      30       300 3000 30000                                   10         100 1000 10000                                                    10   100 1000 10000
+                                                                                                                                                                                                                                                               Modeled execution cost                                           Modeled execution cost                                                       Modeled execution cost
+Figure 6: Explorer-driven search-space reduction. For DeiT-B W1A8 and                                                                                                                                                                                                                             (a) DeiT-Base, W1A8
+Llama2-7B W2A16, bars show enumerated primitives, VRF-feasible primitives,
+and retained frontier points. For Llama2-7B W{1/2/4}A16, bars show the hierar-                                                                                                                                                                            5
+                                                                                                                                                                                                                                                                    ρspearman=0.889                                       200
+                                                                                                                                                                                                                                                                                                                                  ρspearman=0.951                                                     1000
+                                                                                                                                                                                                                                                                                                                                                                                                              ρspearman=0.952
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                                   gem5 latency (s)
+                                                                                                                                                                                                                                   gem5 latency (s)
+
+
+
+
+                                                                                                                                                                                                                                                                                                      gem5 latency (s)
+chical mixed-precision flow: enumerated support sets, post-per-quantization
+candidate sets, and final model-level frontier sets. The line reports overall
+                                                                                                                                                                                                                                                                                                                           20                                                                         100
+reduction from the fully enumerated space.
+                                                                                                                                                                                                                                                                                      ×109                                  2                                        ×109                              10                     ×109
+                                                                                                                                                                                                                                                         0.5
+                                                                                                                                                                                                                                                               1               10         100                                   15                  150                   1500                               30       300      3000
+                                                 1.0            Candidate support sets                                                                                                                                                                         Modeled execution cost                                           Modeled execution cost                                                       Modeled execution cost
+
+                                                                Pareto support sets                                                                                                                                                                                                 (b) Llama2-7B, W{1,2,4}A16, 128 token
+                    execution efficiency score
+
+
+
+
+                                                 0.8
+                           Normalized
+
+
+
+
+                                                 0.6                                                                                                                                                                           Figure 8: Ranking fidelity of the analytical explorer. Each panel compares the
+                                                                                                                                                                                                                               modeled execution cost with gem5-measured latency for analytically retained
+                                                 0.4                                                                                                                                                                           Pareto points and randomly sampled feasible points. Spearman correlations
+                                                                                                                                                                                                                               of 0.889–0.982 indicate strong ordering fidelity.
+                                                 0.2
+
+                                                 0.0                                                                                                                                                                                                                             MAPE=1.4%                                128-bit              256-bit             512-bit
+                                                                                                                                                                                                                                                                                                                                                                                                      MAPE=6.3%
+                                                                                                                                                                                                                                                        10                                                                    20                                  100                                                           40
+                                                            0               20               40              60             80            100                 120               140
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                    ΔPower (mW)
+                                                                                                                                                                                                                               ΔArea (mm2)
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                     Overhead (%)
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                     Overhead (%)
+                                                                                        Normalized hardware overhead                                                                                                                                     1                                                                                                         10
+                                                                                                                                                                                                                                                        0.1                                                                     10                                  1                                                           20
+                                                                                                                                                                                                                                                       0.01                                                                                                        0.1
+Figure 7: Mixed-precision support-set tradeoff space on the 256-bit target. Each
+                                                                                                                                                                                                                                               0.001                                                                            0                                 0.01                                                          0
+point denotes a candidate mixed-precision support set formed by combining                                                                                                                                                                                     0.1          1         10         100                        1000                                          0.1     1                       10         100     1000
+Pareto-efficient primitive points from the individual quantization regimes                                                                                                                                                                                      Modeled Hardware Cost ÷ 1000                                                                               Modeled Hardware Cost ÷ 1000
+for Llama2-7B W{1/2/4}A16. Highlighted points form the final model-level                                                                                                                                                                                            (a) Area Overhead                                                                                      (b) Power Overhead
+Pareto shortlist retained for materialization and gem5 validation. Execution
+efficiency is defined as the inverse of execution cost.
+                                                                                                                                                                                                                               Figure 9: Hardware-cost calibration against TSMC 28 nm synthesis at 1 GHz
+and (2) whether the analytical ranking metric preserves the order-                                                                                                                                                             for Llama2-7B W{1,2,4}A16 support sets on 128/256/512-bit targets. Each point
+                                                                                                                                                                                                                               compares the modeled hardware cost with the synthesized area/power over-
+ing needed for shortlist formation.                                                                                                                                                                                            head for a single support point.
+
+4.2.1 Search Space Reduction. Figure 6 shows that ExaGEMM                                                                                                                                                                      shown in Figure 8, the Spearman correlations are 0.945/0.982/0.969
+shrinks large candidate spaces to small frontiers before gem5 runs.                                                                                                                                                            for DeiT-B W1A8 and 0.889/0.951/0.952 for mixed-precision Llama2
+For uniform quantization, DeiT-B W1A8 shrinks from 780/1170/1638                                                                                                                                                               on the 512/256/128-bit targets.
+enumerated primitive candidates to 10/11/14 frontier points on the                                                                                                                                                                We also calibrate the modeled hardware cost with ASIC synthe-
+128/256/512-bit targets, corresponding to 98.7%/99.1%/99.1% reduc-                                                                                                                                                             sis results on the augmented SIMD datapath RTL for the Llama2-7B
+tion. Llama2-7B W2A16 similarly shrinks from 630/1050/1575 can-                                                                                                                                                                W{1,2,4}A16 Pareto support sets across the 128/256/512-bit targets.
+didates to 7/9/12 frontier points, i.e., 98.9%/99.1%/99.2% reduction.                                                                                                                                                          Figure 9 compares modeled costs with area and power overheads,
+   For mixed precision, ExaGEMM applies the same idea hierarchi-                                                                                                                                                               showing near-linear correlation. The modeled cost, normalized to
+cally. It first computes per-quantization primitive frontiers, forms                                                                                                                                                           the smallest synthesized support point’s area/power, tracks syn-
+support-set candidates only from those reduced spaces, and then                                                                                                                                                                thesis closely, with a mean absolute percentage error (MAPE) of
+applies a model-level Pareto filter. For the Llama2-7B W{1,2,4}A16,                                                                                                                                                            1.4% for area and 6.3% for power. Relative to the original full SIMD
+the raw space contains 187,813,080/869,505,000/2,934,579,375 struc-                                                                                                                                                            datapath baseline, retained support points incur 0.049–1.714% /
+turally enumerated support-set combinations on the 128/256/512-                                                                                                                                                                0.083–2.731% area/power overhead on 128-bit, 0.024–3.564% / 0.042–
+bit targets. After per-quantization frontier reduction, this shrinks                                                                                                                                                           5.448% on 256-bit, and 0.381–13.21% / 0.607–20.81% on 512-bit, con-
+to 280/490/1560 candidates, and the final frontier retains only 14–16                                                                                                                                                          firming that the added select/feed support remains affordable.
+sets per target, yielding 12,520,872×/57,967,000×/183,411,211× re-                                                                                                                                                                Together, these results make ExaGEMM effective for pre-silicon
+duction before gem5. Figure 7 presents the 256-bit case: only a small                                                                                                                                                          screening, preserving candidate ordering for high-value shortlist
+subset of the reduced combinations remains Pareto-competitive.                                                                                                                                                                 formation while estimating hardware cost accurately enough to
+4.2.2 Modeling Fidelity. We evaluate ranking fidelity as whether                                                                                                                                                               compare support points before expensive gem5 evaluation.
+the modeled execution cost (𝐶 exe ) preserves the ordering needed to
+screen candidates before detailed simulation. For each workload-                                                                                                                                                               4.3                              Primitive-Side Efficiency Landscapes
+target pair, we compare the 𝐶 exe against gem5 latency on a sample                                                                                                                                                             We examine the primitive-side execution efficiency landscape under
+set comprising all analytically retained Pareto points together with                                                                                                                                                           fixed constraints before hardware cost is introduced. Figure 10 maps
+randomly sampled feasible points, for a total of 30 points per pair. As                                                                                                                                                        the relative analytical score over effective K-block size 𝐾𝑏 = 𝑏 ·𝑒 and
+                                                                                                                  Hyunwoo Oh, Suyeon Jang, Hanning Chen, Sanggeon Yun, Ryozo Masukawa, and Mohsen Imani
+
+
+                      1                                                                            1                                                                                                                Aggressive fixed (baseline)                              Pareto-efficient points            Fastest
+effective Kb = be
+
+
+
+                      2
+                      4                                                                                                                                                                                     128-bit                                                    256-bit                                 512-bit
+
+
+
+
+                                                                                                                                                                   Latency speedup (×)
+                                                                                W4
+                      8
+     128-bit
+
+
+
+
+                                                                                                         Relative execution-efficiency score at fixed (Kb , c)
+                     16                                                         W2                                                                                                       1.0
+                     32
+                     64                                                         W1
+
+
+
+
+                                                                                                                (Cbest /Cbest@(Kb , c) , optimizing over r, u)
+                    128                                                                                                                                                                  0.5
+                    256
+                    512
+                                                                                                   1/4                                                                                   0.0
+                      1
+effective Kb = be
+
+
+
+
+                      2                                                                                                                                                                        100                           101                        100                          101       100                               101
+                      4                                                                                                                                                                                                               Hardware overhead reduction (×)
+                      8                                                                                                                                                                                                                                 (a) DeiT-B, W1A8
+     256-bit
+
+
+
+
+                     16                                                                  W4
+                     32                                                                                                                                                                                     128-bit                                             256-bit                                        512-bit
+
+
+
+
+                                                                                                                                                                   Latency speedup (×)
+                     64                                                                  W2
+                    128                                                                  W1                                                                                              1.0
+                    256
+                    512
+                                                                                                   1/16
+                      1                                                                                                                                                                  0.5
+effective Kb = be
+
+
+
+
+                      2
+                      4
+                      8                                                                                                                                                                  0.0
+     512-bit
+
+
+
+
+                     16                                                                                                                                                                        100                           101                        100                          101       100                               101
+                     32                                                                                                                                                                                                               Hardware overhead reduction (×)
+                     64                                                                       W4
+                                                                                                                                                                                                                        (b) Llama2-7B, W{1,2,4}A16, 128 token
+                    128
+                    256                                                                    W2
+                    512                                                                    W1
+                                                                                                   1/64
+                          1   2   4 8 16 32   1     2      4 8   16   1     2      4     8 16
+                                                                                                                                                                 Figure 11: Measured support-tradeoff frontier normalized to the aggressive
+                                  tile c                tile c                  tile c
+                              (a) DeiT-B          (b) Llama2-7B           (c) Llama2-7B                                                                          fixed baseline. For each workload/target pair, the horizontal axis reports hard-
+                                W1A8                  W2A16                W{1,2,4}A16                                                                           ware overhead reduction relative to the aggressive fixed design, and the vertical
+                                                                                                                                                                 axis reports latency speedup relative to that same baseline. DeiT-B stays close
+                                                                                                                                                                 to the aggressive fixed point, whereas mixed-precision Llama2 exhibits a richer
+Figure 10: Primitive-side analytical execution efficiency landscapes across                                                                                      frontier, especially on the 512-bit target.
+workloads and targets. For each workload-target pair, the heatmap color at
+each (𝐾𝑏 , 𝑐 ) reports the best relative analytical score at fixed effective K-block
+                                                                                                                                                                                                              ExaGEMM              T-MAC                     llama.cpp                          ExaGEMM               T-MAC (Adapted)
+size 𝐾𝑏 = 𝑏𝑒 and column tile 𝑐 after optimizing over the remaining kernel
+                                                                                                                                                                                                                                                                                               1000
+parameters (𝑟, 𝑢 ) among feasible candidates; highlighted cells mark the best                                                                                               100                 2.43×    4.87×      13.29×                        100          1.92×     2.45×        7.84×                           VAQF [19]
+
+
+
+
+                                                                                                                                                                                                                                     tokens / second
+                                                                                                                                                                                                                                                                                                                      (FPGA): 40.32 ms
+(𝐾𝑏 , 𝑐 ) value(s). Uniform DeiT-B W1A8 and uniform Llama2-7B W2A16 each                                                                                                                                                                                                                        100
+                                                                                                                                                                                   10                                                                  10
+                                                                                                                                                                 seconds
+
+
+exhibit a compact target-scaled hotspot, whereas mixed-precision Llama2-7B
+
+
+
+
+                                                                                                                                                                                                                                                                                   139.62
+
+
+
+
+                                                                                                                                                                                                                                                                                                           663.17
+                                                                                                                                                                                                                                                                                               ms
+                                                                                                                                                                                               62.50
+                                                                                                                                                                                               50.87
+
+
+
+
+                                                                                                                                                                                                                                                                                                                        140.24
+                                                                                                                                                                                                                                                                         24.52
+
+
+
+
+                                                                                                                                                                                                                                                                                                             100.10
+                                                                                                                                                                                                20.97
+
+W{1,2,4}A16 exhibits three regime-specific hotspots labeled W4/W2/W1.
+
+
+
+
+                                                                                                                                                                                                                                                                                      17.81
+                                                                                                                                                                                                         17.45
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                   98.57
+                                                                                                                                                                                                                                                                                                                         95.86
+                                                                                                                                                                                                          10.76
+
+
+
+
+                                                                                                                                                                                                                                                                           9.99
+                                                                                                                                                                                                                                                                                                    10
+
+
+
+
+                                                                                                                                                                                                                    9.38
+
+
+
+
+                                                                                                                                                                                                                                                                                                                                    36.65
+                                                                                                                                                                                                                    7.56
+
+
+
+
+                                                                                                                                                                                                                                                                                        6.61
+                                                                                                                                                                                         1                                                              1
+
+
+
+
+                                                                                                                                                                                                                                                                            3.58
+                                                                                                                                                                                                                                                              2.51
+                                                                                                                                                                                                             2.21
+
+
+
+
+                                                                                                                                                                                                                                                               1.31
+                                                                                                                                                                                                                                                                0.69
+                                                                                                                                                                                                                        0.57
+                                                                                                                                                                                0.1                                                                    0.1                                           1
+column tile 𝑐. For each workload-target pair, the color at each point                                                                                                                           Mobile Laptop         WS                                       Mobile Laptop         WS                   Mobile Laptop         WS
+                                                                                                                                                                                               (128-bit) (256-bit) (512-bit)                                  (128-bit) (256-bit) (512-bit)              (128-bit) (256-bit) (512-bit)
+reports the best relative analytical score attainable at fixed (𝐾𝑏 , 𝑐)                                                                                                                                 Platform                                                       Platform                                       Platform
+                                                                                                                                                                               (a) Llama2-7B, W{1/2/4}A16                                              (b) Llama2-7B, W{1/2/4}A16                         (c) DeiT-Base, W1A8
+after optimizing over the remaining kernel parameters (𝑟, 𝑢) among                                                                                                             (Prefill Latency, 128 Token)                                                (Decode Throughput)                           (End-to-End Latency)
+feasible candidates. Equivalently, the plotted value is the normal-
+ized inverse execution cost, 𝐶 best /𝐶 best@(𝐾𝑏 ,𝑐 ) , where 𝐶 best@(𝐾𝑏 ,𝑐 )                                                                                     Figure 12: End-to-end performance of ExaGEMM against external baselines
+is the best modeled execution cost at that fixed primitive shape.                                                                                                across the 128/256/512-bit targets. (a) Llama2-7B W{1,2,4}A16 prefill latency at
+The highlighted cells thus indicate feasible execution-favorable                                                                                                 128 tokens. (b) Llama2-7B W{1,2,4}A16 decode throughput. (c) DeiT-B W1A8
+                                                                                                                                                                 end-to-end latency. AVX512-specific adaptations are applied to T-MAC and
+operating points rather than unconstrained primitive optima.                                                                                                     llama.cpp. ExaGEMM outperforms the software baselines, with much larger
+    Two patterns emerge. First, the two uniform workloads, DeiT-                                                                                                 widening gains on Llama than on DeiT-B.
+B W1A8 and Llama2-7B W2A16, each exhibit a single dominant
+hotspot once the target width is fixed. As SIMD support widens,                                                                                                  4.4                              End-to-End Comparative Evaluation
+this hotspot shifts toward larger 𝐾𝑏 and 𝑐, indicating that the high-                                                                                            Finally, we evaluate whether the support points selected by Ex-
+performance region is compact and largely target-scaled.                                                                                                         aGEMM remain attractive after gem5 materialization. This closes
+    Second, the mixed-precision Llama2-7B W{1,2,4}A16 workload                                                                                                   the design loop of ExaGEMM by asking which primitive-side execution-
+does not collapse to one hotspot. Instead, it exhibits three separated                                                                                           favorable regions remain worth implementing once hardware over-
+dominant regions aligned with the active quantization regimes,                                                                                                   head is included. Figure 11 compares measured frontier points
+labeled W4, W2, and W1 in Figure 10. Across the 128/256/512-bit                                                                                                  against an aggressive fixed baseline, i.e., the feasible single-primitive
+targets, these regime-specific hotspots move systematically toward                                                                                               design with the highest normalized support cost on each target,
+larger 𝐾𝑏 and 𝑐. Thus, the mixed-precision workload is shaped not                                                                                                while Figure 12 reports end-to-end performance against external
+by arbitrary layer-to-layer noise, but by the superposition of several                                                                                           baselines.
+regime-specific primitive pressures within one model.                                                                                                            Frontier value depends on workload. In Figure 11, the aggressive
+    Selector overhead is introduced only when these primitive choices                                                                                            fixed point for DeiT-B W1A8 lies on the measured frontier across
+are aggregated into model-level support points. Thus, Figure 10                                                                                                  all three targets, indicating that a single aggressive primitive is
+isolates the primitive-side demand pattern in the execution space:                                                                                               already a competitive support choice for the uniform workload. In
+the high-performance region is compact for the uniform workloads                                                                                                 contrast, Llama2-7B W{1,2,4}A16 exhibits a much richer frontier; on
+but split across several regime-specific hotspots for mixed-precision                                                                                            the 512-bit target, a measured frontier point is simultaneously faster
+Llama2. We next ask whether this richer primitive-side structure                                                                                                 and lower-cost than the aggressive fixed baseline. Thus, exploration
+is large enough to change the model-level support decision once                                                                                                  still recovers the aggressive fixed design when it is Pareto-efficient,
+hardware cost is included.                                                                                                                                       but the value of workload-aware frontier selection is much larger
+                                                                                                                                                                 for mixed-precision LLM workloads than for DeiT-B.
+                                                                                                                                                                 Widening benefits LLMs much more than ViTs. This difference
+                                                                                                                                                                 is reinforced by Figure 12, comparing ExaGEMM to the prior SIMD
+ExaGEMM: Exploration Framework for CPU-Driven ML Inference via Associative In-Register Computing for Low-Bit GEMM
+
+
+kernels [5, 22]. For Llama2-7B W{1,2,4}A16, ExaGEMM reduces                            [7] Yuanhong He, Peiyu Niu, Jun Chen, Chenchen Zhang, and Chao Yang.
+prefill latency by 2.43–13.29× and improves decode throughput                              2026. W4A16 Mixed-Precision Matrix Multiplication on Decoupled Archi-
+                                                                                           tecture: Kernel Design and Memory Bottleneck Analysis for Ascend NPUs.
+by 1.92–7.84×. For DeiT-B W1A8, ExaGEMM reduces latency by                                 arXiv:2601.16536 [cs.DC] https://arxiv.org/abs/2601.16536
+1.46–6.62× over T-MAC. Although T-MAC was originally proposed                          [8] Huanqi Hu, Bowen Xiao, Shixuan Sun, Jianian Yin, Zhexi Zhang, Xiang Luo,
+                                                                                           Chengquan Jiang, Weiqi Xu, Xiaoying Jia, Xin Liu, and Minyi Guo. 2025. Liq-
+for LLMs, its GEMM kernel can be adapted to low-bit ViT variants.                          uidGEMM: Hardware-Efficient W4A8 GEMM Kernel for High-Performance LLM
+   The widening payoff is similarly asymmetric. Moving from 256-                           Serving. In Proceedings of the International Conference for High Performance Com-
+bit to 512-bit support reduces Llama prefill latency by 3.89× and                          puting, Networking, Storage and Analysis (SC ’25). Association for Computing
+                                                                                           Machinery, New York, NY, USA, 1619–1630. doi:10.1145/3712285.3759852
+increases decode throughput by 5.69×, whereas DeiT-B improves                          [9] Benoit Jacob, Skirmantas Kligys, Bo Chen, Menglong Zhu, Matthew Tang, An-
+by only 2.62×. DeiT-B also changes little from 128- to 256-bit, while                      drew Howard, Hartwig Adam, and Dmitry Kalenichenko. 2018. Quantization
+Llama already improves sharply over that range. This is the end-                           and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference.
+                                                                                           In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition
+to-end counterpart of Figure 10: DeiT-B is comparatively uniform,                          (CVPR).
+whereas mixed-precision Llama exposes a broader set of profitable                     [10] Yongkweon Jeon, Chungman Lee, Eulrang Cho, and Yeonju Ro. 2022. Mr.BiQ:
+                                                                                           Post-Training Non-Uniform Quantization Based on Minimizing the Reconstruc-
+primitive shapes and therefore benefits more from wider SIMD                               tion Error. In Proceedings of the IEEE/CVF Conference on Computer Vision and
+support and workload-aware selection.                                                      Pattern Recognition (CVPR). 12329–12338.
+   Overall, Figure 11 and Figure 12 show that a single aggressive                     [11] Seungmin Lee, Youngsok Kim, Dukyun Nam, and Jong Kim. 2024. Gem5-AVX:
+                                                                                           Extension of the Gem5 Simulator to Support AVX Instruction Sets. IEEE Access
+primitive can be nearly sufficient for the uniform DeiT-B work-                            12 (2024), 20767–20778. doi:10.1109/ACCESS.2024.3359296
+load studied here, whereas for mixed-precision LLM workloads,                         [12] Sangjun Lee, Seung-taek Woo, Jun-gyu Jin, Changhun Lee, and Eunhyeok Park.
+workload-aware frontier selection changes the support decision                             2025. AMQ: Enabling AutoML for Mixed-precision Weight-Only Quantization
+                                                                                           of Large Language Models. In Proceedings of the 2025 Conference on Empirical
+itself and translates into substantial end-to-end gains.                                   Methods in Natural Language Processing (EMNLP). 35520–35538.
+                                                                                      [13] Ju-Hung Li, Jhih-Kuan Lin, Yung-Cheng Su, Chi-Wei Chu, Lai-Tak Kuok, Hung-
+                                                                                           Ming Lai, Chao-Lin Lee, and Jenq-Kuen Lee. 2023. SIMD Everywhere Op-
+5    Conclusion                                                                            timization from ARM NEON to RISC-V Vector Extensions. arXiv preprint
+                                                                                           arXiv:2309.16509 (2023).
+ExaGEMM formulates lightweight ISA support for low-bit CPU                            [14] Xiangyu Li, Chengyu Yin, Weijun Wang, Jianyu Wei, Ting Cao, and Yunxin Liu.
+GEMM as a pre-silicon support-selection problem. By reusing ex-                            2025. Vec-LUT: Vector Table Lookup for Parallel Ultra-Low-Bit LLM Inference
+                                                                                           on Edge Devices. arXiv:2512.06443 [cs.DC] https://arxiv.org/abs/2512.06443
+isting SIMD datapaths for table generation and accumulation, it                       [15] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen
+reduces new hardware to an in-register select network and treats                           Wang, Guangxuan Xiao, Xingyu Dang, Chuang Gan, and Song Han. 2024. AWQ:
+                                                                                           Activation-aware Weight Quantization for LLM Compression and Acceleration.
+hardware overhead as an explicit design constraint. ExaGEMM                                In MLSys.
+prunes large candidate spaces before gem5, identifies compact                         [16] Hyunwoo Oh, KyungIn Nam, Rajat Bhattacharjya, Hanning Chen, Tamoghno
+non-dominated support frontiers, and generates implementation                              Das, Sanggeon Yun, Suyeon Jang, Andrew Ding, Nikil Dutt, and Mohsen Imani.
+                                                                                           2025. T-SAR: A Full-Stack Co-design for CPU-Only Ternary LLM Inference via
+artifacts for system-level validation. The key result is workload-                         In-Place SIMD ALU Reorganization. arXiv:2511.13676 [cs.AR] https://arxiv.org/
+dependent: a single aggressive primitive is nearly sufficient for                          abs/2511.13676
+uniform DeiT-B, whereas mixed-precision Llama2 benefits substan-                      [17] ONNX Runtime Developers. 2026. ONNX Runtime Execution Providers.
+                                                                                           https://onnxruntime.ai/docs/execution-providers/. https://onnxruntime.ai/docs/
+tially from workload-aware support selection. Across x86 and ARM                           execution-providers/ Accessed: 2026-01-18.
+targets, ExaGEMM delivers substantial gains over software-only                        [18] Mariam Rakka, Mohammed E. Fouda, Pramod Khargonekar, and Fadi Kurdahi.
+                                                                                           2024. A Review of State-of-the-art Mixed-Precision Neural Network Frameworks.
+and fixed-support baselines, providing a practical path to workload-                       IEEE Transactions on Pattern Analysis and Machine Intelligence 46, 12 (2024), 7793–
+aware low-bit CPU support across diverse quantization regimes.                             7812. doi:10.1109/TPAMI.2024.3394390
+                                                                                      [19] Mengshu Sun, Haoyu Ma, Guoliang Kang, Yifan Jiang, Tianlong Chen, Xiao-
+                                                                                           long Ma, Zhangyang Wang, and Yanzhi Wang. 2022. VAQF: Fully Automatic
+References                                                                                 Software-Hardware Co-Design Framework for Low-Bit Vision Transformer.
+                                                                                           arXiv:2201.06618 [cs.LG] https://arxiv.org/abs/2201.06618
+ [1] Arm Ltd. [n. d.]. A64 SIMD Vector Instructions. https://developer.arm.com/       [20] Hongyu Wang, Shuming Ma, Li Dong, Shaohan Huang, Huaijie Wang, Lingxiao
+     documentation/100069/0609/A64-SIMD-Vector-Instructions. Accessed: March               Ma, Fan Yang, Ruiping Wang, Yi Wu, and Furu Wei. 2023. BitNet: Scaling 1-Bit
+     26, 2025.                                                                             Transformers for Large Language Models. arXiv preprint arXiv:2310.11453 (2023).
+ [2] Nathan Binkert, Bradford Beckmann, Gabriel Black, Steven K. Reinhardt, Ali       [21] Xubin Wang, Zhiqing Tang, Jianxiong Guo, Tianhui Meng, Chenhao Wang, Tian
+     Saidi, Arkaprava Basu, Joel Hestness, Derek R. Hower, Tushar Krishna, Somayeh         Wang, and Weijia Jia. 2025. Empowering Edge Intelligence: A Comprehensive
+     Sardashti, Rathijit Sen, Korey Sewell, Muhammad Shoaib, Nilay Vaish, Mark D.          Survey on On-Device AI Models. ACM Comput. Surv. 57, 9, Article 228 (April
+     Hill, and David A. Wood. 2011. The gem5 Simulator. ACM SIGARCH Comput.                2025), 39 pages. doi:10.1145/3724420
+     Archit. News 39, 2 (Aug. 2011), 1–7. doi:10.1145/2024716.2024718                 [22] Jianyu Wei, Shijie Cao, Ting Cao, Lingxiao Ma, Lei Wang, Yanyong Zhang, and
+ [3] Razvan-Gabriel Dumitru, Vikas Yadav, Rishabh Maheshwary, Paul-Ioan Clotan,            Mao Yang. 2025. T-MAC: CPU Renaissance via Table Lookup for Low-Bit LLM
+     Sathwik Tejaswi Madhusudhan, and Mihai Surdeanu. 2024. Layer-Wise Quanti-             Deployment on Edge. In Proceedings of the Twentieth European Conference on
+     zation: A Pragmatic and Effective Method for Quantizing LLMs Beyond Integer           Computer Systems (Rotterdam, Netherlands) (EuroSys ’25). Association for Com-
+     Bit-Levels. arXiv:2406.17415 [cs.CL] https://arxiv.org/abs/2406.17415                 puting Machinery, New York, NY, USA, 278–292. doi:10.1145/3689031.3696099
+ [4] Razvan-Gabriel Dumitru, Vikas Yadav, Rishabh Maheshwary, Paul Ioan Clotan,       [23] He Xiao, Qingyao Yang, Dirui Xie, Wendong Xu, Zunhai Su, Runming yang,
+     Sathwik Tejaswi Madhusudhan, and Mihai Surdeanu. 2025. Variable Layerwise             Wenyong Zhou, Haobo Liu, Zhengwu Liu, and Ngai Wong. 2025. Exploring
+     Quantization: A Simple and Effective Approach to Quantize LLMs. In Findings of        Layer-wise Information Effectiveness for Post-Training Quantization in Small
+     the Association for Computational Linguistics: ACL 2025, Wanxiang Che, Joyce          Language Models. arXiv:2508.03332 [cs.LG] https://arxiv.org/abs/2508.03332
+     Nabende, Ekaterina Shutova, and Mohammad Taher Pilehvar (Eds.). Association      [24] Tianyi Zhang, Jonah Yi, Bowen Yao, Zhaozhuo Xu, and Anshumali Shrivastava.
+     for Computational Linguistics, Vienna, Austria, 534–550. doi:10.18653/v1/2025.        2024. NoMAD-attention: efficient LLM inference on CPUs through multiply-
+     findings-acl.29                                                                       add-free attention. In Proceedings of the 38th International Conference on Neural
+ [5] Georgi Gerganov and ggml-org Contributors. 2026. llama.cpp: LLM inference             Information Processing Systems (Vancouver, BC, Canada) (NIPS ’24). Curran Asso-
+     in C/C++. https://github.com/ggml-org/llama.cpp. https://github.com/ggml-             ciates Inc., Red Hook, NY, USA, Article 3581, 25 pages.
+     org/llama.cpp Accessed: 2026-01-18.                                              [25] Yilong Zhao, Chien-Yu Lin, Kan Zhu, Zihao Ye, Lequn Chen, Size Zheng, Luis
+ [6] Amir Gholami, Sehoon Kim, Zhen Dong, Zhewei Yao, Michael W. Mahoney,                  Ceze, Arvind Krishnamurthy, Tianqi Chen, and Baris Kasikci. 2024. Atom:
+     and Kurt Keutzer. 2021. A Survey of Quantization Methods for Efficient Neural         Low-Bit Quantization for Efficient and Accurate LLM Serving. In Proceedings
+     Network Inference. arXiv:2103.13630 [cs.CV] https://arxiv.org/abs/2103.13630          of Machine Learning and Systems, P. Gibbons, G. Pekhimenko, and C. De Sa
+                                                                             Hyunwoo Oh, Suyeon Jang, Hanning Chen, Sanggeon Yun, Ryozo Masukawa, and Mohsen Imani
+
+
+     (Eds.), Vol. 6. 196–209. https://proceedings.mlsys.org/paper_files/paper/2024/          and Applications. ACM Comput. Surv. 57, 8, Article 209 (March 2025), 35 pages.
+     file/5edb57c05c81d04beb716ef1d542fe9e-Paper-Conference.pdf                              doi:10.1145/3719664
+[26] Yue Zheng, Yuhao Chen, Bin Qian, Xiufang Shi, Yuanchao Shu, and Jiming
+     Chen. 2025. A Review on Edge Large Language Models: Design, Execution,
+

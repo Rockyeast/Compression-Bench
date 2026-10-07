@@ -1,0 +1,810 @@
+                                        J OINT E NCODING OF KV-C ACHE B LOCKS FOR S CALABLE LLM
+                                                                 S ERVING
+
+
+                                                                                 Joseph Kampeas & Emir Haleva
+                                                                                Distributed and Parallel Software Lab
+                                                                                        Huawei Technologies
+                                                                                     first.last@huawei.com
+arXiv:2601.03067v1 [cs.LG] 6 Jan 2026
+
+
+
+
+                                                                                            A BSTRACT
+
+                                                 Modern large language models (LLMs) drive interactive AI systems but are bottlenecked by the
+                                                 memory-heavy growth of key-value (KV) caches, which limits real-time throughput under concurrent
+                                                 loads. Existing KV-cache compression methods rely on rigid heuristics, disrupt tensor layouts, or
+                                                 require specialized compute, hindering scalability and deployment.
+                                                 We propose joint encoding of KV-cache blocks, which fuses similar blocks across requests and input
+                                                 chunks into shared representations while preserving standard cache structure. This alleviates the
+                                                 KV-cache memory bottleneck, supporting high-concurrency serving without specialized hardware.
+                                                 Theoretically, we analyze the rate-distortion tradeoff of fused cache blocks under a Poisson process
+                                                 model. Empirically, our method achieves up to 4.38× KV-cache compression with negligible accuracy
+                                                 loss across diverse LLMs and benchmarks, outperforming recent structured and adaptive compression
+                                                 baselines. In real LLM serving, joint encoding improves the token throughput by ∼40% on a
+                                                 single-machine vLLM benchmark, demonstrating substantial gains in inference throughput. Code is
+                                                 available at kv_joint_encoding.
+
+
+                                        1   Introduction
+
+                                        Large Language Model (LLM) services have recently gained tremendous popularity, but their serving pipeline faces
+                                        distinct challenges across two stages. In the prefill stage, the model processes the input sequence. This stage is
+                                        compute-bound but executed only once per request. In contrast, the decode stage generates the subsequent output
+                                        tokens, is repeated for every token, and is primarily constrained by memory bandwidth. The bottleneck arises because
+                                        each decoding step requires fetching large model parameters from memory to maintain fast computation (Xie et al.,
+                                        2025). This implies that batch size can be increased to serve more concurrent users without increasing generation
+                                        latency, up to the point where computation time aligns with memory access time and becomes the new bottleneck.
+                                        Scaling LLM services for high concurrency rapidly encounters memory constraints. On-chip memory is consumed
+                                        by three main components: the model weights, the inference activations, and the key–value (KV) cache. The weights,
+                                        though large, are static and do not grow with users concurrency. Activations are lightweight, scale linearly with the
+                                        number of users, and vanish after each step. The KV-cache, however, is both persistent and expansive: it scales with
+                                        the number of active sessions, and requires reserving memory proportional to the maximum sequence length per user.
+                                        In practice, the KV-cache rapidly becomes the dominant memory consumer, and hence, it is the primary obstacle to
+                                        scaling users concurrency.
+                                        To alleviate these memory constraints, recent serving frameworks borrow ideas from virtual memory and paging in
+                                        operating systems. In particular, vLLM introduces Paged-Attention (PA) Kwon et al. (2023a), which partitions the
+                                        KV-cache of each request into fixed-size blocks, each holding a predefined number of key-value tokens. These blocks
+                                        do not need to be contiguous in memory; instead, a block table tracks their locations, allowing the attention mechanism
+                                        to retrieve relevant entries efficiently (Kwon et al., 2023b). This design removes the need of reserving per-user memory
+                                        proportional to the maximum sequence length. Instead, memory consumption scales with the actual demand, which is
+                                        typically far smaller on average.
+                                                                                      A PREPRINT - JANUARY 7, 2026
+
+
+Although Paged-Attention mitigates memory fragmentation, it does not address the fundamental asymmetry between
+the compute-bound prefill stage and the memory-bound decode stage. To address this, the vLLM scheduler prioritizes
+prefill requests, reducing the Time-To-First-Token (TTFT) and allowing larger decode batches. Yet, this prioritization
+comes at a cost of delaying decode requests, increasing the Time-Between-Tokens (TBT). In long-context scenarios,
+this elevated TBT can become severe, stalling generation for several seconds (Agrawal et al., 2023). Recently, studies
+suggested to separate the two stages: requests are first processed on prefill servers, and their KV-cache is then migrated
+to decode servers. This separation enables independent optimization of the stages, reducing TTFT during prefill and
+TBT during decoding (Qin et al., 2024; Zhong et al., 2024; Hu et al., 2024).
+In the prefill phase, strategies such as Tensor Parallelism and chunked-prefilling have been shown to reduce TTFT and
+increase compute utilization (Agrawal et al., 2023, 2024). In the decode phase, however, compute utilization remains
+low because each step requires fetching the model parameters to generate only a single token per request. Increasing
+the batch size can mitigate this inefficiency, but larger batches demand proportionally more KV-cache and are limited
+by the memory.
+To reduce this overhead, prefix sharing has been proposed: grouping requests with identical prefixes so they can share
+the cached blocks and hence minimize memory (Zhu et al., 2024; Juravsky et al., 2024). Yet, exact prefix matches are
+rare in heterogeneous workloads, limiting its practical benefit. This limitation motivates the need for more general
+block-sharing mechanisms that extend the advantages of prefix sharing without relying on exact prefix matches.
+In this paper, we address the KV-cache bottleneck in LLM serving by introducing a joint-encoding scheme that
+compresses and reuses similar cache blocks across requests. We develop two complementary methods: Batch Fast-
+Fusion (BFF), which fuses blocks across different requests prior to decoding, and Chunks Fast-Fusion (CFF), which
+fuses blocks across input chunks during prefilling. Both schemes reduce KV-cache size, enable larger batch sizes, and
+lower network bandwidth demands. At the core of our approach is a tree-structured fusion strategy that efficiently
+identifies encoding opportunities while preserving model accuracy. By applying joint encoding in both prefill and
+decode phases, our scheme delivers high throughput even under heterogeneous workloads with diverse input/output
+lengths and arrival patterns. These new fusion strategies substantially extend the generality and efficiency of cache
+sharing, delivering both memory and bandwidth savings in heterogeneous, real-world workloads.
+The remainder of this paper is organized as follows: Section 2 discusses the most relevant related work. Section 3
+outlines the motivation behind block fusion in LLM serving systems. Section 4 describes the proposed scheme in detail.
+Section 5 analyzes the scheme in lens of the point processes, Section 6 presents the experimental results and evaluation,
+and Section 7 concludes the paper.
+
+
+2   Related Work
+
+A major line of research has focused on reducing the memory footprint of the KV-cache, primarily through compression.
+Key approaches include quantization, low-rank approximation, and selective eviction. Quantization-based methods,
+such as Hooper et al. (2024); Liu et al. (2024d), compress key and value embeddings to 2–3 bits with minimal accuracy
+loss, substantially increasing batch size and throughput over standard precision. Low-rank and latent representations,
+for example, Multi-Head Latent Attention (MLA) Liu et al. (2024a) and ReCalKV Yan et al. (2025) stored KV matrices
+in compact subspaces that are later reconstructed as needed. This approach achieves a significant reduction in the
+KV-cache size while maintaining attention accuracy. Recently, Meng et al. (2025) suggested a method for transforming
+the attention of pretrained models to MLA architectures.
+Given the redundancy of KV states across adjacent layers, other works interpolate vector directions or use SVD to
+compress cross-layer states (e.g., Liu et al. (2024b); Chang et al. (2025)), often retaining only a subset of tokens for
+quality. Combining quantization with these techniques achieves KV-cache compression ratios up to 5×. Recent work
+leverages adaptive arithmetic encoding (Liu et al., 2024c), head-level token importance with residual merging (Liu et al.,
+2025), and sensitivity-driven dynamic sparsity (Zhang et al., 2024; Yang et al., 2025) to further boost cache efficiency.
+A complementary research direction explores memory sharing across requests by reusing computation for common input
+segments. Frameworks like HydraGen (Juravsky et al., 2024), RelayAttention (Zhu et al., 2024), and vLLM/SGLang
+(Wu et al., 2025; Zheng et al., 2023) exploit prefix sharing, where requests with identical prefixes share cached states,
+reducing both computation and memory requirements. However, such methods are limited by the rarity of exact prefix
+matches in practical workloads. Fragmentation and fine-grained reuse of overlapping segments are considered in (Zhang
+et al., 2025; Prabhu et al., 2025; Yang et al., 2025).
+Despite significant progress, most prior methods rely on rigid heuristics, disrupt native tensor layouts, or require
+exact prefix matches, limiting scalability and flexible integration into modern LLM serving pipelines. Our work
+directly addresses these limitations by introducing joint compression of KV-cache blocks, allowing finer-grained,
+
+
+                                                            2
+                                                                                       A PREPRINT - JANUARY 7, 2026
+
+
+
+
+                                           (a)                                           (b)
+
+Figure 1: Attention computation (a) batch of requests with similar keys blocks. After the fusion, the KV=cache footprint
+is smaller and batch decoding is optimized by performing matrix-matrix multiplication. (b) After fusing chunks into a
+unified representation, the blocks computation of chunks 0 and 1 can be reused in chunk 2 (same color).
+
+
+layout-preserving, and general block sharing that extends the benefits of prefix reuse to arbitrarily similar segments.
+This flexibility is critical for memory- and bandwidth-efficient serving in real-world settings.
+
+
+3   Motivation
+
+Improving the throughput of LLM serving is often achieved by increasing batch size. Since the decoding phase
+is primarily memory-bound, dominated by repeated fetching of large weight matrices, larger batch sizes do not
+substantially increase per-request decoding latency. However, serving scalability remains constrained by the memory
+footprint of the KV-cache, which must be reserved per user session. Apart from the common compression methods
+like quantization and sparsification (by eviction), prefix-sharing techniques like Juravsky et al. (2024) and Zheng et al.
+(2024) demonstrate that overlapping prompt segments across requests enable KV-cache sharing. In addition, reuse of
+computed blocks as well as improved computation can improve throughput by up to 36% (Huijong Jeong and Kim,
+2024). Nonetheless, these approaches rely on exact prefix matches, which severely limits applicability in real-world
+settings where variations in phrasing or task-specific inputs are common (Wu et al., 2025; Zheng et al., 2024). For
+example, two translation requests with slightly different introductory phrases (“Help me translate” vs. “Translate this”)
+would fail to share any KV blocks under strict prefix matching (Wu et al., 2025).
+To overcome the strict requirement of an exact match, we propose a KV-cache blocks joint-encoding scheme that fuses
+blocks based on similarity threshold. This approach extends the benefits of prefix sharing to non-identical contexts.
+Figure 1 highlights the memory and computational benefits of jointly encoding blocks in Softmax Attention (SA).
+Specifically, Figure 1(a) illustrates the benefits in the decoding phase, where keys with similar representations (indicated
+by color) can be combined into a unified representation. Fusing these keys (and values) into a unified representation not
+only allows increasing the batch size but also facilitates optimized matrix-matrix multiplication, instead of multiple
+matrix-vector multiplications. In the prefill phase, Figure 1(b) illustrates how chunking input requests allows joint
+encoding of blocks across chunks, which reduces KV blocks memory, and thus, facilitates handling longer inputs
+and further reusing computation in SA. Consequently, any SA computation involving a fused block can be reused in
+subsequent chunks that include instances of this block, maximizing efficiency and throughput.
+In both cases, after encoding, some blocks share the same representation and the block table points to the shared
+representation. Thus, any SA computation that involves a fused block can be reused in later chunks that comprise an
+instance of this block. The final SA result is derived by merging the SA of the fused components with that of the unique
+components (and rescaling). The recent version of vLLM can take advantage of the computation of SA with shared
+blocks.
+
+
+4   KV Blocks Joint-Encoding
+
+In this section, we introduce our KV blocks joint-encoding scheme for the chunk-prefilling setting, to further facilitate
+the joint encoding of the chunks while they are processed in the LLM (Qin et al., 2024; Agrawal et al., 2023). The main
+objective of our scheme is to maximize the batch size by jointly encoding KV blocks. The impact is threefold. First, in
+the decode phase, benefit from a higher arithmetic efficiency due to a larger batch size, and further, minimize KV-cache
+prefetching, mitigating the memory bandwidth limit. Second, in the prefill phase, it also enables the reuse of fused
+blocks computations, alleviating the compute limitation (see Figure 1). Third, reduce the usage of network bandwidth,
+which often becomes a bottleneck, especially when considering a high degree of parallelism (Agrawal et al., 2024).
+Certainly, it is crucial to achieve this goal while maintaining the model’s accuracy.
+
+
+                                                             3
+                                                                                        A PREPRINT - JANUARY 7, 2026
+
+
+To fulfill this goal, we propose Fast-Fusion (FF) method that jointly encodes similar blocks into a unified representation
+if the cosine similarity between contexts of different blocks is above predefined threshold. The similarity threshold
+is substantial for both the resulting compression ratio and model’s accuracy. To avoid excessive blocks comparisons
+overhead, we design an efficient tree-like fusion strategy that scales as O(B log B) and O(C log C), where B is the
+batch size and C is the number of chunks, respectively. This strategy allows the parallelization of the fusion process at
+each level of the tree. Accordingly, the fusion can be done over blocks of different requests (i.e., BFF) or blocks of
+different chunks (i.e., CFF).
+In practice, the KV-cache layout in vLLM is (B, p, t, h, d), where p, t, h, and d are the number of blocks, tokens per
+block, number of heads, and the head embedding size, respectively. Before encoding, the KV-cache is unfolded into a
+convenient layout of blocks per request or chunk. Specifically, let r = t · h · d, and note that C = ⌊p · t/(size of chunk)⌋,
+we use a layout of (B, p, r) and (C, p/C, r) for the BFF and the CFF, respectively. The norm of each r is stored to
+allow a proper rescaling of the fused blocks. The algorithm is applied iteratively for every N chunks or requests in each
+layer.
+A pseudo-code of the FF algorithm is given in Algorithm 1. Roughly speaking, after unfolding the KV-cache into a
+convenient layout and storing the norms, we recursively call the FF method in Algorithm 1, which fuses blocks of
+different requests or chunks if their similarity level is above threshold. Intuitively, blocks represented by r-dimensional
+vectors can also be expressed in terms of their norm and corresponding r-dimensional unit (direction) vectors. In this
+view, fusion can be understood as aligning multiple unit vectors into a single unified direction, while preserving the
+distinctiveness of the original blocks through their norms. This allows representing multiple blocks using a single unit
+vector and a norm (scalar) per block. To further enhance the compute, the fused blocks are taken into account in the
+attention computation, allowing low-level kernels to leverage jointly encoded blocks in the decoding phase, and reuse
+computations in the prefill phase. Only one copy of the fused blocks is needed, and redundant copies can be evicted to
+reduce memory usage. Further, different number of blocks may be encoded in each layer, which requires running each
+layer with its own block table, as implemented in vLLM. Note that our scheme attains a compression that is at least the
+compression attained by shared prefix methods, since we further compress inputs that do not share prefixes.
+Consequently, the joint encoding allows us to reuse computations to address the limitations of compute, memory
+bandwidth, and network bandwidth. The tree structure is beneficial for detecting fusion opportunities at a reasonable
+cost in large-scale prefill and decoding serving systems.
+Remark 1. The order of requests impact the resulting compression. Specifically, it is beneficial to place shorter requests
+(in terms of number of blocks) on the left tree to gain higher diversity per block. At the best case, all the blocks in
+the right tree will be unified into the left tree blocks representation, yielding the maximal compression. However, the
+responsibility of ordering the requests belongs to the scheduler, which is out of the scope of this paper.
+Remark 2. To avoid manual tuning, the threshold can be self-adjusted using a simple feedback. For example,
+percentile-based or target-compression strategies monitor fusion statistics during serving: if too many blocks are fused
+(or compression exceeds a desired CR), the threshold is increased, and vice versa. Alternatively, a small calibration set
+can be used to refine the threshold based on acceptable distortion levels, providing a lightweight and fully automated
+adaptation mechanism.
+Remark 3. Prior work (e.g., Wu et al. (2025)) demonstrated that prefix-sharing may leak information through timing
+side-channels. In particular, by examining the TTFT, an attacker can determine whether a particular prefix has already
+been cached by the vLLM. Interestingly, joint encoding mitigates such risks: because multiple distinct KV blocks are
+mapped to a shared latent direction, any reduction in compute time is no longer attributable to a single prefix or token,
+but to a many-to-one cluster. This substantially weakens the leakage signal compared to prefix matching.
+
+
+5   Analysis
+
+The similarity threshold is substantial to the algorithm performance as it dictates the resulting accuracy (or distortion)
+on the one hand, and the compression (or rate) on the other. In terms of rate-distortion, high threshold ensures low
+KV cache distortion, yet may result in low exceedance rate, and consequently, moderate compression. Similarly, low
+threshold value allows unifying many blocks into a single representation (high compression), yet may degrade the
+performance due to a highly distorted KV cache. Hence, it is crucial to thoroughly study the impact of the threshold.
+To analyze the resulting rate, recall that Algorithm 1 recursively fuses pairs of requests (see Figure 2 for illustration).
+Assume a pair of requests with m1 and m2 blocks, respectively, for which there are n = m1 · m2 similarity samples
+     n
+{xi }i=1 . Then, using Kernel Density Estimation (KDE) with a Gaussian
+                                                                     Pn        kernel
+                                                                                     (Wand and Jones, 1994, Ch. 2),
+                                                                  1            x−xi
+the similarity density in each layer is approximately fh (x) = nh i=1 ϕ h , where h is the kernel bandwidth
+
+
+                                                             4
+                                                                                        A PREPRINT - JANUARY 7, 2026
+
+
+
+
+Algorithm 1 Fast Fusion
+Require: KV-cache (k,v), threshold (thr)
+  if len(k) == 1 then
+       return normalize(k), normalize(v)
+  (*tree left*)
+  kl , vl ← FastFusion(k[: len(k)//2], v[: len(v)//2], thr)
+  (*tree right*)
+  kr , vr ← FastFusion(k[len(k)//2 :], v[len(v)//2 :], thr)
+  sim ← (kl k⊤   r ) (*similarity per block of kl *)
+  for each row in sim do
+       idxfused ← indices where sim(row) > thr
+       if |idxfused | > 0 then
+         (*block fusion*)                      P
+         kl (row) ← normalize(kl (row) + i∈idxfused kr (i))            Figure 2: BFF example for 6 request, where each
+                                               P
+         vl (row) ← normalize(vl (row) + i∈idxfused vr (i))            request has a different number of blocks (and a dif-
+         evict fused blocks at kr (idxfused ) and vr (idxfused )       ferent color). The Fast Fusion is recursively called,
+                                                                       fusing every pair of requests (fused blocks are de-
+         (*for matrix-matrix efficiency*)
+                                                                       picted by a mixed color). Then, fusing pairs of
+         mark shared blocks at kl (row), and vl (row)
+  update block-table bt                                                pairs, and so on, until all the requests’ blocks are
+  return cat([kl | kr non-shared blocks]),                             jointly described in the KV-cache. Clearly, some
+            cat([vl | vr non-shared blocks])                           blocks are not fused (remain their original color),
+                                                                       and some are fused more than once while traversing
+                                                                       the tree.
+
+
+(standard deviation). Therefore, the similarity distribution is approximately
+                                                           n             
+                                                        1X         x − xi
+                                             Fh (x) =          Φ            ,                                            (1)
+                                                        n i=1        h
+
+where ϕ and Φ are the Gaussian density and distribution functions, respectively. In other words, each sample xi
+contributes a Gaussian kernel function with mean value xi to the overall estimated probability density function, thus
+contributing a different probability of exceeding the threshold.
+Proposition 1. For a sufficiently high similarity threshold u, the number of above-threshold similarities is asymptotically
+a Poisson variable with rate
+                                                     n                          
+                                                 1X              u − (hbn + xi )
+                                        Λ(u) =          exp −                      ,                                    (2)
+                                                 n i=1                han
+
+where an = (2 log n)−1/2 and bn = (2 log n)1/2 − 21 (2 log n)−1/2 (log log n + log(4π)) are normalization constants.
+
+Proof. Our goal is to analyze the asymptotic threshold exceedance rate of eq. (1). Since the indices of high threshold
+exceedance are random and are relatively rare, the number of above-threshold observations can be modeled as a Poisson
+                                                                                   5). In particular, let u be a threshold
+random variable when the threshold is sufficiently high (Leadbetter et al., 2012, Ch.
+such that the kernel of each sample i satisfies Pr(xi > u) = 1 − Φ u−x        h
+                                                                                i
+                                                                                     = Θ(1/n). Then, according to the
+uniformly asymptotically negligible condition, the number of threshold arrivals is approximately a Poisson variable with
+rate Λ(u) when the samples are independent (Falk et al., 2010, Ch. 8.3). Similar treatment for dependent samples is
+given in (Coles et al., 2001, Ch. 5).
+For the Gaussian case, the threshold exceedance rate is Λ(u) given in eq. (2), where an = (2 log n)−1/2 and bn =
+(2 log n)1/2 − 12 (2 log n)−1/2 (log log n + log(4π)) are normalizing constants (Kampeas et al., 2014, Theorem 5).
+
+Figure 3(a) depicts the empirical similarity and the above-threshold distribution together with the KDE approximation
+for DeepSeek-R1-Distill-Qwen-7B (2025) on nVidia HelpSteer (2024) dataset in several layers. Evidently, for this model
+and dataset, the similarity appears Gaussian, yet with different mean andPvariance   in each layer. Interestingly, letting
+                                                                            n                             Pn
+the similarity in layer ℓ be approximately Gaussian with mean µℓ = n1 i=1 xi and variance σℓ2 = n1 i=1 x2i − µ2ℓ ,
+
+
+                                                                   5
+                                                                                                           A PREPRINT - JANUARY 7, 2026
+
+
+
+      25                                                      layer 4                                                                            layer 4
+                                                              layer 11            200
+                                                 thr=0.8      layer 19
+                                                                                                                                                 layer 11
+                                                                                                                                                 layer 19
+      20                                                      layer 25            175
+                                                                                                                                                 layer 25
+                                                                                  150
+ f(x) 15                                                                     f(x) 125
+                                                                                  100
+      10
+                                                                                   75
+       5                                                                           50
+                                                                                   25
+       0                                                                           0
+           0.0    0.2      0.4          0.6        0.8           1.0               0.800   0.825   0.850    0.875        0.900   0.925   0.950     0.975
+                                    x                                                                                x
+                              (a)                                                                              (b)
+
+Figure 3: Empirical similarity and analysis for DeepSeek-R1-Distill-Qwen-7B (2025) on nVidia HelpSteer (2024)
+dataset for several layers. Bars represents the empirical similarity and solid line the KDE approximation. (a) Blocks
+similarity density. (b) Above-threshold density for threshold=0.8.
+
+                                                                                                       
+by the Poisson point process, the threshold exceedance rate is approximately Λℓ (u) = n · 1 − Φ u−µ σℓ
+                                                                                                       ℓ
+                                                                                                            . Moreover,
+even though each layer follows a different distribution and, therefore, has a different threshold exceedance rate, by
+Proposition 1, the overall exceedance rate for all model layers can be evaluated.
+The Poisson formulation facilitates analyzing the probability of observing non-compressible layer, and the expected
+compression ratio over the entire model. From the properties of the Poisson, we have the following corollary.
+Corollary 1. After the fusion, the compression ratio over L layers is
+                                                                                                     L
+                                                                                                                     !
+                                                                                                     X
+                         compression ratio = L(m1 + m2 )/ (L(m1 + m2 ) −                                   Λℓ (u) .
+                                                                                                     ℓ=1
+
+The probability of no fusion in layer ℓ is
+
+                                              Pr(no fusion in layer ℓ) = exp(−Λℓ (u))
+
+To analyze the
+             √ resulting distortion, let us examine the attention distribution drift that stems from P   fusing blocks. Let
+zt = q · kt / d, ∀t ∈ 1, . . . , p be the logits vector of a block with p tokens, and let let s = exp(z)/ j exp(zj ) be the
+softmax distribution before fusion. Similarly, let z′ = z + δ and s′ = exp(z′ )/ j exp(zj′ ) be the perturbed (fused)
+                                                                                       P
+logits and softmax distribution. Then, the attention distribution drift satisfies the following bound.
+Lemma 1. After fusion, the attention distribution drift is bounded by
+
+                                                         ∥s′ − s∥1 ≤ 2ϵ + O(ϵ2 )
+
+where ϵ = maxi ∥ki√∥∥q∥
+                          p
+                    d
+                              2(1 − u).
+
+Proof is deferred to Section A.1. The analysis provides a theoretical foundation for understanding the trade-offs inherent
+in block fusion for LLM serving. The Poisson point process modeling indeed shows that the similarity threshold directly
+governs the balance between compression and distortion in the KV cache. Our per-layer analysis predicts the expected
+compression for a given threshold, allowing skipping non-compressible layers in probability.
+
+
+6     Results
+
+In this section, we present the results of our fusion scheme for CFF and BFF. Measuring the accuracy, compression,
+and latency together requires a dedicated kernel, which we keep in mind for future work. Sections 6.1-6.3 assess
+compression and accuracy, by fuse and replicate the rescaled cache across all fused blocks (without freeing blocks).
+Section 6.4 examines the end-to-end latency by fusing and freeing blocks (without rescaling).
+We evaluate the performance of our approach using a commodity GPU on various benchmarks and models and compare
+it to the baseline performance. The results demonstrate the effectiveness of our scheduling algorithm in terms of
+compute efficiency, memory reduction, and network bandwidth consumption.
+
+
+                                                                         6
+                                                                                                                                A PREPRINT - JANUARY 7, 2026
+
+
+
+                                                 8 blocks                75
+                    6                                                                                                          70.0
+                                                 16 blocks               70
+                                                 32 blocks
+compression ratio
+
+                    5                                                                                                          67.5
+                                                 64 blocks               65
+                                                                                                                               65.0
+
+
+
+
+                                                              F1 score
+                    4
+
+
+
+
+                                                                                                                    F1 score
+                                                                         60
+                    3                                                                                                          62.5
+                                                                         55
+                    2                                                                                                          60.0
+                                                                         50         baseline                                                baseline
+                    1                                                               BFF                                        57.5         CFF
+                        0     100      200     300      400                   1.0   1.5     2.0 2.5 3.0       3.5                     1.1      1.2     1.3        1.4   1.5
+                                    batch size                                            compression ratio                                      compression ratio
+                                    (a)                                                        (b)                                                     (c)
+
+Figure 4: CR and F1 score of BFF and CFF for Llama-2 7B. (a) CR vs. batch size for diverse number of blocks on
+vLLM random-data benchmark. (b) BFF F1 score vs. CR for batch size 256 on conversational dataset. (c) CFF F1
+score vs. CR, for 4 chunks on conversational dataset.
+
+
+6.1                     Block Diversity and Rate-Distortion
+
+Both the number of requests (or chunks) and the number of blocks in each request (or chunk) influence the resulting
+Compression Ratio (CR). The larger the batch, the more requests to fuse, and the more blocks per request, the greater
+diversity of blocks for fusion, which yields a better CR. To assess the significance of each, we examine the BFF CR on
+the random data benchmark in vLLM API (2023), using a fixed similarity threshold for a various number of requests
+and blocks per request using Llama2-7B with 16 tokens per block. Interestingly, Figure 4(a) reveals that the diversity of
+blocks per request is more significant than the diversity of requests, since the CR grows faster when more blocks per
+request are used.
+Figure 4(b) and 4(c) depict the the rate distortion trade-off for BFF and CFF, respectively. The rate distortion curve is
+given for Llama2-7B on Das (2024) conversational dataset, where the number of requests (chunks) is fixed, and the
+similarity threshold varies. The baseline result is given for reference. Specifically, in Figure 4(b) the BFF achieves a CR
+of ∼ 2.15×, without degrading accuracy for batch size 256 with a block size of 16 tokens. In Figure 4(c), the CFF
+achieves a CR of ∼ 1.25× without losing accuracy for 4 chunks with a block size of 16 tokens.
+Remarkably, this rate distortion formulation indicates that a higher CR can be achieved without sacrificing accuracy
+when fixing the similarity threshold value. In particular, since only the threshold determines the resulting accuracy
+(distortion), once the threshold is fixed, increasing the batch size or the number of blocks per request yields a better CR
+due to diversity in requests and blocks.
+
+
+6.2                     Batch Fast-Fusion During Decoding
+
+The impact of diversity on the CR and the resulting F1 score is of great practical interest, as it indicates the gain of
+a larger batch using our enhancement. Specifically, in this section, we investigate the CR and the F1 score when
+increasing the number of requests in the BFF scheme, where the similarity threshold is set to a fixed value, using the
+nVidia OpenMathInstruct-2 (2024) dataset.
+Figure 5(a) depicts the CR versus batch size for the Llama3.1-8B model and Qwen2.5-72B. Notably, in both cases, the
+CR grows logarithmically with the batch size, reaching CR of ∼ 3.11× and ∼ 4.38× for batch sizes of 128 and 64,
+respectively.
+Using the same settings, we further evaluate the behavior of the F1 score when increasing the number of requests in
+a batch in Figure 5(b). Interestingly, the F1 score is a bit higher on average for both models, and especially for the
+Qwen2.5 72B model. The phenomenon where averaging similar blocks improves the model accuracy can be interpreted
+through the lens of the crowd wisdom effect. Each block representation, akin to an individual expert, contributes unique
+insights about the block context over the layers. When focusing on relatively similar representations, averaging these
+representations reduces individual biases and errors, much as a group makes more accurate decisions (Trott, 2024).
+Table 1 describes the F1 score and the CR behavior when applying BFF to every 8 requests (i.e., batch size 8) for
+various thresholds in a variety of MMLU (2020) tasks and GSM8k (2022). These results highlight the ability of the
+BFF to significantly reduce the KV cache size in many cases, without compromising accuracy, showcasing its value in
+improving decoding efficiency.
+
+
+                                                                                                7
+                                                                                                                               A PREPRINT - JANUARY 7, 2026
+
+
+                                           Table 1: F1 score and CR (in parenthesis) achieved by BFF for Llama3.1-8B.
+                                    Model        Method     GSM8K     Con.Phy.   E.Eng.         F.Logic        HS.Bio     misc.         sociology   Average
+                                                    BFF       41.47    37.87      40.69           35.2          44.19     51.72            40.8      41.71
+                                                  thr=0.7    (×3.1)   (×3.29)    (×3.21)        (×2.69)        (×2.51)   (×2.93)        (×3.11)     (×2.98)
+                                                    BFF       51.91    40.85      38.62            40           46.13     51.34            39.3      44.02
+                                  Llama3.1-8B    thr=0.74   (×2.52)   (×2.52)    (×2.48)        (×2.21)        (×2.04)   (×2.32)         (×2.4)     (×2.36)
+                                                    BFF       62.86    40.43       40            41.27          45.48     54.79           38.31      46.16
+                                                 thr=0.78   (×2.09)   (×1.63)    (×1.59)        (×1.53)        (×1.37)   (×1.52)        (×1.61)     (×1.62)
+                                                 Baseline     62.46    40.85      40.69            40           48.39     54.79           40.8       46.85
+                                       ‘
+
+
+
+
+                          4                                                                           76
+      compression ratio
+
+
+
+
+                                                                                                      74
+                          3                                                                                                         Baseline Llama3.1-8B
+
+
+
+
+                                                                                           F1 score
+                                                                                                      72                            BFF Llama3.1-8B
+                                                                                                                                    Baseline Qwen2.5-72B
+                                                                                                      70                            BFF Qwen2.5-72B
+                          2                            baseline
+                                                       BFF CR Llama3.1-8B                             68
+                                                       BFF CR Qwen2.5-72B
+                          1                                                                           66
+                              0        20       40     60 80 100 120                                       0       20     40        60 80 100 120
+                                                     batch size                                                                   batch size
+                                                     (a)                                                                          (b)
+
+Figure 5: CR and F1 score of BFF vs. baseline for Llama-3.1 8B and Qwen2.5 72B on nVidia OpenMathInstruct-2
+(2024) dataset. (a) CR vs. batch size. (b) F1 score vs. batch size.
+
+
+Practically, these results indicate up to ∼ 3.11× and ∼ 4.38× reduction of KV cache blocks, for Llama3.1-8B and
+Qwen2.5-72B, respectively. Of course, this also mitigates the memory fetching and the network bottleneck which is
+significant, especially when considering a high level of parallelism. Furthermore, using fused blocks is beneficial for
+performing hardware-optimized matrix-matrix multiplications (Juravsky et al., 2024).
+6.3 Chunks Fast Fusion During Prefill
+
+In this section, we examine the CR and the resulting F1 score for the CFF. Even though eliminating the distance that
+stems from RoPE can yield a higher CR, it disables reusing computations, which is substantial for the prefill phase.
+Thus, the CFF is applied to blocks within chunks, together with their positioning. In addition to compression, the results
+also indicate the computation reuse factor.
+To characterize the impart of CFF on the CR and F1 score, the similarity threshold is set to a fixed value, and the
+number of chunks to fuse is varied. The evaluation is performed on Llama3.1-8B and Qwen2.5-72B models with 16
+tokens per block on the Longbench qmsum dataset Bai et al. (2023). This dataset contains relatively long inputs, which
+allows characterizing the CR and accuracy of CFF when applied to increasing number of chunks. Figure 6(a) depicts
+the CR and when applying CFF to the chunks. As we see, the CFF uses up to ∼ 3.25× fewer blocks, for which their
+computation can be reused, thus mitigating computational and network bottlenecks. Figure 6(b) depicts the F1 score of
+the CFF when scaling the number of chunks to fuse on the same task. The CFF manages to keep the accuracy in most
+cases, and experiences only a negligible accuracy loss.
+Table 2 describes the F1 score and the CR behavior when applying CFF to every 8 chunks for various thresholds in a
+variety of Longbench tasks (Bai et al., 2023). The table highlights consistent gains in compression with minimal or no
+loss in accuracy. Notably, even at lower thresholds, the F1 scores remain comparable to the baseline, while achieving
+compression ratios of up to ×1.87.
+
+6.4         End-to-End Serving Perfromance
+
+We evaluate BFF on a single-machine vLLM serving benchmark over a random dataset of 100 requests with input size
+1024 and varying number of output tokens (with random-ratio 0.5) using Llama-3.1-8B. After the fusing blocks (with
+
+
+                                                                                      8
+                                                                                                                                    A PREPRINT - JANUARY 7, 2026
+
+
+
+                                                                                                           88
+                        3.0
+                                                                                                           86
+    compression ratio
+
+                        2.5
+                                                            baseline
+
+
+
+
+                                                                                                F1 score
+                                                            CFF CR Llama3.1-8B                             84
+                        2.0                                 CFF CR Qwen2.5-72B                                          baseline Llama3.1-8B
+                        1.5                                                                                             CFF Llama3.1-8B
+                                                                                                           82           baseline Qwen2.5-72B
+                                                                                                                        CFF Qwen2.5-72B
+                        1.0
+                              0       5     10        15 20             25       30                             0      5       10     15 20          25    30
+                                                     #chunks                                                                         #chunks
+                                                     (a)                                                                             (b)
+
+Figure 6: CR (a) and F1 score (b) of CFF vs. number of chunks for Llama3.1-8B and Qwen2.5-72B using the
+Longbench qmsum dataset.
+
+
+                                        Table 2: F1 score and CR (in parenthesis) achieved by CFF for Llama3.1-8B.
+                              Model        Method           LCC      RepoBench-P      PR-en            TREC         2wikimqa   GovReport   MQA-zh     Average
+                                            CFF             75.77        74.07         21.04          40.48           45.9        83.8       27.34     52.63
+                                          thr=0.62         (×1.87)     (×1.59)        (×1.32)        (×1.43)        (×1.38)     (×1.59)    (×1.53)    (×1.53)
+                                            CFF             77.12         74.8          18.3           40.3          45.88       81.39       38.08      53.7
+                          Llama3.1-8B     thr=0.64         (×1.49)      (×1.3)        (×1.15)        (×1.16)        (×1.17)     (×1.25)    (×1.24)    (×1.25)
+                                            CFF             77.24        75.99         18.38          41.15          44.94       83.83       40.31     54.55
+                                          thr=0.66         (×1.26)     (×1.15)        (×1.06)        (×1.06)        (×1.06)     (×1.09)     (×1.1)    (×1.11)
+                                          Baseline          77.73        75.57         18.74          40.95          44.12       82.81       39.18     54.16
+                                  ‘
+
+
+
+
+similarity above threshold 0.7), the model runner sends the scheduler the updated block-tables, allowing the scheduler
+to free unused blocks, and increase reference counts for shared blocks for further reuse across requests.
+Figure 7 depicts the throughput and end-o-end performance achieved by our naive implementation, where the entire
+fusion overhead is reflected in the decode phase. Remarkably, the BFF yields measurable system-level benefits: lower
+prefill latency (TTFT), higher effective batching, and increased throughput. The Decode-phase inter-token latency (ITL)
+increased due to larger batch GEMMs, and the fusion overhead. However, the overall serving throughput and request
+completion time reduced substantially.
+Overall, the results presented in this section demonstrate the effectiveness of our context-sharing scheduling scheme
+for the KV cache-centric disaggregated architecture. Our approach significantly improves compute efficiency, reduces
+memory and network bandwidth consumption, and scales well with increasing system size, making it a promising
+solution to accelerate LLM serving in resource-constrained scenarios.
+
+
+
+7    Conclusion
+
+In this paper, we presented Fast Fusion, a novel context-sharing enhancement that can improve LLM serving efficiency
+by introducing BFF and CFF. These techniques enable fine-grained fusion of similar KV cache blocks across requests
+or chunks, achieving up to ×4.38 compression without compromising accuracy. By significantly reducing KV cache
+transfers, our method reduces significantly the average number of blocks, and thus, allows to scale the serving capacity
+effectively under heterogeneous workloads. Theoretical analysis based on Poisson point processes provides insight into
+the rate-distortion trade-offs, and extensive empirical evaluations across multiple benchmarks and model sizes validate
+the practical benefits. Looking forward, we plan to explore the impact on serving throughput, using adaptive threshold
+tuning, integration with quantization, and pruning methods.
+
+
+                                                                                           9
+                                                                                                                    A PREPRINT - JANUARY 7, 2026
+
+
+
+
+                2000     Baseline duration                                                  2000        Baseline mean TTFT
+                         BFF duration                                                                   BFF mean TTFT
+                                                                                            1500        Baseline P99 TTFT
+                1500                                                                                    BFF P99 TTFT
+    time [s]
+
+
+
+
+                                                           time [s]
+                1000                                                                        1000
+
+                500                                                                          500
+
+                                                                                                  0
+                        500      1000       1500   2000                                                500           1000       1500        2000
+                                output length                                                                       output length
+                                 (a)                                                                                 (b)
+
+
+                40      Baseline mean ITL                                                   1.4
+
+
+                                                           Token throughput ratio [tok/s]
+                        BFF mean ITL
+                35                                                                          1.3
+    time [ms]
+
+
+
+
+                                                                                            1.2
+                30
+                                                                                            1.1
+                25
+                                                                                            1.0
+                20                                                                                                  BFF / Baseline (tok/s) ratio
+                                                                                            0.9
+                       500      1000       1500    2000                                               500            1000       1500       2000
+                               output length                                                                        output length
+                                 (c)                                                                                 (d)
+
+Figure 7: Throughput and end-to-end performance comparison on Llama3.1-8B (a) benchmark duration (b) TTFT
+mean and P99 (c) mean ITL (d) throughput ratio (tok/sec)
+
+
+References
+A. Agrawal, A. Panwar, J. Mohan, N. Kwatra, B. S. Gulavani, and R. Ramjee. Sarathi: Efficient LLM inference by
+  piggybacking decodes with chunked prefills. arXiv preprint arXiv:2308.16369, 2023.
+A. Agrawal, J. Chen, Í. Goiri, R. Ramjee, C. Zhang, A. Tumanov, and E. Choukse. Mnemosyne: Parallelization
+  strategies for efficiently serving multi-million context length LLM inference requests without approximations. arXiv
+  preprint arXiv:2409.17264, 2024.
+Y. Bai, X. Lv, J. Zhang, H. Lyu, J. Tang, Z. Huang, Z. Du, X. Liu, A. Zeng, L. Hou, et al. Longbench: A bilingual,
+   multitask benchmark for long context understanding. arXiv preprint arXiv:2308.14508, 2023.
+C.-C. Chang, C.-Y. Lin, Y. Akhauri, W.-C. Lin, K.-C. Wu, L. Ceze, and M. S. Abdelfattah. xkv: Cross-layer svd for
+  kv-cache compression. arXiv preprint arXiv:2503.18893, 2025.
+S. Coles, J. Bawa, L. Trenner, and P. Dorazio. An introduction to statistical modeling of extreme values, volume 208.
+   Springer, 2001.
+B. L. Das. Synthetic therapy conversations, 2024. URL https://huggingface.co/datasets/Mr-Bhaskar/
+  Synthetic_Therapy_Conversations. Accessed: 2025-05-6.
+DeepSeek-R1-Distill-Qwen-7B.     Deepseek-r1-distill-qwen-7b,                                               2025.             URL      deepseek-ai/
+  DeepSeek-R1-Distill-Qwen-7B. Accessed: 2025-05-6.
+M. Falk, J. Hüsler, and R.-D. Reiss. Laws of small numbers: extremes and rare events. Springer Science & Business
+ Media, 2010.
+
+
+                                                          10
+                                                                                   A PREPRINT - JANUARY 7, 2026
+
+
+GSM8k. Open-ai gsm8k benchmark, 2022. URL https://huggingface.co/datasets/openai/gsm8k. Accessed:
+  2025-05-6.
+C. Hooper, S. Kim, H. Mohammadzadeh, M. W. Mahoney, Y. S. Shao, K. Keutzer, and A. Gholami. Kvquant: Towards
+  10 million context length llm inference with kv cache quantization. Advances in Neural Information Processing
+  Systems, 37:1270–1303, 2024.
+C. Hu, H. Huang, L. Xu, X. Chen, J. Xu, S. Chen, H. Feng, C. Wang, S. Wang, Y. Bao, et al. Inference without
+  interference: Disaggregate LLM inference for mixed downstream workloads. arXiv preprint arXiv:2401.11181,
+  2024.
+Y. J. Huijong Jeong, Daehyun Ahn and T. Kim. [vllm vs tensorrt-llm] #12. automatic prefix caching, 2024. URL
+  https://blog.squeezebits.com/vllm-vs-tensorrtllm-12-automatic-prefix-caching-38189. Ac-
+  cessed: 2025-05-11.
+J. Juravsky, B. Brown, R. Ehrlich, D. Y. Fu, C. Ré, and A. Mirhoseini. Hydragen: High-throughput LLM inference with
+   shared prefixes. arXiv preprint arXiv:2402.05099, 2024.
+J. Kampeas, A. Cohen, and O. Gurewitz. Capacity of distributed opportunistic scheduling in nonhomogeneous networks.
+   IEEE Transactions on Information Theory, 60(11):7231–7247, 2014.
+W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. Yu, J. Gonzalez, H. Zhang, and I. Stoica. vllm: Easy, fast,
+  and cheap llm serving with pagedattention. See https://vllm. ai/(accessed 9 August 2023), 2023a. URL https:
+ //github.com/vllm-project/vllm.
+W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. Gonzalez, H. Zhang, and I. Stoica. Efficient memory
+  management for large language model serving with pagedattention. In Proceedings of the 29th Symposium on
+ Operating Systems Principles, pages 611–626, 2023b.
+M. R. Leadbetter, G. Lindgren, and H. Rootzén. Extremes and related properties of random sequences and processes.
+ Springer Science & Business Media, 2012.
+A. Liu, B. Feng, B. Xue, B. Wang, B. Wu, C. Lu, C. Zhao, C. Deng, C. Zhang, C. Ruan, et al. Deepseek-v3 technical
+  report. arXiv preprint arXiv:2412.19437, 2024a.
+A. Liu, J. Liu, Z. Pan, Y. He, R. Haffari, and B. Zhuang. Minicache: Kv cache compression in depth dimension for
+  large language models. Advances in Neural Information Processing Systems, 37:139997–140031, 2024b.
+X. Liu, P. Liu, and G. Tang. Zsmerge: Zero-shot kv cache compression for memory-efficient long-context llms. arXiv
+  preprint arXiv:2503.10714, 2025.
+Y. Liu, H. Li, Y. Cheng, S. Ray, Y. Huang, Q. Zhang, K. Du, J. Yao, S. Lu, G. Ananthanarayanan, et al. Cachegen: Kv
+   cache compression and streaming for fast large language model serving. In Proceedings of the ACM SIGCOMM
+   2024 Conference, pages 38–56, 2024c.
+Z. Liu, J. Yuan, H. Jin, S. Zhong, Z. Xu, V. Braverman, B. Chen, and X. Hu. Kivi: A tuning-free asymmetric 2bit
+  quantization for kv cache. arXiv preprint arXiv:2402.02750, 2024d.
+F. Meng, P. Tang, X. Tang, Z. Yao, X. Sun, and M. Zhang. Transmla: Multi-head latent attention is all you need. arXiv
+   preprint arXiv:2502.07864, 2025.
+MMLU. Massive multitask language understanding (MMLU) benchmark, 2020. URL https://huggingface.co/
+ datasets/cais/mmlu. Accessed: 2025-05-6.
+nVidia HelpSteer. nvidia helpsteer, 2024. URL https://huggingface.co/datasets/nvidia/HelpSteer. Ac-
+  cessed: 2025-05-6.
+nVidia OpenMathInstruct-2. nvidia openmathinstruct-2, 2024. URL https://huggingface.co/datasets/nvidia/
+  OpenMathInstruct-2. Accessed: 2025-05-6.
+R. Prabhu, A. Nayak, J. Mohan, R. Ramjee, and A. Panwar. vattention: Dynamic memory management for serving
+  llms without pagedattention. In Proceedings of the 30th ACM International Conference on Architectural Support for
+  Programming Languages and Operating Systems, Volume 1, pages 1133–1150, 2025.
+R. Qin, Z. Li, W. He, M. Zhang, Y. Wu, W. Zheng, and X. Xu. Mooncake: A kvcache-centric disaggregated architecture
+  for LLM serving. arXiv preprint arXiv:2407.00079, 2024.
+S. Trott. Large language models and the wisdom of small crowds. Open Mind, 8:723–738, 05 2024. ISSN 2470-2986.
+   doi: 10.1162/opmi_a_00144. URL https://doi.org/10.1162/opmi_a_00144.
+vLLM API. Randomdataset, 2023. URL https://docs.vllm.ai/en/latest/api/vllm/vllm.benchmarks.
+  datasets.html#vllm.benchmarks.datasets.RandomDataset. Accessed: 2025-05-11.
+
+
+                                                         11
+                                                                                      A PREPRINT - JANUARY 7, 2026
+
+
+M. P. Wand and M. C. Jones. Kernel smoothing. CRC press, 1994.
+G. Wu, Z. Zhang, Y. Zhang, W. Wang, J. Niu, Y. Wu, and Y. Zhang. I know what you asked: Prompt leakage via
+   kv-cache sharing in multi-tenant llm serving. In Proceedings of the 2025 Network and Distributed System Security
+   (NDSS) Symposium. San Diego, CA, USA, 2025.
+R. Xie, A. U. Haq, L. Ma, Y. Fang, Z. B. Engineer, L. Liu, and T. Zhang. Reimagining memory access for llm inference:
+   Compression-aware memory controller design. arXiv preprint arXiv:2503.18869, 2025.
+X. Yan, Z. Li, T. Zhang, L. Kong, Y. Zhang, and X. Yang. Recalkv: Low-rank kv cache compression via head reordering
+   and offline calibration. arXiv preprint arXiv:2505.24357, 2025.
+J. Yang, B. Hou, W. Wei, Y. Bao, and S. Chang. Kvlink: Accelerating large language models via efficient kv cache
+   reuse. arXiv preprint arXiv:2502.16002, 2025.
+C. Zhang, K. Du, S. Liu, W. Kwon, X. Mo, Y. Wang, X. Liu, K. You, Z. Li, M. Long, et al. Jenga: Effective memory
+   management for serving llm with heterogeneity. arXiv preprint arXiv:2503.18292, 2025.
+Y. Zhang, Y. Hu, R. Zhao, J. Lui, and H. Chen. Unifying kv cache compression for large language models with LeanKV.
+   arXiv preprint arXiv:2412.03131, 2024.
+L. Zheng, L. Yin, Z. Xie, J. Huang, C. Sun, C. H. Yu, S. Cao, C. Kozyrakis, I. Stoica, J. E. Gonzalez, et al. Efficiently
+   programming large language models using sglang. CoRR, 2023.
+Z. Zheng, X. Ji, T. Fang, F. Zhou, C. Liu, and G. Peng. Batchllm: Optimizing large batched llm inference with global
+   prefix sharing and throughput-oriented token batching. arXiv preprint arXiv:2412.03594, 2024.
+Y. Zhong, S. Liu, J. Chen, J. Hu, Y. Zhu, X. Liu, X. Jin, and H. Zhang. DistServe: Disaggregating prefill and decoding
+   for goodput-optimized large language model serving. In 18th USENIX Symposium on Operating Systems Design and
+   Implementation (OSDI 24), pages 193–210, 2024.
+L. Zhu, X. Wang, W. Zhang, and R. W. Lau. Relayattention for efficient large language model serving with long system
+   prompts. arXiv preprint arXiv:2402.14808, 2024.
+
+
+A     Appendix
+A.1   Proof to Lemma 1
+
+Proof. First, since k and k′ have √the same norm, we can represent then as k = ∥k∥ · k̂ and k′ = ∥k∥ · k̂′ . Let
+      ′                     ′
+δt = zt − zt = ∥k∥ · q · (k̂ − k̂)/ d. Thus,
+                                          ∥δt ∥ =∥z′t − zt ∥                                                         (3)
+                                                                        √
+                                               ≤∥k∥ · ∥q∥ · ∥k̂′ − k̂∥/ d                                            (4)
+                                                            q               √
+                                               =∥k∥ · ∥q∥ · 2(1 − k̂′ · k̂)/ d                                       (5)
+                                                            p           √
+                                               ≤∥k∥ · ∥q∥ · 2(1 − u)/ d                                              (6)
+
+Since ϵ = maxi |δi |, the denominator of s satisfies
+                                    X                X                        X
+                            exp(−ϵ)     exp(zj ) ≤     exp(zj + δj ) ≤ exp(ϵ)   exp(zj )
+                                      j                j                          j
+
+Similarly, for the numerator of s satisfies
+                                    exp(−ϵ) exp(z) ≤ exp(z + δ) ≤ exp(ϵ) exp(z)
+From these bounds we obtain that each index i satisfies exp(−2ϵ)si ≤ s′i ≤ exp(2ϵ)s, as
+                                                            X
+                             s′ ≤ exp(ϵ) exp(z)/ exp(−ϵ)       exp(zj ) = exp(2ϵ)s.
+                                                                    j
+
+Now, let us divide into the case. When s′i ≥ si , then s′i − si ≤ si (exp(2ϵ) − 1).      Similarly, when s′i < si , then
+si − s′i ≤ si (1 − exp(−2ϵ)) ≤ si (exp(2ϵ) − 1). Thus, |s′i − si | ≤ (exp(2ϵ) − 1)si .
+                                  P                 P ′               ′                                2
+                                                     i |si − si | = ∥s − s∥1 ≤ (exp(2ϵ) − 1) ≤ 2ϵ + O(ϵ ) from
+Finally, sum up the index i, since i si = 1,pwe have √
+Taylor expansion. Since ϵ ≤ maxi ∥ki ∥∥q∥ 2(1 − u)/ d, the lemma follows.
+
+
+                                                               12
+

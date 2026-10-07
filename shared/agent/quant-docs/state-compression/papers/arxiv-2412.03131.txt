@@ -1,0 +1,1260 @@
+                                             DiffKV: Differentiated Memory Management for Large Language Models with
+                                                                      Parallel KV Compaction
+                                                          Yanqi Zhang1* Yuwei Hu1* Runyuan Zhao1 John C.S. Lui2 Haibo Chen3†
+                                                      1 Huawei   2 The Chinese University of Hong Kong 3 Shanghai Jiao Tong University
+
+                                                                       Abstract                              length and the number of concurrent requests, often compris-
+                                                                                                             ing over 90% of total memory consumption [22, 39, 73, 74].
+                                            Large language models (LLMs) demonstrate remarkable
+                                                                                                             As state-of-the-art models continue to support longer se-
+                                         capabilities but face substantial serving costs due to their high
+                                                                                                             quences [4, 20, 36, 45, 66, 68], and with the rise of recent
+                                         memory demands, with the key-value (KV) cache being a
+                                                                                                             thinking models [26, 35, 67] that generate extended reasoning
+                                         primary bottleneck. State-of-the-art KV cache compression
+arXiv:2412.03131v3 [cs.LG] 30 Aug 2025
+
+
+
+
+                                                                                                             processes, the KV cache has emerged as a critical bottleneck
+                                         techniques, such as quantization and pruning, apply uniform
+                                                                                                             for LLM serving efficiency. It limits the number of concurrent
+                                         treatment to both keys and values, and discard unimportant to-
+                                                                                                             requests and increases attention computation latency due to
+                                         kens entirely, overlooking the fine-grained distinctions in the
+                                                                                                             its memory bandwidth bound nature [16, 17].
+                                         significance of individual KV cache components. To address
+                                         such limitations, we introduce DiffKV, a novel framework for           Researchers have investigated various compression tech-
+                                         efficient KV cache compression that exploits three levels of        niques, primarily focused on pruning [11, 23, 42, 71, 76] and
+                                         differentiation in the KV cache: (1) the differing impact of        quantization [2, 32, 44]. Pruning reduces the token sequence
+                                         keys and values on attention computation, (2) the varying           length by eliminating unimportant tokens based on attention
+                                         importance of tokens, and (3) the diverse dynamic sparsity          scores. Quantization, on the other hand, reduces the size of
+                                         patterns across attention heads. These levels of differentiation    the KV cache by converting floating-point feature values into
+                                         introduce irregular memory usage patterns across different          lower-precision representations.
+                                         requests and attention heads, posing significant scalability           While effective, these methods overlook the nuanced vari-
+                                         challenges for memory management. To address these chal-            ations in importance across different components of the KV
+                                         lenges, DiffKV proposes an on-GPU memory manager that               cache. First, existing pruning approaches employ a one-size-
+                                         compacts fragmented free memory list into contiguous re-            fits-all strategy, statically allocating memory uniformly across
+                                         gions in parallel, effectively translating sparsity in the KV       attention heads despite the per-head dynamic attention spar-
+                                         cache into performance gains. We evaluate DiffKV on several         sity patterns. Second, current quantization schemes apply
+                                         mainstream LLMs, including the emerging thinking models             uniform precision to all key and value vectors, ignoring both
+                                         that generate extended chains of thought. DiffKV is able to         the distinct roles of keys versus values in the attention mecha-
+                                         compress the KV cache by 2.7× to 5.7× with near-lossless ac-        nism, and the varying significance of different tokens. Finally,
+                                         curacy on complex workloads requiring sophisticated reason-         both pruning and quantization treat all requests uniformly,
+                                         ing and long-generation capabilities, and enhances throughput       overlooking variability in information density across requests.
+                                         by 1.9× to 5.4×. Source codes of DiffKV are available at               To address these limitations and advance KV cache com-
+                                         https://github.com/zyqCSL/DiffKV.                                   pression, we propose DiffKV, a novel framework that exploits
+                                                                                                             three levels of differentiation within the KV cache:
+                                         1    Introduction                                                   1. Differentiated Keys and Values. DiffKV assigns higher
+                                         Large language models (LLMs) like GPT [4,10,55] and Gem-            precision to key vectors than to value vectors, based on the
+                                         ini [66] have demonstrated significant potential to impact our      observation that keys (critical for attention score computation)
+                                         daily lives, offering promising applications in areas including     play a more significant role than values (used primarily for
+                                         chatbots [13, 14], programming [24, 27], mathematics [59, 78]       weighted aggregation) in attention computations.
+                                         and medical assistance [58, 72]. Despite their exceptional per-     2. Token Importance Differentiation. Guided by attention
+                                         formance, hosting LLMs is costly due to their large model           scores, DiffKV stores tokens at varying precision levels based
+                                         sizes, demanding extensive hardware resources. Given the            on their significance. Most critical tokens are quantized at
+                                         pervasive adoption of LLMs, enhancing serving efficiency            higher precision, less critical tokens are quantized at lower
+                                         has become critically important [7, 21, 28, 38, 43, 56, 62, 75].    precision, and the least significant tokens are pruned.
+                                            To avoid redundant computation, LLM inference frame-
+                                                                                                             3. Per-head Dynamic Sparsity. Attention score distributions
+                                         works typically cache intermediate key and value tensors
+                                                                                                             exhibit dynamic sparsity across both heads and requests: the
+                                         in memory, commonly referred to as the KV cache [39].
+                                                                                                             number of important tokens varies across different heads, and
+                                         The size of the KV cache scales linearly with both sequence
+                                                                                                             for the same head under different requests. To address this
+                                             *Both authors contributed equally to this research.             variability, DiffKV dynamically identifies critical tokens per-
+                                             †Haibo Chen is the corresponding author.                        head, per-request, adapting memory allocation accordingly.
+                                             Key         Value
+
+
+                                                   Key      Value                        ent heads but also between the key and value within individ-
+                       Request 1 & 2                                   Request 1 & 2
+                                                                                         ual heads. To mitigate fragmentation, the memory manager
+               0           1       3     4   80%            0 1 2 3 4            50%
+  Head A                                                                                 must precisely track and allocate memory per head and per
+               0           1       3     4   80%            0 1 2 3 4            50%
+                                                                                         request. However, this introduces a scalability challenge: even
+               0           2       3     4   80%            0 1 2 3 4            50%
+  Head B                                                                                 a modestly sized LLM like Llama3-8B [20] comprises hun-
+               0           2     3    4      80%            0 1 2 3 4 50%
+                           (a) Pruning                          (b) Quantization         dreds of attention heads, and with hundreds of concurrent
+                           Request 1                                     Request 2       requests, the memory manager must handle tens of thousands
+           0       1   3       4
+                                   25%                      0    1   2   3   4
+                                                                                 30%     of heterogeneous memory regions during each inference step.
+  Head A
+           01 3 4                  12.5%                    01 2 3 4             15%     Considering that model execution time per step is on the or-
+           0 2         3       4
+                                   30%                      0 3      4
+                                                                                 25%     der of tens of milliseconds, improper memory management
+  Head B
+           02 3 4                  15%                  03 4                     12.5%   could render the overhead of dynamic allocation prohibitive,
+                                               (c) DiﬀKV                                 negating the benefits of KV cache compression.
+Figure 1: KV cache memory allocation patterns for (a) prun-                                 To overcome the scalability challenge, DiffKV introduces
+ing, (b) uniform quantization, and (c) DiffKV across two atten-                          an on-GPU memory manager that efficiently handles the ir-
+tion heads in two 5-token requests. Boxes represent retained                             regular memory usage patterns via parallel KV compaction,
+tokens (annotated with token IDs), with box size proportional                            which optimizes memory allocation and recycling by packing
+to memory usage. Percentages indicate total memory usage                                 fragmented free memory lists into contiguous regions directly
+relative to an uncompressed KV cache.                                                    on the GPU in parallel. Parallel KV compaction is enabled by
+                                                                                         three essential on-GPU data structures:
+   Figure 1 compares the KV cache usage of pruning, quanti-                              1. Unified Pages. GPU memory is partitioned into fixed-size
+zation, and DiffKV across two heads in two 5-token requests.                             pages, each storing tokens at a specific precision. For example,
+In both requests, pruning uniformly eliminates one token per                             a page may hold tokens with keys in INT8 and values in INT4.
+head (reducing cache usage to 80%), failing to adapt to heads                            Each page is dynamically configured and parsed according to
+with naturally sparser attention patterns. Quantization, mean-                           the precision requirements of the head and request.
+while, applies INT8 precision uniformly to all FP16 values,                              2. Circular Free Page List. All page IDs are managed in
+halving memory usage but missing opportunities for finger-                               a centralized, GPU-resident circular list. Both free and used
+grained savings by treating keys and values differently based                            pages are kept in contiguous regions, enabling efficient page
+on their relative importance. Moreover, both approaches treat                            allocation and recycling via parallel prefix sum [29].
+two requests identically, overlooking their distinct sparsity                            3. Bidirectional Page Table. Instead of maintaining separate
+patterns.                                                                                page tables for high- and low-precision pages, DiffKV consol-
+   In contrast, DiffKV exhibits more adaptive memory us-                                 idates both into a single bi-directional page table to minimize
+age. In Request 1, for Head A, DiffKV prunes one token                                   metadata overhead. High-precision page IDs grow from the
+and further distinguishes precision across the rest: Token 0,                            left side of the table, and low-precision page IDs grow from
+deemed highly important, is stored at high precision (key in                             the right side. Additional precision levels can also be effi-
+INT8, value in INT4), while Tokens 1, 3, and 4 are stored                                ciently accommodated by employing multiple bi-directional
+at lower precision (keys in INT4, values in INT2). This re-                              page tables.
+duces usage to 25% for keys and 12.5% for values. For Head                                  We have implemented DiffKV on vLLM [39] and evaluate
+B, DiffKV instead identifies two tokens as highly important,                             it across multiple LLMs, including the emerging thinking
+resulting in 30% and 15% KV cache usage for keys and val-                                models QwQ-32B [67], R1-Distill-Qwen-14B and R1-Distill-
+ues, respectively. Averaged across both heads, DiffKV uses                               Llama-8B [26]. Our experiment results demonstrate that Diff-
+20.6% of memory for Request 1, outperforming pruning and                                 KV offers a superior cost-accuracy tradeoff. Specifically, Diff-
+quantization. Additionally, DiffKV also adapts flexibly across                           KV compresses the KV cache by 2.7× to 5.7× with near-
+requests. In Request 2, Head A stores one token at high preci-                           lossless accuracy, resulting in throughput improvement of
+sion and the remaining four at lower precision without prun-                             1.9× to 5.4×. Notably, DiffKV is, to the best of our knowl-
+ing, whereas Head B prunes two tokens and stores two others                              edge, the first KV cache compression framework evaluated on
+at high precision. These examples highlight DiffKV’s ability                             thinking models and complex reasoning tasks that require ad-
+to leverage both per-head dynamic sparsity and request-level                             vanced chain-of-thought (CoT) capabilities, while achieving
+variation, enabling more aggressive and flexible compression                             FP16-comparable generation quality.
+than prior methods.
+   Although DiffKV achieves a high KV cache compression                                  2   Background and Related Work
+ratio, it introduces significant memory usage irregularity. As
+depicted in Figure 1, pruning and quantization maintain uni-                             In this section, we describe Transformer-based large language
+form KV cache utilization across attention heads. In contrast,                           models and review existing techniques for KV cache manage-
+DiffKV exhibits substantial variability, not only across differ-                         ment.
+2.1    Large Language Models                                               KV Cache Quantization. Quantization [18, 25, 32, 50] re-
+                                                                           duces the KV cache size by approximating high-precision
+Large language models (LLMs) are predominantly built upon                  floating points with discrete low-bit values. For a tensor
+the Transformer architecture [69]. At the core of Transformer              X, we first compute the scale s and zero point z based on
+is the attention mechanism, which allows each token in a                   Xmin and Xmax , then apply quantization element-wise as:
+sequence to weigh the significance of other tokens when con-               Q = round X−z       . During inference, the original tensor is
+structing its contextualized representation. During autoregres-                             s
+                                                                           approximately reconstructed via dequantization: X̂ = s · Q + z.
+sive inference, the attention mechanism operates in a causal
+                                                                           Unlike the quantized tensor Q, the metadata s and z are kept
+manner, attending only to preceding tokens. Mathematically,
+                                                                           in higher precision (e.g., FP16) to ensure more accurate de-
+the standard attention computation is defined as:
+                                                                           quantization. State-of-the-art KV cache quantization methods
+                               i           
+                                             QK⊤
+                                                                          such as Atom [77] and Qserve [44] apply this process to each
+      Attention(Q, K, V)i = ∑ softmax         √                 vj         key and value vector independently. However, these uniform
+                              j=1              d           ij              quantization methods, which apply a fixed bit-width across
+                                              
+                                            qi ·k j
+                                             √
+                                                                     (1)   keys and values of all tokens, may not be optimal. They over-
+                               i     exp        d
+                           =∑                            vj              look the varying importance of tokens as well as the different
+                                   i              i ·kn
+                                                 q√
+                                                                           roles of keys and values in the attention calculation.
+                              j=1 ∑n=1 exp
+                                                     d
+                                                                           KV Cache Pruning. Several recent works [11, 23, 42, 47, 71,
+Q, K and V are matrices of size l × d, representing the queries,           76] have explored KV cache pruning to alleviate the memory
+keys and values respectively, where l denotes the number of                bottleneck in LLM inference, which can be considered as an
+tokens processed so far in the sequence and d represents the               extreme case of quantization. These methods use attention
+feature dimensionality. Vectors qi , ki , and vi correspond to             scores to assess token importance and evict less important
+the query, key, and value of the ith token.                                tokens, thereby reducing the KV cache size. The effectiveness
+   To capture a broader range of interactions between tokens,              of these methods, however, is limited by their static and inflex-
+Transformer models employ multi-head attention (MHA),                      ible allocation of memory resources. Specifically, H2O [76]
+where each head independently computes attention using dis-                and SnapKV [42] allocate the same memory budget uniformly
+tinct projections of queries, keys, and values. Grouped-query              across all attention heads and layers. PyramidKV [11] allo-
+attention (GQA) [6, 60] improves the efficiency of MHA by                  cates more memory in lower layers and less in higher ones,
+allowing a group of query heads to share the same projection               based on the empirical observation that the number of im-
+of keys and values, referred to as a KV head.                              portant tokens shrinks as the model depth increases, but still
+   LLM execution involves two phases: the prompt phase,                    relies on static heuristics and cannot dynamically adjust cache
+where the model computes latent representations for all to-                allocations to suit various workloads. Complementary to KV
+kens in the prompt and generates the first new token, and                  cache pruning, another line of work [40, 61] addresses GPU
+the generation phase, where subsequent tokens are generated                memory constraints by offloading the entire KV cache to
+iteratively. To avoid redundant computations across gener-                 CPU memory and selectively loading important tokens to the
+ation steps, KV cache is introduced to store the keys and                  GPU for attention computations. However, these methods do
+values of all previous tokens. However, the size of the KV                 not inherently reduce the KV cache size and incur additional
+cache grows linearly with both the sequence length and batch               latency due to data transfers between the CPU and GPU.
+size, quickly becoming a bottleneck for inference through-
+put [39, 74]. Therefore, efficient KV cache management is
+critical for alleviating memory bottlenecks and improving
+                                                                           3   The Case for Differentiated KV
+LLM serving efficiency.
+                                                                           We motivate the design of DiffKV by presenting the case
+                                                                           for three levels of differentiation within the KV cache: (i)
+2.2    KV Cache Optimization                                               the differentiated impacts of keys and values (Section 3.1),
+                                                                           (ii) differentiated token importance (Section 3.2), and (iii)
+PagedAttention. Static KV cache management systems                         per-head dynamic sparsity (Section 3.3). Building on these
+[1, 74] reserve memory for the maximum possible sequence                   insights, Section 3.4 describes how DiffKV combines them
+length, leading to considerable memory waste when actual se-               together and highlights its contributions over prior systems.
+quences are shorter. To mitigate this inefficiency, vLLM [39]
+introduces PagedAttention, which partitions the KV cache                   3.1 Differentiated Impacts of Keys and Values
+into pages, each containing a fixed number of tokens, and
+allocates the pages on-demand as the sequence length grows.                While the significance of different tokens can be directly
+By managing the KV cache at the granularity of pages, vLLM                 inferred from attention scores, the roles of the key and value
+reduces memory waste and enables larger batch sizes to im-                 vectors within a token are less obvious. However, examining
+prove serving efficiency.                                                  Equation 1 reveals a divergence in their impacts. Each token’s
+contribution to the attention output depends on two factors:                                                Attention score vs. Value Norm in Llama3-8B
+                                                                                         1.0
+the attention score from softmax and the value vector. Key                                            score-layer-0
+                                                                                         0.8          v-norm-layer-0
+vectors, as part of the shared softmax denominator, influence                                         score-layer-15
+the attention scores of all tokens, whereas value vectors only                                        v-norm-layer-15
+
+
+
+
+                                                                                CDF(%)
+                                                                                         0.6
+                                                                                                      score-layer-31
+affect their respective token’s contribution to the output.                                           v-norm-layer-31
+                                                                                         0.4
+   Beyond the broader impact of key vectors, it is crucial to
+establish the relative significance of attention scores, deter-                          0.2
+
+mined by key vectors, over value vectors. Without this, the                              0.0
+                                                                                                           10−6         10−4        10−2                  100
+significance of key vectors could be overshadowed by that                                                                Numerical Value
+of value vectors. To this end, we reformulate the attention
+mechanism as a weighted sum of unit vectors, as presented            Figure 2: Distribution of attention score and value vector
+in Equation 2. This formulation decomposes each input to-            norm in Llama3-8B.
+                                                              v
+ken’s contribution into two components: the unit vector |v jj | ,                      10−1
+
+
+
+
+                                                                     Attention score
+obtained by dividing the token’s value vector by its L2 norm
+                                                                                       10−2
+to capture only its direction in feature space, and a coefficient,
+defined as the product of the attention score and the norm of                          10−3
+
+the value vector, which determines the relative significance of                               0      250          500   750      1000       1250   1500         1750   2000
+the token’s direction. This allows us to assess the relative im-                                                              Token index
+
+portance of attention scores and value vectors by examining          Figure 3: Per-token attention scores in the 8th layer of Llama3-
+their contributions to these coefficients.                           8B on a sequence randomly sampled from Wikitext.
+                       i
+                                     QK⊤
+                                          
+                                                       vj
+   Attn(Q, K, V)i = ∑ softmax √                |v j |                Similar sparsity patterns are observed across the other layers
+                      j=1                d ij         |v j |         as well. This non-uniform distribution of token importance
+                          |          {z           } |{z}
+                                 Coefficient       Unit vector       motivates a hierarchical compression strategy that allocates
+                                                              (2)    memory based on token significance: high-precision storage
+   Figure 2 presents the distributions of the average atten-         (e.g., K8V4) for the most important tokens, lower precision
+tion score per token and the norms of value vectors across           (e.g., K4V2) for moderately important tokens, and pruning
+three representative layers of the Llama3-8B model [20], eval-       for the least important. This hierarchical approach enables a
+uated on the first one thousand articles from the Wikitext           smoother trade-off between memory savings and generation
+dataset [49]. Notably, the attention scores span seven orders of     quality than uniform quantization methods (e.g., Atom [77],
+magnitude, vastly exceeding the range of value vector norms,         QServe [44]) and pruning-only approaches (e.g., H2O [76],
+which only cover at most two orders of magnitude. Similar            SnapKV [42]).
+patterns are also observed in the larger Llama3-70B model.
+This pronounced disparity highlights the pivotal role of atten-
+                                                                     3.3                          Per-head Dynamic Sparsity Patterns
+tion scores in determining each token’s contribution to the
+attention output. We therefore conclude that key vectors exert       LLMs exhibit dynamic sparsity patterns that vary across both
+a broader and more impactful influence than value vectors,           attention heads and requests: the number of critical tokens can
+motivating further exploration of processing key and value           differ not only between heads but also for the same head under
+vectors at distinct precision levels. We validate this intuition     different requests. To characterize the sparsity of attention, we
+in Section 7.2, showing that K8V4 and K4V2, which quantize           analyze the minimum number of critical tokens required to
+keys to 8/4 bits and values to 4/2 bits respectively, outperform     retain the majority of information, specifically by preserving
+their mirror configurations K4V8 and K2V4.                           a target percentage (e.g., 95%) of the total attention score.
+                                                                        We begin by investigating dynamic sparsity patterns across
+                                                                     layers, and evaluate the Llama3-8B model with the first thou-
+3.2    Differentiated Token Importance
+                                                                     sand articles from the Wikitext dataset. Figure 4 illustrates the
+Tokens contribute to attention outputs with varying degrees          average number of critical tokens per layer, aggregated across
+of importance, as reflected by their attention scores. By ex-        all KV heads, required to retain 95% of the total attention
+ploiting these differences, we can apply finer-grained com-          score. Vertical bars represent the standard deviation, captur-
+pression strategies that go beyond uniformly quantizing all          ing variability across individual requests. Notably, the degree
+tokens [44, 77] or exclusively pruning the least important           of sparsity varies considerably across layers, as indicated by
+ones [11, 76].                                                       differences in the number of critical tokens.
+   Figure 3 shows the per-token attention scores in the 8th             Next, we delve into the dynamic sparsity within individual
+layer, selected as a representative layer of Llama3-8B [20], on      layers. Figure 5 presents the average number of critical tokens
+a sequence randomly sampled from the Wikitext dataset [49].          per KV head for three representative layers, with horizontal
+                                         Number of Critical Tokens per Layer in Llama3-8B         to prior work that explores importance-based KV cache prun-
+ Number of Critical Tokens
+
+
+
+                             1400                                                                 ing [5,42,65,76] and mixed-precision quantization [19,30,77],
+                             1200                                                                 DiffKV introduces the following key innovations:
+                             1000
+                             800
+                                                                                                      • Request-aware differentiated KV quantization. DiffKV
+                             600
+                                                                                                        adaptively adjusts the mix of high- and low-precision
+                             400                                                                        tokens (e.g., K8V4, K4V2) on a per-request basis (Sec-
+                             200                                                                        tion 4), whereas prior work [5, 19, 77] typically applies a
+                               0                                                                        single static configuration across all requests.
+                                    0       5           10    15         20       25         30
+                                                              Layer
+                                                                                                      • Sequence length-adaptive importance estimation. Diff-
+Figure 4: Number of critical tokens per layer in Llama3-8B                                              KV modulates the proportion of important tokens based
+to preserve 95% of the total attention score.                                                           on sequence length, retaining more tokens in shorter
+                                        Number of Critical Tokens per KV Head in Llama3-8B
+                                                                                                        sequences to preserve quality, while enabling more ag-
+ Number of Critical Tokens
+
+
+
+
+                             1750        layer-0
+                             1500        layer-15                                                       gressive compression for longer ones (Section 4). Prior
+                             1250
+                                         layer-31                                                       approaches [5, 42, 76] typically use a fixed token reten-
+                             1000                                                                       tion ratio, regardless of sequence length.
+                              750                                                                     • Per-head dynamic sparsity exploitation. DiffKV dynam-
+                              500                                                                       ically adjusts memory allocation per head, based on ob-
+                              250
+                                                                                                        served sparsity patterns (Section 3.3 & 4), whereas exist-
+                                0
+                                    0      1        2        3       4        5        6      7         ing methods allocate memory uniformly across attention
+                                                              KV Head
+                                                                                                        heads, missing optimization opportunities.
+Figure 5: Number of critical tokens per KV head in Llama3-
+8B to preserve 95% of the total attention score.                                                      • Scalable on-GPU memory management. DiffKV intro-
+                                                                                                        duces an efficient on-GPU memory manager that han-
+bars indicating the standard deviation across requests. The                                             dles irregular per-head memory allocation patterns, ef-
+sparsity pattern remains highly dynamic: within each layer,                                             fectively translating memory savings into performance
+the number of critical tokens varies significantly across KV                                            gains (Section 5).
+heads. Furthermore, within individual KV heads, the number
+of critical tokens can vary substantially across requests, as
+shown by the high standard deviation in some KV heads.                                            4    KV Compression Policy
+                                                                                                  We present the KV compression policy of DiffKV, designed
+3.4                            Main Insights and Implications
+                                                                                                  to address the three levels of differentiation within the KV
+Our findings reveal three critical levels of differentiation                                      cache. First, to reflect the greater impact of keys on atten-
+within the KV cache:                                                                              tion computation compared to values, we propose quantizing
+                • Keys exert a broader impact on attention computation                            keys at a higher precision than values. For example, keys and
+                  than values, motivating differentiated precisions for keys                      values can be quantized to 8 and 4 bits (K8V4), or 4 and 2
+                  and values.                                                                     bits (K4V2). Second, to account for the varying importance
+                                                                                                  of tokens, we introduce a hierarchical compression strategy
+                • Tokens vary in importance as reflected by their attention
+                                                                                                  that classifies tokens into three significance levels: the most
+                  scores, motivating a fine-grained, hierarchical compres-
+                                                                                                  important tokens are quantized at high precision (e.g., K8V4),
+                  sion strategy.
+                                                                                                  moderately important tokens at lower precision (e.g., K4V2),
+                • Attention sparsity patterns vary across requests and at-                        and the least important tokens are pruned entirely. This strat-
+                  tention heads, requiring dynamically managing memory                            egy is both request-aware and sequence-length adaptive. It
+                  resources on a per-request and per-head basis.                                  dynamically adjusts the mix of high- and low-precision tokens
+   Collectively, these highly dynamic sparsity patterns, across                                   per request to reflect their varying sparsity patterns. More-
+layers, attention heads, and individual requests, underscore the                                  over, it retains a larger fraction of tokens at high precision
+necessity of adaptive memory management on a per-head and                                         for short sequences to preserve quality, while applying low
+per-request basis. They motivate the design of DiffKV, which                                      precision quantization and pruning more aggressively for long
+integrates differentiated precisions for keys and values, hier-                                   sequences to maximize memory savings.
+archical compression based on importance, and per-request                                            Finally, to address the dynamic attention sparsity patterns
+and per-head memory management.                                                                   across requests and attention heads, we propose an adaptive
+Contributions of DiffKV. DiffKV expands the design space                                          memory management approach. Rather than imposing a fixed
+for KV cache compression by jointly exploiting the three                                          memory budget, our approach allows each attention head to
+levels of differentiation in KV cache, enabling higher com-                                       determine its memory requirements dynamically based on its
+pression ratios with minimal quality degradation. Compared                                        specific sparsity pattern.
+     Next, we describe the KV compression policy in greater                to low precision and moved to KVl , the low precision KV
+detail, addressing the prompt phase and the generation phase               cache (line 9); otherwise, tv is pruned. Similarly, if tc ’s sig-
+separately. In both phases, compression is applied per-request             nificance lies within [ αNl , αNh ], it is quantized to low precision
+and per-head, ensuring that memory usage is tailored to the                and added to KVl (line 14). The least important token in KVl
+specific sparsity pattern of each request and attention head.              is designated as the victim tv (line 15), and is further pruned
+Prompt Phase. In the prompt phase, key and value vectors                   if its significance falls below αNl (line 17).
+for all tokens in the prompt are computed. The compression                 Discussion. The proposed KV compression policy is highly
+policy then determines the appropriate precision for storing               extensible, allowing for the potential use of more than two
+each token based on its significance. The significance of the              quantization precision levels. We adopt two quantization pre-
+ith token is calculated by averaging the N −i attention scores it          cision levels primarily to minimize metadata overhead and
+receives from subsequent tokens, where N denotes the prompt                improve system efficiency, as will be detailed in the following
+sequence length. In the case of GQA and MHA, scores from                   section. In Section 7.2, we empirically show that the two-level
+all attention heads associated with the KV head are aggre-                 scheme (K8V4-K4V2) achieves near-lossless generation qual-
+gated using the maximum operation. To mitigate premature                   ity across multiple models and benchmarks. We use a shared
+compression, the most recent W tokens are always quantized                 set of thresholds for all attention heads, as our empirical stud-
+at high precision, where W is typically set to 64. For the                 ies demonstrate that this approach is sufficient to capture
+remaining tokens, the policy determines the precision level                the varying sparsity patterns across different heads. Notably,
+of the ith token in a sequence-length adaptive manner, by                  DiffKV can efficiently support more flexible compression
+comparing its significance score to the theoretical average                policies, such as tuning thresholds for each head individually,
+1
+ i , based on the intuition that tokens with scores below aver-            which could potentially further optimize the balance between
+age are less critical. Specifically, the ith token is quantized            model accuracy and memory efficiency. We leave the explo-
+at high precision if its significance score exceeds αih , at low           ration of such flexible policies for future work.
+precision if its score lies within the interval [ αil , αih ], and is
+pruned otherwise. The parameters αl and αh , which define
+                                                                            Algorithm 1: KV compression policy (generation)
+the thresholds for high- and low-precision quantization, are
+determined offline through profiling on a calibration dataset.                1: Input: Parameters αh , αl ; High & low precision Ph & Pl
+As a result of this hierarchical compression, the KV cache is                 2: Input: Candidate token tc ; Sequence length N
+conceptually divided into two parts: a high-precision section                 3: Input: High & low precision KV cache KVh & KVl
+KVh and a low-precision section KVl .                                         4: Function: Significance Score; Quantization Quant;
+                                                                                                   α
+                                                                              5: if Score(tc ) ≥ Nh then
+Generation Phase. In the generation phase, a single token
+is compressed at each step, aligning with the autoregressive                  6:    KVh .add(Quant(tc , Ph ))
+nature of the generation process. The most recent token is                    7:    tv = argmint∈KVh (Score(t))
+added to the recent window to prevent premature compression,                  8:    if αNl ≤ Score(tv ) < αNh then
+while the earliest token tc in the window becomes a candidate                 9:       KVh .remove(tv ), KVl .add(Quant(tv , Pl ))
+for more aggressive compression. The compression procedure                   10:    else if Score(tv ) < αNl then
+can be divided into two parts. First, token tc is quantized at               11:       KVh .remove(tv )
+either a high or low precision and added to the corresponding                12:    end if
+                                                                                                        α
+                                                                             13: else if Score(tc ) ≥ Nl then
+section of the KV cache, or it may be completely pruned.
+Next, if tc is quantized, the least significant token tv in the              14:    KVl .add(Quant(tc , Pl ))
+corresponding precision section of the KV cache is considered                15:    tv = argmint∈KVl (Score(t))
+for further downgrading: it may be re-quantized to lower                     16:    if Score (tv ) < αNl then
+precision or pruned, depending on its significance. Essentially,             17:       KVl .remove(tv )
+this policy establishes a smooth downgrading path for the less               18:    end if
+                                                                             19: end if
+important token: rather than being pruned directly, it is first
+re-quantized to low precision, with pruning occurring only if
+it remains insignificant.
+     The detailed procedure is outlined in Algorithm 1, follow-            5    Memory Management
+ing the same intuition and parameters as the prompt phase.
+Given the sequence length N, tc is quantized at high precision             In this section, we describe DiffKV’s memory management
+and added to KVh , the high precision KV cache (line 6), if its            mechanism which efficiently supports the three levels of dif-
+significance exceeds αNh . Subsequently, the least significant             ferentiation in the KV cache. We first highlight the challenges
+token in KVh is identified as the victim token tv for more ag-             posed by these differentiations in memory management, and
+gressive compression (line 7). If tv ’s significance exceeds αNh ,         then present parallel KV compaction, a novel memory man-
+it remains in KVh ; if it falls within [ αNl , αNh ], tv is re-quantized   agement technique that effectively tackles the challenges.
+5.1    Challenges                                                     ciently parallelize memory management, and (3) the bidirec-
+                                                                      tional page table to minimize metadata overhead for tracking
+Flexible Paging. In PagedAttention [39], all tokens are stored        tokens of differentiated precisions.
+at the same precision, allowing for a fixed page format. How-
+                                                                      Unified Pages. Unified pages abstract away the complexity
+ever, the differentiation of key and value vectors, along with
+                                                                      of differentiated precisions both within individual tokens and
+varying token importance, introduces multiple precision lev-
+                                                                      across different tokens, thereby simplifying the implemen-
+els both within and across tokens, making a fixed page format
+                                                                      tation of parallel KV compaction. Specifically, we partition
+insufficient. Specifically, a fixed page format requires conser-
+                                                                      the available GPU memory into evenly sized pages, each con-
+vatively allocating high-precision slots for all tokens regard-
+                                                                      figured upon allocation to store tokens at a given precision.
+less of their actual precisions, leading to considerable memory
+                                                                      Each unified page is organized into six segments: quantized
+wastage. Suppose memory is allocated to accommodate the
+                                                                      keys, quantization metadata for keys, quantized values, quan-
+highest precision K8V4, a token with K4V2 precision would
+                                                                      tization metadata for values, token scores, and positions. The
+waste 50% of the memory. Worse, such a fixed page format
+                                                                      quantization metadata includes scales and zero points for the
+results in misaligned memory accesses, which hinder mem-
+                                                                      key and value vectors. The number of tokens stored per page
+ory bandwidth utilization and reduce overall computational
+                                                                      is adjusted according to the quantization configuration, ensur-
+efficiency.
+                                                                      ing compact memory usage. Furthermore, by consolidating
+KV Compaction Scalability. At each LLM inference step,                keys, values, and their metadata into a single structure, unified
+the memory management complexity is O(#requests) for                  pages enhance data locality and eliminate the need for scat-
+PagedAttention, as memory is partitioned uniformly among              tered lookups, improving memory access efficiency during
+attention heads. In contrast, DiffKV must handle varying              attention computation.
+numbers of high- and low-precision tokens across different
+                                                                      Circular Free Page List. The circular free page list serves
+heads, mapping these heterogeneous memory requirements
+                                                                      as the cornerstone of parallel KV compaction, facilitating
+to physical memory. We term this process KV compaction,
+                                                                      the parallelization of memory allocation and recycling by
+whose complexity is O(#requests × #heads) per inference
+                                                                      maintaining both free and used pages in contiguous regions.
+step. This poses significant scalability challenges for mem-
+                                                                         This centralized, GPU-resident data structure contains all
+ory management. Given that model execution time per step
+                                                                      Page IDs and tracks free pages through a pair of pointers: a
+is on the order of tens of milliseconds, improper memory
+                                                                      start pointer for allocations and an end pointer for recycling.
+management could render the overhead of dynamic allocation
+                                                                      These pointers wrap around to the beginning of the list upon
+prohibitive, negating the benefits of KV cache compression.
+                                                                      reaching the end, forming a circular structure. When a page is
+Moreover, managing both high-precision and low-precision
+                                                                      allocated, the start pointer advances to the next available Page
+tokens would require separate data structures for each preci-
+                                                                      ID; when a page is freed, the end pointer advances to add the
+sion, resulting in increased metadata overhead.
+                                                                      released Page ID back into the list. Both the available and
+                                                                      unavailable regions in the list remain contiguous, enabling the
+5.2    Parallel KV Compaction
+                                                                      coordination phase in memory management to be parallelized
+A detailed analysis of the KV compaction process reveals op-          via parallel prefix sum.
+portunities for parallelization. KV compaction can be divided            In parallel KV compaction, after each head determines the
+into two phases: planning and coordination. In the planning           number of pages to be allocated or freed, a parallel prefix
+phase, each attention head independently determines its mem-          sum operation computes a unique offset for each head rela-
+ory allocation requirements. The subsequent coordination              tive to the start or end pointer. This step converts per-head
+phase synchronizes these per-head requirements and maps               memory demands into a globally consistent schedule, where
+them to the GPU’s physical memory. The primary source of              each head is assigned a disjoint region of the free page list to
+increased memory management complexity lies in the plan-              read from (for allocation) or write to (for recycling), ensuring
+ning phase, which is perfectly parallelizable and well-suited         non-conflicting operations within the list. For memory alloca-
+to the GPU’s parallel compute capabilities. Parallelizing the         tion, each head concurrently retrieves its new page IDs from
+coordination phase is more challenging, as it requires synchro-       its designated region in the list, with the start pointer incre-
+nization across heads. However, we observe that this phase            mented by the cumulative number of pages required across
+can be parallelized effectively via parallel prefix sum [51],         all heads. Similarly, for memory recycling, each head writes
+provided that the free memory region is contiguous.                   freed page IDs to its designated region, with the end pointer
+   Thus, we propose parallel KV compaction, a novel manage-           incremented by the total number of pages released.
+ment technique that efficiently performs per-head dynamic             Bidirectional Page Table. Similar to PagedAttention, Diff-
+memory allocation and recycling in parallel directly on the           KV maintains a page table for each attention head, mapping
+GPU. Parallel KV compaction is enabled by three GPU-                  each request to its corresponding list of page IDs. To avoid the
+resident data structures collectively: the (1) unified pages          doubled metadata overhead associated with maintaining sepa-
+to enable flexible paging, (2) the circular free page list to effi-   rate page tables for high- and low-precision pages, DiffKV
+ Request: democracy   builds       on         trust       ,      openness      and           justice   exact numbers of high- and low-precision pages required by
+                      Free Page List               unavailable        available                        each head are unknown a priori, we conservatively allocate
+   Initial
+                                         5 6 7 8 9 10 11 12 13 14 15
+                                                                                                       four unified pages per head, assuming all tokens are stored at
+   State
+                                                                                                       high precision. Pages 5-8 and 9-12 are thus assigned to Head
+                                       start_ptr                                  end_ptr
+                                                                                                       A and B, respectively, as shown in their page tables. The end
+                      Head A’s Page Table                        Head B’s Page Table                   pointer of circular free page list advances to Page 13, marking
+                         5        6       7           8           9     10        11    12             Pages 5-12 as allocated.
+                 high-prec page                                                                           Next comes the planning phase, during which each head
+    Page
+ Allocation      low-prec page                                                                         independently applies the KV cache compression algorithm
+                                                                                                       and calculates its specific memory requirements. In this ex-
+                      Free Page List
+                                                                                                       ample, Head A uses one high-precision page, while Head B
+                                                                            13 14 15
+                                                                                                       uses two; both heads also require one low-precision page.
+                                                                       start_ptr end_ptr
+                                                                                                       We allocate high-precision pages left-to-right in the bidirec-
+                      Free Page List
+                                                                                                       tional page table and low-precision pages right-to-left: Head
+   Page
+ Recycling            6 7 11                                                13 14 15                   A uses Page 5 (high-precision) and Page 8 (low-precision),
+                             end_ptr                                   start_ptr
+                                                                                                       while Head B uses Pages 9–10 (high-precision) and Page 12
+                                                                                                       (low-precision).
+ Figure 6: Memory management flow in the prompt phase.                                                    Following the planning phase, the coordination phase fi-
+                                                                                                       nally reclaims unused pages (Pages 6-7 from Head A and
+introduces a unified, GPU-resident data structure called the                                           Page 11 from Head B) via a parallel prefix-sum. These recy-
+bidirectional page table. This structure efficiently supports                                          cled pages are appended to the circular free page list; since
+the use of two quantization precision levels for KV cache, as                                          the end pointer already points to the list’s tail, it wraps around
+proposed in Section 4, minimizing the metadata overhead. In                                            to the head to accommodate the recycled pages.
+each entry of the bidirectional page table, high-precision page                                        Generation Phase. At each generation step, a head allocates
+IDs grow from the left side of the list, while low-precision                                           a new page only if either its high-precision or low-precision
+page IDs grow from the right, dynamically adapting to the pre-                                         pages are full, requiring at most one additional page per step.
+cision requirements of the workload. The length of each page                                           Each head independently checks its page availability and, if
+table entry is determined by the maximum sequence length                                               needed, allocates a new page in parallel using the prefix-sum-
+divided by the tokens per high-precision page, ensuring no                                             based approach. Unlike in the prompt phase, page recycling
+overflow since low-precision pages always contain more to-                                             is not performed during generation, as the total number of
+kens than high-precision ones. This unified approach not only                                          stored tokens either remains the same if an old token is evicted
+minimizes metadata overhead but also eliminates the need for                                           or increases by one if no eviction occurs. Once a request
+separate lookups based on precision levels, thereby enhancing                                          is finished, all pages allocated for that request are recycled,
+memory access efficiency during attention computations. The                                            freeing up memory for incoming requests.
+memory overhead of the bidirectional page table is minimal:                                            Supporting Additional Precision Levels. The proposed
+for example, with a batch size of 128 on Llama3-8B, which                                              memory management system naturally extends to support
+has 32 layers and 8 KV heads per layer, the total size of all                                          more than two precision levels, by incorporating additional
+bidirectional page tables is only 32 MB. By contrast, the KV                                           page tables. For example, accommodating three precision
+cache for a single request occupies 1 GB.                                                              levels can be achieved by combining a unidirectional page
+                                                                                                       table with a bidirectional one. Similarly, four precision levels
+5.3          KV Compaction Workflow                                                                    can be supported using two bidirectional page tables. This
+                                                                                                       composable design preserves memory efficiency while provid-
+We delve into the KV compaction workflow during the prompt
+                                                                                                       ing the flexibility needed to handle increasingly fine-grained
+and generation phases, illustrating how the three data struc-
+                                                                                                       precision differentiation.
+tures interact to enable differentiated KV cache compression.
+Notably, KV compaction is executed once per inference step
+for all requests in the batch and all layers in the LLM. This
+design ensures sufficient parallelism for efficient GPU exe-                                           6    Implementation
+cution, while amortizing the associated GPU kernel launch
+overheads.                                                                                             We implement DiffKV on top of vLLM, comprising 4.5K
+Prompt Phase. Figure 6 illustrates the KV compaction work-                                             lines of CUDA/C++ code and 9K lines of Python. We first
+flow during the prompt phase for an example request with                                               outline the architecture of DiffKV and then detail our cus-
+eight tokens. In this example, one high-precision page stores                                          tom GPU attention kernel, designed to efficiently support the
+two tokens, and one low-precision page stores four. Since the                                          differentiated KV cache compression.
+                                       Scheduler                                       elements in a vectorized manner, performs dequantization
+                                                                                       on the fly, and computes a partial dot product between the
+                                                                                       key elements and corresponding query elements. Using a
+  Memory Manager                                   Memory Manager Head-2N+1
+                                                                                       straightforward layout such as [F, Ntokens ] for keys, where F
+   Head-0
+                      Head-1
+                                                   Head-2N   Req-1
+                                                                                       denotes the feature dimension length, would cause threads
+            Req-1                                                      Req-0
+    Req-0              Req-0   Req-1                    Req-0
+                                                                               Req-1   within a group to fetch non-contiguous elements strided by
+                                                                                       Ntokens when parallelizing across the feature dimension. Alter-
+  Execution Engine                                 Execution Engine
+   Custom Attention    KV Compressor                Custom Attention   KV Compressor
+                                                                                       natively, using [Ntokens , F] would cause thread groups to fetch
+                                                                                       non-contiguous elements strided by F when parallelizing
+               Worker-0                                         Worker-N
+                                                                                       across tokens. Both layouts suffer inefficient strided memory
+                      Figure 7: DiffKV architecture.                                   accesses, leading to low bandwidth utilization. Instead, we or-
+                                                                                                                            F
+                                                                                       ganize the layout of keys as [ Kvec ×K group
+                                                                                                                                    , Ntokens , Kgroup , Kvec ],
+6.1     DiffKV Architecture                                                            where Kvec denotes the vectorization factor and Kgroup denotes
+The architecture of DiffKV is illustrated in Figure 7. At each                         the number of threads per group. During each execution step,
+inference step, the scheduler batches as many requests as pos-                         each thread fetches Kvec consecutive elements, threads within
+sible within the available GPU memory to maximize through-                             a group collectively fetch Kgroup adjacent chunks, and groups
+put, sending the selected requests to all workers. Each GPU                            within the warp access contiguous chunks along the Ntokens
+hosts one worker, responsible for executing a partition of the                         dimension. As a result, the combined memory accesses of all
+model [33, 52, 53, 63]. To facilitate efficient execution, each                        threads in a warp are contiguous, enabling memory coalescing
+worker includes a dedicated memory manager that oversees                               and maximizing bandwidth utilization.
+the KV cache for its assigned attention heads, as outlined in                             For value processing, tokens in a page are evenly distributed
+Section 5, and an execution engine for model computation. To                           across thread groups in a warp; within each group, individual
+support differentiated KV cache compression, the execution                             threads perform sum reductions over the feature dimension
+engine integrates a KV compressor and a custom GPU atten-                              and save their accumulation results in registers. Once all
+tion kernel. After computing key and value vectors, the KV                             groups finish, a tree reduction aggregates these partial results
+compressor is invoked to compress them following the policy                            and produces the output. The number of registers required per
+described in Section 4, storing the results in the KV cache.                           thread is proportional to the feature dimension range assigned
+The custom GPU attention kernel then efficiently computes                              to it, while during key processing each thread only requires a
+the attention output using the compressed KV cache.                                    single register to store the partial dot product. Consequently,
+                                                                                       vectorization along the feature dimension, as used in key
+6.2     Efficient Attention Kernel                                                     processing, is not suitable for value processing, because it
+                                                                                       would significantly increase register pressure by forcing each
+We develop a custom attention kernel that efficiently sup-                             thread to handle a larger portion of the feature dimension. To
+ports differentiated KV cache compression, leveraging re-                              better align with the computation pattern of reduction across
+duced memory access volume to accelerate performance. No-                              tokens, we apply vectorization to the token dimension instead,
+tably, the kernel design is portable across GPUs and other                             which reduces register pressure and ensures more effective
+NPUs, as mainstream architectures support vectorized mem-                              parallelization. We organize the layout of values as [ VgroupF
+                                                                                                                                                       ,
+ory access and layout-aware tiling [37,79]. We detail the GPU                          Ntokens
+implementation in the following paragraphs.                                             Vvec , Vgroup , Vvec ] accordingly.
+   Overall, we assign each thread block to process a single                               Additionally, for ultra-long sequences, the attention ker-
+attention head per sequence. To mitigate the potential load                            nel supports parallelization along the sequence dimension. It
+imbalance caused by mixed-precision quantization, we let                               splits the sequence into multiple segments, processes them
+thread warps iterate over high-precision pages first, followed                         in parallel using the aforementioned method within separate
+by low-precision pages. Each page is processed in two phases:                          thread blocks, and then merges the results with minimal com-
+dot product between the query and keys to derive attention                             putation overhead.
+scores, and weighted sum of values. These two phases fol-
+low different computation patterns: reduction over the fea-
+ture dimension and token dimension, respectively. To ensure
+coalesced and vectorized memory accesses for both phases,                              7    Evaluation
+we design tailored data layouts and parallelization strategies,
+elaborated as follows.
+                                                                                       We first evaluate the effectiveness of DiffKV’s differentiated
+   For key processing, each warp handles one page at a time,
+                                                                                       KV cache compression policy. Next, we evaluate the effi-
+with threads divided into groups responsible for distinct key
+                                                                                       ciency of the memory manager as well as the end-to-end
+vectors. Within a group, each thread fetches its assigned key
+                                                                                       throughput improvements achieved by DiffKV.
+7.1    Experiment Setup                                                                     FP16     K8V4     K4V8      K8V2       K4V2     K2V4     K4V1
+
+                                                                                                   GSM8K                               HumanEval+
+We evaluate DiffKV on several models spanning three ma-                                                                 70
+                                                                                     80                                 60
+
+
+
+
+                                                                      Accuracy (%)
+jor families: Llama3-8B and 70B [68], Qwen2.5-7B and                                                                    50
+                                                                                     60
+32B [34], and the recent thinking models QwQ-32B [67],                                                                  40
+                                                                                     40                                 30
+R1-Distill-Qwen-14B and R1-Distill-Llama-8B [26], which                                                                 20
+                                                                                     20
+generate extended chains of thought and exhibit strong capa-                                                            10
+                                                                                      0                                  0
+bilities on complex reasoning tasks.                                                         3-8B en2.5-7B ma3-70B                3-8B en2.5-7B ma3-70B
+                                                                                      Llama     Qw      Lla               Llama      Qw      Lla
+    We select benchmarks that align with those commonly
+used in recent LLM technical reports [20, 27, 34, 45, 67],                           Figure 8: Accuracy of differentiated KV quantization.
+covering a diverse set of task domains, including general                           Llama3-8B GSM Llama3-8B HEval Qwen2.5-7B GSM Qwen2.5-7B HEval
+                                                                                  80              50
+knowledge (MMLU [31] and MMLU-Pro [64]), mathemat-                                                               80
+
+
+
+
+                                                                   Accuracy (%)
+                                                                                                                                 50
+                                                                                  60              40
+ics (GSM8K [15] and MATH [41]), code generation (Hu-                                                             60              40
+                                                                                                  30
+                                                                                  40                             40              30
+manEval+ [12, 46] and MBPP+ [8, 46]), and long-context un-                                Dynamic
+                                                                                                  20                             20
+                                                                                  20                             20
+derstanding (LongBench [9]). In addition, we assess DiffKV’s                              Static  10                             10
+                                                                                   0               0              0               0
+generation quality on thinking models using two particularly                        0 20 40 60 80   0 20 40 60     0 20 40 60 80   0 20 40 60
+                                                                                                       Fraction (%) of tokens pruned
+challenging benchmarks: AIME24 [3], a mathematics compe-
+tition dataset, and GPQA [57], which evaluates graduate-level                             Figure 9: Accuracy of dynamic vs. static sparsity.
+science reasoning. We measure the throughput and latency on
+                                                                   precision to keys. On the other hand, K4V1 yields almost zero
+NVIDIA L40 GPUs, each with 48 GB of memory [54]. In all
+                                                                   accuracy, suggesting that 2 bits is the lower bound for effec-
+experiments, model weights are stored in FP16 precision.
+                                                                   tive value quantization. In summary, these results confirm that
+                                                                   keys play a more critical role than values, and demonstrate the
+7.2    Differentiated KV Compression Policy
+                                                                   effectiveness of differentiated KV quantization in preserving
+We first assess the effectiveness of differentiated KV quan-       accuracy while enabling aggressive compression.
+tization and dynamic sparsity individually, and then evalu-           The accuracy trends across various differentiated KV quan-
+ate the combined benefits of the proposed differentiated KV        tization configurations motivate the design of adopting two
+cache compression. To ensure the reliability of our results and    precision levels: K8V4 and K4V2. K8V4 matches the genera-
+mitigate the influence of noise and randomness inherent in         tion quality of the FP16 baseline and is applied to important
+floating-point computations, each experiment is repeated five      tokens to preserve model accuracy. K8V2 and K4V2, when
+times with the dataset randomly shuffled, and the reported         applied uniformly, both lead to noticeable accuracy degra-
+results represent the average across these runs.                   dation. Among them, K4V2 offers better efficiency and is
+Evaluating Differentiated KV Quantization. Figure 8                thus selected for compressing less significant tokens, enabling
+shows the model generation quality of differentiated KV            opportunistic KV cache savings with minimal quality loss.
+quantization on GSM8K and HumanEval+, namely K8V4                  As we demonstrate later, the K8V4–K4V2 scheme achieves
+and K4V2, compared to FP16 baselines, across Llama3-8B             near-lossless generation quality across multiple models and
+& 70B and Qwen2.5-7B. To validate our intuition that keys          benchmarks, obviating the need for an intermediate precision
+have a more significant impact than values (Section 3.1), we       level like K8V2. Likewise, introducing an even lower preci-
+additionally evaluate the mirror configurations, namely K4V8       sion level such as K4V1 is suboptimal: not only does K4V1
+and K2V4, where values are stored with higher precision than       significantly degrade accuracy, but the additional memory
+keys, as well as more skewed variants, K8V2 and K4V1.              savings from a three-level configuration K8V4–K4V2–K4V1
+   Results show that K8V4 matches the accuracy of the FP16         are marginal compared to the K8V4–K4V2 design. That said,
+baseline across all models and benchmarks. In contrast, its        future models employing more aggressive training-time KV
+mirror configuration, K4V8, exhibits noticeable accuracy           compression (e.g., architectures with higher queries-per-KV
+degradation, particularly for Qwen2.5-7B, where accuracy           ratios in GQA) may benefit from an additional high-precision
+drops to nearly zero on both tasks. This pronounced sensitiv-      level (e.g., FP16–K8V4 or FP16–K8V4–K4V2), which we
+ity to 4-bit key quantization in Qwen2.5-7B is likely due to its   leave to future investigation.
+GQA architecture, which applies aggressive KV compression          Evaluating Dynamic Sparsity. We evaluate the effectiveness
+with a queries-per-KV ratio of 7, substantially higher than the    of per-head dynamic sparsity (Section 3.3) in identifying crit-
+ratio of 4 used in Llama3-8B. Similarly, K4V2 retains over         ical tokens, comparing it to the static sparsity method used in
+65% of FP16 accuracy across both benchmarks on Llama3-             SnapKV [42], which allocates an equal memory budget to all
+8B and 70B, while the mirror configuration K2V4 results in         attention heads. Figure 9 reports results on Qwen2.5-7B and
+near-zero accuracy. The more skewed variant K8V2 retains           Llama3-8B across GSM8K and HumanEval+. The x-axis indi-
+at least 83% of FP16 accuracy across all models, even for          cates the percentage of tokens pruned, while the y-axis shows
+Qwen2.5-7B, reinforcing the importance of assigning higher         the resulting task accuracy. Dynamic sparsity significantly
+                        Llama3-8B αh                  Llama3-8B αl                    Qwen2.5-7B αl                                          DiffKV          KIVI    SnapKV          Quest
+               44                            44                              64                                                              FP16            INT4    DuoAttn         H2O
+               42                            42                              62                                                  Llama3-8B GSM8K            Llama3-8B MMLU          Qwen2.5-7B MMLU-P
+                                                                                                                           80                                                  60
+               40                            40                              60                                                                       60
+                             K8V4-K4V2                    K8V4-K4V2-Pr                     K8V4-Prune                      60
+               38            FP16            38           FP16               58            FP16                                                                                40
+                                                                                                                                                      40
+               36            Chosen          36           Chosen             56            Chosen                          40
+Accuracy (%)
+
+
+
+
+                    1     2   3   4      5    0.02 0.04 0.06 0.08 0.10 0.02 0.04 0.06 0.08 0.10                                                       20                       20
+                             αh                          αl                       αl                                       20
+                        Llama3-70B αh             Qwen2.5-32B αh             QwQ-32B αh
+                                             70                       90                                                    0                          0                        0
+               62                                                                                                               10  20    30   40          10  20    30   40        20 25 30 35 40
+                                             68                              88                                                 Qwen2.5-7B HEval+          Qwen2.5-32B MBPP+        Qwen2.5-32B MATH
+               60
+                                             66                              86                                                                                                60
+               58                                                                                                          50                         60
+
+
+
+
+                                                                                                            Accuracy (%)
+                             K8V4-K4V2       64           K8V4-K4V2          84            K8V4-K4V2                       40
+               56            FP16                         FP16                             FP16                                                                                40
+                                             62                              82                                            30                         40
+               54            Chosen                       Chosen                           Chosen
+                                             60                              80                                            20                                                  20
+                    1    2     3    4    5        1   2     3    4       5        1    2     3    4     5                                             20
+                               αh                           αh                               αh                            10
+                                                                                                                            0                          0                        0
+Figure 10: Calibrating the high- and low-precision thresholds                                                                   20 25 30 35 40             20 25 30 35 40           20 25 30 35 40
+                                                                                                                                  QwQ-32B MATH              QwQ-32B AIME24            QwQ-32B GPQA
+αh and αl on the training split of the MATH dataset.                                                                                                  80
+                                                                                                                                                                               60
+                                                                                                                           75                         60
+outperforms static sparsity in Llama3-8B, maintaining full ac-                                                                                                                 40
+curacy with 50% tokens pruned on GSM8K, and 10% tokens                                                                     50                         40
+pruned for the more sensitive HumanEval+. For Qwen2.5-7B,                                                                  25                         20
+                                                                                                                                                                               20
+
+dynamic sparsity also consistently surpasses static sparsity,
+                                                                                                                            0                          0                        0
+achieving accuracy higher than 80% on GSM8K with 50%                                                                            20 25 30 35 40             20 25 30 35 40           20 25 30 35 40
+                                                                                                                                                            Memory (%)
+tokens pruned. While the improvement is less pronounced on
+                                                                                                            Figure 11: KV cache memory normalized to vLLM vs. bench-
+HumanEval+, dynamic sparsity still yields higher accuracy at
+                                                                                                            mark accuracy tradeoff of DiffKV.
+equivalent pruning ratios. In summary, per-head dynamic spar-
+sity is superior to static sparsity by leveraging head-specific
+significance.                                                                                               accuracy based on profiling results: αh = 1 for Llama3-8B and
+Parameter Calibration. As described in Section 4, DiffKV                                                    70B, and αh = 3 for Qwen2.5-32B and QwQ-32B, and disable
+compares the significance score of a token with its theoretical                                             low-precision quantization for Qwen2.5-7B. Subsequently,
+average, N1 , where N denotes the sequence length. A token                                                  we profile the low-precision threshold αl , while keeping αh
+is quantized to high precision if its score exceeds αNh , to low                                            fixed. We observe that setting αl = 0.1 induces at least 5%
+precision if its score falls within the interval [ αNl , αNh ], and is                                      accuracy degradation on the larger models. As a result, we
+pruned otherwise. To calibrate the appropriate parameters αh                                                profile five equally spaced values within the range [0, 0.1] and
+and αl , we utilize the training split of MATH [41]. We select                                              select the one yielding the highest accuracy for each model.
+MATH as the calibration dataset as it is comprised of complex                                               The final selected values of αl are 0.02 for Llama3-8B, 0.04
+mathematical reasoning tasks with high text information den-                                                for Qwen2.5-7B, and 0 for the remaining models. While the
+sity, where even the removal of a single symbol can invalidate                                              profiled values cover a limited portion of the entire parameter
+an argument. This makes MATH highly suitable for parameter                                                  space, as will be demonstrated in the following sections, Diff-
+fitting, as the resulting compression parameters are expected                                               KV significantly outperforms existing baselines with these
+to generalize well across other tasks. Additionally, MATH                                                   fitted parameters, highlighting its potential effectiveness.
+provides a dedicated training split, ensuring that parameter                                                Evaluating Differentiated Compression Policy. Finally, we
+fitting does not involve testing data and mitigating potential                                              evaluate the combined benefits of DiffKV’s KV cache com-
+overfitting.                                                                                                pression policy. We compare DiffKV against several state-of-
+    We profile a consistent range of parameters across all eval-                                            the-art baselines, including pruning-based methods such as
+uated models, as depicted in Figure 10. The x-axis represents                                               H2O [76], SnapKV [42], and DuoAttention [70], quantization-
+the profiled parameter values, while the y-axis shows the re-                                               based approaches such as 4-bit KV, KIVI [48], and QAQ [19],
+sulting accuracy on the calibration dataset. Specifically, we                                               as well as KV partial loading techniques like Quest [65]. Ta-
+profile αh within the integer range [1, 5], progressively re-                                               ble 1 compares the accuracy and KV cache memory usage of
+laxing the high-precision threshold beyond the theoretical                                                  DiffKV and the best-performing baselines, both normalized
+average. This adjustment accounts for aggregating scores                                                    to vLLM [39], for the evaluated non-thinking models. The
+from multiple attention heads by maximum for GQA, as men-                                                   parameters of DiffKV are tuned as described previously. For
+tioned in Section 4. The profiled values of αh achieve FP16-                                                the pruning-based baselines and Quest, we tune their memory
+equivalent accuracy across all models, except for Qwen2.5-7B,                                               usage to 50% of the baseline. DiffKV achieves near-lossless
+which exhibits heightened sensitivity to 4-bit key quantization.                                            accuracy relative to the FP16 baseline, with an average degra-
+Accordingly, we select the values of αh that yield the highest                                              dation of only 0.3%, while using 19.3% to 36.7% memory.
+In contrast, all other baselines incur more significant accuracy                  Pruned            Low-precision              High-precision
+                                                                                       MMLU               HumanEval+                  MATH
+degradation at comparable or higher memory usage. Further-
+                                                                      Llama3-8B            61%    17%     46%         50%            48%       34%
+more, DiffKV dynamically adapts its memory usage based on
+the task’s information density. For example, DiffKV allocates        Qwen2.5-7B             81%                 98%                      86%
+
+less memory for the 5-shot MMLU benchmark compared to               Qwen2.5-32B      73%          27%     60%         40%          65%         35%
+the 0-shot HumanEval+, where the prompt consists solely of                                 50%     100%         50%         100%      50%        100%
+the function name and comments.
+   DiffKV also outperforms baseline methods in long-context         Figure 12: Fraction of tokens pruned, quantized to low preci-
+scenarios, as shown in Table 2, where we present results            sion, and quantized to high precision across different bench-
+from one benchmark in each category of LongBench. For               marks and models.
+Llama3-8B and Qwen2.5-7B, DiffKV achieves memory us-
+age of 14.9% and 27.0%, respectively, while baseline methods        KV Compression Breakdown. Figure 12 shows the fraction
+are tuned to 25% memory usage. Notably, DiffKV consis-              of tokens that are pruned, quantized to low precision, and
+tently achieves superior accuracy across all categories, with       quantized to high precision across three benchmarks (MMLU,
+an average degradation of only 0.4%, while utilizing less or        HumanEval+, and MATH) for three different models. Two key
+comparable memory compared to the baseline methods.                 observations emerge. First, sparsity levels vary substantially
+   Furthermore, the generation quality gap between DiffKV           across workloads. The general knowledge benchmark MMLU
+and baseline methods becomes even more pronounced for               exhibits the highest sparsity, likely due to the lower informa-
+the thinking models QwQ-32B, R1-Distill-Qwen-14B and                tion density of natural language and the use of 5-shot prompts.
+R1-Distill-Llama-8B on the more challenging benchmarks, as          In contrast, the reasoning-intensive benchmarks MATH and
+demonstrated in Table 3. DiffKV achieves FP16-comparable            HumanEval+ display lower sparsity, with HumanEval+ being
+generation quality using 27.4%, 29.4% and 23.5% of the              the least sparse, partly due to its 0-shot setting. Second, de-
+memory on average for QwQ-32B, R1-Distill-Qwen-14B and              spite being calibrated on challenging reasoning-heavy work-
+R1-Distill-Llama-8B, respectively, while all other methods          loads, DiffKV’s KV compression policy adapts effectively to
+experience significant generation quality degradation. On           the varying sparsity patterns across different tasks, highlight-
+the math competition benchmark AIME24, the most accu-               ing its generalizability to diverse scenarios.
+rate baseline, 4-bit KV quantization incurs a 16.0% accuracy
+degradation. On the graduate-level science benchmark GPQA,          7.3    System Performance
+the accuracy of pruning-based and KV partial loading meth-
+ods drops to almost zero, while using 50% of the full KV            In this section, we provide a comprehensive evaluation of
+cache. The larger gap between DiffKV and prior work in              DiffKV’s performance, comparing it against state-of-the-art
+long CoT generation highlights the increased challenges such        systems including vLLM, Quest, and SnapKV across various
+tasks pose for KV cache compression. In long CoT genera-            models. For models that fit within the memory of a single
+tion, tokens are generated autoregressively based on previous       GPU, such as Llama3-8B and Qwen2.5-7B, we use one GPU.
+tokens, and errors introduced by compression are accumu-            For larger models, we parallelize the computation across mul-
+lated and propagated across generation steps. In contrast, in       tiple GPUs: four GPUs for Llama3-70B, and two GPUs for
+long prompt scenarios, the majority of the text is provided as      Qwen2.5-32B and QwQ-32B. Our evaluation focuses on la-
+ground truth in the prompt, and the model-generated portion is      tency breakdown, attention kernel speedup, and end-to-end
+significantly shorter, limiting the impact of errors introduced     throughput to demonstrate the efficiency and scalability of
+by KV cache compression.                                            DiffKV.
+   Lastly, Figure 11 depicts the accuracy-memory trade-offs         Memory Management Overhead. Figure 13 compares Diff-
+of DiffKV under the profiled parameter values, namely αh ∈          KV’s on-GPU parallel KV compaction with an alternative im-
+[0, 5] (step size of 1) for all models and αl ∈ [0.02, 0.1] (step   plementation that performs multi-threaded memory manage-
+size of 0.02) for Llama3-8B and Qwen2.5-7B. We also in-             ment on the CPU. Evaluated with a sequence length of 1024
+clude the accuracy of baseline methods within similar memory        tokens across different batch sizes, DiffKV reduces memory
+usage ranges for comparison. DiffKV consistently matches            management latency by up to three orders of magnitude rela-
+the FP16 baseline accuracy across different models and bench-       tive to the on-CPU approach. For one entire inference step,
+marks within the profiled range of memory usage, demonstrat-        DiffKV significantly outperforms the on-CPU approach, par-
+ing its robustness. In contrast, baseline methods experience        ticularly in the generation phase, where the memory manage-
+significant accuracy degradation, particularly pruning-based        ment overhead on the CPU far exceeds the model execution
+and KV partial loading methods, which suffer rapid accuracy         time. Therefore, DiffKV’s on-GPU parallel memory manage-
+declines as memory usage decreases. In summary, DiffKV              ment is essential for ensuring that the performance benefits
+provides a superior accuracy-memory tradeoff compared to            of KV cache compression are fully realized without being
+state-of-the-art methods.                                           overshadowed by memory management overhead.
+Table 1: Accuracy and memory usage of DiffKV and the best-performing baseline methods across models and benchmarks.
+Numbers in parentheses represent memory usage normalized to FP16. The memory usage is 50.0% for SnapKV, Quest and
+DuoAttn, 25.0% for INT4, 18.8% for QAQ, and 12.5% for KIVI. DiffKV achieves accuracy close to FP16, consistently
+outperforming prior quantization and pruning approaches.
+                             Llama3-8B                                       Qwen2.5-7B                                                    Qwen2.5-32B                                 Llama3-70B
+Benchmarks
+               FP16     DiffKV     INT4 QAQ        DuoAttn   FP16     DiffKV       Quest   SnapKV KIVI                        FP16      DiffKV     Quest INT4         KIVI      FP16      DiffKV     INT4
+   GSM8K       76.3   75.7 (19.3%) 72.6 71.7        32.2     83.5   83.6 (26.8%)   76.7      66.7 72.2                        90.4    90.2 (23.6%) 82.8   88.7        79.3      90.5    90.2 (21.6%) 89.3
+   MATH        28.1   27.9 (21.6%) 23.9 23.5         9.3     58.0   57.7 (32.3%)   41.7      45.1 39.5                        63.2    67.2 (25.3%) 44.3   64.7        42.6      48.7    47.6 (21.3%) 45.3
+   MMLU        66.5   66.1 (17.8%) 65.2 60.9        42.4     75.1   74.7 (30.3%)   64.7      48.2 53.1                        83.8    83.8 (23.1%) 68.5   83.4        70.5      81.0    80.9 (20.1%) 79.4
+ MMLU-Pro      41.5   41.0 (21.5%) 39.1 38.2        34.6     55.4   54.9 (30.2%)   51.6      49.7 45.2                        67.8    67.4 (24.5%) 59.5   66.2        54.5      60.1    60.0 (21.5%) 59.2
+ HumanEval+    50.0   48.0 (27.6%) 45.1  7.9         4.8     57.5   55.9 (36.7%)    8.5      32.9 15.2                        49.4    49.4 (26.2%) 11.0   45.8        15.3      71.3    71.5 (26.7%) 70.1
+   MBPP+       59.3   61.6 (17.6%) 58.8 56.3        35.6     64.3   62.8 (27.9%)   33.3      44.7 18.3                        71.1    70.5 (21.8%) 35.2   67.3        38.6      68.6    69.7 (22.0%) 67.2
+
+
+Table 2: Evaluating DiffKV on LongBench. DiffKV uses                                                                      On-CPU               DiffKV                        On-CPU            DiffKV
+                                                                                                                    Prompt               Generation                  Prompt               Generation
+14.9% memory for Llama3.1-8B and 27.0% for Qwen2.5-7B.                                                                                           456.9                     3938                    492
+                                                                                                                                                                               3573
+
+
+
+
+                                                                                            Latency (ms)
+For Quest and SnapKV, the memory usage is 25%.                                                                            366.0
+                         Qasper    HotpotQA      GovReport TREC     PCount    Lcc                             284.9                    301.5                                            327
+
+                FP16      40.9       61.3          34.0     73.0     6.9      62.2
+               DiffKV     42.8       61.3          32.9     73.0     7.2      61.9                                                                            1166
+Llama3.1-8B                                                                                                                                                          882
+                Quest     38.9       59.8          30.6     66.5     6.4      56.8                                                                                                            26         36
+                                                                                                                    1.4         1.5        0.2          0.2
+               SnapKV     39.2       59.6          30.1     65.9     6.2      57.2                                  8          32       8              32        8           32        8               32
+                FP16      26.5       27.8          33.4     71.0     5.7      61.9                                            Batch Size                                      Batch Size
+ Qwen2.5-7B
+               DiffKV     26.4       28.2          32.2     70.0     5.3      62.3                             (a) Memory management                           (b) One entire inference step
+                Quest     23.6       25.2          31.4     65.6     4.3      53.3
+               SnapKV     22.6       25.5          30.8     64.6     4.5      52.6          Figure 13: Latency comparison between parallel KV com-
+                                                                                            paction and on-CPU multi-threaded memory management.
+        Table 3: Evaluating DiffKV on thinking models.
+                         FP16       DiffKV        INT4    KIVI   Quest    SnapKV                                                      Scheduler                              KV Compressor
+               MATH      90.6     90.6 (26.8%)     87.3   80.6   63.3       65.4                                                      Memory Management                      Model Execution
+  QwQ-32B       GPQA     62.1     63.2 (27.6%)     57.8    2.6    1.2        0.8                                                      Prompt                                      Generation
+                                                                                                              100                                              100
+                                                                                             Percentage (%)
+
+
+
+
+               AIME24    75.5     75.3 (27.8%)     64.3   10.0   23.3       19.2
+                                                                                                              75                                                75
+               MATH      94.2     94.1 (29.5%)     92.7   69.2   68.4       62.6                                        96% 1              97% 1                           92% 5              93% 5
+ R1-Distill-                                                                                                  50                                                50
+                GPQA     55.7     55.6 (29.2%)     52.0    0.0    0.5        0.0
+ Qwen-14B
+               AIME24    67.0     67.0 (29.6%)     61.6   10.0   20.2       17.2                              25                                                25
+                                                                                                                                0                  0                             0                 0
+               MATH      88.8     88.7 (23.2%)     86.1   48.2   58.9       54.2                               0                                                 0
+ R1-Distill-                                                                                                              8                 32                              8                32
+                GPQA     47.4     46.5 (23.5%)     42.9    0.0    0.5        0.5
+ Llama-8B                                                                                                                           Batch Size                                       Batch Size
+               AIME24    51.0     51.0 (23.8%)     42.3    6.6   18.2       15.4
+                                                                                                                          Figure 14: Latency breakdown of DiffKV.
+   Figure 14 further illustrates the latency breakdown of Diff-
+KV during one inference step. The memory management                                         DiffKV achieves a 1.4–1.6× speedup over vLLM. Note that
+overhead is remarkably low thanks to DiffKV’s on-GPU par-                                   while DiffKV does improve latency, its primary design focus
+allel KV compaction, contributing less than 0.2% of the total                               is on enhancing throughput by supporting larger batch sizes.
+latency in the prompt phase and under 0.9% in the generation                                Throughput Speedup. Figure 17 presents the end-to-end
+phase. Model execution dominates the latency in both phases,                                throughput and achieved batch sizes of DiffKV compared
+accounting for 96–97% of the latency in the prompt phase and                                to vLLM, pruning-based approaches including Quest and
+92–93% in the generation phase. Notably, as the batch size                                  SnapKV, as well as quantization-based methods including
+increases, the percentage of time spent on model execution                                  Atom (4-bit) and KIVI (2-bit). Note that these pruning- and
+rises slightly, reflecting the scalability of DiffKV.                                       quantization-based baselines incur larger accuracy degrada-
+Latency Speedup. Figure 15a shows the speedup of Diff-                                      tion than DiffKV, as shown in Table 1. The maximum gen-
+KV’s custom attention kernel against vLLM under different                                   eration length is set to 16K tokens for QwQ-32B, 8K for
+quantization configurations. DiffKV achieves a near-linear                                  Qwen2.5-32B, and 4K for the other models. We evaluate
+speedup proportional to the reduction in KV cache size. For                                 on 1000 sequences sampled from the MATH dataset [41],
+example, with K8V8, which halves the KV cache size relative                                 which elicits chain-of-thought reasoning and typically leads
+to FP16 datatype, the theoretical speedup is 2×, and DiffKV                                 to long generations reaching the specified limit. Compression
+achieves 1.7×. The slight gap is primarily due to the overhead                              thresholds for DiffKV are adopted from Figure 10. Across
+of accessing quantization metadata and performing dequan-                                   all models, DiffKV consistently achieves higher throughput
+tization. Additionally, DiffKV achieves greater speedups on                                 than prior systems. Notably, DiffKV achieves a remarkable
+longer sequences, indicating that its bandwidth optimization                                5.4× higher throughput over vLLM on the QwQ-32B think-
+techniques become increasingly effective as the sequence                                    ing model, while Quest, SnapKV, Atom, and KIVI achieve
+length grows. Figure 15b shows the end-to-end inference la-                                 1.6×, 1.8×, 2.1×, and 3.4× speedups, respectively. This re-
+tency for a batch of 8 sequences. With sequence length 4096,                                sult highlights the superior efficiency of DiffKV in processing
+                                                                                    Average Latency (s/token)
+                                                                                                                                  Llama3-8B                               Qwen2.5-32B
+                    vLLM       K8V4                          vLLM       K8V4                                    2.0                                       10
+                    K8V8       K4V2              2           K8V8       K4V2                                                vLLM                                     vLLM
+                                                                                                                                                           8
+Speedup
+
+
+
+
+                                       Speedup
+          4                                                                                                     1.5         DiffKV                                   DiffKV
+
+          3                                                                                                                                                6
+                                                 1                                                              1.0
+          2                                                                                                                                                4
+          1                                                                                                     0.5
+                                                                                                                                                           2
+          0                                      0
+               1024    2048     4096                    1024    2048     4096                                   0.0                                        0
+                  Sequence Length                          Sequence Length                                            0.1 0.2   0.5 1     2      5   10           1 2     5 .1 .2 0.5 1
+                                                                                                                                                               0.0 0.0 0.0 0 0
+                                                                                                                                                                                               2
+                                                                                                                            Request Rate (req/s)                      Request Rate (req/s)
+              (a) Attention kernel                   (b) One batch end-to-end
+                                                                                Figure 16: Comparison of average latency between DiffKV
+          Figure 15: Latency speedup of DiffKV against vLLM.                    and vLLM under dynamic workloads.
+                                                                                                                                       Throughput normalized to vLLM
+long sequences, making it particularly well-suited for tasks                                                                                                                  5.2            5.4
+                                                                                                                          vLLM             SnapKV                KIVI
+that require extended reasoning.                                                 5.0
+                                                                                                                          Quest            Atom                  DiffKV
+   The throughput improvements are directly correlated with                      2.5                                           2.0                             1.9
+                                                                                                                                              1.9
+the larger batch sizes supported by DiffKV, enabled by its
+KV cache compression techniques. For instance, with the                          0.0
+                                                                                                                                        Batch size normalized to vLLM
+QwQ-32B model, DiffKV sustains a batch size of 15.9, far                                                                                                                      5.3            5.9
+exceeding vLLM’s batch size of 2.7. The increased batch                          5.0
+                                                                                                                                              3.4
+size enables DiffKV to maximize the utilization of GPU com-                                                                    2.4                             2.3
+                                                                                 2.5
+pute capacity, leading to higher throughput. In contrast, Quest
+supports the same batch size as vLLM because it retains the                      0.0
+                                                                                                                      Llama3-8B Llama3-70B Qwen2.5-7B Qwen2.5-32B QwQ-32B
+entire KV cache without reducing memory usage. Its speedup
+comes primarily from faster attention computation, as it pro-                                                         Figure 17: Throughput and achieved batch size.
+cesses only a subset of tokens deemed important. However,
+the process of estimating token importance incurs additional                    sparsity. At the core of DiffKV is the parallel KV compaction
+overhead, limiting the overall efficiency of Quest. Note that                   technique that efficiently handles irregular memory require-
+although Atom and KIVI substantially increase the batch                         ments across requests and attention heads, effectively trans-
+size, approaching or even exceeding DiffKV, their through-                      lating memory savings into performance gains. Our evalua-
+put gains are not proportional. This is because both methods                    tion demonstrated that DiffKV is able to compress the KV
+are built on the HuggingFace Transformers library, which                        cache by 2.7× to 5.7× with near-lossless accuracy, even on
+incurs higher framework overhead than vLLM and DiffKV,                          thinking models and complex workloads that require sophis-
+and lacks high-performance GPU kernels that fuse dequanti-                      ticated reasoning and long-generation capabilities, and en-
+zation with attention computation, as implemented in DiffKV.                    hances throughput by 1.9× to 5.4×, outperforming prior KV
+These results underscore that custom GPU kernels and an                         cache compression methods.
+efficient runtime are essential for effectively translating KV
+cache compression into throughput gains.
+                                                                                9                                Acknowledgment
+Serving Dynamic Workloads. We evaluate DiffKV under
+dynamic workloads and compare it to vLLM [39]. Following                        We sincerely thank our shepherd, Tim Harris, for his thought-
+the methodology of vLLM, we inject requests according to a                      ful feedback and careful guidance throughout the paper shep-
+Poisson arrival process and sweep the request rate. Figure 16                   herding process. We are also thankful to Mingzhe Hao,
+reports the average per-token latency (including both queuing                   Shuang Chen, other friends, and the anonymous reviewers
+and LLM processing time) for Llama3-8B and Qwen2.5-32B                          for their insightful comments on earlier versions of this
+across a range of request rates. DiffKV consistently achieves                   manuscript.
+lower latency and sustains higher loads before queuing delays
+grow sharply. These improvements stem from DiffKV’s re-
+duced KV cache footprint, which enables larger batch sizes,                     References
+and its parallel on-GPU KV compaction, which keeps mem-
+ory management overhead low even under bursty traffic.                           [1] FasterTransformer. https://github.com/NVIDIA/
+                                                                                     FasterTransformer.
+8             Conclusion
+                                                                                 [2] FlashInfer: Kernel Library for LLM Serving. https:
+We proposed DiffKV, which enhances LLM serving efficiency                            //github.com/flashinfer-ai/flashinfer.
+by exploiting three levels of differentiation in KV cache: dif-
+ferentiated precision for keys and values, hierarchical com-                     [3] Aime 2024. https://huggingface.co/datasets/
+pression based on token importance, and per-head dynamic                             AI-MO/aimo-validation-aime, 2024.
+ [4] ACHIAM , J., A DLER , S., AGARWAL , S., A HMAD , L.,               [14] C HIANG , W.-L., Z HENG , L., S HENG , Y., A N -
+     A KKAYA , I., A LEMAN , F. L., A LMEIDA , D., A L -                     GELOPOULOS , A. N., L I , T., L I , D., Z HANG , H.,
+     TENSCHMIDT, J., A LTMAN , S., A NADKAT, S., ET AL .                     Z HU , B., J ORDAN , M., G ONZALEZ , J. E., ET AL .
+     Gpt-4 technical report. arXiv preprint arXiv:2303.08774                 Chatbot arena: An open platform for evaluating llms by
+     (2023).                                                                 human preference. arXiv preprint arXiv:2403.04132
+                                                                             (2024).
+ [5] A DNAN , M., A RUNKUMAR , A., JAIN , G., NAIR , P. J.,
+     S OLOVEYCHIK , I., AND K AMATH , P. Keyformer: Kv                  [15] C OBBE , K., KOSARAJU , V., BAVARIAN , M., C HEN ,
+     cache reduction through key tokens selection for effi-                  M., J UN , H., K AISER , L., P LAPPERT, M., T WOREK ,
+     cient generative inference. Proceedings of Machine                      J., H ILTON , J., NAKANO , R., ET AL . Training ver-
+     Learning and Systems 6 (2024), 114–127.                                 ifiers to solve math word problems. arXiv preprint
+                                                                             arXiv:2110.14168 (2021).
+ [6] A INSLIE , J., L EE -T HORP, J., DE J ONG , M., Z EMLYAN -
+     SKIY, Y., L EBRÓN , F., AND S ANGHAI , S.            Gqa:          [16] DAO , T. Flashattention-2: Faster attention with bet-
+     Training generalized multi-query transformer mod-                       ter parallelism and work partitioning. arXiv preprint
+     els from multi-head checkpoints. arXiv preprint                         arXiv:2307.08691 (2023).
+     arXiv:2305.13245 (2023).
+                                                                        [17] DAO , T., F U , D., E RMON , S., RUDRA , A., AND R É , C.
+ [7] A MINABADI , R. Y., R AJBHANDARI , S., AWAN , A. A.,                    Flashattention: Fast and memory-efficient exact atten-
+     L I , C., L I , D., Z HENG , E., RUWASE , O., S MITH , S.,              tion with io-awareness. Advances in Neural Information
+     Z HANG , M., R ASLEY, J., ET AL . Deepspeed-inference:                  Processing Systems 35 (2022), 16344–16359.
+     enabling efficient inference of transformer models at
+     unprecedented scale. In SC22: International Conference             [18] D ETTMERS , T., L EWIS , M., B ELKADA , Y., AND
+     for High Performance Computing, Networking, Storage                     Z ETTLEMOYER , L. Gpt3. int8 (): 8-bit matrix multipli-
+     and Analysis (2022), IEEE, pp. 1–15.                                    cation for transformers at scale. Advances in Neural In-
+                                                                             formation Processing Systems 35 (2022), 30318–30332.
+ [8] AUSTIN , J., O DENA , A., N YE , M., B OSMA , M.,
+     M ICHALEWSKI , H., D OHAN , D., J IANG , E., C AI ,                [19] D ONG , S., C HENG , W., Q IN , J., AND WANG , W. Qaq:
+     C., T ERRY, M., L E , Q., ET AL . Program synthe-                       Quality adaptive quantization for llm kv cache. arXiv
+     sis with large language models.    arXiv preprint                       preprint arXiv:2403.04643 (2024).
+     arXiv:2108.07732 (2021).
+                                                                        [20] D UBEY, A., JAUHRI , A., PANDEY, A., K ADIAN , A.,
+ [9] BAI , Y., LV, X., Z HANG , J., LYU , H., TANG , J.,                     A L -DAHLE , A., L ETMAN , A., M ATHUR , A., S CHEL -
+     H UANG , Z., D U , Z., L IU , X., Z ENG , A., H OU , L.,                TEN , A., YANG , A., FAN , A., ET AL . The llama 3 herd
+     ET AL . Longbench: A bilingual, multitask bench-                        of models. arXiv preprint arXiv:2407.21783 (2024).
+     mark for long context understanding. arXiv preprint
+     arXiv:2308.14508 (2023).                                           [21] FANG , J., Y U , Y., Z HAO , C., AND Z HOU , J. Turbotrans-
+                                                                             formers: an efficient gpu serving system for transformer
+[10] B ROWN , T. B. Language models are few-shot learners.                   models. In Proceedings of the 26th ACM SIGPLAN
+     arXiv preprint arXiv:2005.14165 (2020).                                 Symposium on Principles and Practice of Parallel Pro-
+                                                                             gramming (2021), pp. 389–402.
+[11] C AI , Z., Z HANG , Y., G AO , B., L IU , T., L U , K., X IONG ,
+     W., D ONG , Y., C HANG , B., H U , J., AND X IAO , W.              [22] G AO , P., Y U , L., W U , Y., AND L I , J. Low latency rnn
+     Pyramidkv: Dynamic kv cache compression based                           inference with cellular batching. In Proceedings of the
+     on pyramidal information funneling. arXiv preprint                      Thirteenth EuroSys Conference (2018), pp. 1–15.
+     arXiv:2406.02069 (2024).
+                                                                        [23] G E , S., Z HANG , Y., L IU , L., Z HANG , M., H AN , J.,
+[12] C HEN , M., T WOREK , J., J UN , H., Y UAN , Q., P INTO ,               AND G AO , J. Model tells you what to discard: Adap-
+     H. P. D. O., K APLAN , J., E DWARDS , H., B URDA ,                      tive kv cache compression for llms. arXiv preprint
+     Y., J OSEPH , N., B ROCKMAN , G., ET AL . Evaluating                    arXiv:2310.01801 (2023).
+     large language models trained on code. arXiv preprint
+     arXiv:2107.03374 (2021).                                           [24] G ITHUB. Github copilot.         https://github.com/
+                                                                             features/copilot, 2023.
+[13] C HIANG , W.-L., L I , Z., L IN , Z., S HENG , Y., W U , Z.,
+     Z HANG , H., Z HENG , L., Z HUANG , S., Z HUANG , Y.,              [25] G UO , C., TANG , J., H U , W., L ENG , J., Z HANG , C.,
+     G ONZALEZ , J. E., S TOICA , I., AND X ING , E. P. Vi-                  YANG , F., L IU , Y., G UO , M., AND Z HU , Y. Olive: Ac-
+     cuna: An open-source chatbot impressing gpt-4 with                      celerating large language models via hardware-friendly
+     90%* chatgpt quality, March 2023.                                       outlier-victim pair quantization. In Proceedings of the
+     50th Annual International Symposium on Computer Ar-              [36] J IANG , A. Q., S ABLAYROLLES , A., ROUX , A., M EN -
+     chitecture (2023), pp. 1–15.                                          SCH , A., S AVARY, B., BAMFORD , C., C HAPLOT, D. S.,
+                                                                           C ASAS , D. D . L ., H ANNA , E. B., B RESSAND , F.,
+[26] G UO , D., YANG , D., Z HANG , H., S ONG , J., Z HANG ,               ET AL .       Mixtral of experts.     arXiv preprint
+     R., X U , R., Z HU , Q., M A , S., WANG , P., B I , X.,               arXiv:2401.04088 (2024).
+     ET AL . Deepseek-r1: Incentivizing reasoning capabil-
+     ity in llms via reinforcement learning. arXiv preprint           [37] J OUPPI , N. P., YOUNG , C., PATIL , N., PATTERSON ,
+     arXiv:2501.12948 (2025).                                              D., AGRAWAL , G., BAJWA , R., BATES , S., B HATIA ,
+                                                                           S., B ODEN , N., B ORCHERS , A., ET AL . In-datacenter
+[27] G UO , D., Z HU , Q., YANG , D., X IE , Z., D ONG , K.,               performance analysis of a tensor processing unit. In
+     Z HANG , W., C HEN , G., B I , X., W U , Y., L I , Y., ET AL .        Proceedings of the 44th annual international symposium
+     Deepseek-coder: When the large language model meets                   on computer architecture (2017), pp. 1–12.
+     programming–the rise of code intelligence. arXiv
+     preprint arXiv:2401.14196 (2024).                                [38] K AO , S.-C., S UBRAMANIAN , S., AGRAWAL , G., YAZ -
+                                                                           DANBAKHSH , A., AND K RISHNA , T. Flat: An opti-
+[28] H AN , M., Z HANG , H., C HEN , R., AND C HEN , H.                    mized dataflow for mitigating attention bottlenecks. In
+     Microsecond-scale preemption for concurrent {GPU-                     Proceedings of the 28th ACM International Conference
+     accelerated}{DNN} inferences. In 16th USENIX Sym-                     on Architectural Support for Programming Languages
+     posium on Operating Systems Design and Implementa-                    and Operating Systems, Volume 2 (2023), pp. 295–310.
+     tion (OSDI 22) (2022), pp. 539–558.
+                                                                      [39] K WON , W., L I , Z., Z HUANG , S., S HENG , Y., Z HENG ,
+[29] H ARRIS , M., S ENGUPTA , S., AND OWENS , J. D. Paral-
+                                                                           L., Y U , C. H., G ONZALEZ , J., Z HANG , H., AND S TO -
+     lel prefix sum (scan) with cuda. GPU gems 3, 39 (2007),
+                                                                           ICA , I. Efficient memory management for large lan-
+     851–876.
+                                                                           guage model serving with pagedattention. In Proceed-
+[30] H E , Y., Z HANG , L., W U , W., L IU , J., Z HOU , H., AND           ings of the 29th Symposium on Operating Systems Prin-
+     Z HUANG , B. Zipcache: Accurate and efficient kv cache                ciples (2023), pp. 611–626.
+     quantization with salient token identification. Advances
+                                                                      [40] L EE , W., L EE , J., S EO , J., AND S IM , J. {InfiniGen}:
+     in Neural Information Processing Systems 37 (2024),
+                                                                           Efficient generative inference of large language mod-
+     68287–68307.
+                                                                           els with dynamic {KV} cache management. In 18th
+[31] H ENDRYCKS , D., B URNS , C., BASART, S., Z OU , A.,                  USENIX Symposium on Operating Systems Design and
+     M AZEIKA , M., S ONG , D., AND S TEINHARDT, J. Mea-                   Implementation (OSDI 24) (2024), pp. 155–172.
+     suring massive multitask language understanding. arXiv
+                                                                      [41] L EWKOWYCZ , A., A NDREASSEN , A., D OHAN , D.,
+     preprint arXiv:2009.03300 (2020).
+                                                                           DYER , E., M ICHALEWSKI , H., R AMASESH , V.,
+[32] H OOPER , C., K IM , S., M OHAMMADZADEH , H., M A -                   S LONE , A., A NIL , C., S CHLAG , I., G UTMAN -S OLO ,
+     HONEY, M. W., S HAO , Y. S., K EUTZER , K., AND G HO -                T., ET AL . Solving quantitative reasoning problems
+     LAMI , A. Kvquant: Towards 10 million context length                  with language models. Advances in Neural Information
+     llm inference with kv cache quantization. arXiv preprint              Processing Systems 35 (2022), 3843–3857.
+     arXiv:2401.18079 (2024).
+                                                                      [42] L I , Y., H UANG , Y., YANG , B., V ENKITESH , B., L O -
+[33] H UANG , Y., C HENG , Y., BAPNA , A., F IRAT, O., C HEN ,             CATELLI , A., Y E , H., C AI , T., L EWIS , P., AND C HEN ,
+     D., C HEN , M., L EE , H., N GIAM , J., L E , Q. V., W U ,            D. Snapkv: Llm knows what you are looking for before
+     Y., ET AL . Gpipe: Efficient training of giant neural                 generation. arXiv preprint arXiv:2404.14469 (2024).
+     networks using pipeline parallelism. Advances in neural
+     information processing systems 32 (2019).                        [43] L I , Z., Z HENG , L., Z HONG , Y., L IU , V., S HENG , Y.,
+                                                                           J IN , X., H UANG , Y., C HEN , Z., Z HANG , H., G ONZA -
+[34] H UI , B., YANG , J., C UI , Z., YANG , J., L IU , D.,                LEZ , J. E., ET AL . {AlpaServe}: Statistical multiplexing
+     Z HANG , L., L IU , T., Z HANG , J., Y U , B., L U , K.,              with model parallelism for deep learning serving. In
+     ET AL . Qwen2. 5-coder technical report. arXiv preprint               17th USENIX Symposium on Operating Systems Design
+     arXiv:2409.12186 (2024).                                              and Implementation (OSDI 23) (2023), pp. 663–679.
+
+[35] JAECH , A., K ALAI , A., L ERER , A., R ICHARDSON , A.,          [44] L IN , Y., TANG , H., YANG , S., Z HANG , Z., X IAO , G.,
+     E L -K ISHKY, A., L OW, A., H ELYAR , A., M ADRY, A.,                 G AN , C., AND H AN , S. Qserve: W4a8kv4 quantization
+     B EUTEL , A., C ARNEY, A., ET AL . Openai o1 system                   and system co-design for efficient llm serving. arXiv
+     card. arXiv preprint arXiv:2412.16720 (2024).                         preprint arXiv:2405.04532 (2024).
+[45] L IU , A., F ENG , B., WANG , B., WANG , B., L IU , B.,          NVIDIA-L40-Datasheet-January-2023.pdf,
+     Z HAO , C., D ENGR , C., RUAN , C., DAI , D., G UO , D.,         2023.
+     ET AL . Deepseek-v2: A strong, economical, and effi-
+     cient mixture-of-experts language model. arXiv preprint     [55] O UYANG , L., W U , J., J IANG , X., A LMEIDA , D.,
+     arXiv:2405.04434 (2024).                                         WAINWRIGHT, C., M ISHKIN , P., Z HANG , C., AGAR -
+                                                                      WAL , S., S LAMA , K., R AY, A., ET AL . Training lan-
+[46] L IU , J., X IA , C. S., WANG , Y., AND Z HANG , L. Is           guage models to follow instructions with human feed-
+     your code generated by chatGPT really correct? rigorous          back. Advances in neural information processing sys-
+     evaluation of large language models for code generation.         tems 35 (2022), 27730–27744.
+     In Thirty-seventh Conference on Neural Information
+     Processing Systems (2023).                                  [56] P OPE , R., D OUGLAS , S., C HOWDHERY, A., D EVLIN ,
+                                                                      J., B RADBURY, J., H EEK , J., X IAO , K., AGRAWAL , S.,
+[47] L IU , Z., D ESAI , A., L IAO , F., WANG , W., X IE , V.,        AND D EAN , J. Efficiently scaling transformer inference.
+     X U , Z., K YRILLIDIS , A., AND S HRIVASTAVA , A. Scis-          Proceedings of Machine Learning and Systems 5 (2023),
+     sorhands: Exploiting the persistence of importance hy-           606–624.
+     pothesis for llm kv cache compression at test time. Ad-
+     vances in Neural Information Processing Systems 36          [57] R EIN , D., H OU , B. L., S TICKLAND , A. C., P ETTY, J.,
+     (2024).                                                          PANG , R. Y., D IRANI , J., M ICHAEL , J., AND B OW-
+                                                                      MAN , S. R. Gpqa: A graduate-level google-proof q&a
+[48] L IU , Z., Y UAN , J., J IN , H., Z HONG , S., X U , Z.,         benchmark. In First Conference on Language Modeling
+     B RAVERMAN , V., C HEN , B., AND H U , X. Kivi: A                (2024).
+     tuning-free asymmetric 2bit quantization for kv cache.
+     arXiv preprint arXiv:2402.02750 (2024).                     [58] S AAB , K., T U , T., W ENG , W.-H., TANNO , R., S TUTZ ,
+                                                                      D., W ULCZYN , E., Z HANG , F., S TROTHER , T., PARK ,
+[49] M ERITY, S., X IONG , C., B RADBURY, J., AND
+                                                                      C., V EDADI , E., ET AL . Capabilities of gemini models
+     S OCHER , R. Pointer sentinel mixture models. arXiv
+                                                                      in medicine. arXiv preprint arXiv:2404.18416 (2024).
+     preprint arXiv:1609.07843 (2016).
+                                                                 [59] S HAO , Z., WANG , P., Z HU , Q., X U , R., S ONG , J.,
+[50] NAGEL , M., F OURNARAKIS , M., A MJAD , R. A.,
+                                                                      Z HANG , M., L I , Y., W U , Y., AND G UO , D. Deepseek-
+     B ONDARENKO , Y., VAN BAALEN , M., AND
+                                                                      math: Pushing the limits of mathematical reason-
+     B LANKEVOORT, T. A white paper on neural network
+                                                                      ing in open language models.            arXiv preprint
+     quantization. arXiv preprint arXiv:2106.08295 (2021).
+                                                                      arXiv:2402.03300 (2024).
+[51] NAKANO , K. An optimal parallel prefix-sums algorithm
+     on the memory machine models for gpus. In Interna-          [60] S HAZEER , N. Fast transformer decoding: One write-
+     tional Conference on Algorithms and Architectures for            head is all you need. arXiv preprint arXiv:1911.02150
+     Parallel Processing (2012), Springer, pp. 99–113.                (2019).
+
+[52] NARAYANAN , D., H ARLAP, A., P HANISHAYEE , A.,             [61] S HENG , Y., Z HENG , L., Y UAN , B., L I , Z., RYABININ ,
+     S ESHADRI , V., D EVANUR , N. R., G ANGER , G. R.,               M., C HEN , B., L IANG , P., R É , C., S TOICA , I., AND
+     G IBBONS , P. B., AND Z AHARIA , M. Pipedream: Gen-              Z HANG , C. Flexgen: High-throughput generative in-
+     eralized pipeline parallelism for dnn training. In Pro-          ference of large language models with a single gpu. In
+     ceedings of the 27th ACM symposium on operating sys-             International Conference on Machine Learning (2023),
+     tems principles (2019), pp. 1–15.                                PMLR, pp. 31094–31116.
+
+[53] NARAYANAN , D., S HOEYBI , M., C ASPER , J.,                [62] S HI , Y., YANG , Z., X UE , J., M A , L., X IA , Y., M IAO ,
+     L E G RESLEY, P., PATWARY, M., KORTHIKANTI , V.,                 Z., G UO , Y., YANG , F., AND Z HOU , L. Welder:
+     VAINBRAND , D., K ASHINKUNTI , P., B ERNAUER , J.,               Scheduling deep learning memory access via tile-graph.
+     C ATANZARO , B., ET AL . Efficient large-scale language          In 17th USENIX Symposium on Operating Systems De-
+     model training on gpu clusters using megatron-lm.                sign and Implementation (OSDI 23) (2023), pp. 701–
+     In Proceedings of the international conference for               718.
+     high performance computing, networking, storage and
+     analysis (2021), pp. 1–15.                                  [63] S HOEYBI , M., PATWARY, M., P URI , R., L E G RESLEY,
+                                                                      P., C ASPER , J., AND C ATANZARO , B. Megatron-lm:
+[54] N VIDIA. Nvidia L40 datasheet. https://www.                      Training multi-billion parameter language models using
+     nvidia.com/content/dam/en-zz/Solutions/                          model parallelism. arXiv preprint arXiv:1909.08053
+     design-visualization/support-guide/                              (2019).
+[64] TAGHANAKI , S. A., K HANI , A., AND K HASAHMADI ,               [73] YANG , Y., Z HAO , L., L I , Y., Z HANG , H., L I , J., Z HAO ,
+     A.    Mmlu-pro+: Evaluating higher-order reason-                     M., C HEN , X., AND L I , K. Infless: a native serverless
+     ing and shortcut learning in llms. arXiv preprint                    system for low-latency, high-throughput inference. In
+     arXiv:2409.02257 (2024).                                             Proceedings of the 27th ACM International Conference
+                                                                          on Architectural Support for Programming Languages
+[65] TANG , J., Z HAO , Y., Z HU , K., X IAO , G., K ASIKCI ,             and Operating Systems (2022), pp. 768–781.
+     B., AND H AN , S. Quest: Query-aware sparsity for
+     efficient long-context llm inference. arXiv preprint            [74] Y U , G.-I., J EONG , J. S., K IM , G.-W., K IM , S., AND
+     arXiv:2406.10774 (2024).                                             C HUN , B.-G. Orca: A distributed serving system
+[66] T EAM , G., A NIL , R., B ORGEAUD , S., W U , Y.,                    for {Transformer-Based} generative models. In 16th
+     A LAYRAC , J.-B., Y U , J., S ORICUT, R., S CHALKWYK ,               USENIX Symposium on Operating Systems Design and
+     J., DAI , A. M., H AUTH , A., ET AL . Gemini: a family               Implementation (OSDI 22) (2022), pp. 521–538.
+     of highly capable multimodal models. arXiv preprint
+                                                                     [75] Z HANG , H., TANG , Y., K HANDELWAL , A., AND S TO -
+     arXiv:2312.11805 (2023).
+                                                                          ICA , I. {SHEPHERD}: Serving {DNNs} in the wild. In
+[67] T HE Q WEN T EAM. Qwq-32b: Embracing the power of                    20th USENIX Symposium on Networked Systems Design
+     reinforcement learning, March 2025.                                  and Implementation (NSDI 23) (2023), pp. 787–808.
+
+[68] T OUVRON , H., M ARTIN , L., S TONE , K., A LBERT, P.,          [76] Z HANG , Z., S HENG , Y., Z HOU , T., C HEN , T., Z HENG ,
+     A LMAHAIRI , A., BABAEI , Y., BASHLYKOV, N., BA -                    L., C AI , R., S ONG , Z., T IAN , Y., R É , C., BARRETT, C.,
+     TRA , S., B HARGAVA , P., B HOSALE , S., ET AL . Llama               ET AL . H2o: Heavy-hitter oracle for efficient generative
+     2: Open foundation and fine-tuned chat models. arXiv                 inference of large language models. Advances in Neural
+     preprint arXiv:2307.09288 (2023).                                    Information Processing Systems 36 (2024).
+
+[69] VASWANI , A. Attention is all you need. Advances in             [77] Z HAO , Y., L IN , C.-Y., Z HU , K., Y E , Z., C HEN , L.,
+     Neural Information Processing Systems (2017).                        Z HENG , S., C EZE , L., K RISHNAMURTHY, A., C HEN ,
+                                                                          T., AND K ASIKCI , B. Atom: Low-bit quantization for
+[70] X IAO , G., TANG , J., Z UO , J., G UO , J., YANG , S.,
+                                                                          efficient and accurate llm serving. Proceedings of Ma-
+     TANG , H., F U , Y., AND H AN , S. Duoattention: Efficient
+                                                                          chine Learning and Systems 6 (2024), 196–209.
+     long-context llm inference with retrieval and streaming
+     heads. arXiv preprint arXiv:2410.10819 (2024).                  [78] Z HONG , T., L IU , Z., PAN , Y., Z HANG , Y., Z HOU , Y.,
+[71] X IAO , G., T IAN , Y., C HEN , B., H AN , S., AND L EWIS ,          L IANG , S., W U , Z., LYU , Y., S HU , P., Y U , X., ET AL .
+     M. Efficient streaming language models with attention                Evaluation of openai o1: Opportunities and challenges
+     sinks. arXiv preprint arXiv:2309.17453 (2023).                       of agi. arXiv preprint arXiv:2409.18486 (2024).
+
+[72] X IE , Y., W U , J., T U , H., YANG , S., Z HAO , B., Z ONG ,   [79] Z UO , P., L IN , H., D ENG , J., Z OU , N., YANG , X., D IAO ,
+     Y., J IN , Q., X IE , C., AND Z HOU , Y. A preliminary               Y., G AO , W., X U , K., C HEN , Z., L U , S., ET AL . Serv-
+     study of o1 in medicine: Are we closer to an ai doctor?              ing large language models on huawei cloudmatrix384.
+     arXiv preprint arXiv:2409.15277 (2024).                              arXiv preprint arXiv:2506.12708 (2025).
+

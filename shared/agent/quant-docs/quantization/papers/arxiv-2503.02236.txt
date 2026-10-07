@@ -1,0 +1,1889 @@
+                                                           2025 IEEE International Symposium on High-Performance Computer Architecture (HPCA)
+
+
+
+                                          VQ-LLM: High-performance Code Generation for
+                                           Vector Quantization Augmented LLM Inference
+                                                    Zihan Liu1,2 , Xinhao Luo1,2 , Junxian Guo1 , Wentao Ni1 , Yangjie Zhou1 , Yue Guan1,2 , Cong Guo3 ,
+                                                    Weihao Cui1,4 , Yu Feng1 , Minyi Guo1,2 , Yuhao Zhu5 , Minjia Zhang6 , Chen Jin7 , Jingwen Leng1,2,∗
+                                                1
+                                                Shanghai Jiao Tong University, 2 Shanghai Qi Zhi Institute, 3 Duke University, 4 National University of Singapore
+                                                               5
+                                                                 University of Rochester, 6 University of Illinois Urbana-Champaign, 7 Magik Compute
+                                                {altair.liu, lxh666, guojunxian, wennitao, yj zhou, bonboru, weihao, y-feng}@sjtu.edu.cn, cong.guo@duke.edu
+                                             guo-my@cs.sjtu.edu.cn, yzhu@rochester.edu, minjiaz@illinois.edu, chenj@magikcompute.ai, leng-jw@cs.sjtu.edu.cn
+
+
+                                              Abstract—Vector quantization (VQ), which treats a vector          and algorithms, like MXFP and ANT, with varying scal-
+arXiv:2503.02236v2 [cs.DC] 30 Jun 2025
+
+
+
+
+                                         as a compression unit, gains increasing research interests for         ing granularities to represent the original data using fewer
+                                         its potential to accelerate large language models (LLMs). Com-         bits [20], [49]. However, these techniques treat each data point
+                                         pared to conventional element-wise quantization methods, VQ
+                                         algorithms can compress weight and KV cache tensors in LLMs            as an independent element for compression, overlooking the
+                                         with a greater ratio while maintaining the high model accuracy.        potential information between elements. As a result, these
+                                         However, translating a VQ algorithm’s memory reduction into            methods typically reach a 4-bit limit; compressing to 2 bits
+                                         the actual latency improvement is challenging. We profile and          or less leads to a substantial accuracy loss [12], [15], [56].
+                                         analyze the current approach of integrating VQ into computation           Under these scenarios, vector quantization (VQ) emerges
+                                         kernels and show that its major inefficiency lies in the poor access
+                                         efficiency of codebooks in VQ algorithms and uncoordinated             as a pivotal technique to further reduce LLMs’ memory foot-
+                                         computation dataflow. Meanwhile, the diversity of VQ algo-             prints [12], [56], [57], [67], [69]. The VQ methods compress
+                                         rithms (e.g., different vector sizes and entry counts) and LLMs’       a vector of multiple elements into a single element and
+                                         computation kernels (e.g matrix-matrix/vector multiplication and       enabling the capture of information across elements [57], [69].
+                                         attention computation) makes it impractical to manually craft          Typically, this cross-element information is gathered through
+                                         efficient kernel implementations for each specific case.
+                                            In this work, we design and implement VQ-LLM, an efficient          clustering, which involves applying a clustering algorithm to
+                                         fused VQ kernel generation framework. We first introduce a             all vectors and using cluster centroids to represent nearby
+                                         software abstraction called codebook cache to optimize codebook        vectors [26], [37]. Furthermore, some researchers suggest
+                                         access efficiency and support the integration of VQ with various       iteratively processing the residuals between the original and
+                                         computations. The codebook cache adaptively stores different           quantized data to enhance reconstruction quality [32], [63]. For
+                                         entries across the GPU’s memory hierarchy, including off-chip
+                                         global memory, on-chip shared memory, and registers. Centered          LLMs, VQ achieves higher accuracy at the same 4-bit level or
+                                         around the codebook cache, we design an efficient computation          maintains equivalent accuracy at 2-bits, and some approaches
+                                         engine that optimizes memory traffic during computations in-           can compress the KV cache in LLMs to 1-bit [69].
+                                         volving codebooks. This compute engine adopts the codebook-               Despite their appealing accuracy and compression ratios,
+                                         centric dataflow and fusion optimizations. Additionally, we pro-       VQ-augmented LLMs do not significantly enhance the model’s
+                                         vide adaptive heuristics to tailor parameter selection in our
+                                         optimizations to diverse VQ configurations. Our optimizations          latency performance in practice. Our analysis in Sec. III
+                                         achieve the latency reduction of 64.36% to 99.1% compared to           indicates that existing VQ methods have substantially higher
+                                         existing open-source implementations. A final comparison with          latency than conventional element-wise quantization methods,
+                                         state-of-the-art element-wise quantization methods like AWQ and        often performing worse than the original FP16 version. The
+                                         QoQ shows that our VQ-LLM is practically viable, achieving             inefficiencies primarily stem from how memory access and
+                                         latencies close or even better latencies to those at equivalent bit-
+                                         widths, potentially offering greater accuracy.                         computation dataflow are managed when interacting with the
+                                                                                                                codebooks in VQ methods. We have identified three key chal-
+                                                                  I. I NTRODUCTION                              lenges that must be addressed to generate high-performance
+                                            With the great success of large language models (LLMs),             kernels integrating VQ with subsequent computations.
+                                         neural networks are placing significant pressure on current               The first challenge lies in the placement of VQ’s codebooks.
+                                         hardware, especially memory systems [21], [27], [28], [33].            We find that the common practice of storing all codebook
+                                         Quantization techniques become essential for deploying these           entries in GPU shared memory increases shared memory
+                                         large models [15], [18]–[20], [24], [30], [31], [51], [62].            usage, thereby reducing the number of thread blocks that
+                                         Quantization reduces the original IEEE-754 half format FP16            can concurrently operate on each SM, which diminishes
+                                         data to types with much narrower bit-widths, such as FP8               performance. Additionally, the number of codebook entries
+                                         and INT4, decreasing the memory footprint significantly [1].           far exceeds the number of available shared memory banks,
+                                         Researchers have developed numerous novel data formats                 leading to significant bank conflicts. The second challenge
+                                                                                                                involves coordinating the loading of codebooks and subsequent
+                                           *Jingwen Leng is the corresponding author of this paper.             computation. There is excessive traffic in loading the codebook
+from global memory to shared memory, and in transferring
+codebook entries from shared memory to registers, which                       Vector size
+should be much lower in theory. The reasons include multiple
+thread blocks loading duplicate codebooks, and the require-
+
+
+
+
+                                                                                                                                            Codebooks
+                                                                     #Entry
+ment for threads to store data reconstructed via codebook
+entries (we refer to them as dequantized data throughout the
+paper) back to shared memory in a layout that differs from
+their dequantization for subsequent computations. The last                      Residuals                                    Quantization
+challenge is that the diversity of VQ algorithms (e.g., dif-                                    2 0 2 3 1 1 0 3
+                                                                                                                           Dequantization
+ferent vector sizes and entry counts) and LLMs’ computation
+
+
+
+
+                                                                                                                                              Codebooks
+kernels (e.g matrix-matrix/vector multiplication and attention
+computation) makes it impractical to manually craft efficient
+kernel implementations for each specific case.
+   To address the challenges, this work develops VQ-LLM, an
+
+
+
+
+                                                                                                                                              Entries
+automatic high-performance fused VQ kernel code generation                        +               +                 +                 +
+framework. We begin by introducing a software abstraction
+
+
+
+
+                                                                                 =
+
+
+
+
+                                                                                                  =
+
+
+
+
+                                                                                                                   =
+
+
+
+
+                                                                                                                                      =
+called codebook cache, designed to optimize codebook access
+efficiency and facilitate the integration of VQ with various                                                   Concat
+computations. This cache enables efficient codebook place-
+ment across the GPU’s memory hierarchy. We have identi-
+fied that only a select few entries are accessed frequently.                          Fig. 1. Typical vector quantization pipeline.
+Therefore, rather than indiscriminately caching all entries in
+shared memory, we adopt a hierarchical approach: entries with
+low access frequency remain in global memory, while those           equivalent bit-widths, potentially offering greater accuracy.
+accessed more frequently are cached in shared memory. To              We list our main contributions as follow:
+address inevitable bank conflicts, entries that are accessed        • To the best of our knowledge, we are the first to deeply dive
+extremely frequently are stored in thread-local registers, elim-      into performance issues of vector quantization and make it
+inating bank conflict issues. Furthermore, to mitigate negative       practically feasible in LLM inference.
+impacts on computation (reduced concurrency), we utilize            • We deliver a detailed analysis and identify these issues are
+available slacks, which ensues no drop in resource utilization,       caused by inefficient codebook entries access and uncoordi-
+to adaptively determine the optimal placement of entries.             nated codebook loading and subsequent computation.
+   Centering the codebook cache, we design an efficient com-        • Based on the finding, we propose VQ-LLM to generate
+pute engine that optimizes memory traffic when computing              efficient fused VQ kernel implementation, it consists of
+with codebooks, and it consists of two novel techniques. The          codebook cache and codebook based compute engine, with
+first called codebook-centric dataflow divides and parallelizes       configurable parameters and adaptive heuristics.
+the original computation task in a way that minimizes the           • We compare VQ-LLM with open-sources implementations
+codebook switch overhead. It may split the reduction dimen-           and element-wise quantization works, with detail speed-up
+sion of the original computation task, for which we adaptively        breakdown analysis on proposed optimizations.
+determine the split factor to balance the global reduction.
+The second technique, codebook-centric hierarchical fusion,                       II. BACKGROUND AND R ELATED W ORKS
+extends the default shared memory level fusion to support             This section first introduces the basic concept of vector
+the additional register-level fusion. This mechanism leverages      quantization and its applications in quantizing large language
+a GPU feature known as intra-warp data exchange [45] to             models. It then provides a detailed analysis of serving vector
+rearrange the dequantized data into the required layout for         quantized large language models with existing solutions.
+subsequent computations directly in registers. We adaptively
+decide where to conduct the fusion based on profiled exchang-       A. Vector Quantization (VQ)
+ing overhead and difference between layout of dequantized              Compared to traditional quantization, vector quantization
+data and layout required by subsequent computation.                 (VQ) treats the vector of multiple elements as a unit and
+   Our evaluation shows that VQ-LLM achieves the latency            uses trained quantization points organized into codebooks
+reduction of 64.36% to 99.1% compared to compared to                to quantize the vector into a single element, rather than in
+existing open-source implementations [13], [56]. We also            an element-wise manner as in traditional quantization. This
+perform extensive sensitivity to verify the effectiveness of each   technique is widely used in vector database, nearest neighbor
+technique in our framework. A final comparison with state-          search, etc. [29], [34] VQ has several configurable parameters,
+of-the-art element-wise quantization methods like AWQ [30]          highlighted in Fig. 1, which allow it to be specified for
+and QoQ [31] shows that our VQ-LLM is practically viable,           product quantization (PQ), additive quantization (AQ), and
+achieving latencies close or even better latencies to those at      hybrid quantization (PRQ) [4], [11], [17], [25]. Apart from
+these, there are other techniques such as hash-based [23] and                             Element-wise       VQ           Element-wise       VQ
+lattice-based methods [2]. However, these techniques either                        6    2-bit   3-bit      4-bit    0.5 KVQuant        4-bit
+cannot reconstruct the original data or need to be used in                         4      AWQ                                         QoQ
+
+
+
+
+                                                                            ΔPPL
+
+
+
+
+                                                                                                                   ΔPPL
+                                                                                                     GPT-Q                CQ
+conjunction with PQ, AQ, and PRQ. Therefore, we do not                             2                      AWQ                          KVQuant
+delve into these techniques as they do not influence the core                      0 GPT-VQ                               0
+                                                                                                AQLM       QuiP#                 2-bit         CQ
+findings and insights of this work.
+   Typical VQ Pipeline. We use the example in Fig. 1 to                                 Quantization points                    Quantization points
+                                                                               2                                      2
+demonstrate the typical VQ pipeline, and numbers in (·)                                                  Outlier
+represent the value of parameters in this example. We also
+summarize the VQ parameters in Tbl. I. First, the original 16-                 0                                      0
+dimensional vectors are split into four sets of vector size (4)-
+                                                                                                MSE=5.2e-3                               MSE=3.2e-3
+dimensional sub-vectors. Next, we collect sub-vectors in one                −2                                     −2
+sub-space (or several sub-spaces, depending on algorithms)                         −2            0             2          −2             0           2
+and conduct k-means clustering to group these sub-vectors               Fig. 2. (Upper) Accuracy of VQ and element-wise quantization, left is
+into #Entry (4) clusters. The original sub-vectors are then             weight and right is KV cache quantization. (Lower) VQ (right) can better
+replaced with the index of their closest cluster centroids, using       capture the distribution of data than element-wise quantization (left), with
+                                                                        inter-dimensions information.
+log2 #Entry (2) bits. Next, we collect the differences between
+the original sub-vectors and their closest cluster centroids as
+the residuals. We then perform another round of k-means                 Each head in MHA can be thought of as an independent
+clustering and replace the residual sub-vectors with the index          attention layer with its own learnable parameters. Outputs
+of the closest centroids of the new clusters. This process              of these heads are then concatenated and fed to subsequent
+of residual quantization can be repeated, as determined by              operations. Mathematically, MHA can be described as follows:
+the Residual (2) parameter. The quantization process is now             MultiHead(Q, K, V ) = Concat(head1 , . . . , headh )W O ,
+complete, as shown in the upper part of Fig. 1. We then gather
+                                                                                      headi = Attention(Q = HWiQ , K = HWiK , V = HWiV ),
+all the aforementioned cluster centroids and organize them                                                   p
+                                                                         Attention(Q, K, V ) = softmax(QK T / dk )V.
+into codebooks. In the following sections, we refer to these
+centroids as codebook entries.                                          Here, WiQ , WiK , WiV , and W O are parameter matrices for
+   To reconstruct the original data, a dequantization process is        the i-th head and the output projection, respectively. And H
+required, as shown in the lower part of Fig. 1. For each resid-         is the hidden state. The sof tmax function is applied over the
+ual, we use its quantized data to look up the corresponding             keys to normalize their weights, ensuring that the output is a
+codebooks and find the codebook entry indexed by the quan-              weighted sum of the values based on the input’s relevance.
+tized data in each sub-space. We then gather the results from              In the context of text generation, LLMs often first im-
+the same sub-spaces across different residuals, typically via           plement a prefill stage where the model processes existing
+element-wise accumulation. Finally, we concatenate the results          tokens before generating new ones. This sets the initial state
+from all sub-spaces. Throughout the entire process, vector size,        of the model’s memory and attention mechanisms, making
+#Entry, and Residual are configurable. These configurations             the generation process more context-aware. Following this,
+are annotated with x,y,z, in the format of VQ<x,y,z>. In                the decode phase begins, during which the model generates
+this example, the configuration is VQ<4,2,2>.                           one token at a time, updating its internal state based on
+                                                                        both the newly generated token and the preceding context.
+B. Large Language Models (LLMs)                                         To efficiently reuse previously computed token representations
+   LLMs adopt the Transformer architecture [58], which is               during the decode phase, a Key-Value (KV) cache mechanism
+pivotal in processing and generating natural language in se-            is often utilized [46], [68], enhancing inference performance.
+quences of tokens. The core of the Transformer architecture is          C. VQ for LLM Acceleration
+multi-head attention (MHA), designed to run several parallel
+attention processes, allowing the model to simultanesly focus              VQ gains increasing interests for its great potential for com-
+on different types of information from a single input sequence.         pressing and accelerating LLMs. This is because LLMs are
+                                                                        highly memory-bound [61], with many researchers identifying
+                                                                        weights and KV-cache as the main bottlenecks, accounting for
+                            TABLE I                                     over 95% of the memory footprint [28]. To further compress
+                  PARAMETERS OF VQ ALGORITHMS                           the weights and KV-cache and reduce memory usage, VQ has
+                                                                        come to the center of the stage with its superior compression
+                                                             Value in   ratio and reconstruction quality. Various newly proposed VQ-
+      Item                     Description
+                                                             Sec. III
+                                                                        based compression algorithms outperform SOTA element-
+   Vector size    Number of elements to quantize at once        4       wise quantization baselines in both weight-only compres-
+     #Entry       Number of quantization points (entries)      28
+    Residual     Number of times to quantize residual data      1
+                                                                        sion (AWQ [30]) and KV-cache compression (KVQuant [24],
+                                                                        QoQ [31]) under the same equivalent bitwidth [12], [56],
+ FP16     KV Cache     VQ attn KV Cache Quantized   VQ attn KV Cache Quantized                         FP16-attn              5
+
+
+
+
+                                                                                   performance
+                                                                                                 2                            4       FP16-attn          2.52×106
+
+
+
+
+                                                                                                                   Relative
+ attn                    GC                           SC
+
+
+
+
+                                                                                     Relative
+
+
+
+
+                                                                                                                    Ratio
+                                                                                                                              3
+                        Codebook                     Codebook                                    1                            2
+                                        Dequantize                   Dequantize
+                         @ Global                    @ Shared                                                                 1
+                               Dequantized @ Shared         Dequantized @ Shared                 0                            0
+                                                                                                                                       SM       Shared    Shared    Global->   Shared->
+
+
+
+
+                                                                                                          tn
+
+
+                                                                                                          tn
+ Q,K,V     Attention       Q,K,V       Attention         Q,K,V       Attention                                                    Utilization   Usage     Bank      Shared       Reg
+
+
+
+
+                                                                                                       GC
+
+
+                                                                                                       SC
+                                                                                                       -at
+
+
+                                                                                                       -at
+                                                                                                     VQ
+
+
+                                                                                                     VQ
+                                                                                                                                                         Conflict   Traffic     Traffic
+            Output                      Output                        Output
+                                                                                   Fig. 4. (left) Latency of VQ-attn-GC and VQ-attn-SC relative to
+             Fig. 3. Workflow of investigated VQ kernels.                          FP16-attn. (right) Relative performance counters of VQ-attn-SC.
+
+
+
+[57], [67], [69], as shown in the upper part of Fig. 2.                            CQ-2 [69]. As illustrated in Fig. 3, the first FP16-attn
+Some can even achieve higher quality with fewer equivalent                         version implements Flash Decoding [10] from the FlashAtten-
+bits. The underlying reason is depicted in the lower part                          tion library [7], [9]. We implement the VQ-attn-GC version
+of Fig. 2. With cross-dimension information, VQ can better                         ourselves following the original paper [12], [56], [57], [69]
+capture the distribution characteristics of the data, resulting in                 due to the lack of open-source kernels. VQ-attn-GC receives
+lower reconstruction error. In contrast, traditional quantization                  the VQ quantized KV cache and its codebooks, dequantizes
+relies on the Cartesian product of quantization points between                     them to FP16 precision, and performs the subsequent attention
+dimensions and cannot represent some outliers well.                                computation, with codebooks stored in global memory. Given
+   While converting the reduced memory footprint to actual                         the long access latency of global memory, we propose and
+speed-up is challenging due to the need for efficient kernels                      implement another optimized version that stores codebooks
+that take quantized data and codebooks as inputs, dequantize                       in shared memory and hence is labelled as VQ-attn-SC,
+them, and perform computations. Unfortunately, existing al-                        with the rest of the process mirroring that of VQ-attn-GC.
+gorithms only provide kernels with high latency, making them                       Here we only analyze attention kernel thus KV cache com-
+impractical for use [12], [56], as verified in Sec. VII. In the VQ                 pression, while these observations can also be generalized to
+pipeline, dequantization is the main bottleneck in the context                     GeMM/GeMV and weight compression.
+of LLMs. This is because quantization can be done offline
+(for weights) or asynchronously with tiny overhead (for KV                         B. Inefficiency Analysis
+cache, also discussed in Sec. VII). However, dequantization is
+                                                                                      Since the attention (decoding) process is highly memory-
+required every time before a computation since the quantized
+                                                                                   bound, using VQ<4,8,1>, which compresses the KV cache
+data store codebook indices and cannot be directly operated
+                                                                                   to 1/8, should significantly enhance its performance. How-
+on. Therefore, this paper focuses on developing efficient fused
+                                                                                   ever, as depicted on the left of Fig. 4, both VQ versions
+dequantization-computation kernels.
+                                                                                   underperform the FP16 baseline. We also observe that the
+   In the next section, we will analyze the inefficiencies of ex-
+                                                                                   shared-memory-based codebook version, VQ-attn-SC, out-
+isting and vanilla optimized fused dequantization-computation
+                                                                                   performs the global-memory-based version, VQ-attn-GC,
+kernel. As mentioned before, the core difference between
+                                                                                   demonstrating the effectiveness of utilizing shared memory
+VQ and element-wise quantization is the use of vectorized
+                                                                                   for codebooks. Although shared memory and the GPU L1
+codebooks, and we primiaily focus on them in our analysis.
+                                                                                   cache share the same physical space, the hardware-managed
+   Noted that we target NVIDIA GPUs in this paper, althouth
+                                                                                   L1 cache fails to capture the temporal locality of codebook
+GPUs from other vendors share similar concepts [3], [39],
+                                                                                   entries. This is because the size and irregular access pattern of
+[40], [54]. A GPU compute kernel launches thousands of
+                                                                                   the entries does not align with the cache line size and prefetch
+threads, organized into thread blocks within a grid. Each thread
+                                                                                   width (128 bytes [41]) of the L1 cache. According to our
+block is dispatched to a Streaming Multiprocessor (SM), which
+                                                                                   profiling results, VQ-attn-GC achieves only a 12.45% L1
+may handle multiple thread blocks to overlap instructions.
+                                                                                   cache hit rate, indicating significant wasted capacity in the L1
+Threads access three memory hierachies: registers (local to
+                                                                                   cache. Consequently, we default to the VQ-attn-SC version
+each thread), shared memory (local to the thread block), and
+                                                                                   to investigate its sources of inefficiencies.
+global memory (accessible by all threads).
+                                                                                      Inefficient Codebook Access. Fig. 4 (right) compares the
+                          III. M OTIVATION                                         various performance counters of the VQ-attn-SC version
+   In this section, we analyze the inefficiencies of current                       and the FP16 version. We first observe an over 30% drop
+VQ implementation centering how codebooks are placed and                           in compute (SM) utilization in the VQ-attn-SC version
+utilized. We first outline our setup for a micro-benchmark-                        (1st bar). This decline is attributed to the VQ’s significantly
+based investigation in Fig. 3 and then analyze it in detail.                       increasing shared memory footprint (2nd bar), which reduces
+                                                                                   the number of thread blocks that can run concurrently on
+A. Investigation Setup                                                             each SM, leading to decreased performance. Additionally,
+  We evaluate an attention kernel from Llama-7B [55] with 32                       we note high bank conflicts (3rd bar), indicative of highly
+heads and head dimension of 128 on an RTX 4090 GPU [43].                           serialized access to shared memory. Eliminating these bank
+We investigate three implementations of vector quantized (VQ)                      conflicts is challenging for several reasons. First, the number of
+KV cache with the configuration VQ<4,8,1> that follows                             codebook entries vastly exceeds the number of shared memory
+                                  Channel                                       Channel                                             Tid 0 Dequant
+                                                  FP16-attn                                                                         Tid 1 Dequant
+                                  Query                                         Output
+                                Inner product                               Global reduce                                          Tid 0 Compute
+                                 Block 0                                        Block 0                                            Tid 1 Compute       K cache          V cache
+
+
+
+
+                                                     Global reduce
+                 Dequantize
+
+
+
+
+                                                                                              Dequantize
+                                Block 1                                         Block 1
+   Tokens
+
+
+
+
+                                                                                                                 Tokens
+                                K Cache                                         V Cache                                   Fig. 6. Layout of dequantized data and required layout of following
+                                Block 2                                         Block 2                                   computation of KV cache in attention (decoding).
+                                Block 3                                         Block 3
+
+                 K Codebook                     VQ-attn-SC                       V Codebook                               every (256, 256) tile of the weight matrix shares a codebook,
+                                                                                                                          while the task is spliced into (·, 128) tiles on weight matrix,
+Fig. 5. Dataflow of FP16-attn (inner box) and VQ-attn-SC (outer box).
+                                                                                                                          and every two thread blocks access and load a same codebook.
+                                                                                                                             Besides the increased off-chip global memory traffic, we
+banks, e.g., 256 entries versus 32 banks, and their accesses                                                              also observe a significant rise in on-chip shared memory to
+are random during the VQ dequantization process, precluding                                                               register traffic in the VQ-attn-SC version, as shown in the
+the use of common static reordering or padding solutions                                                                  last bar of Fig. 4 (right). Ideally, this traffic should remain the
+for coalesced accesses [41]. It is possible to reorder entries                                                            same to the FP16-attn version, given that the computation
+or threads at runtime, which can introduce extra complexity                                                               precision and the volume of data involved in the computation
+and overhead. Second, a single codebook entry can occupy                                                                  remain unchanged. The unusual Shared → Reg traffic stems
+multiple banks in VQ, exacerbating the difficulty of mitigating                                                           from a mismatch between the layout of dequantized data and
+bank conflicts.                                                                                                           the layout required by the computation.
+   Takeaway 1 Storing codebooks in fast on-chip buffers like                                                                 As illustrated in Fig. 6, one thread dequantizes a row of
+shared memory is necessary, but not trivial.                                                                              four elements at a time for the KV cache following the
+   Uncoordinated Codebook Load and Compute. The 4th bar                                                                   CQ-2 algorithm [69]. It then stores these four elements in
+in Fig. 4 (right) indicates that the traffic from off-chip global                                                         thread-local registers. However, the computation requires a
+to on-chip shared memory is higher for the VQ version than                                                                column-wise weighted accumulation on the V cache, and the
+for the FP16 version. This is counterintuitive since VQ is                                                                four dequantized elements by the thread do not match the
+expected to significantly reduce global memory access. The                                                                data needed for subsequent computations. Consequently, the
+cause of this unexpected off-chip traffic is that integrating VQ                                                          dequantized data in local registers must be stored back into
+into the original compute kernel results in uncoordinated and                                                             shared memory, allowing the correct threads to access them.
+duplicated loads of codebooks.                                                                                            Notice that as depicted in the figure, the K cache does not
+   The inner box of Fig. 5 shows the original FlashDecoding’s                                                             introduce such a shared memory round-trip since its row-wise
+dataflow [10], which parallelizes the computation of different                                                            accumulation process aligns with the dequantization process.
+tokens and computes the local softmax in global memory.                                                                      Takeaway 2 Integrating and fusing VQ algorithms into
+When integrating the VQ codebooks to this computation                                                                     LLM’s kernels requires a careful coordination between the
+dataflow, computing every four channels for a token needs                                                                 codebook load and the fused kernel’s compute dataflow.
+to switch to a different codebook, following the VQ algorithm                                                             C. Additional Complexity of VQ Diversity
+of CQ-2 [69]. Consequently, thread blocks handling different
+tokens end up accessing and loading identical codebooks as                                                                   Our above analysis primarily focuses on a specific VQ
+they process data across all channels, as shown in the outer                                                              configuration for the FlashDecoding kernel. In fact, we have
+box of Fig. 5. This results in significant duplicated off-chip                                                            surveyed state-of-the-art methods of using VQs to accelerate
+memory traffic, and this challenge is also presented in the                                                               LLMs and found considerable diversity, as listed in Tbl. II.
+integration of VQ with GeMM kernels. For GPTVQ-2 [57],                                                                    These varied configurations add complexity when generating
+                                                                                                                          high-performance fused computation kernels. Moreover, dif-
+                                                                                                                          ferent algorithms choose to train a codebook with different
+                                            TABLE II                                                                      parts of tensor which further push up this complexity. For
+                              VQ ALGORITHM AND THEIR CONFIGURATIONS                                                       instance, QuiP# [56] can avoid duplicated Global → Shared
+                                                                                                                          traffic as it train one codebook with the entire weight tensor,
+                                     Compression                     Vector                                               yet it may increase bank conflicts and cause layout mismatches
+       Algorithm                                                                   #Entry             Residual
+                                  Ratio against FP16                  Size
+                                                                                                                          with its vector size 8. Conversely, CQ-4 [69] is able to reduce
+       QuiP#-4                             25%                          8          65536*                    2            bank conflicts and layout issues with its vector size 2, but it
+      AQLM-3                             18.75%                         8           4096                     2
+      GPTVQ-2                             12.5%                         4            256                     1            may lead to significantly duplicated Global → Shared traffic
+        CQ-4                               25%                          2            256                     1            since it train different codebooks with different channels.
+        CQ-2                              12.5%                         4            256                     1               On the other hand, there are various computations associ-
+            Configs.                                                 21,2,...      21,2,...                1,2,...        ated with VQ algorithms, such as VQ-gemm and VQ-gemv
+*QuiP# utilize a lattice-based codebook, though it has 65536 entries, it only                                             for weight-only quantization, and VQ-attn for KV cache
+need to look up from 256 of them every dequantization with bit operations.                                                quantization, as previously mentioned. The combination of
+                                                                                         48
+
+
+
+
+                                                                             frequency
+             Codebook-Based Compute Engine                                                                                                μ+3σ
+
+
+
+
+                                                                               Access
+                                                                                         32
+                                                                                                                                          μ+0σ
+      6.1      Codebook Centric Dataflow                                                 16
+
+
+
+
+                                                    Adaptive Heuristics
+                                                                                                  26                     1911
+                                                                                          0
+       5              Codebook Cache                                                          0         1024        2048           3072    4096
+                                                                                                               Codebook entry ID
+            Global       Shared        Register
+            Cold         Medium          Hot                              Fig. 8. Codebook entries access frequency of one thread block in VQ-GeMM
+                                                                          kernel, with VQ<8,12,2> (AQLM-3).
+               Codebook Reorder & Update
+
+      6.2 Codebook Centric Hierachical Fusion
+                                                                          overhead and difference between layout of dequantized data
+                                                                          and layout required by subsequent computation.
+                 Fig. 7. VQ-LLM design overview.
+                                                                            Our VQ-LLM framework comprises a set of CUDA tem-
+                                                                          plates that employ a codebook-centric dataflow and fusion
+VQ algorithm diversity and multiple subsequent computation                scheme, along with a set of adaptive heuristics. These tem-
+patterns makes it impractical to manually craft efficient kernel          plates include both algorithm-specific and hardware-related
+implementations for each specific case.                                   parameters. To generate a specific VQ-augmented compute
+   Takeaway 3 An adaptive solution is necessary to achieve                kernel, we supply the configuration of the algorithm and target
+optimal performance across a variety of VQ algorithms and                 GPU to the corresponding compute kernel template. VQ-LLM
+their subsequent computations.                                            then automatically selects the optimal parameters based on the
+                                                                          template specifications and heuristics.
+                     IV. VQ-LLM OVERVIEW
+   From the analysis in the previous section, we identify three                                        V. C ODEBOOK C ACHE
+key challenges in utilizing VQ to accelerate LLM inference: i)               We first present the design intuition of codebook cache,
+efficient codebook entry access, ii) coordinated codebook load-           and then implementation details. Finally, we describe the user
+ing and subsequent computation, and iii) significant diversity            interface that can be utilized by subsequent computations.
+in VQ algorithms and subsequent computation patterns.
+   To address these challenges, we design and implement VQ-               A. Design Rationale
+LLM, an automatic high-performance code generation frame-                     As Sec. III explains, naively placing the entire codebook
+work in Fig. 7. We introduce a software abstraction called                in the shared memory results in suboptimal performance due
+codebook cache to optimize codebook access efficiency and                 to two issues: i) increased shared memory usage and ii)
+support the integration of VQ with various computations. The              significant bank conflicts. To address these issues, we propose
+codebook cache adaptively stores different entries across the             storing different entries at various memory levels based on
+GPU’s memory hierarchy, including off-chip global memory,                 their access frequencies. Specifically, we can store rarely
+on-chip shared memory, and registers. It does so by leveraging            accessed entries in off-chip global memory to conserve shared
+the offline-profiled characteristics of codebook entry access,            memory usage, and store the most frequently used entries in
+such as cold, medium, and hot.                                            the thread local registers to eliminate bank conflicts.
+   The codebook cache also enables seamless integration with                  We find that different entries in a codebook indeed demon-
+the subsequent computations. Centered around the codebook                 strate varying levels of ‘hotness’ in terms of access frequency.
+cache, we design an efficient computation engine that op-                 Fig. 8 illustrates such an example of AQLM-3, and results
+timizes memory traffic during computations involving code-                of other algorithms will be shown in Sec. VII. Over half
+books, incorporating two core techniques. The first technique,            of the codebook entries are accessed less frequently than the
+called codebook-centric dataflow, divides and parallelizes the            average, indicating that placing them in shared memory yields
+original computation task in a way that minimizes the code-               little benefit. There are 26 hot entries that are accessed more
+book switch overhead. It may split the reduction dimension                frequently than µ+3σ (mean plus three standard deviations),
+of the original computation task, for which we adaptively                 suggesting that they are more susceptible to inevitable bank
+determine the split factor to balance the global reduction. With          conflicts. This observation forms the foundation of our code-
+this dataflow, we eliminate the excessive off-chip memory                 book cache design, the details of which we introduce next.
+traffic caused by redundant codebook loads from different
+thread blocks in current VQ implementations.                              B. Implementation
+   The second technique employed by our compute engine,                      Typically, the implementation of a cache relies on tag
+named codebook-centric hierarchical fusion, extends the de-               array [59] or lookup table [36], which could incur additional
+fault shared memory level fusion to support the additional                latency and storage overhead. In our codebook cache imple-
+register-level fusion. This mechanism leverages a GPU fea-                mentation, we adopt a reorder-based static mapping mecha-
+ture known as intra-warp data exchange [45] to rearrange                  nism that is extremely lightweight and configurable, which
+the dequantized data into the required layout for subsequent              means there is also no complex eviction policy.
+computations directly in registers. And we adaptively decide                 In our implementation, we first sort and reorder the code-
+where to conduct the fusion based on profiled exchanging                  book entries by their access frequency in the descending order.
+ Block ID                                                                                                                 Computation resource consumption
+
+
+
+
+                                                                                        GPU occupancy
+                                                                                                             1
+
+
+
+
+                                                                                          OP B OP A
+                                      Entry ID                                                               0
+                                                                                                             1
+            Fig. 9. Entries hot and cold of different parts of tensor.
+                                                                                                             0
+                                                                                                                  0        64 128 192                     0    32   64    96
+                                                                                                                          B32 registers (#)               Shared memory (KB)
+This is done at the profiling-based offline phase, which ensures
+that the index of the most frequent entry is 0, and the index of         Fig. 10. Computation kernel resource consumption and corresponding occu-
+                                                                         pancy of the hardware. The blue region is the resource slacks we can use
+the least frequent entry is the maximum value. All the quan-             without influencing the performance.
+tized data would use these new indices. Next, we establish two
+boundaries: nreg and nshared . We allocate the first nreg entries to
+
+
+
+
+                                                                                   TB 0
+                                                                                                TB 1
+                                                                                                             TB 2
+
+
+
+
+                                                                                                                                                                 TB 0
+                                                                                                                                                                              TB 1
+
+                                                                                                                                                                                           TB 2
+                                                                                                                          TB..
+
+
+
+
+                                                                                                                                                                                                        TB..
+thread local registers and the subsequent entries up to nshared
+
+
+
+
+                                                                                                                                                      So ap
+                                                                                                                                                            ax
+                                                                                                                                           al
+in shared memory. We store any remaining entries in global
+
+
+
+
+                                                                                                                                                          m
+                                                                                                                                                        ftm
+                                                                                                                                          rti
+                                                                                                                                         Pa
+
+
+
+                                                                                                                                                  tn
+memory. During runtime dequantization, addressing codebook
+
+
+
+
+                                                                                                                                                 At
+                                                                                                                           Codebook 31
+
+
+
+
+                                                                                                                                                                                                        Codebook 31
+                                                                                                             Codebook …
+
+
+
+
+                                                                                                                                                                                           Codebook …
+entries involves simple index comparisons, we locate entries in
+
+
+
+
+                                                                                   Codebook 0
+
+                                                                                                Codebook 1
+
+
+
+
+                                                                                                                                                                 Codebook 0
+
+                                                                                                                                                                              Codebook 1
+                                                                          Tokens
+
+
+
+
+                                                                                                                                                                                                                      Tokens
+registers if the index <nreg , in shared memory if nreg ≤ index
+                                                                                                                                                  +
+<nshared , and in global memory if the index ≥nshared .
+   In this implementation, we conduct frequency-based re-
+                                                                                   K cache (1 head)                                             Reduce           V cache (1 head)
+ordering at the tensor level, although different parts of a
+tensor might have different frequently accessed entries. Fig. 9          Fig. 11. Example of codebook centric dataflow for attention (decode)
+                                                                         computation following CQ configuration.
+presents data to support our choice, where the y-axis represents
+different parts of the tensor (i.e., different thread blocks), and
+x-axis indicates the access frequencies of different codebook            The first API is Load, which loads codebooks stored in global
+entries of a thread block. White color indicates frequently              memory into the cache. It accepts the codebooks and memory
+accessed entries, and the opposite for darker shades. We                 slack, returning the codebooks cached across the memory
+observe many vertical white lines, suggesting that these entries         hierarchy along with two access boundaries. The second API
+are consistently accessed across different tensor parts. This            is Access, allowing users to access specific entries during the
+observation supports the rationale for globally determining the          dequantization process. It accepts cached and global memory-
+most frequently accessed entries.                                        stored codebooks along with indices to locate entries. It also
+   Adaptivity. The shared memory and register resources of our           uses two boundaries to determine where to locate entries.
+codebook cache can be adjusted using two parameters: nreg and            Additionally, while we configure these boundaries with preset
+nshared . As mentioned in Sec. III, these resources are limited          heuristics, users can still overwrite them.
+on GPUs, and excessive usage can decrease the occupancy                     The last API is Switch, useful when algorithms train dif-
+of thread blocks. We employ a heuristic-based method that                ferent codebooks for different parts of a tensor, as in GPTVQ-
+adapts their allocation to subsequent computations. Initially,           2 [57]. This API facilitates the switch to new codebooks based
+we identify slack in the use of both recources. This concept             on the specific tensor section being processed by the user.
+is illustrated in Fig. 10, where we assign varying amounts
+of shared memory and registers to two computation kernels,                                      VI. C ODEBOOK -BASED C OMPUTE E NGINE
+highlighting the most performant configuration with a circle                Based on the above codebook cache, we design an efficient
+marker. Resource slack, depicted as the blue shaded area in              compute engine to optimize the excessive codebook-related
+Fig. 10, is a space of resource that we can occupy without               traffic when using VQ in the subsequent computation. We first
+hurting concurrency and GPU utilization. The existence of                introduce two core techniques employed by our computation
+these slacks is due to the GPU’s resource partitioning and               engine: codebook-based dataflow and codebook-based hierar-
+scheduling [52], which we will not explore further due to space          chical fusion. We then detail the combined usage of the entire
+constraints. It is important to note that different computations         computation engine along with the codebook cache.
+exhibit varying slacks, which can also be derived by offline
+                                                                         A. Codebook Centric Dataflow
+profiling. We determine nreg and nshared by dividing the avail-
+able slacks by the size of a single codebook entry.                         We start by explaining the intuition of our design. Subse-
+                                                                         quently, we detail our implementation.
+C. User Interface                                                           1) Design Rationale: To fully leverage the parallel compu-
+   We provide and explain the following APIs for users to                tation resources of GPUs, researchers employ tiling to divide
+utilize our codebook cache, henceforth abbreviated as CB.                and parallelize computation tasks [6], [42], [72]. Under the
+                                                                         VQ scenario, naive parallelization introduces excessive traffic
+            CBcached , nreg,shared ← Load(CB, Slack)                     due to conflicts between the codebook switch axes and the task
+            Entry ← Access(CBcached , nreg,shared , CB, Index)           reduction axes, as discussed in Sec. III. We address this issue
+            CB ← Switch(N ew CB P ointer)                                with a new codebook-centric dataflow illustrated in Fig. 11,
+which employs the same settings as Fig. 5 in Sec. III. In              Quantized                Thread id                  Register array index
+                                                                                                  0 2                      0 1 2 3 0 1 2 3                          0   0   2   3    0    1   2   2
+this codebook-centric dataflow, we partition and parallelize the
+
+
+
+
+                                                                    Warp tile
+                                                                                                                        reg[tid^1]=shfl(reg[tid^1],1)             reg[tid^2]=shfl(reg[tid^2],2)
+task across every four channels, i.e., every codebook, ensuring
+                                                                                                    1    3                 0   1   2   3    0    1   2   3          1   1   2   3    0    1   3   3
+
+
+
+
+                                                                                                                       e
+that each thread block only needs to load one codebook, thus
+
+
+
+
+                                                                                                                    tiz
+                                                                                         Ma read
+                                                                                              ing
+
+
+
+
+                                                                                                                                                              e
+                                                                                                                 an
+
+
+
+
+                                                                                                                                                             uﬄ
+                                                                                           pp
+                                                                                          Th
+
+
+
+
+                                                                                                                qu
+
+
+
+
+                                                                                                                                                             Sh
+                                                                                                               De
+eliminating any need for duplicated codebooks or switches.                      (16,2)              (16,2)                             (16,16)                                  (16,16)
+
+
+
+
+                                                                                                                                                                                                            e
+                                                                                                                                                                                                         uﬄ
+                                                                                   mma.sync
+Instead of globally reducing the local softmax of different
+
+
+
+
+                                                                                                                                                                                                      Sh
+                                                                                                                           0   0   0   0    2    2   2   2          0   0   0   3    2    1   2   2
+tokens as in FlashDecoding [10], we now require global                                                                                                            reg[tid^3]=shfl(reg[tid^3],3)
+
+accumulation of partial inner-products.                                                                                    1   1   1   1    3    3   3   3          1   1   2   1    0    3   3   3
+
+
+
+
+                                                                                                               mp d!
+                                                                                                                  ute
+                                                                                                             Co tche
+
+
+
+
+                                                                                                                                                              e
+                                                                                                                                                             uﬄ
+   2) Implementation: We now formally define our design for
+
+
+
+
+                                                                                                              Ma
+
+
+
+
+                                                                                                                                                             Sh
+                                                                                                                                       (16,16)                                  (16,16)
+
+the codebook-based dataflow. We first identify the axes where
+reduction occurs and where codebooks need to be switched,           Fig. 12. Intra-warp data exchange based on shuffle API example, eight
+as indicated in Tbl. III. Subsequently, we split and parallelize    elements are dequantized one time per thread, while following computation
+                                                                    requires one thread hold only two elements (mma instructions).
+the computation along the codebook switch axes. Finally, for
+those axes that traditionally perform temporal accumulation
+but are now parallelized (intersecting with the codebook switch     traffic between shared memory and registers, as previously
+axes and annotated with colors), we perform an explicit global      explained. Alternatively, we utilize a modern GPU feature
+reduction to ensure accurate results.                               that facilitates register-level data exchange [45], effectively
+   Adaptivity. To balance the overhead of global reduction in       bypassing shared memory with following API:
+our dataflow, we utilize a split factor to control the extent
+of task parallelization along the codebook switch axes. A                                               register ← shf lxor (register, of f set)                                                          (1)
+larger split factor results in fewer duplicated codebooks but
+necessitates more global reductions, and vice versa. With the       This API exchanges the reg of the calling thread (idsrc )
+objective of minimizing overhead, we adaptively determine the       with reg of the thread whose iddst ⊕offset=idsrc in place
+split factor based on the size of the tensor that needs reduction   (⊕:xor). Note that this instruction is commonly used to
+and the traffic associated with duplicated codebooks.               enhance the efficiency of collective communication and result
+                                                                    reduction [27], [71]. However, we are the first to apply it to
+                                                                    accelerate VQ-compressed LLMs.
+            TrafficReduce ← Split F actor × Output Size
+                                                                       We illustrate the application of this API for register-level
+                            Original Codebook T raf f ic
+          TrafficCodebook ←                                         fusion through an example that fuses VQ<8,...> with
+                                     Split F actor
+                                                                    GeMM. In Fig. 12, the layout of the dequantized data is 8
+Since these two variables exhibit opposing trends with respect      (i.e., VQ vector size), while the layout required by the mma
+to the split factor, we can achieve a minimum by equating           instruction is 2. We initially map the dequantization threads
+them according to the Mean Value Theorem [48].                      in a specialized manner, as depicted in the figure, to ensure
+                                                                    that all data exchanges are confined to four threads, which we
+B. Codebook Centric Hierarchical Fusion
+                                                                    subsequently refer to as a mini-warp. Within this mini-warp,
+   Similarly, we begin with a concrete example to illustrate our    we execute three exchange (shfl) operations as follows:
+new fusion scheme. Subsequently, we formally abstract the               • Tid 0.[1]↔Tid 1.[0], Tid 2.[3]↔Tid 3.[2]
+hierarchical fusion algorithm and detail our implementation.            • Tid 0.[2]↔Tid 2.[0], Tid 1.[3]↔Tid 3.[1]
+   1) Design Rationale: The baseline method described in                • Tid 0.[3]↔Tid 3.[0], Tid 2.[1]↔Tid 1.[2]
+Sec. III employs shared-memory-level fusion, which combines
+                                                                    Note that both the array index and thread ID can be represented
+VQ dequantization and the subsequent computation kernel by
+                                                                    using the xor operation. After these shuffle operations, the
+transferring data through shared memory. It leads to excessive
+                                                                    data held by each thread’s register aligns precisely with the
+                                                                    requirements of the mma computation instruction.
+                         TABLE III                                     Thread Mapping. Our approach necessitates a specialized
+      R EDUCE AND CODEBOOK SWITCH AXES OF COMPUTATIONS              thread mapping within a warp for dequantization, as the
+                                                                    naive sequential mapping requires a complex exchange pattern.
+          GeMM                  Reduce       Codebook               Consider the sequential mapping with the mma instruction in
+                     All axes
+          GeMV                   axes      switching axes
+                                                                    Fig. 12, data[8,0:8] (blue color) is dequantized by thread 16 but
+                                          R: AQLM,QuiP#             is required by threads 0-3. However, the data held by threads
+          Weight     M,N,R       M,R
+                                           M,N: GPT-VQ
+                                                                    0-3 is not needed by thread 16 but rather by threads 0-7.
+                R: Residual, M,N: M rows, N columns                 This results in a complex data exchange path where ultimately
+         Attention   All axes
+                                Reduce       Codebook               all threads are implicated. Meanwhile, it requires additional
+                                 axes      switching axes
+                                                                    registers as the exchange happens in place. To circumvent
+          K Cache    B,H,T,C      C           H,C: CQ               this, we predetermine the thread mapping offline, based on
+          V Cache    B,H,T,C      T           H,C: CQ
+                                                                    the layout of the dequantized data and the layout required by
+              B: Batch, H: Head, T: Token, C: Channel               the computation, with details described as follows.
+Algorithm 1 Intra-warp data exchange based on shuffling                     13-14). Notice now threads are mapped to quantized data
+Input: data, iter, layoutdequant,compute                                    following Thread_Mapping determined offline, for mini-
+Output: data
+                                                                            mum shuffle if applicable. After dequantization, we perform
+1: function T HREAD M APPING(data, layoutdequant,compute )                  codebook-centric hierarchical fusion (lines 15-18) using the
+2:    for item ∈ data do
+3:        item.tidcompute,dequant ← GetT id(item, layoutcompute,dequant )   Reg_Fusion and Shared_Fusion function. Both func-
+ 4:    mini warps ← []
+                                                                            tions accept dequantized data, with the former requiring a
+ 5:    for dequant thread ∈ warp do                                         counter nshuffle to indicate the number of required shuffle
+ 6:        mw ← [data.tidcompute for data.tiddequant =dequant thread]       operations and latter requiring the source-destination layout to
+ 7:        if mw ∈ / mini warps then
+ 8:            mini warps[mw] ← []
+                                                                            initialiate correct shared memory accesses. Once the data is in
+ 9:        mini warps[mw].append(dequant thread)                            the proper layout, we proceed with computation (lines 19-20).
+10:    for mw ∈ mini warps do                                               Finally, we perform a global reduction if necessary (line 21)
+11:        mini warps[mw][i] ← mw[i]// Thread mapping we need               via the Reduce function, where the first parameter specifies
+12: function R EG F USION(data, iter)                                       the partial result to be reduced and the second determines the
+13:    for off in [1, iters) do // intersected 0 no shuffle needed
+14:        data[tidˆoff ] ← shf lxor (data[tidˆoff ],off )
+                                                                            axes along which the global reduction is conducted.
+15:    return reg
+                                                                            Algorithm 2 Complete VQ-aware computation template
+                                                                            Input: quantized, codebook, compute op
+                                                                            Output: output
+   2) Implementation: We outline our algorithm in Alg. 1. To
+                                                                             1: function K ERNEL T EMPLATE
+determine the thread mapping, we first find the association                  2:    All, Reduce ← compute op.all axes, reduce axes
+between each element in terms of dequantization and compu-                   3:    layoutsrc,dst ← codebook.vector size, compute op.required size
+tation (lines 2-3). Subsequently, for each thread, we identify               4:    Budget ←Free shared and reg to preserve occupancy
+                                                                             5:    f actor ←Value to make TrafficReduce =TrafficCodebook
+all threads that require its dequantized data, grouping these                6:    nshuffle ← layoutsrc /layoutdst
+threads into a mini-warp (lines 4-6). We then construct mini-                7:    if nshuffle ≤ thresshuffle (= 5) then
+warps for all threads (lines 7-9). In the previous example,                  8:       Thread_Mapping(compute op.warp tile, layoutsrc,dst )
+                                                                             9:    Parallel_For(codebook.switch axes, f actor)
+threads 0, 1, 16, and 17 possess identical data [0, 1, 2, 3] and            10:       if required by algorithm then
+thus form a mini-warp. Finally, we remap all threads by mini-               11:          CB ←Switch(New codebook ptr)
+warps (lines 10-11); for instance, we assign threads 2 and 3 to             12:       CBcached , boundry ←Load(CB, Budget)
+                                                                            13:       for id in quantized data do
+dequantize the data initially handled by threads 16 and 17. This            14:          data ←Access(CBcached , boundry, CB, id)
+process is executed offline to ensure proper thread mapping                 15:       if nshuffle ≤ thresshuffle then
+in runtime dequantization, enabling the implementation of                   16:          data ←Reg_Fusion(data, nshuffle )
+                                                                            17:       Else
+register-level fusion via the shuffle API (lines 12-15).                    18:          data ←Shared_Fusion(data, layoutsrc,dst )
+   Adaptivity. Clearly, a larger discrepancy between the de-                19:       for temporal iteration on All − codebook.switch axes do
+quantization layout and the required layout of the computation              20:          partial ← compute op(data, temporal iteration)
+kernel increases the need for shuffling. Consequently, we                   21:       output ←Reduce(partial, Reduce ∩ codebook.switch axes)
+                                                                            22:    Return output
+propose conducting hierarchical fusion adapted to the vector
+size of the codebook entry. Profiling results indicate that the
+latency of shared memory access is nearly five times that                                          VII. E VALUATION
+of register access combined with shuffling. Therefore, for
+quantized tensors requiring fewer than five shuffle operations,                In this section, we evaluate the effectiveness of proposed
+we implement register-level fusion. For other tensors, we                   optimizations in VQ-LLM through comprehensive experi-
+maintain the conventional shared memory-level fusion.                       ments. We first present overall speedup results for various VQ-
+                                                                            based computation kernels over existing approaches. Then,
+C. Overall Workflow                                                         we provide a detailed breakdown analysis of the proposed
+   Our compute engine adopts a template-based design in                     optimizations. Next, we compare our work with FP16 ker-
+Alg. 2 to generate final fused kernels. First at the offline phase,         nels and several element-wise quantization works to show
+based on the VQ configuration and targeted computation,                     its viability for accelerating LLMs. Finally, we performed
+we determine shared/register budgets, split factors, required               a comprehensive end-to-end evaluation, analyzing both the
+number of shuffles, and the corresponding thread mapping for                overall speedup and accuracy across various GPUs.
+our proposed optimizations (lines 2-8).
+   Subsequently, we launch the codebook-centric dataflow                    A. Experimental Setup
+computation (line 9) via the Parallel_For function that                       In this study, we conduct a comprehensive evaluation at
+binds following sub-tasks to parallel thread blocks. Its two                both the individual kernel and end-to-end model levels. The
+parameters represent the task splitting axes and the split factor,          evaluations were performed on an NVIDIA RTX 4090 24GB
+respectively. Within each parallelized task, we first load the              GPU [43]. For the end-to-end evaluation, we included a
+codebook into the codebook cache (lines 10-12), followed                    Tesla A40 GPU [39] to explore the potential of VQ-LLM
+by dequantization using the provided APIs in Sec. V (lines                  with lower bandwidth.. The evaluated computation kernels
+                           TABLE IV                                              80%
+
+
+
+
+                                                                       reduced
+                                                                       Latency
+                                                                                       GeMM   GeMV BS1 GeMV BS16 1k Attention 4k      Mean
+              B REAK DOWN ANALYSIS CONFIGURATION                                 40%
+                                                                                 0%
+       Optimization
+
+
+
+
+                                                                                  G LM-4
+                                                                                        VQ 3
+                                                                                           -2
+
+
+                                                                                  G LM-4
+                                                                                        VQ 3
+                                                                                           -2
+
+
+                                                                                  G L M -4
+                                                                                        VQ 3
+                                                                                           -2
+
+                                                                                     -2 1
+                                                                                            8
+
+                                                                                     -2 1
+                                                                                            8
+ ID                                    Description
+
+
+
+
+                                                                                    PT -
+
+
+
+
+                                                                                    PT -
+
+
+
+
+                                                                                    PT -
+
+
+
+                                                                                    Q S
+                                                                                         BS
+
+
+                                                                                    Q S
+                                                                                         BS
+                                                                                                                                        7B
+
+
+
+
+                                                                                    AQiP#
+
+
+
+
+                                                                                    AQ P#
+
+
+
+
+                                                                                    AQ #
+
+
+
+
+                                                                                  C -2 B
+
+
+
+                                                                                  C -2 B
+        Category
+
+
+
+
+                                                                                         P
+                                                                                                                                        65B
+
+
+
+
+                                                                                      ui
+
+
+
+
+                                                                                      ui
+                                                                                      u
+                                                                                    Q
+
+
+
+
+                                                                                    Q
+
+
+
+
+                                                                                    Q
+
+
+
+
+                                                                                    Q
+
+
+
+                                                                                    Q
+                                                                                  C
+
+
+
+                                                                                  C
+ GC        No                     Naive implementation
+ SC      Greedy             Cache all entries in shared memory         Fig. 13.   Overall latency reduction of best perform version against un-
+                                                                       optimized version for various VQ configurations.
+ O1    Hierarchical   + Shared memory level caching (medium entries)
+ O2      Buffer            + Register level caching (hot entries)
+ O3      Compute              + Codebook centric dataflow              For Attention (Decode), 1k and 4k means sequence length of
+ O4       Engine          + Codebook centric hierarchical fusion
+                                                                       1024 and 4096, respectively.
+                                                                          Although VQ-LLM achieves significant speedup values
+                                                                       for both GeMM and GeMV kernels, we observe a counter-
+include various VQ-augmented GeMM, GeMV and FlashDe-                   intuitive discrepancy that our optimizations achieve a relatively
+coding [10]. The evaluated VQ configurations are listed in             high speedup value for GeMM kernels compared to GeMV
+Tbl. II, including QuiP#-4, AQLM-3, GPTVQ-2 and CQ-                    kernels. In other words, the quality of VQ algorithm inte-
+2/4, the suffix number represent the equivalent bit-width. The         gration is more critical to the compute-bound kernels (e.g.,
+first two kernels adopt weight quantization and the last one           GeMM) than to the memory-bound kernels (e.g., GeMV).
+adopts KV cache quantization. For the kernel-level evaluation,         The reason is the former benefit less from reduced memory
+we set the shape for these kernels following the Llama-7B              footprint while suffer more from extra operation (dequanti-
+and Llama-65B [55] models. These kernels run on a single               zation) [60], leading to significant performance degradation
+GPU, while large model serving like Llama-65B typically                of unoptimized implementation. Meanwhile, we also observe
+uses multiple GPUs with Tensor Parallel (TP) strategy [35],            an opposite trend for AQLM-3 between GeMM and GeMV.
+[47], [70]. The required adjustments to our framework include          This AQ configuration has an unaligned 12-bit storage format,
+final results gathering for Attention and partial results con-         which necessitates additional unpacking and decoding logic
+catenation/reduction for GeMM/GeMV [38]. These are usually             and requires a more careful optimization for the integration.
+conducted via communication library like NCCL [44], and we                We observe that our speedup values for GeMV kernels re-
+identify this distributed scenario an orthogonal topic and leave       main consistent regardless of batch size, whereas they increase
+it to the future work.                                                 with batch size for attention kernels. This is because different
+   Tbl. IV lists various baselines and VQ-LLM optimizations            input samples share the same weight tensor but have distinct
+used in our evaluation. For the baselines, we use GC and SC            KV caches. Since the GeMV kernel corresponds to weight
+method explained in Sec. III that stores the codebook in global        quantization and the attention kernel to KV cache quantization,
+memory and shared memory, respectively. For the results, we            the former only requires loading the VQ-compressed weight
+report the latency reduction against GC. We also decompose             tensor once, while the latter loads VQ-compressed KV cache
+the optimizations used in VQ-LLM into four levels (O1-O4),             tensors multiple times. Consequently, our optimizations are
+with each explained in Tbl. IV. We also compare VQ-LLM                 more effective for the attention kernel with large batch sizes.
+with SOTA element-wise quantization methods under the same                Moreover, Llama-65B achieves almost identical speedup to
+equivalent 4-bit width, including AWQ [30] for GeMM/GeMV               Llama-7B, except in the Attention (Decode) scenario with a
+and QoQ for Attention [31], all integrated into qServe [31].           1k sequence length and a single batch. This identical speedup
+For FP16, we use cutlass [42] and flash-attn [8].                      occurs because the operators in the larger model can be
+   In practice, LLM inference involves various operators be-           trivially assembled using those from the smaller ones. We can
+yond GeMM/GeMV and Attention, such as RMSNorm [66],                    readily double the launched thread blocks when we double the
+SiLU [14], and RoPE [53], etc. Therefore, it is crucial to             hidden dimension, demonstrating the good scalability of our
+evaluate the end-to-end speedup that accounts for all operators.       optimizations. The sole exception arises because, in Llama-
+For the end-to-end evaluation, we set a batch size of 16 and           7B, the baseline cannot fully utilize the hardware due to an
+a sequence length of 1024, measuring the total latency for             insufficient number of thread blocks for a 1k sequence length
+generating 256 tokens. We also assess accuracy using the arc-          single batch. In contrast, for Llama-65B, the baseline fully
+challenge task [5], applying the QuiP#-4 and CQ-4 algorithms           occupies the hardware, resulting in better performance and
+for quantizing the weights and KV-Cache, respectively. To              reducing the relative speedup of our system.
+obtain the final accuracy results, we integrate these algorithms
+into the LMEval framework [16].                                        C. Speedup Breakdown
+                                                                          We first analyze the speedup breakdown of GeMM and
+B. Overall Speedup                                                     GeMV, as depicted in Fig. 14. Tbl. V enumerates several
+  As shown in Fig. 13, VQ-LLM reduces the latency by                   factors that influence optimization effects, facilitating our
+an average of 46.13% (53.73% at most), corresponding to a              analysis. For QuiP#-4, SC and O1 perform identically due
+speedup of 1.9× (2.2×) (BSx indicates the batch size of x).            to the small size of its codebook (i.e., 2 KB in Tbl. V).
+                                                                                                                                                                                                        Relative
+  Latency Latency
+
+0 50 00 50 0 1 2
+            (103us)
+
+
+
+
+                                                                                                                                                                                                        latency
+                                                                                                        Latency
+
+                                                                                                       0 20 40
+
+
+
+
+                                                                                                                                         0 50 00 50
+                                                                                                                                                                                                                   1
+
+
+
+
+                                                                                                                                                                                  0 00 00
+                                                                              1
+
+
+
+
+                                                                                                          (us)
+                                          0 00 00 0 1 2
+
+
+
+
+                                                                                                                                                               0 30 60
+                                                                                                                                                                                                                       CQ-2
+
+
+
+
+                                                                                                                                             1 1
+
+
+
+
+                                                                                                                                                                                   2 4
+                                                                                                                                                                                                                   0
+
+
+
+
+                                                                              0
+
+
+
+
+                                                                                                                                GC
+                                                                                                                                SC
+                                                                                                                                O1
+                                                                                                                                O2
+                                                                                                                                O3
+                                                                                                                                O4
+
+                                                                                                                                                      GC
+                                                                                                                                                      SC
+                                                                                                                                                      O1
+                                                                                                                                                      O2
+                                                                                                                                                      O3
+                                                                                                                                                      O4
+
+                                                                                                                                                                         GC
+                                                                                                                                                                         SC
+                                                                                                                                                                         O1
+                                                                                                                                                                         O2
+                                                                                                                                                                         O3
+                                                                                                                                                                         O4
+
+                                                                                                                                                                                            GC
+                                                                                                                                                                                            SC
+                                                                                                                                                                                            O1
+                                                                                                                                                                                            O2
+                                                                                                                                                                                            O3
+                                                                                                                                                                                            O4
+
+
+
+
+                                                                                                                                                                                                              1k S1
+                                                                                                                                                                                                              4k S8
+                                                                                                                                                                                                              4k S1
+                                                                                                                                                                                                                    8
+                              BS1   BS16
+
+
+
+
+                                                                                                                                                                                                                 BS
+                                                                                                                                                                                                                 B
+                                                                                                                                                                                                                 B
+                                                                                                                                                                                                                 B
+    (us)
+    1 1
+
+
+
+
+                                            1 2
+                                                                                                                                1k BS1                1k BS8             4k BS1             4k BS8
+
+
+
+
+                                                                                                                                                                                                              1k
+                                                                              50
+                                                                                                       Fig. 15. (left) Breakdown of optimizations of CQ-2 for Attention (Decode).
+
+
+
+
+                                                                              0
+                      GC SC O1 O2 O3 O4                   GC SC O1 O2 O3 O4        GC SC O1 O2 O3 O4
+                           QuiP#-4                             AQLM-3                  GPTVQ-2
+                                                                                                       (right) Relative latency of CQ-4 against CQ-2.
+
+Fig. 14. Breakdown of optimizations for GeMM (upper) and GeMV (lower).
+
+                                                                                                       area have a lesser impact on performance.
+                                                          TABLE V                                         For Attention (decode), VQ-LLM achieves similar im-
+                  FACTORS THAT INFLUENCE THE EFFECT OF OPTIMIZATIONS
+                                                                                                       provements with various sequence lengths and batches. SC
+                       Item           QuiP#-4                  AQLM-3         GPTVQ-2       CQ-2       significantly reduces performance due to CQ’s large codebook,
+                                                                                                       necessitating the use of O1 for achieving high performance.
+       Codebook/block                      2 KB                 128 KB    32 KB            64 KB
+      #Entry freq> µ+3σ                     1-3                  15-30     <1                <1        O2 offers only a slight improvement because few entries
+       Output size/block                                     32 KB/<1 KB*                  1-4 KB      are accessed very frequently, mirroring situations in QuiP#-
+           #Shuffle                          3/7*                 3/7*     1/3                3        4 and GPTVQ-2. O3 significantly enhances performance by
+                                                    *GeMM/GeMV                                         eliminating considerable duplicated traffic in the original com-
+                                                                                                       putation dataflow. O4 provides a minor improvement, for
+                                                                                                       reasons similar to those for O4 in GeMV. Additionally, we
+AQLM-3 and GPTVQ-2 exhibit noticeable improvements,
+                                                                                                       illustrate the latency of CQ-4 relative to CQ-2 in the right
+attributed to their larger codebooks. Additionally, for GeMV,
+                                                                                                       part of Fig. 15. Our proposed optimizations achieve a similar
+SC has a significantly negative impact on AQLM-3, due to its
+                                                                                                       speedup to CQ-2, so we omit the detailed results to save space.
+large codebook (i.e., 128 KB in Tbl. V), which restricts the
+parallelization of memory-bound computations.                                                          D. FP16 and Element-wise Quantization Comparison
+   O2 delivers the most improvement in AQLM-3; we find that
+                                                                                                          We now compare the latency of our optimized VQ kernels
+frequencies of 15-30 entries exceed µ+3σ, and O2’s register-
+                                                                                                       against FP16 and element-wise quantization works. Under the
+level caching optimization effectively reduces bank conflicts
+                                                                                                       same equivalent bit width, the latency of kernels with the
+when accessing these entries. Conversely, the remaining two
+                                                                                                       element-wise quantization is the theoretical upper bound of
+configurations QuiP#-4 and GPTVQ-2 exhibit far fewer entries
+                                                                                                       VQ kernels if using the same computation dataflow. As such,
+exceeding µ+3σ, indicating the less optimization opportunity
+                                                                                                       this comparison further verifies the effectiveness of our work.
+of register-level caching and hence marginal improvements.
+                                                                                                          As shown in Fig. 16, at 4-bit encoding, our work achieves
+   O3 affects GeMM and GeMV differently. In GeMM, O3
+                                                                                                       latencies comparable to (1.01× for Attention (Decode)), or
+introduces negative effects due to a large output size. Fur-
+                                                                                                       even lower than (0.88×/0.96× for GeMV/GeMM), those of
+thermore, multiple residuals in QuiP#-4 configuration lead to
+                                                                                                       AWQ [30] and QoQ [31]. This reduction in latency likely
+redundant computations for O3, causing significantly increased
+                                                                                                       results from our co-designed computational dataflow. These re-
+latency in GeMM. In contrast, for AQLM-3, its misaligned
+                                                                                                       sults suggest that our implementation is as viable as AWQ and
+12-bit indices result in costly unpacking and decoding. It
+                                                                                                       QoQ, and therefore comparable to qServe [31]. Moreover, VQ
+leads to low compute pipeline utilization, and hence is more
+                                                                                                       kernels can deliver better accuracies at the same bit-width. The
+tolerant to redundant computations. In GeMV, the output size
+                                                                                                       open-source implementations of QuiP# [56] and AQLM [12]
+is much smaller and the computation is lighter compared to
+                                                                                                       are impractical for real-world applications, exhibiting 2.83× to
+GeMM. The smaller output size results in minimal global
+                                                                                                       114.4× latencies. Our work successfully translates theoretical
+reduction overhead, and the lighter computation introduces
+                                                                                                       algorithmic improvements into practical applications.
+less computational overhead than in GeMM. These factors
+                                                                                                          We would like to explain that in Fig. 16, while both our
+make O3 more advantageous for GeMV.
+                                                                                                       approach and element-wise quantization methods outperform
+   O4 significantly enhances GeMM’s performance. This im-
+                                                                                                       the cutlass-FP16 baseline in GeMV and Attention kernels, both
+provement primarily stems from GeMM’s utilization of mma
+                                                                                                       underperform relative to the cutlass-FP16 baseline in GeMM
+instructions, which require a layout of 2 and can be satisfied
+                                                                                                       kernels. This underperformance is due to the complex tiling
+through one to three shuffling instructions. Additionally, O4
+conserves a substantial amount of shared memory, which is
+crucial as GeMM typically consumes a large shared memory,                                                                                                                                      *: Open source impl.
+                                                                                                        Relative latency
+
+
+
+
+                                                                                                                                AWQ-4bit              QoQ-4bit (All from qServe)
+thus yielding a significant positive impact. Conversely, GeMV                                                              10
+                                                                                                                                  114×                  GeMM                                 GeMV         Attention
+requires element-wise reduction, resulting in QuiP#-4 and                                                                                                                                    BS16          BS1 1k
+                                                                                                                            1
+AQLM-3, with a vector size of 8, requiring a greater number
+                                                                                                                       0.1
+of shuffling instructions. This leads to a slowdown in these
+                                                                                                                                 LM *
+                                                                                                                              tla -4*
+                                                                                                                             Q -16
+
+                                                                                                                             PT -4
+                                                                                                                                     -2
+
+
+
+                                                                                                                                 LM *
+                                                                                                                              tla -4*
+                                                                                                                             Q -16
+
+                                                                                                                             PT -4
+                                                                                                                                     -2
+
+
+
+                                                                                                                                                                                                             6
+                                                                                                                                                                                                           -4
+                                                                                                                                                                                                           -2
+                                                                                                                            AQ #-4
+
+
+
+
+                                                                                                                            AQ #-4
+
+
+
+
+                                                                                                                                                                                                          -1
+                                                                                                                           G P#
+                                                                                                                                  VQ
+
+
+
+
+                                                                                                                           G P#
+                                                                                                                                  VQ
+
+
+
+
+                                                                                                                                                                                                          Q
+                                                                                                                                                                                                          Q
+
+
+
+
+configurations. However, for GPTVQ-2 with a vector size of
+                                                                                                                                  ss
+
+
+
+
+                                                                                                                                  ss
+
+
+
+
+                                                                                                                                                                                                     sh
+
+                                                                                                                                                                                                            C
+                                                                                                                                                                                                        C
+                                                                                                                                  P
+
+
+
+
+                                                                                                                                  P
+                                                                                                                                ui
+
+
+
+
+                                                                                                                                ui
+                                                                                                                               ui
+
+
+
+
+                                                                                                                               ui
+
+
+
+
+                                                                                                                                                                                                    a
+                                                                                                                                                                                                 Fl
+                                                                                                                            Q
+
+
+
+
+                                                                                                                            Q
+                                                                                                                           cu
+
+
+
+
+                                                                                                                           cu
+
+
+
+
+4, a slight improvement is still observed. Furthermore, since
+GeMV typically uses minimal shared memory, savings in this                                                                  Fig. 16. Latency comparing to element-wise quantization works.
+           3
+
+
+
+
+                                                                                                Relative latency
+Speedup
+                                                                                                                         Seq_len = 1k        Seq_len = 2k      Seq_len = 4k
+
+
+
+
+                                                       arc-challenge
+                                                                   46% FP16    VQ-LLM (4 bit)
+
+
+
+
+                                                                                                  to VQ-LLM
+           2
+  E2E
+
+
+
+
+                                                         Accuracy
+                                                                                                                   BS1                              BS8
+                                           FP16
+
+
+
+
+                                                                                                  01234
+           1                                                       45%
+           0
+                                                                   44%
+                    t)
+
+
+                              t)
+
+
+                                                  t)
+
+
+                                           A4 t)
+                                                                               qServe (4 bit)
+                bi
+
+
+                          bi
+
+
+                                               bi
+
+
+                                          a bi
+
+
+
+
+                                                                                                                      od sh
+
+
+
+                                                                                                                      od sh
+
+
+
+                                                                                                                                      nt sh
+
+
+
+                                                                                                                                      nt sh
+
+
+
+
+                                                                                                                                                      od sh
+
+
+
+                                                                                                                                                      od sh
+
+
+
+                                                                                                                                                                   nt sh
+
+
+
+                                                                                                                                                                   nt sh
+                                              0
+               (4
+
+
+                         (4
+
+
+                                            (2
+
+
+                                             4
+
+
+
+
+                                                                                                                    ec Fla
+
+
+
+                                                                                                                    ec la
+
+
+
+                                                                                                                                    te la
+
+
+
+                                                                                                                                    te la
+
+
+
+                                                                                                                                                    ec Fla
+
+
+
+                                                                                                                                                    ec la
+
+
+
+                                                                                                                                                                 te la
+
+
+
+                                                                                                                                                                 te la
+                                                                                                                           g
+
+
+
+                                                                                                                           g
+
+
+
+                                                                                                                                           n
+
+
+
+                                                                                                                                           n
+
+
+
+                                                                                                                                                  Pa ing
+
+
+
+                                                                                                                                                           g
+
+
+
+                                                                                                                                                                        n
+
+
+
+                                                                                                                                                                        n
+                                    Te (
+
+
+
+
+                                                                                                                        in
+
+
+
+                                                                                                                        in
+
+
+
+                                                                                                                                        io
+
+
+
+                                                                                                                                        io
+
+
+
+
+                                                                                                                                                        in
+
+
+
+                                                                                                                                                                     io
+
+
+
+                                                                                                                                                                     io
+                                                                                                                   D dF
+
+
+
+                                                                                                                                  At F
+
+
+
+                                                                                                                                  At F
+
+
+
+
+                                                                                                                                                  D dF
+
+
+
+                                                                                                                                                               At F
+
+
+
+                                                                                                                                                               At d F
+                                                                         1              2
+          ve
+
+                    LM
+
+
+                              LM
+
+
+                                   @ LLM
+
+
+
+
+                                                                                                                                      d
+                                       sl
+
+
+
+
+                                                                                                                     ge
+
+
+
+
+                                                                                                                                   ge
+
+
+
+
+                                                                                                                                                     ge
+
+
+
+
+                                                                                                                                                                ge
+          er
+
+                 -L
+
+
+                           -L                                                 E2E Speedup
+
+
+
+
+                                                                                                                       Pa
+
+
+
+
+                                                                                                                                        Pa
+
+
+
+
+                                                                                                                                                                   Pa
+     qS
+
+
+
+
+                                     -
+
+
+
+
+                                                                                                                   D
+
+
+
+
+                                                                                                                                                  D
+               VQ
+
+
+                         VQ
+
+
+                                   VQ                                                           Fig. 18. Relative latency of various attention baselines against our best
+                                                                                                perform implementation of CQ-4.
+Fig. 17. (left) Overall speedup against FP16 and (right) accuracy of arc-
+challenge of SOTA element-wise quantization (qServe) and VQ-LLM.
+                                                                                                Attention, Paged Flash Attention and Paged Flash Decod-
+                                                                                                ing [7]–[9], [50]. As illustrated in Fig. 18, our work surpasses
+strategy employed by cutlass-FP16 GeMM, which could incor-                                      all these baselines, primarily due to a significantly reduced
+porate our method. However, we do not pursue this integration                                   KV cache memory footprint enabled by CQ-4. We achieved
+for two reasons. First, accelerating individual GeMM kernels                                    a 66.4% latency reduction compared to the best-performing
+offers minimal overall speedup for LLM inference, as these                                      FP16 baseline, with a 75% reduction in memory footprint,
+kernels are used in the prefilling stage (Sec. II-B). The de-                                   under the conditions of eight batches and a sequence length
+coding stage, which dominates LLM inference execution time,                                     of 4096. This indicates an effective transfer from theoretical
+has a greater impact on performance [64], as confirmed by our                                   benefit to practical application. Additionally, our work scales
+end-to-end evaluation results in the next subsection. Second,                                   effectively with increases in sequence length and batch size.
+modifying the cutlass code requires significant engineering                                        Quantization Overhead. For weight compression, no run-
+effort due to its intricate, template-based kernel design [22],                                 time quantization overhead is introduced. In KV cache com-
+[73]. Therefore, we leave this integration for future work.                                     pression, the runtime overhead of on-the-fly quantization for
+E. End-to-End (E2E) Result                                                                      the new key and value of a new token in the decode phase is
+                                                                                                negligible (<1 µs). During the prefill phase, quantizing the
+   We present the end-to-end LLM inference improvements of                                      keys and values of all prompt tokens introduces less than
+various quantization methods compared to the FP16 baseline                                      a 10% overhead compared to linear projections. However,
+in Fig. 17 (left). In the equivalent 4-bit setting, VQ-LLM                                      the subsequent computation does not immediately require the
+achieves a speedup comparable to the state-of-the-art element-                                  quantized KV cache, rendering these overheads negligible.
+wise quantization method, qServe [31], with both providing
+approximately a 2.2× improvement over the FP16 baseline.                                                                           VIII. C ONCLUSIONS
+Additionally, VQ-LLM surpasses qServe in accuracy by about                                         In this work, we proposed VQ-LLM, an optimized code
+2.5% on the arc-challenge task [5], as shown in Fig. 17                                         generation framework for vector quantization (VQ), consisting
+(right). This result demonstrates VQ-LLM’s effectiveness in                                     of codebook cache and codebook based compute engine. With
+accelerating LLM inference. he RMSNorm, SiLU, and RoPE                                          which we achieve 46.13% latency reduction on average over
+operators together account for roughly 10% and 20% of total                                     unoptimized version and up-to 99% over open source imple-
+latency in the FP16 and 4-bit quantized versions, respectively.                                 mentations. For codebook cache, we propose a hierachical
+We also observe a greater speedup with a 2-bit compression                                      placement strategy to preserve hardware utilization and reduce
+ratio, further highlighting the potential of VQ, as previous                                    bank conflict. For compute engine, we propose codebook cen-
+research suggests that 2-bit quantization can maintain practical                                tric dataflow and fusion scheme to reduce excessive off-chip
+accuracy. Additionally, we evaluate the performance of VQ-                                      and on-chip traffic. All proposed optimizations are configured
+LLM in a 4-bit setting on the Tesla A40 GPU, which provides                                     adaptively via several heuristics. Finally we demostrate effec-
+67% of the memory bandwidth of the RTX 4090 [39]. Inter-                                        tiveness and viability of VQ-LLM comparing to un-optimized
+estingly, the Tesla A40 demonstrates a greater speedup than                                     implementations and element-wise quantization works.
+the RTX 4090, suggesting that VQ-LLM is more effective in
+bandwidth-constrained environments. In summary, VQ-LLM                                                                        IX. ACKNOWLEDGEMENTS
+offers improved accuracy with comparable latency to element-                                       This work was supported by the National Key R&D
+wise quantization, and vice versa. In terms of memory usage,                                    Program of China under Grant 2022YFB4501400, the Na-
+the FP16 baseline consumes over 22 GB, whereas qServe-4                                         tional Natural Science Foundation of China (NSFC) grant
+and VQ-LLM-4 use less than 6 GB of GPU memory, aligning                                         (62222210, 62072297 and U21B2017). This work was also
+closely with theoretical estimates [65].                                                        supported by Shanghai Qi Zhi Institute Innovation Program
+                                                                                                SQZ202316. We would like to thank the anonymous reviewers
+F. Additional Discussion                                                                        for their constructive feedback and comments to improve this
+   Different Types of Attention. The aforementioned details                                     work. Special thanks to Vega Jiang for continuous help and
+about Attention (Decode) are based on using Flash Decod-                                        support. Yuhao Zhu was not financially supported by the
+ing [10] as our baseline dataflow. We also evaluate the speedup                                 awards acknowledged by the other author(s) of this publica-
+of our work against various attention baselines, including Flash                                tion.
+                              R EFERENCES                                         [21] C. Guo, R. Zhang, J. Xu, J. Leng, Z. Liu, Z. Huang, M. Guo, H. Wu,
+                                                                                       S. Zhao, J. Zhao, and K. Zhang, “Gmlake: Efficient and transparent
+ [1] “Ieee standard for floating-point arithmetic,” IEEE Std 754-2019 (Revi-           GPU memory defragmentation for large-scale DNN training with virtual
+     sion of IEEE 754-2008), pp. 1–84, 2019.                                           memory stitching,” in Proceedings of the 29th ACM International
+ [2] E. Agrell and B. Allen, “On the best lattice quantizers,” IEEE Trans.             Conference on Architectural Support for Programming Languages and
+     Inf. Theory, vol. 69, no. 12, pp. 7650–7658, 2023.                                Operating Systems, Volume 2, ASPLOS 2024, La Jolla, CA, USA, 27
+ [3] AMD,        “Amd      cdna     architecture:     The     all-new      amd         April 2024- 1 May 2024. ACM, 2024, pp. 450–466.
+     gpu architecture for the modern era of hpc & ai,”                            [22] B. Hagedorn, B. Fan, H. Chen, C. Cecka, M. Garland, and V. Grover,
+     https://www.amd.com/content/dam/amd/en/documents/instinct-business-               “Graphene: An IR for optimized tensor computations on gpus,” in
+     docs/white-papers/amd-cdna-white-paper.pdf, 2020.                                 Proceedings of the 28th ACM International Conference on Architectural
+ [4] A. Babenko and V. S. Lempitsky, “Additive quantization for extreme                Support for Programming Languages and Operating Systems, Volume 3,
+     vector compression,” in 2014 IEEE Conference on Computer Vision and               ASPLOS 2023, Vancouver, BC, Canada, March 25-29, 2023. ACM,
+     Pattern Recognition, CVPR 2014, Columbus, OH, USA, June 23-28,                    2023, pp. 302–313.
+     2014. IEEE Computer Society, 2014, pp. 931–938.                              [23] P. Haghani, S. Michel, P. Cudré-Mauroux, and K. Aberer, “LSH at large
+ [5] S. Bhakthavatsalam, D. Khashabi, T. Khot, B. D. Mishra, K. Richardson,            - distributed KNN search in high dimensions,” in 11th International
+     A. Sabharwal, C. Schoenick, O. Tafjord, and P. Clark, “Think you have             Workshop on the Web and Databases, WebDB 2008, Vancouver, BC,
+     solved direct-answer question answering? try arc-da, the direct-answer            Canada, June 13, 2008, 2008.
+     AI2 reasoning challenge,” CoRR, vol. abs/2102.03315, 2021.                   [24] C. Hooper, S. Kim, H. Mohammadzadeh, M. W. Mahoney, Y. S.
+ [6] T. Chen, T. Moreau, Z. Jiang, L. Zheng, E. Q. Yan, H. Shen, M. Cowan,             Shao, K. Keutzer, and A. Gholami, “Kvquant: Towards 10 million
+     L. Wang, Y. Hu, L. Ceze, C. Guestrin, and A. Krishnamurthy, “TVM:                 context length LLM inference with KV cache quantization,” CoRR, vol.
+     an automated end-to-end optimizing compiler for deep learning,”                   abs/2401.18079, 2024.
+     in 13th USENIX Symposium on Operating Systems Design and                     [25] H. Jégou, M. Douze, and C. Schmid, “Product quantization for nearest
+     Implementation, OSDI 2018, Carlsbad, CA, USA, October 8-10,                       neighbor search,” IEEE Trans. Pattern Anal. Mach. Intell., vol. 33, no. 1,
+     2018. USENIX Association, 2018, pp. 578–594. [Online]. Available:                 pp. 117–128, 2011.
+     https://www.usenix.org/conference/osdi18/presentation/chen                   [26] B. Kövesi, J. Boucher, and S. Saoudi, “Stochastic k-means algorithm
+ [7] T. Dao, “Flashattention-2: Faster attention with better parallelism and           for vector quantization,” Pattern Recognit. Lett., vol. 22, no. 6/7, pp.
+     work partitioning,” CoRR, vol. abs/2307.08691, 2023.                              603–610, 2001.
+ [8] ——, “flash-attention,” 2024. [Online]. Available: https://github.com/        [27] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. Yu,
+     Dao-AILab/flash-attention                                                         J. Gonzalez, H. Zhang, and I. Stoica, “vllm: Easy, fast, and
+ [9] T. Dao, D. Y. Fu, S. Ermon, A. Rudra, and C. Ré, “Flashattention: Fast           cheap llm serving with pagedattention,” 2024. [Online]. Available:
+     and memory-efficient exact attention with io-awareness,” in Advances              https://blog.vllm.ai/2023/06/20/vllm.html
+     in Neural Information Processing Systems 35: Annual Conference on            [28] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. Gonzalez,
+     Neural Information Processing Systems 2022, NeurIPS 2022, New                     H. Zhang, and I. Stoica, “Efficient memory management for large
+     Orleans, LA, USA, November 28 - December 9, 2022, 2022.                           language model serving with pagedattention,” in Proceedings of the
+[10] T. Dao, D. Haziza, F. Massa, and G. Sizov, “Flash-decoding for                    29th Symposium on Operating Systems Principles, SOSP 2023, Koblenz,
+     long-context inference,” 2023. [Online]. Available: https://crfm.stanford.        Germany, October 23-26, 2023. ACM, 2023, pp. 611–626.
+     edu/2023/10/12/flashdecoding.html                                            [29] Y. Lee, H. Choi, S. Min, H. Lee, S. Beak, D. Jeong, J. W. Lee, and T. J.
+[11] M. DouzeIR, “Faiss the index factory,” 2024. [Online]. Available:                 Ham, “ANNA: specialized architecture for approximate nearest neighbor
+     https://github.com/facebookresearch/faiss/wiki/The-index-factory                  search,” in IEEE International Symposium on High-Performance Com-
+[12] V. Egiazarian, A. Panferov, D. Kuznedelev, E. Frantar, A. Babenko, and            puter Architecture, HPCA 2022, Seoul, South Korea, April 2-6, 2022.
+     D. Alistarh, “Extreme compression of large language models via additive           IEEE, 2022, pp. 169–183.
+     quantization,” CoRR, vol. abs/2401.06118, 2024.                              [30] J. Lin, J. Tang, H. Tang, S. Yang, W. Chen, W. Wang, G. Xiao, X. Dang,
+[13] ——, “Official pytorch repository for extreme compression of large                 C. Gan, and S. Han, “AWQ: activation-aware weight quantization for
+     language models via additive quantization,” 2024. [Online]. Available:            on-device LLM compression and acceleration,” in Proceedings of the
+     https://github.com/vahe1994/AQLM                                                  Seventh Annual Conference on Machine Learning and Systems, MLSys
+[14] S. Elfwing, E. Uchibe, and K. Doya, “Sigmoid-weighted linear units                2024, Santa Clara, CA, USA, May 13-16, 2024. mlsys.org, 2024.
+     for neural network function approximation in reinforcement learning,”        [31] Y. Lin, H. Tang, S. Yang, Z. Zhang, G. Xiao, C. Gan, and S. Han,
+     Neural Networks, vol. 107, pp. 3–11, 2018.                                        “Qserve: W4A8KV4 quantization and system co-design for efficient
+[15] E. Frantar, S. Ashkboos, T. Hoefler, and D. Alistarh, “GPTQ: accu-                LLM serving,” CoRR, vol. abs/2405.04532, 2024.
+     rate post-training quantization for generative pre-trained transformers,”    [32] S. Liu, H. Lu, and J. Shao, “Improved residual vector quantization
+     CoRR, vol. abs/2210.17323, 2022.                                                  for high-dimensional approximate nearest neighbor search,” CoRR, vol.
+[16] L. Gao, J. Tow, B. Abbasi, S. Biderman, S. Black, A. DiPofi, C. Foster,           abs/1509.05195, 2015.
+     L. Golding, J. Hsu, A. Le Noac’h, H. Li, K. McDonell, N. Muen-               [33] Z. Liu, J. Leng, Z. Zhang, Q. Chen, C. Li, and M. Guo, “VELTAIR: to-
+     nighoff, C. Ociepa, J. Phang, L. Reynolds, H. Schoelkopf, A. Skowron,             wards high-performance multi-tenant deep learning services via adaptive
+     L. Sutawika, E. Tang, A. Thite, B. Wang, K. Wang, and A. Zou, “A                  compilation and scheduling,” in ASPLOS ’22: 27th ACM International
+     framework for few-shot language model evaluation,” 07 2024.                       Conference on Architectural Support for Programming Languages and
+[17] T. Ge, K. He, Q. Ke, and J. Sun, “Optimized product quantization,”                Operating Systems, Lausanne, Switzerland, 28 February 2022 - 4 March
+     IEEE Trans. Pattern Anal. Mach. Intell., vol. 36, no. 4, pp. 744–755,             2022, B. Falsafi, M. Ferdman, S. Lu, and T. F. Wenisch, Eds. ACM,
+     2014.                                                                             2022, pp. 388–401.
+[18] C. Guo, Y. Qiu, J. Leng, X. Gao, C. Zhang, Y. Liu, F. Yang, Y. Zhu,          [34] Z. Liu, W. Ni, J. Leng, Y. Feng, C. Guo, Q. Chen, C. Li, M. Guo,
+     and M. Guo, “Squant: On-the-fly data-free quantization via diagonal               and Y. Zhu, “JUNO: optimizing high-dimensional approximate nearest
+     hessian approximation,” in The Tenth International Conference on                  neighbour search with sparsity-aware algorithm and ray-tracing core
+     Learning Representations, ICLR 2022, Virtual Event, April 25-29, 2022.            mapping,” in Proceedings of the 29th ACM International Conference
+     OpenReview.net, 2022.                                                             on Architectural Support for Programming Languages and Operating
+[19] C. Guo, J. Tang, W. Hu, J. Leng, C. Zhang, F. Yang, Y. Liu, M. Guo,               Systems, Volume 2, ASPLOS 2024, La Jolla, CA, USA, 27 April 2024-
+     and Y. Zhu, “Olive: Accelerating large language models via hardware-              1 May 2024. ACM, 2024, pp. 549–565.
+     friendly outlier-victim pair quantization,” in Proceedings of the 50th       [35] G. Lu, R. Chen, Y. Wang, Y. Zhou, R. Zhang, Z. Hu, Y. Miao, Z. Cai,
+     Annual International Symposium on Computer Architecture, ISCA 2023,               L. Li, J. Leng, and M. Guo, “Distsim: A performance model of large-
+     Orlando, FL, USA, June 17-21, 2023. ACM, 2023, pp. 3:1–3:15.                      scale hybrid distributed DNN training,” in Proceedings of the 20th ACM
+[20] C. Guo, C. Zhang, J. Leng, Z. Liu, F. Yang, Y. Liu, M. Guo, and Y. Zhu,           International Conference on Computing Frontiers, CF 2023, Bologna,
+     “ANT: exploiting adaptive numerical data type for low-bit deep neural             Italy, May 9-11, 2023. ACM, 2023, pp. 112–122.
+     network quantization,” in 55th IEEE/ACM International Symposium on           [36] Z. Ma, Y. Tan, H. Jiang, Z. Yan, D. Liu, X. Chen, Q. Zhuge, E. H. Sha,
+     Microarchitecture, MICRO 2022, Chicago, IL, USA, October 1-5, 2022.               and C. Wang, “Unified-tp: A unified TLB and page table cache structure
+     IEEE, 2022, pp. 1414–1433.                                                        for efficient address translation,” in 38th IEEE International Conference
+     on Computer Design, ICCD 2020, Hartford, CT, USA, October 18-21,             [57] M. van Baalen, A. Kuzmin, M. Nagel, P. Couperus, C. Bas-
+     2020. IEEE, 2020, pp. 255–262.                                                    toul, E. Mahurin, T. Blankevoort, and P. N. Whatmough, “GPTVQ:
+[37] E. Mata, S. Bandeira, P. S. G. de Mattos Neto, W. T. A. Lopes, and                the blessing of dimensionality for LLM quantization,” CoRR, vol.
+     F. Madeiro, “Accelerating families of Fuzzy K-Means algorithms for                abs/2402.15319, 2024.
+     vector quantization codebook design,” Sensors, vol. 16, no. 11, p. 1963,     [58] A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez,
+     2016.                                                                             L. Kaiser, and I. Polosukhin, “Attention is all you need,” in Advances
+[38] D. Narayanan, M. Shoeybi, J. Casper, P. LeGresley, M. Patwary,                    in Neural Information Processing Systems 30: Annual Conference on
+     V. Korthikanti, D. Vainbrand, P. Kashinkunti, J. Bernauer, B. Catan-              Neural Information Processing Systems 2017, December 4-9, 2017, Long
+     zaro, A. Phanishayee, and M. Zaharia, “Efficient large-scale language             Beach, CA, USA, 2017, pp. 5998–6008.
+     model training on GPU clusters using megatron-lm,” in International          [59] H. Wang, T. Sun, and Q. Yang, “CAT - caching address tags: A technique
+     Conference for High Performance Computing, Networking, Storage and                for reducing area cost of on-chip caches,” in Proceedings of the 22nd
+     Analysis, SC 2021, St. Louis, Missouri, USA, November 14-19, 2021.                Annual International Symposium on Computer Architecture, ISCA ’95,
+     ACM, 2021, p. 58.                                                                 Santa Margherita Ligure, Italy, June 22-24, 1995. ACM, 1995, pp.
+[39] NVIDIA,         “Nvidia      ampere       ga102    gpu      architecture,”        381–390.
+     https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-                 [60] S. Williams, A. Waterman, and D. A. Patterson, “Roofline: an insightful
+     architecture-whitepaper-v2.pdf, 2021.                                             visual performance model for multicore architectures,” Commun. ACM,
+[40] ——,          “Nvidia       h100      tensor     core      gpu       archi-        vol. 52, no. 4, pp. 65–76, 2009.
+     tecture,”                        https://www.advancedclustering.com/wp-      [61] C. Wolters, X. Yang, U. Schlichtmann, and T. Suzumura, “Memory is
+     content/uploads/2022/03/gtc22-whitepaper-hopper.pdf, 2022.                        all you need: An overview of compute-in-memory architectures for ac-
+[41] ——, “Cuda c++ programming guide,” 2024. [Online]. Available:                      celerating large language model inference,” CoRR, vol. abs/2406.08413,
+     https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html                  2024.
+[42] ——, “Cuda templates for linear algebra subroutines,” 2024. [Online].         [62] G. Xiao, J. Lin, M. Seznec, H. Wu, J. Demouth, and S. Han,
+     Available: https://github.com/NVIDIA/cutlass                                      “Smoothquant: Accurate and efficient post-training quantization for large
+[43] ——, “Nvidia ada craft the engineering marvel of the rtx 4090.” 2024.              language models,” in International Conference on Machine Learning,
+     [Online]. Available: https://images.nvidia.com/aem-dam/Solutions/                 ICML 2023, 23-29 July 2023, Honolulu, Hawaii, USA, ser. Proceedings
+     geforce/ada/ada-lovelace-architecture/nvidia-ada-gpu-craft.pdf                    of Machine Learning Research, vol. 202. PMLR, 2023, pp. 38 087–
+[44] ——, “Nvidia collective communications library (nccl),” 2024. [Online].            38 099.
+     Available: https://developer.nvidia.com/nccl                                 [63] D. Yang, S. Liu, R. Huang, J. Tian, C. Weng, and Y. Zou, “Hifi-codec:
+[45] ——, “Nvidia cuda warp shuffle functions,” 2024. [Online]. Avail-                  Group-residual vector quantization for high fidelity audio codec,” CoRR,
+     able:     https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.            vol. abs/2305.02765, 2023.
+     html#warp-shuffle-functions                                                  [64] L. Yu and J. Li, “Stateful large language model serving with pensieve,”
+[46] OpenAI, “GPT-4 technical report,” CoRR, vol. abs/2303.08774, 2023.                CoRR, vol. abs/2312.05516, 2023.
+[47] S. Rajbhandari, J. Rasley, O. Ruwase, and Y. He, “Zero: memory               [65] Z. Yuan, Y. Shang, Y. Zhou, Z. Dong, C. Xue, B. Wu, Z. Li, Q. Gu,
+     optimizations toward training trillion parameter models,” in Proceedings          Y. J. Lee, Y. Yan, B. Chen, G. Sun, and K. Keutzer, “Llm inference
+     of the International Conference for High Performance Computing,                   unveiled: Survey and roofline model insights,” 2024.
+     Networking, Storage and Analysis, SC 2020, Virtual Event / Atlanta,          [66] B. Zhang and R. Sennrich, “Root mean square layer normalization,”
+     Georgia, USA, November 9-19, 2020. IEEE/ACM, 2020, p. 20.                         in Advances in Neural Information Processing Systems 32: Annual
+[48] K. A. Ross, Elementary Analysis: The Theory of Calculus. Springer                 Conference on Neural Information Processing Systems 2019, NeurIPS
+     New York, NY, 2013.                                                               2019, December 8-14, 2019, Vancouver, BC, Canada, 2019, pp. 12 360–
+[49] B. D. Rouhani, R. Zhao, A. More, M. Hall, A. Khodamoradi, S. Deng,                12 371.
+     D. Choudhary, M. Cornea, E. Dellinger, K. Denolf, D. Stosic, V. Elango,      [67] H. Zhang, X. Ji, Y. Chen, F. Fu, X. Miao, X. Nie, W. Chen, and
+     M. Golub, A. Heinecke, P. James-Roxby, D. Jani, G. Kolhe, M. Lang-                B. Cui, “Pqcache: Product quantization-based kvcache for long context
+     hammer, A. Li, L. Melnick, M. Mesmakhosroshahi, A. Rodriguez,                     llm inference,” CoRR, vol. abs/2407.12820, 2024.
+     M. Schulte, R. Shafipour, L. Shao, M. Y. Siu, P. Dubey, P. Micikevicius,     [68] S. Zhang, S. Roller, N. Goyal, M. Artetxe, M. Chen, S. Chen, C. Dewan,
+     M. Naumov, C. Verilli, R. Wittig, D. Burger, and E. S. Chung, “Mi-                M. T. Diab, X. Li, X. V. Lin, T. Mihaylov, M. Ott, S. Shleifer, K. Shuster,
+     croscaling data formats for deep learning,” CoRR, vol. abs/2310.10537,            D. Simig, P. S. Koura, A. Sridhar, T. Wang, and L. Zettlemoyer,
+     2023.                                                                             “OPT: open pre-trained transformer language models,” CoRR, vol.
+[50] J. Shah, G. Bikshandi, Y. Zhang, V. Thakkar, P. Ramani, and T. Dao,               abs/2205.01068, 2022.
+     “Flashattention-3: Fast and accurate attention with asynchrony and low-      [69] T. Zhang, J. Yi, Z. Xu, and A. Shrivastava, “KV cache is 1 bit
+     precision,” CoRR, vol. abs/2407.08608, 2024.                                      per channel: Efficient large language model inference with coupled
+[51] W. Shao, M. Chen, Z. Zhang, P. Xu, L. Zhao, Z. Li, K. Zhang,                      quantization,” CoRR, vol. abs/2405.03917, 2024.
+     P. Gao, Y. Qiao, and P. Luo, “Omniquant: Omnidirectionally calibrated        [70] L. Zheng, Z. Li, H. Zhang, Y. Zhuang, Z. Chen, Y. Huang, Y. Wang,
+     quantization for large language models,” CoRR, vol. abs/2308.13137,               Y. Xu, D. Zhuo, E. P. Xing, J. E. Gonzalez, and I. Stoica, “Alpa:
+     2023.                                                                             Automating inter- and intra-operator parallelism for distributed deep
+[52] G. Shobaki, A. Kerbow, and S. Mekhanoshin, “Optimizing occupancy                  learning,” in 16th USENIX Symposium on Operating Systems Design
+     and ILP on the GPU using a combinatorial approach,” in CGO ’20:                   and Implementation, OSDI 2022, Carlsbad, CA, USA, July 11-13,
+     18th ACM/IEEE International Symposium on Code Generation and                      2022. USENIX Association, 2022, pp. 559–578. [Online]. Available:
+     Optimization, San Diego, CA, USA, February, 2020. ACM, 2020, pp.                  https://www.usenix.org/conference/osdi22/presentation/zheng-lianmin
+     133–144.                                                                     [71] L. Zheng, L. Yin, Z. Xie, J. Huang, C. Sun, C. H. Yu, S. Cao,
+[53] J. Su, M. H. M. Ahmed, Y. Lu, S. Pan, W. Bo, and Y. Liu, “Roformer:               C. Kozyrakis, I. Stoica, J. E. Gonzalez, C. W. Barrett, and Y. Sheng,
+     Enhanced transformer with rotary position embedding,” Neurocomput-                “Efficiently programming large language models using sglang,” CoRR,
+     ing, vol. 568, p. 127063, 2024.                                                   vol. abs/2312.07104, 2023.
+[54] M. Thread, “Mtt s4000: Empower large model ai with no limits,”               [72] S. Zheng, S. Chen, S. Gao, L. Jia, G. Sun, R. Wang, and Y. Liang,
+     https://en.mthreads.com/product/S4000, 2024.                                      “Tileflow: A framework for modeling fusion dataflow via tree-based
+[55] H. Touvron, T. Lavril, G. Izacard, X. Martinet, M. Lachaux, T. Lacroix,           analysis,” in Proceedings of the 56th Annual IEEE/ACM International
+     B. Rozière, N. Goyal, E. Hambro, F. Azhar, A. Rodriguez, A. Joulin,              Symposium on Microarchitecture, MICRO 2023, Toronto, ON, Canada,
+     E. Grave, and G. Lample, “Llama: Open and efficient foundation                    28 October 2023 - 1 November 2023. ACM, 2023, pp. 1271–1288.
+     language models,” CoRR, vol. abs/2302.13971, 2023.                           [73] Y. Zhou, M. Yang, C. Guo, J. Leng, Y. Liang, Q. Chen, M. Guo,
+[56] A. Tseng, J. Chee, Q. Sun, V. Kuleshov, and C. D. Sa, “Quip#:                     and Y. Zhu, “Characterizing and demystifying the implicit convolution
+     Even better LLM quantization with hadamard incoherence and lattice                algorithm on commercial matrix-multiplication accelerators,” in IEEE
+     codebooks,” CoRR, vol. abs/2402.04396, 2024.                                      International Symposium on Workload Characterization, IISWC 2021,
+                                                                                       Storrs, CT, USA, November 7-9, 2021. IEEE, 2021, pp. 214–225.
+

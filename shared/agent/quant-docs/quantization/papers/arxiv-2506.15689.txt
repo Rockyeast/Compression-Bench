@@ -1,0 +1,928 @@
+                                           BASE-Q: Bias and Asymmetric Scaling Enhanced
+                                          Rotational Quantization for Large Language Models
+
+
+                                                            Liulu He                                      Shenli Zheng
+                                                        Nanjing University                              Nanjing University
+                                                 602022230015@smail.nju.edu.cn                    shenlizhen@smail.nju.edu.cn
+arXiv:2506.15689v2 [cs.LG] 29 Aug 2025
+
+
+
+
+                                                           Kaiwei Sun                                      Yijiang Liu
+                                                        Nanjing University                              Nanjing University
+                                                 522024230057@smail.nju.edu.cn                    yijiangliu@smail.nju.edu.cn
+
+                                                           Yufei Zhao                                  Chongkang Tan
+                                                        Nanjing University                              Alibaba Group
+                                                  yufeizhao@smail.nju.edu.cn                    chongkangtan@antgroup.edu.cn
+
+                                                     Huanrui Yang                          Yuan Du                         Li Du
+                                                  University of Arizona                Nanjing University            Nanjing University
+                                               huanruiyang@arizona.edu                yuandu@nju.edu.cn              ldu@nju.edu.cn
+
+
+
+                                                                                      Abstract
+                                                  Rotations have become essential to state-of-the-art quantization pipelines for large
+                                                  language models (LLMs) by effectively smoothing outliers in weights and acti-
+                                                  vations. However, further optimizing the rotation parameters offers only limited
+                                                  performance gains and introduces significant training overhead: due to rotation
+                                                  parameter sharing, full-model must be loaded simultaneously to enable backpropa-
+                                                  gation, resulting in substantial memory consumption and limited practical utility. In
+                                                  this work, we identify two fundamental limitations of current rotational quantization
+                                                  methods: (i) rotation fails to align channel means, resulting in wider quantization
+                                                  bounds and increased rounding errors; and (ii) rotation makes the activation dis-
+                                                  tribution more Gaussian-like, increasing energy loss caused by clipping errors.
+                                                  To address these issues, we introduce BASE-Q, a simple yet powerful approach
+                                                  that combines bias correction and asymmetric scaling to effectively reduce round-
+                                                  ing and clipping errors. Furthermore, BASE-Q enables blockwise optimization,
+                                                  eliminating the need for memory-intensive full-model backpropagation. Extensive
+                                                  experiments on various LLMs and benchmarks demonstrate the effectiveness of
+                                                  BASE-Q, narrowing the accuracy gap to full-precision models by 50.5%, 42.9%,
+                                                  and 29.2% compared to QuaRot, SpinQuant, and OSTQuant, respectively. The
+                                                  code can be found at https://github.com/Heliulu/BASE-Q.
+
+
+                                         1   Introduction
+                                         Large language models (LLMs)[1, 2, 3, 4, 5] drive advances across diverse natural language tasks,
+                                         but their ever-increasing scales present significant challenges for efficient deployment, particularly
+                                         regarding inference latency and memory consumption. Low-precision quantization[6, 7, 8, 9] (e.g.,
+                                         4 bits or lower) is a crucial technique for mitigating these bottlenecks. However, aggressively
+                                         reducing numerical precision to such low bit-widths results in substantial accuracy degradation. A
+
+                                         Preprint. Under review.
+major challenge underlying this degradation is the presence of significant outliers in activations
+and weights[10, 11], which necessitates wider quantization ranges and consequently amplifies
+quantization error.
+To address the challenge of outliers in LLM quantization, linear equivalent transformations, such
+as scaling and rotation, have emerged. For instance, SmoothQuant[12] introduces channel-wise
+scaling to reduce activation variance, substantially smoothing distributions and delivering robust
+improvements in INT8 post-training quantization (PTQ) across various LLMs. Building on this
+direction, QuaRot[13] introduces Hadamard rotations as another form of equivalent transformation
+to redistribute outliers and reduce channel-wise disparities, leading to robust INT4 PTQ. Since
+RMSNorm in LLMs normalizes activation energy for every residual block, and this energy is
+preserved under rotation, the same rotation matrix can be shared across all blocks and fused into
+adjacent linear layers, incurring no additional computation.
+Building upon the effectiveness of fixed rotations like Hadamard, subsequent research (e.g.,
+SpinQuant[14], OSTQuant[15]) has investigated optimizing more complex, learnable rotations for
+enhanced performance. While these approaches may offer marginal gains, they implicitly highlight
+that fixed rotations do not resolve all quantization error sources. Crucially, optimizing these learnable
+rotations requires computationally and memory-intensive full-model optimization procedures, as the
+rotation matrix is shared by all blocks, making them significantly less practical than fixed-rotation
+approaches. Therefore, to advance rotation-based quantization without impractical overhead, it
+is essential to (i) identify the residual quantization errors after fixed rotation and (ii) propose
+efficient techniques to mitigate these errors without relying on full-model optimization.
+Motivated by these challenges, we conduct a detailed analysis of post-rotation quantization errors to
+identify the key bottlenecks in current rotation-based methods. Firstly, our analysis reveals that even
+after applying rotation, a dominant source of rounding error stems from the variance of channel-wise
+means. While further optimizing rotation parameters can partially mitigate this issue, the objectives
+of outlier suppression and channel mean alignment are inherently conflicting—especially when a
+single rotation is shared across all blocks. This conflict severely constrains the rotation’s ability
+to simultaneously achieve both goals, forcing suboptimal trade-offs. To address the problem, we
+fix the rotation matrix shared across all blocks instead of training it, and introduce a channel bias
+correction mechanism that effectively aligns channel means with negligible inference overhead
+and lightweight block-wise optimization. Secondly, we uncover the detrimental effect caused by
+dynamic activation clipping, which is commonly adopted to suppress outliers. Rotation transforms
+distributions into more compact, near-Gaussian shapes. Consequently, quantization clipping impacts
+a larger fraction of activation values, significantly reducing their total energy and fundamentally
+breaking the computational equivalence established by rotation. To address this, we introduce an
+asymmetric scaling strategy: by appropriately increasing the pre-quantization scaling factor, we
+preserve the activation energy after clipping.
+Our main contributions are:
+
+       • Theoretical Insight. We provide a systematic analysis that reveals key components of
+         quantization error after rotation, uncovering why existing approaches plateau and where
+         further optimization is possible.
+       • Efficient Blockwise Correction. We propose BASE-Q, a novel and practical quantization
+         framework that uses blockwise channel bias correction and asymmetric scaling under fixed
+         rotations, achieving significant performance enhancement without the expansive full-model
+         optimization.
+       • Extensive Empirical Validation. Extensive experiments on various LLMs and bench-
+         marks demonstrate the effectiveness of our BASE-Q, narrowing the accuracy gap to full-
+         precision models by 50.5%, 42.9%, and 29.2% compared to QuaRot[13], SpinQuant[14],
+         and OSTQuant[15], respectively.
+
+2   Related work
+Equivalent Transformations in LLM Quantization. Post-training quantization (PTQ) has attracted
+considerable attention for the efficient deployment of LLMs, but remains challenging due to frequent
+outliers in both activations and weights. AWQ[16] introduced channel-wise scaling for weight-only
+
+
+                                                   2
+PTQ, while SmoothQuant[12] tailored rescaling for activations and weights to suppress outlier
+effects and enable robust INT8 quantization. OmniQuant[17] extended this concept with learnable
+scaling coefficients for each submodule, allowing finer-grained adaptation across network components.
+AffineQuant[18] further generalized these ideas by employing learnable affine transformations to
+jointly align the mean and variance before quantization. Beyond scaling-based methods, QuIP[19, 20]
+first applied rotation transformations for weight-only PTQ. QuaRot[13] proposed applying Hadamard
+rotations to both activations and weights, making distributions more Gaussian and further suppressing
+outliers, thus simplifying the quantization process. DuQuant[21] employed rotation and permutation
+to more effectively eliminate outliers. SpinQuant[14] took this further by learning optimal rotation
+matrices from calibration data, achieving lower quantization errors at the cost of greater computational
+and memory requirements. OSTQuant[15] unified learnable rotations and scaling within a single
+framework, providing additional flexibility and consistently outperforming previous methods across
+various LLM benchmarks. FlatQuant[22] employed layer-wise learned online matrix transforms
+to improve quantized linears, at the cost of increased inference overhead and parameter count. Our
+theoretical insights enable BASE-Q to outperform previous rotational quantization baselines with
+only fixed rotation and no global optimizations.
+
+
+3     Error analysis of existing methods
+
+In this section, we theoretically analyze the errors derived by rotation-based quantization, specifically
+focusing on the Hadamard transformation. We begin by investigating the error reduction mechanism
+inherent in this transformation, deriving quantitative expressions for both rounding and clipping errors
+in Section 3.1. Subsequently, in Sections 3.2 and 3.3, we provide an in-depth analysis of these error
+sources, uncovering potential components that are amenable to further optimization and providing
+key insights for methodological improvements. Finally, drawing inspiration from OSTQuant[15],
+which demonstrates complementary effects of scaling and rotation, we interpret and substantiate this
+synergy through our error decomposition framework in Section 3.4.
+
+3.1   Quantization error analysis for Hadamard rotations
+
+The key challenge in the LLM quantization is the presence of extreme outliers in activation channels,
+which significantly increases the dynamic range and severely raises quantization difficulty. To clarify
+how Hadamard rotations mitigate this issue, consider a token activation x ∈ Rn with outlier values
+structured as follows:
+                                                 X
+                                       x =g+         ai δe i ,                                      (1)
+                                                   i∈O
+
+where g ∼ N (µ, δ 2 I) represents the “main mass” as a Gaussian component, and each outlier channel
+i ∈ O is modeled as a scaled one-hot vector of amplitude ai δ with ai ≫ 1 and |O| ≪ n. When an
+                                                                     1
+orthogonal Hadamard rotation H is applied (where each entry is ±n− 2 ), the transformed activation
+becomes:
+                                                   X
+                                      Hx = Hg +        ai δHe i .                               (2)
+                                                       i∈O
+
+Since Gaussian distributions are invariant under orthogonal transformations, the main mass Hg
+remains Gaussian. Critically, each outlier term ai δe i is now mapped to the i-th column of H , a
+dense vector whose√large amplitude ai δ is evenly spread across all channels, with each channel
+receiving only ai δ/ n. For large n, the per-channel impact of any outlier is significantly diminished;
+effectively, outliers are “absorbed” into the Gaussian bulk, yielding a distribution that is far more
+conducive to quantization.
+This mechanism extends beyond simple Gaussian activations to more general cases where acti-
+vations exhibit correlated structures or multiple modes (e.g., Gaussian mixtures or channel-wise
+mean/variance discrepancies). In such cases, applying a principal component transformation to
+diagonalize the covariance matrix, followed by a Hadamard rotation, further balances the marginal
+variances and minimizes the prominence of outliers:
+
+                                       x ′ = HU T (x − E[x ]),                                       (3)
+
+
+                                                   3
+where U is the principal component basis. To quantify the effect on quantization, consider uniform
+quantization with per-channel clipping:
+                                                x −z
+                          x q = Fclip (Fround (        ), 0, 2b − 1) ∗ s + z,                   (4)
+                                                  s
+where z and s denote the quantization lower bound and step size, respectively, and b is the target
+bit-width. The overall quantization error consists of two components:
+                                                                                    2
+                                                                                 s
+        • Rounding error, with expected ℓ2 energy per channel: E[∥εround ∥22 ] = 12 .
+        • Clipping error, defined by the mass outside quantization bounds: E[∥εclip ∥22 ] =
+          Rz                  R +∞
+           −∞
+              x2 P (x)dx + z+∆ x2 P (x)dx, where ∆ = s(2b − 1) and P (x) is the empirical
+          channel distribution.
+
+By dispersing outlier energy and compressing the activation dynamic range, Hadamard transforma-
+tions significantly reduce rounding errors by enabling smaller quantization steps s.
+
+3.2    Rounding errors from misaligned channel means
+
+
+
+
+      (a) Raw Activation      (b) Hadamard Rres          (c) Learned Rres     (d) Hadamard + Bias Corr.
+Figure 1: (a) Raw activation distribution of the first MLP block in Llama3-8B. (b) Hadamard
+rotation suppresses outliers but leaves residual inter-channel misalignment. (c) Learned rotations
+also fail to address this misalignment. (d) Our bias correction eliminates most inter-channel mean
+variability, thereby reducing V ar(µj ), which is the main rounding error component as formalized in
+Equations (5) and (6). More visualizations are in Appendix B.
+
+As shown in the previous section, the energy of the rounding error is proportional to the quantization
+scale, s = 2b∆−1 . As rotations gaussianize the activation distribution, the quantization range can
+be seen as being proportional to the standard deviation of activations, σ. Therefore, the expected
+rounding error satisfies:
+                                      E[∥εround ∥22 ] ∝ s2 ∝ σ 2 .                                  (5)
+                     2
+The total variance σ of the activations can be decomposed into two components:
+                                               n
+                                            1X 2
+                                     σ2 =        σ + V ar(µj ),                                     (6)
+                                            n j=1 j
+
+where σj2 and µj are the variance and mean of the j-th channel, respectively. The first term, the
+average channel variance, is invariant under orthogonal transformations and dictated by the data
+distribution. In contrast, the second term, V ar(µj ) —the variance of channel means—can remain
+substantial in LLMs that use RMSNorm, since this normalization does not enforce alignment across
+channel means. As shown in Figure 1, hadamard rotations are effective at attenuating outliers but
+leave the means of individual channels misaligned. Surprisingly, according to Equation (6), we
+found that V ar(µj ) causes up to 85% layer rounding error in Qwen2.5-3B (as shown in Figure 2;
+additional details for more models are provided in Appendix C).
+Ideally, optimizing rotation would bring all channel means into alignment, achieving V ar(µj ) = 0.
+In practice, however, the LLM shares a single rotation Rres across all transformer blocks, despite
+
+
+                                                   4
+block-wise variation in bias. The limited expressiveness of a global rotation makes it infeasible
+to simultaneously eliminate outliers and achieve mean alignment. As a result, globally learned
+rotations (e.g., SpinQuant) can only minimize V ar(µj ) in a least-loss sense but cannot completely
+remove this error from mean discrepancies. This motivates our explicit bias correction strategy,
+which precisely cancels the variance-of-means term post-rotation. Moreover, this approach supports
+blockwise optimization, avoiding the need for costly full-model optimization.
+
+3.3   Clipping eliminates non-negligible energy
+
+Orthogonal rotation, such as Hadamard transform, significantly alters the distribution of activations.
+While raw activations often exhibit a heavy-tailed distribution with sparse outliers, post-rotation
+activations approximate a Gaussian distribution. This transformation is critical: unlike heavy-tailed
+distributions where extreme values are rare, the Gaussian shape concentrates a larger proportion of
+activation energy towards the distribution tails. Consequently, applying a fixed clipping threshold
+removes a non-negligible amount of energy associated with values beyond the threshold.
+
+
+
+
+Figure 2: Misalignment causes Figure 3: (Left) MSE-optimal clipping on rotated activations
+up to 85% layer-wise rounding results in a 18.4% loss of layer’s input energy, (Right) which
+error in Qwen2.5-3B.          induces significant discrepancies in the layer output.
+Formally, consider activations x ∼ N (µ, σ 2 ) quantized to b = 4 bits (INT4), the minimum MSE-
+optimal clipping threshold is commonly found to be:
+                                                        x −θ
+           θ∗ = arg min E[∥x − θ − Fclip (Fround (                ), 0, 2b − 1)∥2 ] ≈ 2.2σ         (7)
+                    θ                                 2θ/(2b − 1)
+At this threshold, the proportion of the total activation energy contained within the clipped regions
+(i.e., the energy loss) can be quantified. For a zero-mean Gaussian, the expected L2 energy of the
+clipped values is approximately 18.4% of the total energy:
+                                   Z −2.2σ              Z +∞
+                   E[∥εclip ∥2 ] =         x2 P (x)dx +        x2 P (x)dx ≈ 18.4%,                 (8)
+                                 −∞                     +2.2σ
+
+where P (x) is the probability density function. 18.4% of the energy is non-negligible in the context
+of deep neural networks. When this clipping is applied layer by layer throughout a deep network,
+the accumulated energy loss becomes substantial. The empirical consequence of this breakdown
+is illustrated in Figure 3, where the distribution of the layer output significantly mismatches the
+original. Moreover, in practical LLM architectures, using globally or per-layer optimized clipping
+bounds cannot fully resolve this energy loss, as joint optimization across all layers is intractable.
+This limitation explains the observed diminishing returns of aggressive clipping in rotation-based
+quantization schemes, even with parameter tuning.
+To address this issue, we introduce asymmetric scaling for each activation quantization step, which
+restores the energy loss and maintains accurate signal magnitude, thereby improving both theoretical
+fidelity and empirical performance.
+
+3.4   Role of scaling in rotational quantization
+
+Combining scaling with orthogonal transformations (rotations) has been shown to be crucial for en-
+hancing quantization performance. Theoretically, the rounding noise introduced by quantization after
+rotation can be modeled as zero-mean uniform noise with variance determined by the quantization
+bin width, defined as:
+                                                   s s
+                                        ϵ ∼ U(− , ),                                             (9)
+                                                   2 2
+
+                                                  5
+where ϵ and s denote the rounding noise and quantization bin width, respectively. An orthogonal
+transform preserves the variance. Thus, the noise is equivalent to additive isotropic Gaussian noise in
+the original space, which becomes:
+                                                      s2
+                                           ϵ ∼ N (0, ).                                              (10)
+                                                      12
+Referring to the matrix multiplication of weights and activations in the specific layer, the layer output
+includes terms arising from error propagation:
+                            (w + ϵw ) · (a + ϵa ) = w · a + (w · ϵa + ϵw · a) + ϵw · ϵa ,            (11)
+where w, a are the original weights and activations, respectively, and ϵa , ϵw are the corresponding
+quantization errors.
+Introducing per-channel scaling factors s (for w) and 1/s (for a) allows balancing the propagated
+error energy between these terms. The total variance of the noisy product, dominated byw · ϵa and
+ϵw · a, is minimized when their variances are equal. By the arithmetic-geometric mean (AM-GM)
+inequality, the optimality is achieved if
+                                                          E[|w|2 ]
+                                                  s2 =             .                                 (12)
+                                                          E[|a|2 ]
+This choice of scaling enables optimal allocation of quantization noise energy, ensuring minimal loss
+in the presence of channel-wise variations and reinforcing the theoretical motivation for scaling in
+rotational quantization.
+
+4             BASE-Q
+As discussed in Sections 3.2 and 3.3, while rotation-based quantization methods effectively smooth
+outliers, they exhibit three notable limitations: (a) Channel-mean variance cannot be eliminated
+via rotation-only optimization, leading to a persistent rounding error term (as formalized in Equa-
+tions (5) and (6)). (b) Implementing flexible and optimal activation clipping schemes within standard
+rotation-based PTQ is challenging, resulting in cumulative energy loss across layers. (c) Optimizing
+full-network rotation parameters requires prohibitive GPU memory and computational resources,
+especially for large models. To address these issues, we propose BASE-Q (Bias and Asymmetric
+Scaling Enhanced Quantization), a lightweight yet powerful quantization framework that strength-
+ens rotation-based methods through two key innovations: explicit bias correction to fully remove
+channel mean variance, and asymmetric scaling to improve clipping and quantizer fit at each block.
+The blockwise optimization capability avoids the heavy cost and complexity of full-model rotation
+learning, thereby enabling efficiency and enhanced overall quantization performance.
+
+                             MHSA Block                                        MLP Block
+                                       softmax
+                              RoPE
+
+
+
+
+                                                                                   swish
+    RMSNorm
+
+
+
+
+                                                               RMSNorm
+                              RoPE
+
+
+
+
+                                                                  Unlearned       Learned       Online
+                       Activation     Weight     Kernel           Global Res     Intrablock   Hadamard
+                       Quantizer      Fusion     Fusion            Rotation       Rotation     Rotation
+
+
+Figure 4: An overview of BASE-Q, highlighting three key design features: (a) it incorporates channel-
+wise bias correction to reduce rounding error in activation quantization. (b) it applies asymmetric
+scaling to compensate for the loss of computational equivalence caused by the clipping; (c) it avoids
+learning Rres , thereby eliminating full model optimization. This mechanism matches the parameter
+count and hardware fusion efficiency of typical scaling strategies.
+
+
+Fundamental Rotation Settings. Figure 4 provides a schematic of our BASE-Q. The core op-
+timized transformations within each transformer block include the global shared residual rotation
+(Rres ), the blockwise value rotation (Rv ), and the online rotations (Rqk and Rdown ). Rres is
+
+
+                                                          6
+applied on the residual pathway, which can be fused into linear weights without extra inference
+overhead. Because the residual path connects all blocks, a single shared rotation is used throughout.
+As our method further removes channel mean variance and optimizes quantization for activations,
+it is preferable to set Rres to primarily optimize weight statistics. Following Section 3.1, we com-
+pute the PCA transform U across all related linear weights, and compose it with the Hadamard
+transformation:
+                                           Rres = U T H ,                                        (13)
+where U is derived from the covariance of all associated linear weights. Rv can be exactly fused
+layer-wise into linear parameters and supports independent, block-level optimization. We use
+PyTorch’s built-in Cayley orthogonal mapping for rotation learning, initialized as a Hadamard
+matrix. Rqk and Rdown require on-the-fly computation during inference. To reduce memory
+and computation overhead, we adopt Hadamard rotations, which have binary elements and can be
+efficiently implemented through fast algorithms. This setup matches the conventions of leading
+baselines such as QuaRot[13], SpinQuant[14], and OSTQuant[15].
+
+Bias Correction. To target the critical channel-mean variance term, we inject a learnable bias
+before activation quantization. After quantized inference and the corresponding linear projection, this
+bias is subtracted, yielding:
+                         y = Qw (WR) Qa ([R−1 x − b c ]) + WRb c + b                                    (14)
+                                                           | {z    }
+                                                                                    f used bias
+
+where WR denotes rotated weights and b is the usual layer bias. The learnable bias correction
+terms—including b cqkv , b co , b cup and b cdown , which incur negligible parameter overhead (less than
+0.1% of original model size), and are highly efficient to optimize.
+
+Asymmetric Scaling. For the O and Down linear layers, we introduce both global symmetric s and
+per-quantizer asymmetric scaling s a . Asymmetric scaling s a can adjusts the quantization range at
+inference time to better fit activation statistics and clipping needs:
+                     Y = Qw (WsR) Qa (s a R−1 s −1 x − b c ) + (WRb c + b)                              (15)
+
+Blockwise Optimization. Combining these techniques, our blockwise optimization strategy jointly
+optimizes Rv , b ci ,s j , s ai , and activation clipping threshold αi per block via minimizing the MSE
+between the floating-point and quantized outputs:
+                            argmin               Lmse (y F P , y Q ; Rv , b ci , s j , s ai , αi , θ)   (16)
+                        Rv ,b ci ,s j ,s a
+                                         i ,αk
+
+where y F P and y Q denote the reference and quantized outputs, and θ is the set of frozen model and
+rotation parameters. This framework achieves state-of-the-art quantization accuracy with negligible
+memory and compute overhead under quantization process.
+
+5   Experiment
+Models and Tasks. We evaluate our method on 12 open-source LLMs, spanning various
+sizes: Llama-2-7/13/70B[1], Llama-3-8/70B[3], Llama-3.1-8/70B, Llama-3.2-1/3B, and Qwen2.5-
+3/14/32B[23]. We report perplexity on the Wikitext-2 dataset[24] and zero-shot accuracy on nine
+tasks, including ARC-Easy and ARC-Challenge[25], BoolQ[26], HellaSwag[27], LAMBADA[28],
+OpenBookQA[29], PIQA[30], SIQA[31], and WinoGrande[32]. Baseline methods include
+QuaRot[13], which uses fixed Hadamard rotations, SpinQuant[14], which leverages learned ro-
+tations, and OSTQuant[15], which employs both learned rotations and scaling.
+
+Deployment Details. Our quantization is implemented in PyTorch and evaluated using lm-eval[33].
+Activations are quantized with per-token asymmetric dynamic quantization, KV-cache with per-head
+asymmetric dynamic quantization, and weights with per-channel symmetric quantization. Calibration
+uses 128 samples from Wikitext-2. For each block, symmetric scaling is trained for 3 epochs,
+followed by weight quantization using GPTQ[34], and finally, bias terms, asymmetric scaling, and
+learnable clipping factors are trained for 5 epochs. Learning rates are initialized as 1e-2 for scaling
+and clipping, 1e-3 for bias, and all are cosine-decayed throughout training. It takes 0.7 hours for 3B
+models and 10 hours for 70B models on a single A800 GPU.
+
+
+                                                                7
+5.1   Main results
+
+Table 1 presents the overall performance of BASE-Q and baseline methods under W4A4KV4 quanti-
+zation, reporting perplexity on Wikitext-2 and the average accuracy across nine zero-shot tasks. Since
+BASE-Q is explicitly designed to tackle the most challenging 4-bit activation quantization, we focus
+solely on the W4A4KV4 configuration. Across all evaluated models, BASE-Q consistently achieves
+superior results, with an average accuracy drop of only 3.40% from full precision. In comparison,
+the average accuracy drops for QuaRot, SpinQuant, and OSTQuant are 6.87%, 5.95%, and 4.80%,
+respectively (averaged over eight supported models). This translates to BASE-Q narrowing the
+gap to full-precision by 50.5%, 42.9%, and 29.2% relative to QuaRot, SpinQuant, and OSTQuant,
+respectively. Notably, BASE-Q performs exceptionally well on Qwen2.5-3B, where all existing
+methods suffer severe degradation (perplexity increases by more than 100%). These results strongly
+validate our theoretical insights and demonstrate the practical effectiveness of our proposed bias
+correction and asymmetric scaling strategies.
+
+Table 1: Comparison on Wikitext-2 perplexity and 9 zero-shot benchmark tasks. All baseline results—QuaRot,
+SpinQuant, and OSTQuant—are reproduced using their official open-source implementations, with necessary
+modifications to support the Qwen model, which differs from LLaMA mainly by including attention bias. As
+the official OSTQuant repository does not support FSDP (Fully Sharded Data Parallel) training, its results are
+limited to models with up to 14B parameters. Complete results are provided in Appendix A.
+
+
+                  Qwen-2.5 3B Qwen-2.5 14B Qwen-2.5 32B LLaMA-3.1 8B LLaMA-3.1 70B LLaMA-3.2 1B
+  W4A4KV4         0-shot9 Wiki 0-shot9 Wiki 0-shot9 Wiki 0-shot9        Wiki   0-shot9   Wiki   0-shot9   Wiki
+                  Avg.(↑) (↓) Avg.(↑) (↓) Avg.(↑) (↓) Avg.(↑)           (↓)    Avg.(↑)   (↓)    Avg.(↑)   (↓)
+ Full-Precision   64.17   8.03    70.95   5.29   71.11   5.02   68.70   6.23   73.76     2.81   55.89     9.75
+   QuaRot         44.30   69.33   67.23   6.77   68.14   6.04   63.74   7.82   69.56     5.31   48.66     14.44
+  SpinQuant       46.86   46.35   67.29   6.55   68.51   5.88   64.58   7.51   70.69     4.74   49.41     13.46
+  OSTQuant        50.81   20.09   67.81   6.37   OOM     OOM    64.91   7.40    OOM      OOM    50.85     12.84
+   BASE-Q         58.13   10.83   68.90   6.28   70.18   5.65   65.36   7.17   71.54     4.17   50.61     12.66
+                  Llama-2 7B      Llama-2 13B    Llama-2 70B    LLaMA-3 8B     LLaMA-3 70B      LLaMA-3.2 3B
+  W4A4KV4         0-shot9 Wiki 0-shot9 Wiki 0-shot9 Wiki 0-shot9        Wiki   0-shot9   Wiki   0-shot9   Wiki
+                  Avg.(↑) (↓) Avg.(↑) (↓) Avg.(↑) (↓) Avg.(↑)           (↓)    Avg.(↑)   (↓)    Avg.(↑)   (↓)
+ Full-Precision   65.22   5.47    67.62   4.88   71.57   3.32   68.11   6.14   73.82     2.86   63.59     7.81
+   QuaRot         61.59   6.12    65.03   5.39   70.28   3.76   62.89   7.82   68.76     5.62   55.86     10.07
+  SpinQuant       61.38   5.99    65.63   5.30   70.22   3.71   63.80   7.49   69.93     5.11   57.74      9.32
+  OSTQuant        62.08   5.92    65.43   5.24   OOM     OOM    64.72   7.36    OOM      OOM    59.29     9.16
+   BASE-Q         62.50   5.85    65.95   5.19   70.74   3.59   65.60   7.12   71.83     4.06   60.02      9.01
+
+
+
+5.2   Prefill acceleration on GPU
+
+To evaluate real-world acceleration, we benchmark INT4 quantization during the compute-bound
+prefill stage on an NVIDIA 3090 GPU. All experiments use a sequence length of 2048, with batch
+sizes varying from 1 to 64. 4-bit matrix multiplications are implemented by the NVIDIA’s Cutlass
+library, while other custom operators are written in Triton for flexibility and speed. To minimize
+overhead, we fuse the online bias and scaling introduced by BASE-Q within quantization and de-
+quantization into a single Triton kernel (Figure 6), rendering the additional costs of bias and scaling
+computation negligible. For the online Hadamard transform, we find that the fast algorithm [35]
+adopted in Quarot, which uses the recursive Cooley-Tukey method to achieve O(nlogn) complexity,
+does not fully leverage tensor core parallelism on modern GPUs. To address this, we implement the
+Hadamard transform as a larger matrix multiplication in Triton, better utilizing available compute.
+For query and key projections (with small dimensions, e.g., 128×128), we perform the transformation
+directly as a matrix multiplication. For the much larger down layer, we only apply one single
+Cooley-Tukey step, ensuring all compute-intensive kernels operate on manageable, high-parallelism
+sub-matrices. As shown in Figure 5, our approach yields 2.1× to 2.4× acceleration across all batch
+sizes compared with standard FP16. Notably, our optimizations incur only minimal overhead versus
+pure INT4 quantization without any online operations.
+
+
+                                                         8
+                                                                                Triton Kernel       Triton Kernel
+
+                                                                      Input                                         Output
+
+                                                                                  Quantize             De-Quant
+
+
+
+                                                                                Cutlass INT4 Matmul Kernel
+
+
+
+Figure 5: Prefill speedup for Llama2-7B with                          Figure 6: Illustration of kernel fusion.
+seqlens 2048 as batch size scales from 1 to 64.
+
+5.3   Ablation study
+
+We perform a systematic ablation study on Qwen2.5-3B, Llama2-7B, and Llama3-8B to assess the
+effects of different quantization strategies in BASE-Q, as well as those from Quarot, SpinQuant, and
+OSTQuant. Our experiments as shown in Table 2 indicate that bias correction yields substantial
+perplexity reductions for Qwen2.5-3B and Llama3-8B, highlighting the importance of addressing
+inter-channel bias in these models. In contrast, its effect on Llama2-7B is marginal. Notably, asym-
+metric scaling delivers consistent improvements across all three models, confirming its effectiveness
+in mitigating the adverse impact of clipping.
+
+                           Table 2: Ablation Study on WikiText2 (word perplexity↓)
+                           Fixed       Learned   Bias Unpaired
+          Method                                               Scale Qwen2.5-3B Llama-2-7B Llama-3-8B
+                          Rotation     Rotation Corect. Scale
+          QuaRot     Rres Rv Rqk Rdown                                 69.33       6.12       7.82
+                   Rres Rqk Rdown           Rv                                  54.38 -5.95    6.18 +0.06   7.63 -0.19
+                   Rres Rqk Rdown           Rv         ✓                        13.59 -40.79   6.12 -0.06   7.42 -0.21
+                   Rres Rqk Rdown           Rv         ✓       ✓                10.82 -2.77    5.92 -0.20   7.22 -0.20
+          BASE-Q Rres Rqk Rdown             Rv         ✓       ✓          ✓     10.83 +0.01    5.85 -0.07   7.14 -0.08
+         SpinQuant   Rqk Rdown            Rres Rv                                 46.35          5.99         7.49
+         OSTQuant    Rqk Rdown            Rres Rv                         ✓       20.09          5.92         7.36
+
+We further performed ablation studies where, within the BASE-Q framework, global rotations
+were respectively implemented as a standard Hadamard matrix, a random Hadamard matrix, and a
+learnable rotation (following SpinQuant’s official codebase). In SpinQuant (cf. Fig. 4 in [14]), the
+authors observed that using random Hadamard rotations could cause large fluctuations and subpar
+quantization performance. Based on this observation, SpinQuant advocates for learnable global
+rotations to stabilize and improve quantization results under their framework.
+However, in our ablation studies Table 3 we found that, across five benchmark LLMs, the quantization
+metrics showed negligible differences across different rotation types within our BASE-Q framework.
+This suggests that any potential improvements from learnable global rotations are effectively sub-
+sumed by BASE-Q’s bias correction component. Therefore, the additional memory and computational
+cost introduced by learnable global rotations is unnecessary for maintaining quantization quality in
+our method.
+
+                                      Table 3: Ablation study on Rres choice.
+
+                                       Qwen-2.5 3B Qwen-2.5 14B LLaMA-2 7B LLaMA-3 8B LLaMA-2 13B
+  W4A4KV4           Rres Setting      0-shot9 Wiki 0-shot9 Wiki 0-shot9 Wiki 0-shot9 Wiki 0-shot9 Wiki
+                                      Avg.(↑) (↓) Avg.(↑) (↓) Avg.(↑) (↓) Avg.(↑) (↓) Avg.(↑) (↓)
+ Full-Precision                        64.17   8.03    70.95       5.29       65.22   5.47     68.11    6.14      67.62      4.88
+   QuaRot         Random Hadamard      44.30   69.33   67.23       6.77       61.59   6.12     62.89    7.82      65.03      5.39
+  SpinQuant        Learned Rotation    46.86   46.35   67.29       6.55       61.38   5.99     63.80    7.49      65.63      5.30
+   BASE-Q         Standard Hadamard    58.93   10.43   69.17       6.28       62.08   5.85     65.33    7.13      65.89      5.20
+                  Random Hadamard      58.60   10.43   69.22       6.28       62.24   5.87     65.21    7.14      65.46      5.20
+                  Learned Hadamard     57.95   10.44   68.43       6.26       62.68   5.86     65.01    7.13      65.60      5.20
+
+
+
+                                                           9
+5.4                 Resource and accuracy trade-offs
+
+Recent studies such as FlatQuant[22] employ layer-wise learned online matrix transforms to improve
+the performance of quantized linear layers, at the cost of increased inference overhead. In contrast,
+BASE-Q applies rotations Rres that can be fused into the weights, eliminating the need for the
+extra computation. As shown in Figure 7, BASE-Q consistently achieves Pareto-optimal trade-offs
+between accuracy and inference overhead, outperforming Quarot at comparable cost, while FlatQuant
+suffers from significant computation overhead. Furthermore, FlatQuant suffers from significant
+instability on Qwen2.5-3B, where the quantized model collapses. Figure 8 further demonstrates the
+lower GPU memory usage of BASE-Q under quantization process. Importantly, our method is fully
+orthogonal to other advanced methods and can flexibly combine with them, allowing practitioners to
+efficiently adapt to different deployment and training requirements.
+               68
+                                          FP16 Acc.                                                                                    371.4
+               67                                                             Llama3-70B                          59.2
+                                                                                                          40.1
+Accuracy (%)
+
+
+
+
+               66                                           FlatQuant                             19.5
+               65                  BASE-Q
+                                   OSTQuant                                                           29.1            Quarot
+               64                                     BASE-Q (Ours)                                21.1               Base-Q
+               63
+                                   SpinQuant          Pareto Frontier          Llama3-8B         12.3                 FlatQuant
+                                   Quarot             FP16 Accuracy                            6.2                    SpinQuant
+               62
+                 0.0        0.5     1.0        1.5    2.0      2.5                         0     20      40      60      80   100   350 400 450
+                    Additional FP Transform FLOPs (% of Int4 MatMul)                                     GPU Memory (GB)
+Figure 7: Zero-shot9 accuracy and inference                                  Figure 8: GPU memory consumption during
+overhead on Llama3-8B. BASE-Q achieves                                       optimization. BASE-Q enables quantizing a
+Pareto-optimal trade-offs. Note that hadamard                                70B model on a single A800 GPU within 10
+rotations require only addition operations com-                              hours, whereas SpinQuant requires at least 5
+pared to standard matrix transformation.                                     A800 GPUs and a total of 36 GPU-hours.
+
+6               Conclusion
+In this work, we analyze key challenges in rotational quantization for large language models, iden-
+tifying channel mean discrepancies and cumulative clipping-induced energy loss as major sources
+of quantization errors. To address these issues, we propose BASE-Q, which introduces blockwise
+bias correction and per-channel asymmetric scaling to achieve accurate and efficient quantization
+with minimal resource overhead. Experiments on popular LLM benchmarks demonstrate that BASE-
+Q closes the accuracy gap to floating-point baselines while substantially reducing memory usage,
+enabling single-GPU quantization even for large-scale models. Our results highlight BASE-Q as a
+practical and scalable approach for quantizing large language models.
+
+References
+  [1] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timo-
+      thée Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open
+      and efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023.
+  [2] Jinze Bai and et al. Qwen technical report. ArXiv, abs/2309.16609, 2023.
+  [3] Abhimanyu Dubey and et al. The llama 3 herd of models. ArXiv, abs/2407.21783, 2024.
+  [4] Hugo Touvron and et al. Llama 2: Open foundation and fine-tuned chat models. ArXiv,
+      abs/2307.09288, 2023.
+  [5] DeepSeek-AI. Deepseek-v3 technical report. ArXiv, abs/2412.19437, 2024.
+  [6] Markus Nagel, Rana Ali Amjad, Mart van Baalen, Christos Louizos, and Tijmen Blankevoort.
+      Up or down? adaptive rounding for post-training quantization. ArXiv, abs/2004.10568, 2020.
+  [7] Yuhang Li, Ruihao Gong, Xu Tan, Yang Yang, Peng Hu, Qi Zhang, Fengwei Yu, Wei Wang,
+      and Shi Gu. Brecq: Pushing the limit of post-training quantization by block reconstruction.
+      ArXiv, abs/2102.05426, 2021.
+
+
+                                                                        10
+ [8] Yijiang Liu, Huanrui Yang, Zhen Dong, Kurt Keutzer, Li Du, and Shanghang Zhang. Noisyquant:
+     Noisy bias-enhanced post-training activation quantization for vision transformers. 2023
+     IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), pages 20321–
+     20330, 2022.
+ [9] Yijiang Liu, Hengyu Fang, Liulu He, Rongyu Zhang, Yichuan Bai, Yuan Du, and Li Du.
+     Fbquant: Feedback quantization for large language models. ArXiv, abs/2501.16385, 2025.
+[10] Xiuying Wei, Yunchen Zhang, Yuhang Li, Xiangguo Zhang, Ruihao Gong, Jinyang Guo, and
+     Xianglong Liu. Outlier suppression+: Accurate quantization of large language models by
+     equivalent and optimal shifting and scaling. ArXiv, abs/2304.09145, 2023.
+[11] Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. Llm.int8(): 8-bit matrix
+     multiplication for transformers at scale. ArXiv, abs/2208.07339, 2022.
+[12] Guangxuan Xiao, Ji Lin, Mickael Seznec, Julien Demouth, and Song Han. Smoothquant: Accu-
+     rate and efficient post-training quantization for large language models. ArXiv, abs/2211.10438,
+     2022.
+[13] Saleh Ashkboos, Amirkeivan Mohtashami, Maximilian L. Croci, Bo Li, Martin Jaggi, Dan
+     Alistarh, Torsten Hoefler, and James Hensman. Quarot: Outlier-free 4-bit inference in rotated
+     llms. ArXiv, abs/2404.00456, 2024.
+[14] Zechun Liu, Changsheng Zhao, Igor Fedorov, Bilge Soran, Dhruv Choudhary, Raghuraman
+     Krishnamoorthi, Vikas Chandra, Yuandong Tian, and Tijmen Blankevoort. Spinquant: Llm
+     quantization with learned rotations. ArXiv, abs/2405.16406, 2024.
+[15] Xing Hu, Yuan Cheng, Dawei Yang, Zukang Xu, Zhihang Yuan, Jiangyong Yu, Chen Xu, Zhe
+     Jiang, and Sifan Zhou. Ostquant: Refining large language model quantization with orthogonal
+     and scaling transformations for better distribution fitting. ArXiv, abs/2501.13987, 2025.
+[16] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-Ming Chen, Wei-Chen Wang, Guangxuan
+     Xiao, Xingyu Dang, Chuang Gan, and Song Han. Awq: Activation-aware weight quantization
+     for on-device llm compression and acceleration. Proceedings of Machine Learning and Systems,
+     6:87–100, 2024.
+[17] Wenqi Shao, Mengzhao Chen, Zhaoyang Zhang, Peng Xu, Lirui Zhao, Zhiqiang Li, Kaipeng
+     Zhang, Peng Gao, Yu Jiao Qiao, and Ping Luo. Omniquant: Omnidirectionally calibrated
+     quantization for large language models. ArXiv, abs/2308.13137, 2023.
+[18] Yuexiao Ma, Huixia Li, Xiawu Zheng, Feng Ling, Xuefeng Xiao, Rui Wang, Shilei Wen, Fei
+     Chao, and Rongrong Ji. Affinequant: Affine transformation quantization for large language
+     models. ArXiv, abs/2403.12544, 2024.
+[19] Jerry Chee, Yaohui Cai, Volodymyr Kuleshov, and Christopher M De Sa. Quip: 2-bit quantiza-
+     tion of large language models with guarantees. Advances in Neural Information Processing
+     Systems, 36:4396–4429, 2023.
+[20] Albert Tseng, Jerry Chee, Qingyao Sun, Volodymyr Kuleshov, and Christopher De Sa. Quip#:
+     Even better llm quantization with hadamard incoherence and lattice codebooks. arXiv preprint
+     arXiv:2402.04396, 2024.
+[21] Haokun Lin, Haobo Xu, Yichen Wu, Jingzhi Cui, Yingtao Zhang, Linzhan Mou, Linqi Song,
+     Zhenan Sun, and Ying Wei. Duquant: Distributing outliers via dual transformation makes
+     stronger quantized llms. Advances in Neural Information Processing Systems, 37:87766–87800,
+     2024.
+[22] Yuxuan Sun, Ruikang Liu, Haoli Bai, Han Bao, Kang Zhao, Yuening Li, Jiaxin Hu, Xianzhi
+     Yu, Lu Hou, Chun Yuan, et al. Flatquant: Flatness matters for llm quantization. arXiv preprint
+     arXiv:2410.09426, 2024.
+[23] An Yang, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chengyuan
+     Li, Dayiheng Liu, Fei Huang, Haoran Wei, et al. Qwen2. 5 technical report. arXiv preprint
+     arXiv:2412.15115, 2024.
+
+
+                                                11
+[24] Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture
+     models. arXiv preprint arXiv:1609.07843, 2016.
+[25] Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabharwal, Carissa Schoenick,
+     and Oyvind Tafjord. Think you have solved question answering? try arc, the ai2 reasoning
+     challenge. arXiv preprint arXiv:1803.05457, 2018.
+[26] Christopher Clark, Kenton Lee, Ming-Wei Chang, Tom Kwiatkowski, Michael Collins, and
+     Kristina Toutanova. Boolq: Exploring the surprising difficulty of natural yes/no questions.
+     arXiv preprint arXiv:1905.10044, 2019.
+[27] Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. Hellaswag: Can a
+     machine really finish your sentence? arXiv preprint arXiv:1905.07830, 2019.
+[28] Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al.
+     Language models are unsupervised multitask learners. OpenAI blog, 1(8):9, 2019.
+[29] Todor Mihaylov, Peter Clark, Tushar Khot, and Ashish Sabharwal. Can a suit of armor conduct
+     electricity? a new dataset for open book question answering. arXiv preprint arXiv:1809.02789,
+     2018.
+[30] Yonatan Bisk, Rowan Zellers, Jianfeng Gao, Yejin Choi, et al. Piqa: Reasoning about phys-
+     ical commonsense in natural language. In Proceedings of the AAAI conference on artificial
+     intelligence, volume 34, pages 7432–7439, 2020.
+[31] Maarten Sap, Hannah Rashkin, Derek Chen, Ronan LeBras, and Yejin Choi. Socialiqa: Com-
+     monsense reasoning about social interactions. arXiv preprint arXiv:1904.09728, 2019.
+[32] Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavatula, and Yejin Choi. Winogrande: An
+     adversarial winograd schema challenge at scale. Communications of the ACM, 64(9):99–106,
+     2021.
+[33] Leo Gao, Jonathan Tow, Baber Abbasi, Stella Biderman, Sid Black, Anthony DiPofi, Charles
+     Foster, Laurence Golding, Jeffrey Hsu, Alain Le Noac’h, Haonan Li, Kyle McDonell, Niklas
+     Muennighoff, Chris Ociepa, Jason Phang, Laria Reynolds, Hailey Schoelkopf, Aviya Skowron,
+     Lintang Sutawika, Eric Tang, Anish Thite, Ben Wang, Kevin Wang, and Andy Zou. The
+     language model evaluation harness, 07 2024.
+[34] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. Gptq: Accurate post-training
+     quantization for generative pre-trained transformers. ArXiv, abs/2210.17323, 2022.
+[35] Tri Dao.    fast-hadamard-transform,        2023.       https://github.com/Dao-AILab/
+     fast-hadamard-transform.
+
+
+
+
+                                                12
+A    Full quantization results
+
+We present comprehensive quantization results in this section, including perplexity on WikiText2 and
+zero-shot accuracy on nine evaluation datasets. All baseline results, including QuaRot, SpinQuant,
+and OSTQuant, are reproduced using their official open-source implementations, with necessary
+modifications to support the Qwen model, which differs from LLaMA mainly by including attention
+bias. As the official OSTQuant repository does not support FSDP (Fully Sharded Data Parallel)
+training, its results are limited to models with up to 14B parameters, while larger models, such as the
+70B model, encounter out-of-memory (OOM) issues. Results for the Llama2 series are summarized
+in Table 4, those for the Llama3 series are in Table 5, and for the Qwen2.5 series in Table 6.
+
+Table 4: Complete comparison of the perplexity score on WikiText2 and accuracy on Zero-shot Common Sense
+Reasoning tasks for Llama-2 models.
+        #Bits Method
+ Model W-A-KV                  ARC-c ARC-e BoolQ HellaS. Lam. OBQA PIQA SIQA WinoG. Avg. Wiki2
+                                (↑)   (↑)   (↑)   (↑)     (↑)  (↑)  (↑)   (↑)   (↑)   (↑)   (↓)
+       16-16-16 Full Precision 46.33 74.54 77.74 76.02 73.90 44.20 79.05 46.16 69.06 65.22 5.47
+  2-7B          Quarot         42.15 70.37 73.00 73.09 70.68 39.40 77.26 43.30 65.04 61.59 6.12
+         4-4-4 SpinQuant       40.78 70.45 73.79 72.40 71.30 38.40 75.63 43.45 66.22 61.38 5.99
+                OSTQuant       41.64 68.94 74.43 73.17 71.61 42.20 77.09 43.71 65.90 62.08 5.92
+                BASE-Q         42.24 71.42 74.74 73.69 71.32 41.80 77.53 43.35 66.38 62.50 5.85
+       16-16-16 Full Precision 49.15 77.44 80.61 79.38 76.73 45.20 80.52 47.39 72.14 67.62 4.88
+ 2-13B          Quarot         46.76 75.08 76.97 75.84 74.36 42.80 78.84 45.19 69.46 65.03 5.39
+         4-4-4 SpinQuant       48.46 74.33 77.28 76.27 74.83 44.60 78.67 46.01 70.24 65.63 5.30
+                OSTQuant       47.10 75.20 77.46 77.71 75.14 44.60 78.67 45.75 68.03 65.41 5.24
+                BASE-Q         47.01 75.67 78.90 77.42 74.87 44.60 79.27 45.34 70.48 65.95 5.19
+       16-16-16 Full Precision 57.25 81.06 83.76 83.82 79.62 48.80 82.70 49.18 77.98 71.57 3.32
+ 2-70B          Quarot         55.97 80.18 81.87 82.25 78.73 48.00 81.39 47.49 75.69 70.28 3.76
+         4-4-4 SpinQuant       54.78 79.76 81.90 82.78 79.20 47.40 81.77 48.46 76.80 70.22 3.71
+                OSTQuant       OOM OOM OOM OOM OOM OOM OOM OOM OOM OOM OOM
+                BASE-Q         56.40 80.09 82.17 82.79 79.37 48.20 82.32 48.62 76.72 70.74 3.59
+
+
+
+Table 5: Complete comparison of the perplexity score on WikiText2 and accuracy on Zero-shot Common Sense
+Reasoning tasks for Llama-3 models.
+
+          #Bits Method
+  Model W-A-KV                   ARC-c ARC-e BoolQ HellaS. Lam. OBQA PIQA SIQA WinoG. Avg. Wiki2
+                                  (↑)   (↑)   (↑)   (↑)     (↑)  (↑)  (↑)   (↑)   (↑)   (↑)   (↓)
+         16-16-16 Full Precision 53.33 77.74 81.35 79.15 76.01 45.00 80.79 47.13 72.53 68.11 6.14
+   3-8B           Quarot         46.08 70.50 74.50 74.47 70.58 40.60 76.50 44.93 67.88 62.89 7.82
+           4-4-4 SpinQuant       47.35 73.36 75.75 74.74 70.70 41.20 77.04 44.93 69.14 63.80 7.49
+                  OSTQuant       48.21 72.69 79.02 75.69 70.52 44.00 77.86 44.98 69.53 64.72 7.36
+                  BASE-Q         50.51 76.05 78.26 76.48 71.22 43.60 78.89 45.75 69.61 65.60 7.12
+         16-16-16 Full Precision 64.33 85.90 85.23 84.89 79.82 48.60 84.55 50.72 80.35 73.82 2.86
+  3-70B           Quarot         53.16 78.11 82.91 80.80 75.49 44.40 79.65 47.49 76.87 68.76 5.62
+           4-4-4 SpinQuant       57.25 80.22 83.06 81.05 75.04 46.20 81.88 47.44 77.27 69.93 5.11
+                  OSTQuant       OOM OOM OOM OOM OOM OOM OOM OOM OOM OOM OOM
+                  BASE-Q         59.98 82.70 84.65 83.92 78.42 47.20 83.08 48.41 78.14 71.83 4.06
+         16-16-16 Full Precision 53.50 81.19 82.08 78.90 75.82 44.80 81.23 47.19 73.56 68.70 6.23
+  3.1-8B          Quarot         46.08 72.31 77.34 74.46 71.36 42.40 76.82 44.37 68.51 63.74 7.82
+           4-4-4 SpinQuant       47.87 76.05 76.76 74.63 70.54 43.20 79.27 45.70 67.17 64.58 7.51
+                  OSTQuant       47.44 75.34 78.84 75.48 71.38 41.80 78.24 47.13 68.51 64.91 7.40
+                  BASE-Q         49.15 77.19 78.56 76.41 70.72 42.40 79.16 45.85 69.22 65.36 7.17
+         16-16-16 Full Precision 64.93 86.66 85.41 85.02 79.16 48.00 84.28 50.56 79.79 73.76 2.81
+ 3.1-70B          Quarot         57.51 80.35 83.27 81.45 75.65 44.80 81.66 45.60 75.77 69.56 5.31
+           4-4-4 SpinQuant       59.13 82.28 84.37 82.24 76.32 46.00 82.21 47.24 76.40 70.69 4.74
+                  OSTQuant       OOM OOM OOM OOM OOM OOM OOM OOM OOM OOM OOM
+                  BASE-Q         60.49 84.13 83.12 83.10 77.06 47.40 83.24 47.85 77.43 71.54 4.17
+         16-16-16 Full Precision 36.35 60.48 64.07 63.65 62.93 37.20 74.54 42.99 60.77 55.89 9.75
+  3.2-1B          Quarot         31.23 51.01 59.42 54.74 43.90 34.40 66.92 40.48 55.88 48.66 14.44
+           4-4-4 SpinQuant       32.68 51.68 58.47 56.68 47.22 34.80 67.79 40.23 55.17 49.41 13.46
+                  OSTQuant       33.45 55.26 61.80 56.02 48.90 33.80 70.02 41.61 56.83 50.85 12.84
+                  BASE-Q         31.23 53.91 59.79 56.61 46.73 31.60 70.57 40.74 56.91 49.79 12.63
+         16-16-16 Full Precision 45.90 71.63 73.33 73.60 70.48 43.00 77.58 46.98 69.85 63.59 7.81
+  3.2-3B          Quarot         38.40 59.13 64.56 66.49 60.00 37.20 72.25 42.68 62.04 55.86 10.07
+           4-4-4 SpinQuant       37.12 60.90 68.72 68.83 61.67 39.60 73.88 44.58 64.40 57.74 9.32
+                  OSTQuant       41.04 68.06 68.84 68.75 63.50 40.40 74.21 44.78 64.01 59.29 9.16
+                  BASE-Q         41.64 66.86 72.45 69.83 62.57 40.80 75.84 44.52 65.67 60.02 9.01
+
+
+
+
+                                                  13
+Table 6: Complete comparison of the perplexity score on WikiText2 and accuracy on Zero-shot Common Sense
+Reasoning tasks for Qwen2.5 Models.
+          #Bits Method
+  Model W-A-KV                   ARC-c ARC-e BoolQ HellaS. Lam. OBQA PIQA SIQA WinoG. Avg. Wiki2
+                                  (↑)   (↑)   (↑)   (↑)     (↑)  (↑)  (↑)   (↑)   (↑)   (↑)   (↓)
+         16-16-16 Full Precision 47.53 73.06 77.22 73.52 67.11 42.00 78.84 49.80 64.14 64.17 8.03
+  2.5-3B          Quarot         30.72 52.69 51.16 49.52 20.63 34.60 66.70 38.84 53.83 44.30 69.33
+           4-4-4 SpinQuant       34.47 57.58 54.04 50.91 24.14 32.20 68.01 40.48 57.93 46.86 46.35
+                  OSTQuant       38.48 58.08 61.90 56.19 36.33 37.60 67.90 42.48 58.33 50.81 20.09
+                  BASE-Q         42.75 67.26 71.96 66.21 52.24 38.40 74.59 46.01 63.77 58.13 10.83
+         16-16-16 Full Precision 58.87 79.17 85.26 82.91 74.62 45.20 82.05 55.17 75.30 70.95 5.29
+ 2.5-14B          Quarot         55.80 79.46 80.24 78.40 70.06 41.60 78.45 50.20 70.88 67.23 6.77
+           4-4-4 SpinQuant       53.75 79.97 78.87 79.18 70.97 44.00 79.22 49.23 70.40 67.29 6.55
+                  OSTQuant       54.78 78.91 80.73 79.81 69.18 44.40 79.71 50.15 72.61 67.81 6.37
+                  BASE-Q         56.14 82.41 82.23 79.75 70.89 42.80 80.20 52.97 72.69 68.90 6.28
+         16-16-16 Full Precision 55.63 80.93 87.19 84.06 76.96 44.00 82.32 56.29 75.22 71.11 5.02
+ 2.5-32B          Quarot         52.05 74.66 85.41 81.70 73.14 42.40 79.98 52.81 71.11 68.14 6.04
+           4-4-4 SpinQuant       52.82 76.05 85.11 80.99 72.71 44.40 80.03 52.15 72.30 68.51 5.88
+                  OSTQuant       OOM OOM OOM OOM OOM OOM OOM OOM OOM OOM OOM
+                  BASE-Q         54.61 78.16 87.06 82.49 75.61 44.60 81.12 53.63 74.35 70.18 5.65
+
+
+
+B     Visualization of activation distribution
+We provide visualization results for the input activations of the multi-head attention blocks and MLP
+blocks at the 1st, 11th, and 31st layers of Qwen2.5-3B, Llama2-7B, and Llama3-8B. For each selected
+layer, we illustrate the distributions of activations under various rotation strategies. We observe that
+inter-channel mean misalignment consistently occurs in different layers and across all evaluated
+models, and that learned rotations are insufficient to eliminate this issue. As discussed in Section 3.2,
+this misalignment is a significant source of quantization error, which can be effectively mitigated by
+our proposed bias correction technique.
+
+
+
+
+    Figure 9: Visualizations comparing the activation distributions from the 1st MHSA block in Llama2-7B.
+
+
+
+
+    Figure 10: Visualizations comparing the activation distributions from the 1st MLP block in Llama2-7B.
+
+
+
+                                                     14
+Figure 11: Visualizations comparing the activation distributions from the 11th MHSA block in Llama2-7B.
+
+
+
+
+Figure 12: Visualizations comparing the activation distributions from the 11th MLP block in Llama2-7B.
+
+
+
+
+Figure 13: Visualizations comparing the activation distributions from the 31st MHSA block in Llama2-7B.
+
+
+
+
+ Figure 14: Visualizations comparing the activation distributions from the 31st MLP block in Llama2-7B.
+
+
+                                                  15
+Figure 15: Visualizations comparing the activation distributions from the 1st MHSA block in Qwen2.5-3B.
+
+
+
+
+ Figure 16: Visualizations comparing the activation distributions from the 1st MLP block in Qwen2.5-3B.
+
+
+
+
+Figure 17: Visualizations comparing the activation distributions from the 11th MHSA block in Qwen2.5-3B.
+
+
+
+
+Figure 18: Visualizations comparing the activation distributions from the 11th MLP block in Qwen2.5-3B.
+
+
+                                                  16
+Figure 19: Visualizations comparing the activation distributions from the 31st MHSA block in Qwen2.5-3B.
+
+
+
+
+Figure 20: Visualizations comparing the activation distributions from the 31st MLP block in Qwen2.5-3B.
+
+
+
+
+ Figure 21: Visualizations comparing the activation distributions from the 1st MHSA block in Llama3-8B.
+
+
+
+
+  Figure 22: Visualizations comparing the activation distributions from the 1st MLP block in Llama3-8B.
+
+
+                                                   17
+Figure 23: Visualizations comparing the activation distributions from the 11th MHSA block in Llama3-8B.
+
+
+
+
+Figure 24: Visualizations comparing the activation distributions from the 11th MLP block in Llama3-8B.
+
+
+
+
+Figure 25: Visualizations comparing the activation distributions from the 31st MHSA block in Llama3-8B.
+
+
+
+
+ Figure 26: Visualizations comparing the activation distributions from the 31st MLP block in Llama3-8B.
+
+
+                                                  18
+C    Composition of rounding errors
+This section presents visualizations of the composition of rounding errors, calculated according to
+Equations (5) and (6), across various models.
+
+
+
+
+Figure 27: Percentage of V ar(µj ) contribu-          Figure 28: Percentage of V ar(µj ) contribu-
+tion to rounding error in Llama2-7B.                  tion to rounding error in Llama2-13B.
+
+
+
+
+Figure 29: Percentage of V ar(µj ) contribu-          Figure 30: Percentage of V ar(µj ) contribu-
+tion to rounding error in Llama3-8B.                  tion to rounding error in Qwen2.5-3B.
+
+
+
+
+Figure 31: Percentage of V ar(µj ) contribu-          Figure 32: Percentage of V ar(µj ) contribu-
+tion to rounding error in Qwen2.5-14B.                tion to rounding error in Qwen2.5-32B.
+
+
+
+
+                                                19
+

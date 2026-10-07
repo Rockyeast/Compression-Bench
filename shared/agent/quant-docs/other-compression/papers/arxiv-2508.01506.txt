@@ -1,0 +1,2040 @@
+                                        FlashSVD: Memory-Efficient Inference with Streaming for
+                                        Low-Rank Models
+
+                                        Zishan Shao1,2∗ , Yixiao Wang2 , Qinsi Wang2 , Ting Jiang2 , Zhixu Du2 , Hancheng Ye2 , Danyang Zhuo3 ,
+                                        Yiran Chen2 , Hai Li2
+                                        1 Department of Statistical Science
+arXiv:2508.01506v1 [cs.LG] 2 Aug 2025
+
+
+
+
+                                        2 Department of Electrical & Computer Engineering
+                                        3 Department of Computer Science
+
+
+
+                                        Abstract
+                                        Singular Value Decomposition (SVD) has recently seen a surge of interest as a simple yet powerful tool
+                                        for large language models (LLMs) compression, with a growing number of works demonstrating 20-80%
+                                        parameter reductions at minimal accuracy loss. Previous SVD-based approaches have focused primarily on
+                                        reducing the memory footprint of model weights, largely overlooking the additional activation memory overhead
+                                        incurred during inference when applying truncated factors via standard dense CUDA kernels. Our experiments
+                                        demonstrate that this activation overhead, scaling with sequence length and hidden dimension, prevents current
+                                        SVD compression techniques from achieving any reduction in peak inference memory, thereby limiting their
+                                        viability for real-world, on-device deployments.
+                                        We introduce FlashSVD, a novel, end-to-end rank-aware streaming inference framework specifically designed
+                                        for SVD-compressed large language models. FlashSVD can be seamlessly integrated with any model that
+                                        employs SVD-based methods for parameter reduction. By fusing low-rank projection kernels directly into both
+                                        the self-attention and feed-forward network (FFN) pipelines, FlashSVD avoid materializing full-size activation
+                                        buffers. Instead, small tiles of the truncated factors are loaded into on-chip SRAM, multiplied and reduced on the
+                                        fly, and immediately evicted, preserving high GPU occupancy and adding no extra latency. On standard encoder
+                                        benchmarks (e.g., BERT-Base), FlashSVD cuts peak activation memory by up to 70.2% and intermediate
+                                        transient memory by 75%, all while incur no accuracy loss with upstreaming compression methods, offering a
+                                        practical path toward memory-constrained deployment of low-rank LLMs.
+
+
+                                        1.      Introduction
+                                        Recent advances in Transformer architectures have yielded state-of-the-art performance across diverse tasks
+                                        with the cost of ever-increasing model size and computational complexity. Rapid scaling of model size poses
+                                        non-negligible challenges on deploying large pre-trained models on edge devices due to stringent peak mem-
+                                        ory constraints: activations and full-precision weights together often exceed available high-bandwidth memory
+                                        (HBM), leading to out-of-memory (OOM) failures even for moderately sized context. While parameter com-
+                                        pression techniques such as truncated singular value decomposition (SVD) can reduce model size by over 50%
+                                        with minimal accuracy loss [10, 30], they do not address the activation memory spikes during inference. In
+                                        practice, mainstream inference backends (e.g., FlashAttention [2, 3], xFormers [31], Megatron [23]) offer no
+                                             ∗ Correspondence E-mail: zishan.shao@duke.edu
+                 FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+native support for low-rank layers, so peak memory remains dominated by large intermediate buffers, almost as
+high as in fully dense implementations when using these inference backends.
+    Concurrent with advances in model compression, extensive research has targeted activation-aware opti-
+mizations for dense transformers. Key–value caching in autoregressive decoders reuses past attention states
+to eliminate redundant O (𝐵𝑀 2 ), where B is the batch size and M is the sequence length, computations and
+storage overhead [20]. FlashAttention further accelerates both training and inference by fusing the softmax and
+matrix-multiply operations into a single GPU kernel, thereby obviating the need to materialize full attention
+score matrices [2, 3]. Complementary methods such as mixed-precision arithmetic, quantization, and struc-
+tured pruning have also proven effective at reducing compute and memory demands without modifying the
+core transformer architecture [4, 8, 12, 29, 9, 13, 18, 19, 15, 7]. Despite these infrastructural and algorithmic
+innovations for dense and block-sparse layers, prior SVD-based compression techniques focus on dense model
+weights factorization but still execute inference with standard dense matrix kernels-thereby overlooking both
+activation memory overhead and the opportunity to tailor computations to low-rank structure.
+    In this work we introduce FlashSVD, an end-to-end inference framework that enables rank-awared activation
+for SVD-based low-rank models. Our key contributions are:
+
+     • We identify that activation memory-alongside fixed parameter cost-dominates inference overhead, whereas
+       prior work has largely targeted weight compression. We propose rank-aware fine-tuning as a promising
+       direction to drive ranks lower without sacrificing accuracy, yielding further activation-cost reductions.
+
+     • We proposed two series of rank-awared streaming low-rank kernels that consumes only low-rank ac-
+       tivations in a single pass with no memory-expensive dense intermediates while ensure computational
+       efficiency in moderate-large context window (Theorem 2, 4, 9, 10).
+
+     • By exploiting the multi-head structure when compressing the attention projection matrices, the necessary
+       rank-loss ratio 1 − 𝑟retained
+                             𝑟max is substantially lower than that required by single-head compression methods in
+       prior works, thereby permitting more moderate rank reductions while still achieving comparable overall
+       compression performance.
+
+
+
+2.    Related Work
+Low-Rank Weight Compression SVD-based factorization is a classical approach for transformer compres-
+sion, where small singular values are truncated under the Eckart–Young Mirsky theorem to reduce parameter
+counts at some cost of accuracy [30, 27]. Activation-aware SVD (ASVD) introduces rank awareness into both
+weight and KV-cache compression for decoders, factorizing cache states into low-rank components to achieve
+up to 30 % weight reduction and 50 % KV-cache memory savings with no retraining [30]. Building on this idea,
+SVD-LLM (v1-v2) [27, 28] also stores KV-cache in low-rank form but further employs a lightweight calibration
+set to determine optimal truncation thresholds, thereby preserving downstream performance despite more ag-
+gressive compression. MoDeGPT partitions each Transformer block into modular subcomponents and applies
+Nystrom, CR decomposition, and SVD at the module level - enabling structured, fine-tuning-free compression
+that saves up to 30% compute and increases inference throughput by 46% on 13B models [14]. Dobi-SVD
+makes the truncation process differentiable by learning per-layer cut positions via gradient-based optimization
+and deriving optimal low-rank updates, thus maintaining performance under 40% parameter compression [26].
+Palu [1] introduced a rank-aware KV-Cache compression scheme that dynamically adapts the low-rank ap-
+proximation of cached keys and values per attention head that significantly reducing memory footprint without
+degrading retrieval accuracy for the SVD decomposed models.
+
+                                                                                                               2
+                                  FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+
+                                         Our method                                                                                                            Our Advantages
+
+                                                       Original                                                             Dense     Avoidable with
+                                                                                                                                      FlashAttention
+                                                                                                                                                        Attention
+                                                                                                                                                                                Tradeoffs
+                                                                                                                              O                                           Less Rank Loss
+       Attn: SVD generates dense intermediates
+                                                                                                         w. FlashAttn
+                                                                                                                                                        Activation        SRAM                           SRAM
+                                   Vq
+                                                             HBM                                                                          SVD
+                                                                                    Flash                                   Score
+                       Uq                               Q K V                        Attn                         O                          O         FlashSVD            HBM                             HBM
+
+       FFN: SVD generates dense intermediates
+                                                                                                                              Q              Q             O              FlashAttn                  FlashSVDAttn
+                                                             HBM                             Vi          Vanilla SVD FFN
+                                                                                                                                                           Pq
+                                  Vi                                                                                          K              K                                  NO ADDITIONAL COMMUNICATION
+                    Ui                                    FFN                  Ui                                 O                                        Pk
+                                                        Interim                                                                V             V             Pv
+                                                                                                                                                                          SRAM                           SRAM
+
+                                                                                                                                                                           HBM                             HBM
+                                                  FlashSVD
+                                                                                                                            Dense        SVD             FFN             Vanilla FFN                 FlashSVDFFN
+       Attn: FlashSVD only consume low-rank                                                in tiles
+                                                                                                                                                       Activation
+                                                HBM                                  Vq               w. FlashSVDAttn         O             O                               ONE ADDITIONAL COMMUNICATION
+                                                                    Flash
+                                               Low Rank            SVDAttn
+                             Uq               Factors only
+                                                                                                              O
+                                                                             Consume only low
+                                                                               rank factors
+                                                                                                                                                       FlashSVD
+        FFN: FlashSVD avoid interims                                                      One Additional Communication to     FFN         FFN
+                                                                                                   save S in HBM
+                                                                                                                            Interim     Interim           O           Kernels      Attention    Dataflow     Lightweight
+                                                                                                                                                                                    Layer                     Dataflow
+                                        HBM                           Uo              HBM                Vo                                               S                                                      HBM
+                                                                                                                                                                                                  SRAM          Activati
+                            Ui          Pi              Flash          Vi                                      O                                          Pi          PyTorch
+                                                                                                                                                                                                                  ons
+                                                       SVDFFN                                                                                                                                                  Transient
+                                                                                                                                                                      Matmul      FFN Layer    On-Chip Mem      Memory
+                                                                Avoid FFN interim                      w. FlashSVDFFN
+
+
+
+
+Fig. 1: FlashSVD fuses low-rank projections into both the self-attention and FFN stages by streaming small tiles of
+the truncated U and V factors through on-chip SRAM instead of materializing dense activation matrices in HBM.
+FlashSVDAttn only consumes low-rank factors, reducing complexity from 𝑂 (𝐵𝑀D A          Θ ) to 𝑂 (𝐵𝑀𝑟 ∗ ). In the FFN, inputs
+                                                                                                      Θ
+are first projected into the low-rank factor space via a cuBLAS GEMM (for standard matrix multiplication) and then passed
+through FlashSVDFFN in one pass, avoiding any 𝑂 (𝐵𝑀D Θ       F
+                                                               ) intermediate activations and ensuring the rank-awared HBM
+performance.
+
+
+Streaming Inference FlashAttention reorders the standard attention computation into tiled matrix-multiply
+and softmax steps that fit in on-chip SRAM, thereby minimizing HBM-SRAM transfers and achieving up to 3×
+end-to-end speedups on GPT-2 with exact numerical equivalence to dense attention [2]. FlashAttention-2 and
+-3 optimize work partitioning and kernel fusion to sustain 50–73 % of peak FLOPs on NVIDIA A100s, and
+FlashAttention-3 on H100s delivers 1.5–2.0× speedups in FP16 (up to 740 TFLOPs/s, 75 % utilization) and
+near 1.2 PFLOPs/s in FP8—with 2.6× lower numerical error than baseline FP8 attention [3, 21]. BlockLLM
+introduces a block-parallel inference engine that shards and caches KV blocks across multiple concurrent
+workflows, reducing redundant memory loads and lowering per-token latency by as much as 33% in multi-tenant
+serving scenarios [22]. Star Attention partitions long-sequence inputs across hosts in two phases—a block-local
+intra-node attention followed by a global inter-node aggregation—enabling exact, distributed attention on
+sequences exceeding 64K tokens with sublinear communication overhead [16].
+
+Fine-Tuning & Hybrid Compression LoRA inserts trainable, low-rank adaptation matrices into the frozen
+weights of each Transformer layer, reducing the number of fine-tuned parameters by over four orders of magnitude
+while matching full-fine-tuning performance on tasks such as GLUE and SQuAD [11]. QLoRA builds on this
+by first quantizing all model weights to 4-bit integers using NormalFloat and GPTQ techniques, then applying
+LoRA to the quantized weights; this combination enables fine-tuning of 65B-parameter LLMs on a single 48
+GB GPU with negligible quality loss [4].
+    Although low-rank SVD compressors and I/O-aware streaming kernels have each shown dramatic gains, they
+have developed in isolation: SVD methods focus on offline factorization with no regard for GPU memory-I/O
+or block-parallel execution, while streaming kernels target dense weights. There is limited work in developing a
+rank-awared streaming kernels for SVD-based low-rank models inference. We bridge this gap with two families
+of rank-aware GPU kernels that eliminate memory-intensive dense activation materialization. Our method is
+
+                                                                                                                                                                                                                           3
+                 FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+agnostic to the upstream SVD compression – applicable to any SVD-compressed model without degrading
+accuracy.
+
+
+3.   Methodology
+Optimal Low-Rank Factorization via SVD Let 𝑊 ∈ R𝑚×𝑛 be a dense matrix (e.g. a full self-attention
+projection matrix). Its full singular value decomposition
+
+                                    𝑊 = 𝑈 Σ 𝑉 ⊤ , Σ = diag 𝜎1 , . . . , 𝜎min{𝑚,𝑛} ,
+                                                                                 
+                                                                                              (1)
+                                    𝜎𝑖 ≥ 𝜎 𝑗 , ∀ 𝑖 > 𝑗 .
+
+yields the best rank-𝑟 approximation in Frobenius norm by the Eckart–Young–Mirsky theorem [6]. Concretely,
+truncating to the top-𝑟 singular values gives
+
+                                         𝑊 [𝑟 ] = 𝑈 [:,1:𝑟 ] Σ [1:𝑟 ,1:𝑟 ] 𝑉[:,1:𝑟
+                                                                            ⊤
+                                                                                   ],
+
+which provably minimizes ∥𝑊 −𝑊 [𝑟 ] ∥ 𝐹 over all rank-𝑟 matrices. For simplicity, we evenly distribute the singular
+values, rewriting as 𝑊 [𝑟 ] = 𝑈˜ 𝑉˜ ⊤ where 𝑈˜ = 𝑈 [:,1:𝑟 ] Σ1/2 and 𝑉˜ = 𝑉[:,1:𝑟 ] Σ1/2 .
+
+                                                                                         (ℓ )
+                                                                                              ∪ Θ (ℓ )            (ℓ )
+                                                                                                                       and Θ (ℓ )
+                                                                                                     𝐿
+Model Decomposition For a general large-language model Θ =                              ΘA        F ℓ=1
+                                                                                                        , where Θ A          F
+                                                                                                       (ℓ ) 𝐿
+denote the attention and FFN parameters in block ℓ . Equivalently, grouping across layers gives Θ = {Θ A   }ℓ=1 ∪
+    (ℓ ) 𝐿                                                                     (ℓ )      (ℓ )
+{Θ F }ℓ=1 , so truncated SVD can be independently applied layer-wise on each Θ A and Θ F subfactors, enabling
+fine-grained, per-layer rank selection and compression. We apply rank-𝑟 Θ∗ truncated SVD (Definition 1, 2) to
+each dense projection matrix in a Transformer block, where the rank for the self-attention module follows
+Theorem 3, while the FFN rank is selected according to Theorem 5. The resulting compressed model is denoted
+Θ∗ , so that 𝑟 Θ∗ = 𝑟 Θ∗ . These rank choices directly influence the memory–compute trade-offs described in
+Theorem 14. The self-attention projections are square matrices of size D AΘ , while the FFN projection matrices
+
+𝑊𝑖⊤ and 𝑊𝑜 are rectangular of shape D Θ F
+                                           × DAΘ.
+
+
+
+Streaming Activations In standard multi-head self-attention calculation, one forms the full score matrix
+            ⊤
+Softmax( √𝑄𝐾 ) ∈ R 𝐵× 𝑀 × 𝑀 , where 𝑑ΘA ,ℎ = D A
+                                               Θ / 𝐻, ∀ ℎ ∈ {1, . . . , 𝐻}, 𝐵 is batch size, and 𝑀 is sequence
+            𝑑ΘA ,ℎ
+length, incurring O (𝐵𝑀 2 ) off-chip memory and bandwidth per head. FlashAttention [2, 3] instead tiles and
+streams the queries, keys, and values, small blocks of 𝑄, 𝐾 and 𝑉, sized to fit the GPU’s shared memory per
+streaming multiprocessor, are loaded on-chip, dot-products are then computed and softmaxed with streaming,
+and results are immediately accumulated in full FP32 precision without ever materializing the full 𝐵 × 𝐻 × 𝑀 2
+matrix on HBM. Consequently, HBM memory complexity for attention computation drops from O 𝐵𝐻 𝑀 2
+to O (𝐵𝐻 𝑀 𝑑ΘA ,ℎ ) for 𝐻 heads attention, enabling state-of-the-art attention computation performance in both
+training and inference.
+
+FlashSVDAttention FlashSVDAttention (Theorem 2) enable rank-awared streaming by consuming only the
+low-rank factors of each head’s query, key, and value projections:
+
+                            𝑃𝑞 , 𝑃 𝑘 , 𝑃𝑣 ∈ R 𝐵× 𝑀 ×𝑟Θ∗ ,        𝑉𝑞 , 𝑉𝑘 , 𝑉𝑣 ∈ R𝑟Θ∗ ×𝑑ΘA ,ℎ .
+
+
+
+                                                                                                                               4
+                   FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+Algorithm 1 FlashSVDAttention Forward Pass
+ 1: Part I. Subroutine load_tiles:
+ 2: Input: Factor 𝑃 𝑎 ∈ R 𝐵×𝐵 𝑀 ×𝑟Θ∗ , projection 𝑉𝑎 ∈ R𝑟Θ∗ ×𝑑ΘA ,ℎ , bias 𝑏 𝑎 ∈ R𝑑ΘA ,ℎ , tile size 𝐵 𝑅 , rank 𝑟 Θ∗ , padded rank
+             ∗
+    𝑅 = ⌈ 𝑟𝐵Θ𝑅 ⌉ · 𝐵 𝑅
+ 3: Output: Reconstructed tiles 𝐴tile for each 𝑟 with padding mask
+ 4: for 𝑟 = 0 to 𝑅 step 𝐵 𝑅 do
+ 5:     𝐴tile ← 𝑃 𝑎 [:, :, 𝑟 : 𝑟 + 𝐵 𝑅 ] 𝑉𝑎 [𝑟 : 𝑟 + 𝐵 𝑅 , :] + 𝑏 𝑎
+ 6: end for
+ 7: Part II. FlashSVDAttention Forward Pass:
+ 8: Input: Low-rank factors 𝑃𝑞 , 𝑃 𝑘 , 𝑃 𝑣 ∈ R 𝐵× 𝑀 ×𝑟Θ∗ , projections 𝑉𝑞 , 𝑉𝑘 , 𝑉𝑣 ∈ R𝑟Θ∗ ×𝑑ΘA ,ℎ , biases 𝑏 𝑞 , 𝑏 𝑘 , 𝑏 𝑣 ∈ R𝑑ΘA ,ℎ ,
+    tile size 𝐵 𝑀 and 𝐵 𝑅 , sequence length 𝑀
+ 9: Output: Output 𝑂 ∈ R 𝐵× 𝑀 ×𝑑ΘA ,ℎ
+10: Initialize 𝑂 ← 0
+11: for ℓ = 0 to 𝑀 − 1 step 𝐵 𝑀 do
+12:     Reconstruct Q block on-chip
+13:     𝑄 tile ← LOAD_TILES(Pq [:, ℓ : ℓ + BM , :], Vq [:, :, ℓ : ℓ + BM ], bq , BR )
+14:     for 𝑚 = 0 to 𝑀 − 1 step 𝐵 𝑀 do
+15:         Reconstruct K and V blocks on-chip
+16:         𝐾tile ← LOAD_TILES(Pk [:, ℓ : ℓ + BM , :], Vk [:, :, ℓ : ℓ + BM ], bk , BR )
+17:        𝑉tile ← LOAD_TILES(Pv [:, ℓ : ℓ + BM , :], Vv [:, :, ℓ : ℓ + BM ], bv , BR )
+18:         Compute attention√︁ scores and softmax
+19:         scores ← 𝑄 tile (𝐾tile )⊤ / 𝑑ΘA ,ℎ
+20:         𝛼 ← stream-softmax(scores, axis = −1)
+            [2]
+21:         𝑂 [:, ℓ : ℓ + 𝐵 𝑀 , :] + = 𝛼 𝑉tile
+22:     end for
+23: end for
+
+
+where the 𝑃 𝑎 factors are formulated from 𝑋𝑈𝑎 , and 𝑉𝑎 ∀ 𝑎 ∈ {𝑞, 𝑘, 𝑣}. Internally the kernel tiles the (𝑀, 𝑑ΘA ,ℎ )
+plane into small (𝐵 𝑀 , 𝑑ΘA ,ℎ ) blocks that stream through on-chip SRAM. For each tile it (1) forms the local low-
+rank query block 𝑄 tile = 𝑃𝑞,tile 𝑉𝑞,tile + 𝑏 𝑞 with iterative accumulation over 𝑟 Θ∗ , (2) multiplies and accumulates
+score with corresponding reconstructed key blocks 𝐾tile = 𝑃 𝑘,tile 𝑉𝑘,tile + 𝑏 𝑘 , (3) applies a row-wise softmax,
+and (4) weights and reduces the value factors 𝑃𝑣,tile 𝑉𝑣,tile to produce the output slice. By fusing the two small
+GEMMs and the softmax into one pass, and never materializing the full 𝐵×𝐻 × 𝑀 ×𝑑ΘA ,ℎ score or output buffers
+off-chip, FlashSVDAttn attains the rank-aware O 𝐻𝑟 Θ∗ (𝐵 𝑀 + 𝑑ΘA ,ℎ ) HBM bound proven in Theorem 4.
+
+FlashSVDFFN Once the FlashAttention alleviated the peak-memory burden of self-attention [2, 3], the feed-
+forward network (FFN) becomes the new dominant factor (theorem 8). Even when 𝑊𝑖 and 𝑊𝑜 admit low-rank
+                 [𝑟 ∗ ]            [𝑟 ∗ ]
+decompositions 𝑊𝑖 Θ = 𝑈𝑖 𝑉𝑖 and 𝑊𝑜 Θ = 𝑈𝑜 𝑉𝑜 with ranks 𝑟 Θ∗ ≪ 𝐷 ΘF , the intermediate 𝜙(𝑋𝑈𝑖 𝑉𝑖 + 𝑏 𝑖 ) ∈
+             Θ
+R (𝐵× 𝑀 ) ×𝐷F must still be materialized in full, dominating HBM despite in low-rank case (theorem 8). We
+propose two rank-aware streaming FFN variants to eliminate this large interim activation that trade off compute
+versus I/O: a mild version that maximizes reuse of vendor-tuned GEMM kernels at the cost of extra off-chip
+traffic, and an extreme version that enable zero I/O to HBM.
+
+FlashSVDFFN V1 (Rank-Aware Fusion) First, the input is projected into the factor space with 𝑃 = 𝑋 𝑈𝑖 via
+the cuBlas GEMM, storing (𝐵 × 𝑀) × 𝑟 𝑖 sized intermediate in HBM. Second, a lightweight streamed kernel
+applies the nonlinearity and the next projection in one fused pass by computing 𝑆 = 𝜙(𝑃 𝑉𝑖 + 𝑏 𝑖 ) 𝑈𝑜 according
+to algorithm 2 without ever materializing the full (𝐵 × 𝑀) × 𝐷 ΘF activation. Finally, the output is reconstructed
+
+                                                                                                                                     5
+                FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+                                                Multihead vs Single Head: Rank Loss Impact on Parameters
+                                                                                                           Multihead (64 4)
+                                                                                                           Single Head (768 48)
+                                                                 2657k
+                                                               rank=576
+
+                   Parameter Count
+                                                                                    1772k
+                                 106                             1440k            rank=384
+                                                                rank=48
+                                                                                     961k                 887k
+                                                                                   rank=32             rank=192
+                                                                                                          482k
+                                                                                                        rank=16
+                                           Key Insight: Multihead benefits from
+                                           smaller rank loss ratio!
+                                 105
+                                           0                     0.25                   0.5               0.75                1.0
+                                                             Rank Loss Ratio (1 - retained_rank/max_rank)
+                                     1.0               Rank Loss Required for Same Parameter Reduction
+                                                Multihead
+                                                                                                       0.84       0.88 0.91
+                                                Single Head
+                                     0.8                                                 0.75
+                                                                                                0.69
+                    Rank Loss Ratio
+
+
+
+
+                                                                        0.66
+                                     0.6              0.56                       0.56
+
+                                     0.4                        0.38
+
+                                     0.2       0.19
+
+                                     0.0         1500K            1200K            900K            600K             300K
+                                                                          Target Parameter Count
+
+     Fig. 2: Multi-head SVD compresses model attention projection matrices more gently than single-head SVD.
+
+
+with 𝑂 = 𝑆 𝑉𝑜 + 𝑏 𝑜 via a second cuBlas GEMM. Because both 𝑃 and 𝑆 remain bounded by the truncated rank
+𝑟 Θ∗ , the overall computation and intermediate memory scale with 𝑟 Θ∗ with the tradeoff for two extra I/O with
+HBM, directly yielding the tight bounds on activation memory and FLOP reduction stated in Theorem 9 and
+Theorem 14.
+
+FlashSVDFFN V2 (Extreme-Case) employs a single fused GEMM–Activation–GEMM GPU kernel to
+stream the low-rank FFN forward pass by directly loading 𝑋, projection factors 𝑈𝑖 , 𝑉𝑖 , 𝑈𝑜 , 𝑉𝑜 , and biases
+𝑏 𝑖 , 𝑏 𝑜 on-the-fly, incuring no additional arithmetic cost or asymptotic complexity compared to a dense FFN
+(identical O 𝐵 𝑀 𝑟 Θ∗ 𝐷 ΘF + 𝐵 𝑀 𝑟 Θ∗ 𝐷 ΘA FLOPs). This unified pipeline supports arbitrary activations 𝜙(·),
+and theoretically pushes the lower bound for variable part of rank-aware activation compression to zero (see
+Theorem 10). By launching one kernel block per tile and accumulating directly into the output buffer, we avoid
+any materialized (𝐵 × 𝑀) × D Θ     F
+                                     mid-buffers, achieving the 𝑂 (𝑟 Θ∗ (𝐵 𝑀 + D Θ
+                                                                                 F
+                                                                                   )) HBM bound of Theorem 9.
+
+Multi-Head Attention Amplifies SVD Savings Many recent compression schemes (e.g., ASVD [30], Dobi-
+SVD [26]) apply SVD to the entire D A Θ × D Θ attention projection as a single matrix. This single head approach
+                                            A
+only yields parameter reduction when 𝑟 Θ∗ < 12 D A  Θ , and in practice forces drastic rank cuts that frequently
+
+degrade accuracy and limits the overall compression capacity of SVD-based method. In contrast, the native
+                              Θ into 𝐻 heads of size 𝑑
+multi-head structure splits D A                                  Θ
+                                                       ΘA ,ℎ = D A /𝐻. By applying truncated SVD per head, the
+                                                      A
+                                                                                 DΘ
+threshold for parameter compression drops to 𝑟 Θ∗ < 𝐻+1 . As Figure 2 illustrates, compressing BERT’s head
+projections to 1.5 M parameters requires a 56% rank reduction under single-head SVD, risking severe quality
+
+
+                                                                                                                                    6
+                  FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+Algorithm 2 FlashSVDFFN Forward Pass V1
+                                Θ                          Θ                Θ          Θ
+Require: Input 𝑋 ∈ R 𝐵×𝑀 × DA ; SVD factors 𝑈𝑖 ∈ R DA ×𝑟Θ∗ , 𝑉𝑖 ∈ R𝑟Θ∗ × DF , 𝑏 𝑖 ∈ R DF ;
+               Θ                   Θ           Θ
+    𝑈𝑜 ∈ R DF ×𝑟Θ∗ , 𝑉𝑜 ∈ R𝑟Θ∗ × DA , 𝑏 𝑜 ∈ R DA ; number of blocks 𝐺; nonlinearity 𝜙(·).
+                          Θ
+Ensure: 𝑂 ∈ R 𝐵× 𝑀 × DA
+ 1: 𝐵 𝑀 ← ⌈𝑀/𝐺⌉, 𝐵 𝐷 Θ ← ⌈D Θ          F
+                                         /𝐺⌉
+                             F
+ 2: GEMM 1st: project into factor-space (cuBlas)
+ 3: 𝑃 ← 𝑋 𝑈𝑖 {(𝐵𝑀) × 𝑟 Θ∗ }
+ 4: On-Chip: rank-aware activation streaming
+ 5: for ℓ = 0 to 𝑀 − 1 step 𝐵 𝑀 do
+ 6:    initialize 𝑍tile ← 0 𝐵×𝐵 𝑀 ×𝑟Θ∗
+ 7:    for 𝑑 = 0 to D Θ F
+                          − 1 step 𝐵 𝐷 Θ do
+                                            F
+
+ 8:      𝑉𝑖(𝑑) ← 𝑉𝑖 [:, 𝑑 : 𝑑 + 𝐵 𝐷 Θ ]{(𝑟 Θ∗ × 𝐵 𝐷 Θ )}
+                                        F           F
+
+ 9:      𝑈𝑜(𝑑) ← 𝑈𝑜 [𝑑 : 𝑑 + 𝐵 𝐷 Θ , :]{(𝐵 𝐷 Θ × 𝑟 Θ∗ )}
+                                    F           F
+
+10:      𝑏 𝑖(𝑑) ← 𝑏 𝑖 [𝑑 : 𝑑 + 𝐵 𝐷 Θ ]{(𝐵 𝐷 Θ )}
+                                  F       F
+
+11:      𝑌 ← 𝜙 𝑃 𝑉𝑖(𝑑) + 𝑏 𝑖(𝑑) {𝐵 × 𝐵 𝑀 × 𝐵 𝐷 Θ }
+                                                    F
+
+12:      𝑍tile += 𝑌 𝑈𝑜(𝑑) {(𝐵 × 𝐵 𝑀 × 𝐵 𝐷 Θ ) × (𝐵 𝐷 Θ × 𝑟 Θ∗ )}
+                                         F          F
+13:   end for
+14:   𝑍 ← 𝑍tile {(𝐵𝑀) × 𝑟 Θ∗ }
+15: end for
+16: GEMM 2nd: project to model-space (cuBlas)
+17: 𝑂 ← 𝑍 𝑉𝑜 + 𝑏 𝑜 {(𝐵𝑀) × D A     Θ}
+
+
+
+
+loss, whereas multi-head SVD needs only a 19% cut, achieving the same compression with far gentler rank
+pruning.
+
+
+4.    Analysis
+FlashSVD establishes provable memory efficient upper bounds on dominant activations during inference by
+exploiting low-rank structure. Below, we summarize the key theorems that characterize these activation bounds
+and clarify the fundamental time–memory trade-offs in FlashSVD.
+
+Peak Memory Footprint Analysis Table 1 demonstrates that combining   FlashSVDAttention with FlashSVDFFN
+reduces the activation memory footprint from O 𝐵𝑀 (D Θ       Θ + 𝑀) to O 𝑟 ∗ (𝐵𝑀 + D Θ + D Θ ) . The FFN
+                                                                                               
+                                                       F
+                                                         + D A              Θ          F    A
+memory can be further reduced using FlashSVDFFN-V2, and ultimately brought variable part to zero. In the
+typical regime where 𝑟 Θ∗ ≪ D AΘ , D Θ , 𝐵𝑀, these optimizations yield a ranked-bounded reduction in HBM
+                                     F
+activation.
+
+Rank Sensitivity The memory footprint of FlashSVD depends critically on the selected SVD rank 𝑟 Θ∗ . For
+the attention module, lowering the rank by one in a single head saves ΔMflash-svd-attn-single = O (𝐵𝑀 + D A  Θ)
+
+                   Proposition 4. Applied across all 𝐻 heads, the aggregate saving is ΔMflash-svd-attn-multi =
+words, as proved in
+O (𝐻 𝐵𝑀 + 𝑑ΘA ,ℎ ) (Proposition 5).
+    An analogous result holds for the feed-forward network. Proposition 7, 8 shows that a unit decrease in rank
+reduces off-chip memory by                                          
+                                        ΔMflash-svd-ffn ≤ O 𝐵𝑀 + 𝐷 ΘF ,
+
+                                                                                                             7
+                 FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+demonstrating that FFN layers benefit from rank reduction along both the batch-sequence and feature dimensions.
+
+     Table 1: Peak HBM M Complexity for each sub-module. See Theorems 2, 4, 9, 10 in Appendix, Supplementary.
+
+                                  Module                Mdense            MFlashSVD
+                                  Single-Head Attn. 3𝐵𝑀 DA   + 𝐵𝑀 2   O (𝑟Θ∗ (𝐵𝑀 + DA ) )
+                                  Multi-Head Attn.     𝐵𝑀 DA          O (𝑟Θ∗ (𝐵𝑀 + DA ) )
+                                  FFN-V1               𝐵𝑀 DF          O (𝑟Θ∗ (𝐵𝑀 + DF ) )
+                                  FFN-V2               𝐵𝑀 DF               O (𝑟Θ∗ DF )
+
+
+
+
+Speedup and Latency Analysis We analyze the performance benefits of FlashSVD along three dimensions:
+FLOP count, memory I/O volume, and end-to-end latency.
+     Theoretical FLOP savings arise from replacing dense matrix multiplications with low-rank projections: the
+full-rank computation costs O (𝐷 ΘA ) 2 𝑀 𝐵 + 𝐷 ΘA 𝐷 ΘF 𝑀 𝐵 , while the low-rank version requires only O 𝑟 Θ2 ∗ 𝑀 𝐵 +
+𝑟 Θ∗ 𝐷 ΘA 𝑀 𝐵 + 𝑟 Θ∗ 𝐷 ΘF 𝑀 𝐵 . The resulting asymptotic speedup factor is given in Theorem 14:
+                             
+
+                                                                              !
+                                                     (𝐷 ΘA ) 2 + 𝐷 ΘA 𝐷 ΘF
+                                              Θ 2                               .
+                                                 𝑟 Θ∗ + 𝑟 Θ∗ 𝐷 ΘA + 𝑟 Θ∗ 𝐷 ΘF
+
+    In terms of data movement, the full-rank model must load all query/key/value activations and FFN outputs,
+with total volume O (𝐵𝑀 (𝐷 ΘA + 𝐷 ΘF )) as shown in Theorem 15. In contrast, FlashSVD only needs to read and
+write low-rank components, yielding reduced volume
+
+                                           O (𝑀 𝐵𝑟 Θ∗ + 𝑟 Θ∗ 𝐷 ΘA + 𝑟 Θ∗ 𝐷 ΘF ),
+
+also see Theorem 15.
+    Finally, following the roofline model, the end-to-end latency per layer is bounded below by the slower of the
+compute- and bandwidth-limited paths:
+                                                 n FLOPs          4 𝑁bytes o
+                                      𝑇 ≥ max                   ,            ,
+                                                  PeakFLOP/s         𝛽
+where 𝑁bytes,in is the number of input bytes and 𝛽 is the memory bandwidth in bytes/s, as formalized in
+Theorem 15.
+
+
+5.     Experiment
+5.1.    Experimental Setup
+Model Setup While the prior activation-aware inference methods (e.g., ASVD [30], Palu [1]) have focused
+primarily on decoder-side KV-Cache compression for causal LMs, the encoder-side activation overhead remains
+largely unexplored. FlashSVD naturally extends to decoder models, but since KV-Cache overheads are already
+well-studied, our evaluation concentrates on encoder architectures. Concretely, we target the most widely adopted
+compressed encoder pipelines, including naive SVD-BERT, fine-tuned low-rank BERT (FWSVD-BERT), and
+our fully fused FlashSVD-BERT-applied to BERT and RoBERTa. To isolate the impact of our fusion kernels,
+we perform an ablation study-toggling FlashSVDAttn and FlashSVDFFN (with autotuned streaming block size)
+independently across diverse settings of inputs. Decoder-side experiments should follow a similar protocol on
+causal language models, but our primary focus remains the encoder.
+
+                                                                                                                   8
+                    FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+Table 2: Main Results: Base Mem (Base), Total Mem (Peak), Transient Mem (Tran), Latency (Lat), Accuracy (Acc),
+Compression Ratio (Ratio), batch = 64, ratio = 25%, 50%, All Training-Free
+
+                                                                  BERT Experiments
+
+   Methodology   Base                    sst2                                        qqp                                        mnli
+
+                         Peak    Tran     Lat    Acc     Ratio    Peak      Tran       Lat    Acc     Ratio   Peak     Tran      Lat    Acc     Ratio
+
+       Dense     418.7   695.0   277.3   79.7    92.32   1.00     971.1     553.5     147.3   90.93   1.00    1547.4   1129.7   310.2   84.06   1.00
+                                                                 Parameter Ratio: 25%
+   Vanilla SVD   332.4   741.6   409.1   161.1   85.16     -     1149.7     817.3     200.2   72.80     -     1990.0   1657.5   359.7   66.73     -
+   FlashSVD v1   332.4   576.7   244.2   188.8   85.16   0.60     785.8     453.4     264.8   72.82   0.55    1230.2    897.7   490.5   66.71   0.54
+   FlashSVD v2   332.4   576.7   244.2   253.5   85.16   0.60     785.8     453.4     400.9   72.81   0.55    1230.2    897.7   753.0   66.71   0.54
+      FWSVD      332.4   913.6   581.1   83.8    89.91     -     1692.7    1360.3     194.0   84.80     -     3853.0   3520.5   463.2   78.01     -
+   FlashFWSVD    332.4   541.6   209.2   139.6   89.91   0.36     756.8     424.4     269.3   84.78   0.31    1213.2    880.8   479.9   77.90   0.25
+                                                                 Parameter Ratio: 50%
+   Vanilla SVD   249.7   653.5   403.8   150.8   66.88     -     1057.1     807.4     180.4   64.05     -     1888.4   1638.7   321.1   37.92     -
+   FlashSVD v1   249.7   461.6   211.8   141.6   66.88   0.52     673.3     423.5     193.5   64.05   0.52    1120.7    870.9   350.6   37.81   0.53
+   FlashSVD v2   249.7   461.6   211.8   192.9   66.88   0.52     673.3     423.5     313.2   64.05   0.52    1120.7    870.9   584.7   37.82   0.53
+      FWSVD      249.7   821.1   571.3   66.5    79.44     -     1592.2    1342.5     165.5   63.75     -     3734.3   3484.5   427.8   51.06     -
+   FlashFWSVD    249.7   453.4   203.7   101.5   79.44   0.36     665.3     415.6     189.9   63.75   0.31    1112.5    862.8   341.4   50.92   0.25
+
+                                                                 RoBERTa Experiments
+
+       Dense     475.5   753.0   277.5   78.1    94.17   1.00    1029.1     553.6     110.1   91.3    1.00    1605.4   1129.9   217.5   87.59   1.00
+                                                                 Parameter Ratio: 25%
+   Vanilla SVD   390.3   883.4   493.1   119.2   49.20     -     1375.5     985.3     148.6   60.63     -     2383.8   1993.5   225.0   33.37     -
+   FlashSVD v1   390.3   634.5   244.2   184.0   49.20   0.49     843.7     453.4     263.9   60.59   0.46    1288.0    897.7   393.1   33.40   0.45
+   FlashSVD v2   390.3   634.5   244.2   238.1   49.20   0.49     843.7     453.4     396.8   60.63   0.46    1288.0    897.7   744.4   33.42   0.45
+      FWSVD      390.3   875.4   485.1   110.5   89.29     -     1366.5     976.3     113.7   82.34     -     2374.8   1984.5   220.8   77.21     -
+   FlashFWSVD    390.3   599.5   209.2   127.4   89.00   0.43     814.7     424.4     217.1   82.11   0.43    1271.1    880.8   401.3   77.46   0.44
+                                                                 Parameter Ratio: 50%
+   Vanilla SVD   307.6   790.8   483.3   110.3   50.94     -     1274.0     966.4     100.7   62.07     -     2264.2   1956.7   247.7   31.16     -
+   FlashSVD v1   307.6   519.4   211.8   148.8   51.34   0.44     731.1     423.5     170.1   62.08   0.44    1178.5    870.9   287.1   31.10   0.45
+   FlashSVD v2   307.6   519.4   211.8   195.1   51.63   0.44     731.1     423.5     313.7   62.06   0.44    1178.5    870.9   570.8   31.07   0.45
+      FWSVD      307.6   782.9   475.3   103.0   71.09     -     1266.0     958.5      93.5   63.36     -     2256.1   1948.5   345.6   37.82     -
+   FlashFWSVD    307.6   511.3   203.7   105.5   69.49   0.43     723.2     415.6     156.7   63.31   0.43    1170.4    862.8   279.2   38.40   0.44
+
+
+
+
+Evaluation Metrics For encoders, we assess model quality via task-specific classification accuracy on widely-
+recognized GLUE datasets [25], evaluating performance at input lengths of 128, 256, and 512 tokens. Mem-
+ory efficiency is quantified by measuring peak activation usage during end-to-end inference, and reported in
+mebibytes (MiB) - using PyTorch’s profiler. Compute efficiency is captured through wall-clock latency per batch
+(milliseconds) on an NVIDIA L40S GPU. We evaluate a family of models spanning a range of compression
+ratios ( # Param  Compressed
+            # Param Dense ) divided by that of the dense baseline) and report how latency and memory savings
+scale as the parameter budget is varied.
+
+5.2.    Main Results
+Table 2 demonstrates that FlashSVD strikes an outstanding balance between model compression, memory
+footprint, and inference throughput on both BERT-Base and RoBERTa-Base across multiple GLUE benchmarks.
+Regardless of the compression ratio, Flashsvd incurs no measurable degradation relative to the vanilla SVD and
+FWSVD method (maximum difference of only 0.58 % for RoBERTa at 50 % parameters on MNLI). At the same
+time, it slashes transient activation memory by 69 % on SST-2 and QQP and by 75 % on MNLI, reducing peak
+inference usage to 1,213 MiB, well below the 1,547 MiB of the original BERT and the 1,990 MiB of a naive SVD,
+compressed variant. These results reveal that the naive SVD-based compression, despite lowering parameter
+counts, can actually inflate runtime memory demands and undermine deployment in resource-constrained
+environments.
+    Moreover, FlashSVD maintains competitive inference latency while entirely eliminating large dense inter-
+mediate tensors, despite the additional I/O tradeoff. On MNLI, with 50 % of the original parameters retained,
+FlashSVD processes each batch in 341 ms, nearly 20 % faster than the 427.8 ms observed with the baseline SVD
+approach. Similarly, on SST-2 under the same compression level, FlashSVD achieves 141.6 ms per batch versus
+150.8 ms for vanilla SVD. These results demonstrate that our rank-aware optimizations not only preserve model
+
+                                                                                                                                                        9
+                FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+Table 3: Rank Awareness: latency and transient-memory trade-offs on SST-2 as MHA/FFN rank varies, Sequence Length
+= 128 for SST-2 dataset and 256 for STS-B dataset
+
+                             Dataset    MHA Latency Trans. Mem. Peak. Mem.
+                            & Method    Rank (ms)      (MB)        (MB)
+                                         64  112.9     214.2       719.6
+                               SST-2     56  114.0     214.2       708.6
+                            Vanilla SVD 48   112.2     214.2       697.7
+                              (b = 32)   32  110.1     214.2       675.7
+                                            64     166.0      136.5        641.9
+                              SST-2         56     165.5      125.2        619.7
+                            FlashSVD        48     164.9      118.2        601.7
+                             (b = 32)       32     158.9      118.2        579.7
+                                           768     158.1      424.3        929.7
+                               STS-B       384     132.7      413.1        756.5
+                            Vanilla SVD    192     138.3      406.8        669.2
+                              (b = 32)      96     126.7      404.1        626.0
+                                           768     285.8      250.6        756.0
+                              STS-B        384     152.0      251.4        594.8
+                            FlashSVD       192     119.4      251.1        513.5
+                             (b = 32)       96     109.6      251.4        473.3
+
+
+accuracy and drastically reduce memory consumption but also sustain-and in some cases improve-inference
+speed relative to both dense and standard SVD-based methods.
+    In the extreme configuration, FlashSVD achieves comparable memory savings but incurs substantial latency
+overhead, with up to 60 % in some cases, because the extra reconstruction loop in the feed-forward network
+undermines parallelism. Although FlashSVDFFN V2 offers a theoretically lower transient memory bound,
+FlashSVDFFN V1 strikes a more balanced trade-off between memory reduction and inference speed and is
+therefore the recommended variant for practical deployment.
+
+Rank Awareness As shown in Table 3, in the attention module, as we reduce the SVD rank from 64 to 32,
+peak activation memory drops from 641.9 MiB to 579.7 MiB, but transient memory levels off at around 118 MiB
+by rank 48. Beyond this point, other components of the transformer (i.e. residual buffers and layer-norm state)
+become the dominant contributors to the working set and scaling pattern halted. Latency also falls modestly
+with rank: FlashSVD’s processing time decreases slightly from 166.0 ms at rank 64 to 158.9 ms at rank 32, a 4.3
+% reduction. These observations show that at higher ranks, the O (𝐵𝐻 𝑀𝑟 Θ∗ ) low-rank factors dictate memory
+usage while highlighting that the MHA is not the latency overhead.
+    In the FFN module, FlashSVDFFN V1 latency steadily improves as the rank shrinks: from 152.0 ms at rank
+384 to 119.4 ms at 192 and 109.6 ms at 96 over the vanilla SVD. Throughout this range, transient memory remains
+essentially constant round 250 MiB, confirming that in medium-to-low rank regimes the MHA components,
+with memory complexity of O (𝐵𝐻 𝑀𝑟 Θ∗ ), remain the primary drivers of the transient memory footprint, and
+that our rank-aware reconstruction effectively restores parallelism without inflating activation buffers.
+
+5.3.   Ablation Study
+FlashSVDAttn To quantify the speed–quality trade-offs introduced by our FlashSVDAttn module, we measure
+relative speedup in latency against PyTorch’s fused SDPA (equivalent to FlashAttention) across mild (𝑀 ≤ 256)
+
+                                                                                                              10
+                FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+                Table 4: STS-B (Pearson) Performance and 50% Compression Ratio with Finetuning
+
+                                                            Trans. Mem   Peak       Lat.
+                             Model               Acc. (%)      (MiB)   Mem. (MiB)   (ms)
+                             Dense                81.41       281.3      699.0      98.8
+                             SVD                  80.52       399.8      652.8      128.9
+                             FlashSVD             80.52       207.8      460.8      114.8
+                             SVD (no finetune)    13.50       408.3      658.0      160.1
+
+
+
+and long (𝑀 ≥ 512) contexts. As shown in Table S3, at full rank (𝑅 = 64) FlashSVDAttn runs at 0.62× the
+speed of Dense for 𝑀 = 128 and 0.89× for 𝑀 = 256, but as we reduce rank, the gap narrows: at 𝑅 = 32 the
+module achieves parity with Dense (1.00×) for 𝑀 = 256, and at 𝑅 = 16 it actually surpasses Dense by 8%
+(1.08×) in the mild setting. In the compute-bound long-context regime, FlashSVDAttn consistently outperforms
+Dense—speedups grow from 1.05× at 𝑅 = 64 up to 1.37× (𝑀 = 512) and 1.64× (𝑀 = 1024) at 𝑅 = 16. This
+ablation confirms that (1) low-rank FlashSVDAttn can match or exceed fused SDPA even for medium or short
+context and (2) delivers substantial speedups for long sequences, validating its practical utility in both regimes.
+
+FlashSVDFFN Table S2 summarizes the computation-efficiency gains of our FlashSVDFFN kernels across a
+range of FFN truncation ranks and context lengths. FlashSVDFFN V1 offers the best practical trade-off between
+memory reduction and speedup. At rank 192, FlashSVDFFN V1 achieves over 50% of dense speed for medium
+(256) contexts and nearly 80% for longer (512–1024). At rank 96, it outperforms dense FFN by up to 1.9×,
+demonstrating that low-rank fusion can turn compression into a net performance gain. FlashSVDFFN V2 follows
+the same trend but with smaller peak speedups (around 0.25× at rank 96) due to finer-grained tiling limiting
+parallelism. Overall, FlashSVDFFN V1 strikes the ideal balance-leveraging reduced arithmetic and maintained
+GPU occupancy - to deliver up to 1.9× acceleration over the dense FFN under realistic low-rank budgets.
+
+Finetuning Unlocks Extreme Low-Rank Compression While many recent methods [30, 27, 10] emphasize
+training-free SVD to avoid retraining overhead, our results show that judicious fine-tuning of low-rank factors
+unleashes far greater compression without accuracy loss. In particular, by fine-tuning BERT after 50% parameter
+reduction, we recover nearly full task performance while slashing transient memory by 48.2% and peak memory
+by 29.4%, about same size as the persistent memory of dense model (Table 4). These findings underscore that a
+rank-aware inference framework, like FlashSVD, paired with targeted fine-tuning can push transformer models
+to much more aggressive low-rank regimes, making extreme compression truely viable for edge deployment
+with minimal performance loss. Full details is available in table S6.
+
+
+6.   Conclusion
+In this work, we introduce FlashSVD, the first fused, rank-aware inference framework for SVD-compressed
+transformers. By streaming low-rank projections directly into FlashAttention and FFN kernels, we eliminate
+large activations and cut peak on-chip memory by up to 71% with no extra computational cost. Across BERT
+and RoBERTa, FlashSVD matches or exceeds dense throughput under 25–50% compression and achieves up to
+1.9× FFN speedups at modest ranks. These results demonstrate that rank-aware tiling makes low-rank SVD a
+practical, high-performance strategy for memory-constrained transformer deployment.
+
+
+
+
+                                                                                                                11
+                FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+References
+ [1] C.-C. Chang, W.-C. Lin, C.-Y. Lin, C.-Y. Chen, Y.-F. Hu, P.-S. Wang, N.-C. Huang, L. Ceze, M. S.
+     Abdelfattah, and K.-C. Wu. Palu: KV-cache compression with low-rank projection. In The Thirteenth
+     International Conference on Learning Representations, 2025. URL https://openreview.net/forum?id=
+     LWMS4pk2vK.
+
+ [2] T. Dao, D. Y. Fu, S. Ermon, A. Rudra, and C. Ré. Flashattention: Fast and memory-efficient exact attention
+     with io-awareness. arXiv preprint, 2022. arXiv:2205.14135.
+
+ [3] T. Dao, D. Y. Fu, S. Ermon, A. Rudra, and C. Ré. Flashattention-2: Faster attention with better parallelism
+     and work partitioning. arXiv preprint, 2023. arXiv:2307.08691.
+
+ [4] T. Dettmers, A. Pagnoni, A. Holtzman, and L. Zettlemoyer. Qlora: Efficient finetuning of quantized llms.
+     arXiv preprint, 2023. arXiv:2305.14314.
+
+ [5] J. Devlin, M.-W. Chang, K. Lee, and K. Toutanova. Bert: Pre-training of deep bidirectional transformers
+     for language understanding. In Proceedings of the 2019 conference of the North American chapter of
+     the association for computational linguistics: human language technologies, volume 1 (long and short
+     papers), pages 4171–4186, 2019.
+
+ [6] C. Eckart and G. Young. The approximation of one matrix by another of lower rank. Psychometrika, 1(3):
+     211–218, 1936.
+
+ [7] A. Gordon, E. Eban, O. Nachum, B. Chen, H. Wu, T.-J. Yang, and E. Choi. Morphnet: Fast & simple
+     resource-constrained structure learning of deep networks. arXiv preprint arXiv:1711.06798, 2017.
+
+ [8] S. Han, H. Mao, and W. J. Dally. Deep compression: Compressing deep neural networks with pruning,
+     trained quantization and huffman coding. In International Conference on Learning Representations
+     (ICLR), 2016. arXiv:1510.00149.
+
+ [9] Y. He, X. Zhang, and J. Sun. Channel pruning for accelerating very deep neural networks. In IEEE
+     International Conference on Computer Vision (ICCV), Oct 2017.
+
+[10] Y.-C. Hsu, T. Hua, S. Chang, Q. Lou, Y. Shen, and H. Jin. Language model compression with weighted
+     low-rank factorization. arXiv preprint arXiv:2207.00112, 2022.
+
+[11] E. J. Hu, Y. Shen, P. Wallis, Z. Allen-Zhu, Y. Li, S. Wang, L. Wang, and W. Chen. Lora: Low-rank
+     adaptation of large language models. In ICLR, 2021. arXiv:2106.09685.
+
+[12] B. Jacob, S. Kligys, B. Chen, M. Zhu, M. Tang, A. Howard, H. Adam, and D. Kalenichenko. Quantization
+     and training of neural networks for efficient integer-arithmetic-only inference. In Proceedings of the
+     IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), pages 2704–2713, 2018.
+     arXiv:1712.05877.
+
+[13] H. Li, A. Kadav, I. Durdanovic, H. Samet, and H. P. Graf. Pruning filters for efficient convnets. In
+     International Conference on Learning Representations (ICLR), 2017. arXiv:1608.08710.
+
+[14] B. Lin and Colleagues. Modegpt: Modular decomposition for large language model compression. In
+     ICML, 2024. OpenReview: 8EfxjTCg2k.
+
+
+                                                                                                             12
+                FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+[15] S. Lin, R. Ji, Y. Li, C. Deng, and X. Li. Towards compact convnets via structure-sparsity regularized filter
+     pruning. arXiv preprint arXiv:1901.07827, 2019.
+
+[16] F. Liu and N. Team. Star attention: Efficient llm inference over long sequences. arXiv preprint, 2024.
+     arXiv:2411.17116.
+
+[17] Y. Liu, M. Ott, N. Goyal, J. Du, M. Joshi, D. Chen, O. Levy, M. Lewis, L. Zettlemoyer, and V. Stoyanov.
+     Roberta: A robustly optimized bert pretraining approach. arXiv preprint arXiv:1907.11692, 2019.
+
+[18] J.-H. Luo and J. Wu. An entropy-based pruning method for cnn compression.                   arXiv preprint
+     arXiv:1706.05791, 2017.
+
+[19] J.-H. Luo, J. Wu, and W. Lin. Thinet: A filter level pruning method for deep neural network compression.
+     In IEEE International Conference on Computer Vision (ICCV), 2017. arXiv:1707.06342.
+
+[20] R. Pope, S. Douglas, A. Chowdhery, J. Devlin, J. Bradbury, J. Heek, K. Xiao, S. Agrawal, and J. Dean.
+     Efficiently scaling transformer inference. Proceedings of Machine Learning and Systems, 5:606–624,
+     2023.
+
+[21] J. Shah, G. Bikshandi, Y. Zhang, V. Thakkar, P. Ramani, and T. Dao. Flashattention-3: Fast and accurate
+     attention with asynchrony and low-precision. Advances in Neural Information Processing Systems, 37:
+     68658–68685, 2024.
+
+[22] E. Shi and Team. Blockllm: Multi-tenant finer-grained serving for large language models. arXiv preprint,
+     2024. arXiv:2404.18322.
+
+[23] M. Shoeybi, M. Patwary, R. Puri, P. LeGresley, J. Casper, and B. Catanzaro. Megatron-lm: Training
+     multi-billion parameter language models using model parallelism. arXiv preprint arXiv:1909.08053,
+     2019.
+
+[24] H. Touvron, T. Lavril, G. Izacard, X. Martinet, M.-A. Lachaux, T. Lacroix, B. Rozière, N. Goyal, E. Hambro,
+     F. Azhar, et al. Llama: Open and efficient foundation language models. arXiv preprint arXiv:2302.13971,
+     2023.
+
+[25] A. Wang, A. Singh, J. Michael, F. Hill, O. Levy, and S. R. Bowman. Glue: A multi-task benchmark and
+     analysis platform for natural language understanding. arXiv preprint arXiv:1804.07461, 2018.
+
+[26] Q. Wang, J. Ke, M. Tomizuka, K. Keutzer, and C. Xu. Dobi-svd: Differentiable svd for llm compression
+     and some new perspectives. In ICLR, 2025. OpenReview: kws76i5XB8.
+
+[27] X. Wang, Y. Zheng, Z. Wan, and M. Zhang. Svd-llm: Truncation-aware singular value decomposition for
+     large language model compression. arXiv preprint arXiv:2403.07378, 2024.
+
+[28] X. Wang, S. Alam, Z. Wan, H. Shen, and M. Zhang. Svd-llm v2: Optimizing singular value truncation for
+     large language model compression. arXiv preprint arXiv:2503.12340, 2025.
+
+[29] H. Wu, P. Judd, X. Zhang, M. Isaev, and P. Micikevicius. Integer quantization for deep learning inference:
+     Principles and empirical evaluation. arXiv preprint arXiv:2004.09602, 2020.
+
+[30] A. Yuan and Others. Activation-aware singular value decomposition for large language models. OpenRe-
+     view preprint, 2023. arXiv:2502.01403.
+
+                                                                                                              13
+               FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+[31] J. Zhang, Y. Zhang, J. Gu, J. Dong, L. Kong, and X. Yang. Xformer: Hybrid x-shaped transformer for
+     image denoising. In ICLR, 2024.
+
+[32] S. Zhang, S. Roller, N. Goyal, M. Artetxe, M. Chen, S. Chen, C. Dewan, M. Diab, X. Li, X. V. Lin, et al.
+     Opt: Open pre-trained transformer language models. arXiv preprint arXiv:2205.01068, 2022.
+
+
+
+
+                                                                                                          14
+                   FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+Algorithm S1 FlashSVDFFN Forward Pass V2
+                                Θ                         Θ                  Θ          Θ
+Require: Input 𝑋 ∈ R 𝐵× 𝑀 × DA ; SVD factors 𝑈𝑖 ∈ R DA ×𝑟Θ∗ , 𝑉𝑖 ∈ R𝑟Θ∗ × DF , 𝑏 𝑖 ∈ R DF ;
+              Θ                    Θ            Θ
+    𝑈𝑜 ∈ R DF ×𝑟Θ∗ , 𝑉𝑜 ∈ R𝑟Θ∗ × DA , 𝑏 𝑜 ∈ R DA ; number of blocks 𝐺; nonlinearity 𝜙(·).
+                         Θ
+Ensure: 𝑂 ∈ R 𝐵× 𝑀 × DA
+ 1: 𝐵 𝑀 ← ⌈𝑀/𝐺⌉, 𝐵 𝐷 Θ ← ⌈D Θ          F
+                                          /𝐺⌉
+                             F
+ 2: Initialize 𝑂 ← 0 𝐵×𝑀 × D Θ , 𝑍tile ← 0 𝐵×𝐵 𝑀 × D Θ
+                               A                       A
+ 3: On-Chip: direct activation streaming
+ 4: for ℓ = 0 to 𝑀 − 1 step 𝐵 𝑀 do
+ 5:    𝑃tile ← 𝑋 [:, ℓ : ℓ + 𝐵 𝑀 , :] 𝑈𝑖 [:, 𝑘] {(𝐵, 𝐵 𝑀 , 𝑟 Θ∗ )}
+ 6:    for 𝑑 = 0 to D Θ F
+                          − 1 step 𝐵 𝐷 Θ do
+                                           F
+ 7:       for 𝑘 = 0 to 𝑟 Θ∗ − 1 do
+ 8:          𝑌 += 𝑃tile 𝑉𝑖 [𝑘, 𝑑 : 𝑑 + 𝐵 𝐷 Θ ]
+                                              F
+ 9:       end for
+          𝑌 ← 𝜙 𝑌 + 𝑏 𝑖 [𝑑 : 𝑑 + 𝐵 𝐷 Θ ] {(𝐵 × 𝐵 𝑀 × D Θ
+                                            
+10:                                                            F
+                                                                 )}
+                                        F
+11:       for 𝑘 = 0 to 𝑟 Θ∗ − 1 do
+12:          𝑍tile += 𝑌 𝑈𝑜 [𝑑 : 𝑑 + 𝐵 𝐷 Θ , 𝑘] + 𝑏 𝑜 [𝑑 : 𝑑 + 𝐵 𝐷 Θ ]
+                                           F                        F
+13:       end for
+14:    end for
+15: end for
+16: 𝑂 ← 𝑍tile accumulation {broadcast to (𝐵, 𝐵 𝑀 , D A        Θ )}
+
+
+
+
+S1.      Supplementary Materials
+
+S2.      Appendix
+S2.1.    Additional Methodology
+FlashSVDFFN V2 (Extreme-Case) The FFN kernel streams low-rank factors of both weight matrices
+   [𝑟 ∗ ]                  [𝑟 ∗ ]
+𝑊𝑖 Θ = 𝑈𝑖 Σ𝑖 𝑉𝑖 and 𝑊𝑜 Θ = 𝑈𝑜 Σ𝑜 𝑉𝑜 through a fused GEMM–ACTIVATION-GEMM pipeline on ar-
+bitrary activation function 𝜙(·). We tile the sequence dimension into chunks of batch-sequence dimension 𝐵 𝑀
+and the intermediate feature dimension D Θ  F
+                                              into blocks of width 𝐵 D Θ . For each (𝐵 × 𝐵 𝑀 ) × 𝐵 D Θ tile:
+                                                                                 F                     F
+
+                                                               
+                                    𝑌 = 𝜙 (𝑋tile 𝑈𝑖 ) 𝑉𝑖,tile ,     𝑍tile + = (𝑌 𝑈𝑜,tile ) 𝑉𝑜 ,
+
+where (·)tile denotes the accumulation buffer on SRAM. By launching one kernel block per tile and accumulating
+directly into the output buffer, we avoid any materialized (𝐵 × 𝑀) × D Θ    F
+                                                                              mid-buffers, achieving the 𝑂 (𝑟 Θ∗ (𝐵 𝑀 +
+   Θ
+D F )) HBM bound of Theorem 9.
+     FlashSVDFFN V2 (Alg. S1) incurs no additional arithmetic cost         or asymptotic complexity compared to a
+dense FFN: it executes the identical 𝑂 𝐵 𝑀 𝑟 Θ∗ 𝐷 ΘF + 𝐵 𝑀 𝑟 Θ∗ 𝐷 ΘA FLOPs, yet reduces peak on-chip storage
+per token from 𝑂 (𝑟 Θ∗ (𝐵 𝑀 + D Θ  F
+                                     )) to 𝑂 (𝑟 Θ∗ D Θ
+                                                     F
+                                                       ). This theoretically pushes the lower bound for variable part
+of rank-aware activation compression to zero (see Theorem 10). In practice, however, V2’s fine-granularity
+tiling can limit GPU parallelism, especially in higher rank case, and our experiments show that factors such
+as residual-add operation and layer-norm ordering begin to dominate end-to-end latency. Addressing these
+secondary bottlenecks will be key to unlocking V2’s full on-edge performance potential.
+
+
+
+
+                                                                                                                    15
+                 FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+                                                  Θ
+                                                 DA      𝐻    𝑑ΘA ,ℎ   Threshold on 𝑟
+                                  Multi-Head      768    12     64     𝑟 < 768
+                                                                           13 ≈ 59.1
+                                  Single Head     768    —      —      𝑟 < 768
+                                                                            2 = 384
+
+Table S1: Example (BERT-Base, D A  Θ = 768, 𝐻 = 12, 𝑑           Θ
+                                                      ΘA ,ℎ = D A /𝐻): Rank-truncation thresholds for head-wise vs.
+full-matrix SVD to achieve compression.
+
+
+Proof of MHA Reduction Efficiency We provide the proof of rank-loss efficiency for the MHA based
+compression. We have also provided a case study with results summarized in table S1.
+                                                                                   D × DA          Θ    Θ
+               Θ = 𝑑
+Proof. Given D A     ΘA ,ℎ × 𝐻, the SVD for single head projection matrices 𝑊 𝑎 ∈ R A     , ∀𝑎 ∈ 𝑞, 𝑘, 𝑣,
+                                                                  Θ
+we have 𝑊𝑎 = 𝑈𝑎𝑉𝑎 in full rank case, which 𝑈𝑎𝑉𝑎 ∈ R DA ×𝑟Θ∗ . Once 𝑟 Θ∗ = D A                Θ , we have 𝑈 𝑉 be twice
+                                                                                                            𝑎 𝑎
+larger than 𝑊𝑎 and we can only achieve compression after pruning over half of the rank. For multi-head case,
+                          (ℎ)                            (ℎ)       Θ
+                                                             ∈ R DA ×𝑑ΘA ,ℎ . The low-rank decomposition is given as
+                 Ð𝐻
+which 𝑊𝑎 =          ℎ=1 𝑊 𝑎 , ∀ℎ ∈ 1, 2, . . . 𝐻 and 𝑊 𝑎
+                                       Θ
+𝑊𝑎(ℎ) ≈ 𝑈𝑎(ℎ) 𝑉𝑎(ℎ) , with 𝑈𝑎(ℎ) ∈ R DA ×𝑟Θ∗ and 𝑉𝑎(ℎ) ∈ R𝑟Θ∗ ×𝑑ΘA ,ℎ with 𝑟 Θ∗ ≤ 𝑑ΘA ,ℎ . Therefore, in the worst case
+                                        𝑈𝑎(ℎ) 𝑉𝑎(ℎ) in size:
+                                Ð𝐻
+where 𝑟 Θ∗ = 𝑑ΘA ,ℎ , we have ℎ=1
+
+
+                                             Θ
+                                        𝐻 × DA × 𝑑ΘA ,ℎ + 𝐻 × 𝑑ΘA ,ℎ × 𝑑ΘA ,ℎ
+                                            Θ              Θ
+                                     = 𝐻 × DA × 𝑑ΘA ,ℎ + D A × 𝑑ΘA ,ℎ
+                                                   Θ
+                                     = (𝐻 + 1) × D A × 𝑑ΘA ,ℎ
+                                        Θ , rank reduction to achieve parameter reduction benefits in comparison to
+     Thus, it only requires 𝑟 Θ∗ < 12 D A
+       1    Θ
+𝑟 Θ∗ < 2 D A , of single head case.
+                                                                                                                  □
+
+    Palu [1] showed that grouping 𝐻 heads into 𝐺-SVD blocks improves the reconstruction–expressivity
+trade-off in the KV-Cache of low-rank models; Theorem 7 and Proposition 6 extends this to general compres-
+sion
+   of model weights    and activations (e.g. Q, K, V, FFN intermediates, attention output projection) at cost
+                   Θ 
+                  DA
+O 𝐺 𝑟 Θ∗ 𝐵 𝑀 + 𝐺 , interpolating between 𝐺 = 1 and 𝐺 = 𝐻. Moreover, we apply this analysis uniformly to
+transformer layers and, for the first time, quantify its impact on peak activation memory.
+
+S2.2.    Additional Analysis
+In this section, we characterize FlashSVD’s advantages under practical modeling conditions. We begin by
+deriving tight memory–complexity bounds for low-rank activations, explicitly comparing against both full-rank
+storage and naive low-rank implementations. Building on this foundation, we introduce a layer-wise sensitivity
+analysis that reveals which parts of the Transformer—be it multi-head attention, grouped-head attention, or the
+feed-forward network-yield the greatest benefit per truncated singular dimension. We then turn to computational
+costs, providing detailed estimates of FLOP reductions and end-to-end kernel latency improvements. Finally,
+we establish provable bounds on the numerical error introduced by streaming, showing how metrics such as
+perplexity degrade as a function of rank, layer depth, and data distribution. All main statements are formalized
+as theorems or lemmas, with proof sketches deferred to the appendix.
+
+
+
+                                                                                                                      16
+                FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+S2.3.   Memory Complexity
+                                             Θ
+For any given model Θ, let 𝑋 ∈ R 𝐵× 𝑀 × DA denote a batch of 𝐵 token sequences of length 𝑀 with hidden
+dimensionality D A  Θ . In both training and inference, a Transformer’s memory consumption is dominated by
+
+(i) the static storage of its model parameters and (ii) the dynamic allocations required to hold intermediate
+activations. In particular, the activations for the attention sublayer consist of the query, key, and value tensors
+                          Θ                                                              Θ
+𝑄, 𝐾, 𝑉 ∈ R 𝐵× 𝑀 × DA , while the feed-forward sublayer produces 𝑆out ∈ R 𝐵× 𝑀 ×𝐷F , where 𝐷 ΘF denotes the
+hidden dimension of the intermediate projection. In this work, we propose replacing each of these full-rank
+activation tensors with a rank-𝑟 approximation computed via singular value decomposition (SVD). We derive
+upper bounds on the resulting memory footprint—showing that it scales as O (𝑟 Θ∗ (𝐵𝑀 + D A         Θ + 𝐷 Θ )) rather
+                                                                                                         F
+than O (𝐵𝑀D A   Θ + 𝐵𝑀 𝐷 Θ )—and we quantify the trade-off between compression ratio and approximation error.
+                            F
+This theoretical analysis lays the groundwork for deploying rank-constrained Transformers in resource-limited
+settings without sacrificing accuracy.
+
+Remark 1 (Scope of Memory Analysis). Throughout the following off-chip memory analyses, we focus on
+the variable (change-inducing) components and omit persistent peak memory terms, such as the HBM-resident
+                       Θ
+matrices 𝑉∗ ∈ R𝑟Θ∗ × DA and the final output activations. However, when discussing rank selection and practical
+deployment guidance, we account for the full off-chip memory footprint, including both transient and persistent
+terms, to ensure our analysis reflects real-world constraints. Note that we conduct memory analysis at the
+                                                           Θ               Θ
+per-layer level, excluding the output activation R 𝐵× 𝑀 × DA and R 𝐵× 𝑀 × DF , which is always present and agnostic
+to the attention variant.
+
+Attention We first consider the multi-head attention module in a Transformer block, which is parameterized
+                                               Θ   Θ
+by the projection matrices 𝑊𝑞 , 𝑊 𝑘 , 𝑊𝑣 ∈ R DA × DA and applied to an input of shape (𝐵, 𝑀, D A Θ ). When the
+
+total activation size 𝐵 𝑀 far exceeds the hidden dimension D A Θ , the DRAM footprint of the query, key, value,
+
+and scoring tensors typically dominates. In what follows, we derive tight upper and lower bounds on the off-chip
+memory cost incurred by SVD-based compression of these attention activations.
+                                                                          Θ
+Definition 1 (Attention Activation Approximation). Let 𝑋 ∈ R 𝐵× 𝑀 × DA be the input to a multi-head attention
+                                                  Θ    Θ
+block with projection matrices 𝑊𝑞 , 𝑊 𝑘 , 𝑊𝑣 ∈ R DA × DA . Define the (flattened) query, key, and value activations
+                                                            Θ
+𝑄 = 𝑋𝑊𝑞 , 𝐾 = 𝑋𝑊 𝑘 , 𝑉 = 𝑋𝑊𝑣 , each of shape R (𝐵 𝑀 ) × DA . We say that 𝑄 admits a rank-𝑟 SVD approximation
+if
+                                ∗
+                            𝑄 [𝑟Θ ] = 𝑈𝑄 Σ𝑄 𝑉𝑄⊤ ,
+                                                                                                               (S1)
+                                               ∗              ∗  ∗              Θ   ∗
+                               𝑈𝑄 ∈ R (𝐵𝑀 ) ×𝑟Θ , Σ𝑄 ∈ R𝑟Θ ×𝑟Θ , 𝑉𝑄 ∈ R DA ×𝑟Θ .
+and similarly for 𝐾 and 𝑉, with 𝑟 Θ∗ be the layer rank given by the compression algorithm. Compressing all three
+projections to rank 𝑟 then replaces the full activations by the factor pairs (𝑈𝑄 , Σ𝑄 , 𝑉𝑄 ), (𝑈𝐾 , Σ𝐾 , 𝑉𝐾 ), and
+(𝑈𝑉 , Σ𝑉 , 𝑉𝑉 ), which the Σ∗ are usually merged into either 𝑈∗ or 𝑉∗ for simplicity.
+    For a Transformer layer Θ A with 𝐻 attention heads, the total attention dimension D A        Θ is uniformly
+
+partitioned across heads, so each head has dimension
+                                                               Θ
+                                                              DA
+                                                  𝑑ΘA ,ℎ :=        .
+                                                              𝐻
+                                              Θ
+All activation tensors (𝑄, 𝐾, 𝑉) ∈ R 𝐵× 𝑀 × DA are reshaped as 𝐻 parallel sub-tensors of shape R 𝐵× 𝑀 ×𝑑ΘA ,ℎ to
+enable independent attention computations per head.
+
+                                                                                                                 17
+                FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+Theorem 1 (Memory Complexity of Dense Multi-Head Attention). For a single-head attention module defined
+in Definition 1, the peak working memory (number of stored scalars) required by the unoptimized dense multi-
+head attention mechanism is Mdense = 3 𝐵 𝑀 D AΘ + 𝐵 𝑀2.
+
+
+Proof. In the standard dense Θ and unoptimized low-rank model Θ∗ , one first computes three full-rank linear
+projections of the input embeddings into queries 𝑄, keys 𝐾, and values 𝑉. Each of these tensors has shape
+𝐵×𝑀 ×D A  Θ , and to avoid redundant re-computation all three must reside in memory simultaneously, contributing
+
+                                          ∑︁
+                                                        Θ               Θ
+                                                 𝐵𝑀D A      = 3 𝐵 𝑀 DA    .
+                                       𝑎∈ {𝑞,𝑘,𝑣 }
+
+Next, the attention logits are formed as the batch of pairwise dot-product matrices
+
+                                     𝑆 (𝑏) = 𝑄 (𝑏) 𝐾 (𝑏) ⊤   for 𝑏 = 1, . . . , 𝐵,
+
+each of size 𝑀 × 𝑀. Storing all 𝐵 score matrices therefore requires 𝐵 𝑀 2 scalars. No other intermediate buffers
+exceed these sizes, so the total peak memory is Mdense = 3 𝐵 𝑀 D A Θ + 𝐵 𝑀2.                                  □
+
+Proposition 1 (Memory Complexity of Multi-Head Attention). A multi-head attention module defined in
+                                                                        Θ + 𝐻𝐵𝑀 2 ).
+Definition 1 yields a total dense attention memory cost Mdense = O (𝐵𝑀D A
+Proof. Each head computes its own set of projections for queries, keys, and values, each of shape 𝐵 × 𝑀 × 𝑑ΘA ,ℎ ,
+                 Θ /𝐻. Across all heads, the total Q, K, V memory remains as stated in Theorem 1:
+where 𝑑ΘA ,ℎ = D A
+                                                              Θ
+                                              M 𝑄𝐾𝑉 = 3 𝐵 𝑀 D A .
+
+   Each head also computes a score matrix of shape 𝐵 × 𝑀 × 𝑀, contributing 𝐵𝑀 2 memory per head. With
+𝐻 heads, these score matrices total:
+                                           Mscores = 𝐻𝐵𝑀 2 .
+    Therefore, the total dense memory cost is:
+                                                         Θ
+                                        Mdense = 3 𝐵 𝑀 D A + 𝐻 𝐵 𝑀2.
+
+                                                                                                                □
+
+To mitigate the high memory overhead of materializing the full 𝐵𝑀 2 attention score matrix, we adopt FlashAt-
+tention [2, 3], which streams the computation and avoids instantiating intermediate tensors. The following
+proposition quantifies its peak memory usage.
+Proposition 2 (Memory Complexity with FlashAttention). Under the same notation in Proposition 1, the peak
+HBM footprint of streaming (Flash) attention is
+                                                                  Θ
+                                            Mflash-attn = 3 𝐵 𝑀 D A ,
+
+as the 𝑂 (𝐵𝑀 2 ) score-matrix never coexists in off-chip memory.
+Proof. FlashAttention partitions the 𝑀-length sequence into tiles whose keys and values are loaded on-chip (in
+SRAM) just long enough to compute the corresponding query-key dot-products. Queries stream through the
+device once, accumulating weighted sums of values, and each key and value tile is evicted immediately after
+                                           Θ projections (for 𝑄, 𝐾, 𝑉) occupy HBM simultaneously, yielding
+use. As a result, only the three 𝐵 × 𝑀 × D A
+Mflash = 3 𝐵 𝑀 D A Θ.                                                                                        □
+
+                                                                                                               18
+                FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+Despite low-rank compression of the attention weights, standard attention implementations still require recon-
+structing full 𝑄, 𝐾, and 𝑉 tensors, leading to quadratic memory costs. This limitation is formalized below.
+Proposition 3 (Activation Materialization Lower Bound). Vanilla SVD models Θ∗ defined in Definition 1
+requires dense formulation of 𝑄, 𝐾, 𝑉 despite the weights 𝑊𝑞 , 𝑊 𝑘 , 𝑊𝑣 are offloaded in low-rank formats 𝑈𝑞,𝑘,𝑣 ∈
+                                Θ
+R 𝐵× 𝑀 ×𝑟Θ∗ and 𝑉𝑞,𝑘,𝑣 ∈ R𝑟Θ∗ ×𝐷A . Therefore, a standard attention implementation requires reconstructing full
+          Θ
+R 𝐵× 𝑀 × DA tensors, so peak dynamic memory remains O (𝐵𝐻 𝑀 2 ).
+                                                               Θ
+Proof. Storing factors (𝑈𝑞,𝑘,𝑣 ∈ R 𝐵𝑀 ×𝑟Θ∗ , 𝑉𝑞,𝑘,𝑣 ∈ R𝑟Θ∗ × DA ) uses (𝐵𝑀 + D AΘ ) 𝑟 ∗ entries. Despite the low-
+                                                                                     Θ
+rank parameterization, the full O (𝐵𝑀 × 𝑀) score matrix across all heads must be materialized in HBM during
+a vanilla attention computation, incurring a memory cost of at least O (𝐵𝐻 𝑀 2 ).                               □
+
+Although current GPU constraints prevent applying FlashSVD directly to single-head attention due to unsup-
+ported kernel tiling, and real-world memory behavior remains governed by Proposition 2, we nevertheless
+provide a complete theoretical analysis in Theorems 2 and 3, with further rank sensitivity characterized in
+Proposition 4.
+Theorem 2 (Memory Complexity of FlashSVDAttention). Consider a low-rank attention model Θ∗ with fac-
+torization rank 𝑟 Θ∗ . For each 𝑎 ∈ {𝑞, 𝑘, 𝑣}, the projection matrix 𝑊𝑎 is decomposed as 𝑊𝑎 = 𝑃 𝑎𝑉𝑎 , where
+                                 Θ                 Θ                                          Θ
+𝑃 𝑎 = 𝑋𝑈𝑎 with 𝑋 ∈ R 𝐵× 𝑀 × DA and 𝑈𝑎 ∈ R DA ×𝑟Θ∗ . Then 𝑃 𝑎 ∈ R 𝐵× 𝑀 ×𝑟Θ∗ and 𝑉𝑎 ∈ R𝑟Θ∗ × DA . Under the
+FlashAttention tiling scheme, the peak variable off-chip memory usage is
+
+                                           Mflash-svd-attn = O (𝐵𝑀𝑟 Θ∗ ).
+
+Proof. According to Remark 1, we focus only on the variable off-chip memory terms whose sizes depend on
+the batch size 𝐵 and sequence length 𝑀. FlashAttention avoids materializing the full 𝐵 × 𝑀 × D A   Θ projections
+
+on HBM. Instead, it streams 𝑄, 𝐾, and 𝑉 through SRAM tile by tile. Thus, the full activation tensors never exist
+simultaneously off-chip.
+    The only HBM-resident quantities that vary with the input are the intermediate projections 𝑃 𝑎 for 𝑎 ∈
+{𝑞, 𝑘, 𝑣}, each with shape 𝐵 × 𝑀 × 𝑟 Θ∗ . Therefore, across all three projections, the total peak variable HBM
+memory is                           ∑︁
+                                           𝐵𝑀𝑟 Θ∗ = 3𝐵𝑀𝑟 Θ∗ = O (𝐵𝑀𝑟 Θ∗ ).
+                                  𝑎∈ {𝑞,𝑘,𝑣 }
+                                                           Θ
+   We note that the output-side factors 𝑉𝑎 ∈ R𝑟Θ∗ × DA are persistent parameters and not included in the
+                                                                                         Θ to HBM usage.
+asymptotic result per Remark 1. However, they do contribute a constant offset of 3𝑟 Θ∗ D A
+   In scenarios where D AΘ ≫ 𝑀, the persistent off-chip memory required to store the projection matrices 𝑉 ∈
+                                                                                                          𝑎
+       Θ
+R𝑟Θ∗ × DA may dominate the total memory footprint, even though the variable memory remains at O (𝐵𝑀𝑟 Θ∗ ).
+Conversely, in regimes where D AΘ ≪ 𝑀, the dynamic (activation-related) term dominates, and the persistent
+
+cost becomes negligible.
+                                                                                                        □
+
+Theorem 3 (Single-Head Compression Threshold). For a single-head attention module defined in Definition 1,
+low-rank compression yields memory savings if and only if
+                                                             Θ
+                                                         𝐵𝑀D A
+                                                𝑟 Θ∗ <          Θ
+                                                                    .
+                                                         𝐵𝑀 + D A
+                                                                                                  Θ }).
+The maximum achievable compression ratio, attained in the rank-one case 𝑟 Θ∗ = 1, is O (min{𝐵𝑀, D A
+
+                                                                                                               19
+                 FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+                                                                                             Θ ).
+Proof. From Proposition 2, the off-chip memory required by standard FlashAttention is O (𝐵𝑀D A
+   In contrast, Theorem 2 establishes that FlashSVDAttention requires
+                                                                    Θ
+                           Mflash-svd-attn-single = 𝐵𝑀𝑟 Θ∗ + 𝑟 Θ∗ D A       (for a single head),
+
+which corresponds to the transient peak memory during computation, as clarified in Remark 1.
+   Memory savings occur when this quantity is smaller than the baseline:
+                                                           Θ       Θ
+                                           𝐵𝑀𝑟 Θ∗ + 𝑟 Θ∗ D A < 𝐵𝑀D A .
+
+Solving for 𝑟 Θ∗ yields the threshold:
+                                                               Θ
+                                                           𝐵𝑀D A
+                                                 𝑟 Θ∗ <          Θ
+                                                                        .
+                                                          𝐵𝑀 + D A
+    In the extreme low-rank case 𝑟 Θ∗ = 1, the compression ratio becomes
+                                                             Θ
+                                                         𝐵𝑀D A
+                                                            Θ
+                                                                  ,
+                                                     𝐵𝑀 + D A
+                             Θ }), depending on which term dominates in the denominator.
+which scales as O (min{𝐵𝑀, D A                                                                               □
+
+Proposition 4 (Marginal Memory Reduction per Rank). Under the same setup as Theorem 3, decreasing the
+SVD rank from 𝑟 Θ∗ to 𝑟 Θ∗ − 1 reduces the off-chip memory by exactly
+                                                                        Θ
+                                     ΔMflash-svd-attn-single = O 𝐵𝑀 + D A  .
+                                                   Θ elements of HBM storage across the three projections.
+In particular, each unit drop in rank saves 𝐵𝑀 + D A
+
+Proof. By Theorem 2, the total HBM cost for one head of rank 𝑟 is
+                                                                  Θ
+                                           M (𝑟) = O (𝐵 𝑀 𝑟 + 𝑟 D A ).
+
+Hence
+                                                                         Θ
+                                    M (𝑟 Θ∗ ) − M (𝑟 Θ∗ − 1) = O 𝐵 𝑀 + D A  ,
+which establishes the claimed marginal saving.                                                               □
+
+We now begin our analysis of multi-head attention, which corresponds directly to the implementation in
+Algorithm 1. The following theorem establishes the transient memory complexity under low-rank compression
+applied independently to each head.
+
+Theorem 4 (Compressed Multi-Head Memory Upper Bound). Let a multi-head attention module be defined as
+                                                                                               Θ /𝐻. If each
+in Definition 1, with 𝐻 heads each operating on activation size 𝐵𝑀 × 𝑑ΘA ,ℎ , where 𝑑ΘA ,ℎ = D A
+head is compressed to rank 𝑟 Θ∗ , then the total transient off-chip memory reduces from
+                                           Θ
+                                  O (𝐵 𝑀 D A )      to    O (𝐻 𝑟 Θ∗ (𝐵 𝑀 + 𝑑ΘA ,ℎ )).
+
+In particular, setting 𝑟 Θ∗ = 1 yields an 𝐻-fold memory reduction in the transient term.
+
+
+
+
+                                                                                                         20
+                FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+Proof. Each uncompressed attention head requires storing the activation tensor of shape 𝐵 𝑀 × 𝑑ΘA ,ℎ , for a
+                                                                                        Θ ).
+total of 𝐵 𝑀 𝑑ΘA ,ℎ entries. Across all 𝐻 heads, this yields a total memory of O (𝐵 𝑀 D A
+    Under rank-𝑟 Θ∗ SVD compression, each head’s activation is replaced by two factors of shape 𝐵 𝑀 × 𝑟 Θ∗ and
+𝑑ΘA ,ℎ × 𝑟 Θ∗ , storing
+                                              (𝐵 𝑀 + 𝑑ΘA ,ℎ ) · 𝑟 Θ∗
+entries per head. Summing over all heads gives the total
+                                                                               Θ
+                                  𝐻 𝑟 Θ∗ (𝐵 𝑀 + 𝑑ΘA ,ℎ ) = 𝐻 𝐵 𝑀 𝑟 Θ∗ + 𝑟 Θ∗ D A ,
+
+as claimed.
+    Finally, we note by Remark 1 that this expression captures only the change-inducing (transient) memory
+                                                                             Θ
+terms. Persistent memory components such as the low-rank bases 𝑉∗ ∈ R𝑟Θ∗ × DA are not included here, but are
+considered in total memory budget discussions, e.g., for rank selection.                                  □
+
+Proposition 5 (Marginal Memory Reduction per Rank in Multi-Head Setting). Under the setup of Theorem 4,
+decreasing the SVD rank of each head from 𝑟 Θ∗ to 𝑟 Θ∗ − 1 reduces off-chip memory by
+                                                                            
+                                ΔMflash-svd-attn-multi = O 𝐻 (𝐵𝑀 + 𝑑ΘA ,ℎ ) ,
+
+In other words, each unit decrease in rank saves 𝐻 (𝐵𝑀 + 𝑑ΘA ,ℎ ) elements of DRAM storage across all heads.
+
+Proof. By Theorem 4, the HBM storage cost for multi-head of rank 𝑟 is
+                                                                                 
+                                 Mflash-svd-attn-multi (𝑟) = O 𝐻 𝑟 (𝐵𝑀 + 𝑑ΘA ,ℎ ) .
+
+Hence
+
+                            ΔMflash-svd-attn-multi
+                             = Mflash-svd-attn-multi (𝑟 Θ∗ ) − Mflash-svd-attn-multi (𝑟 Θ∗ − 1)
+                                                         
+                             = O 𝐻 (𝐵𝑀 + 𝑑ΘA ,ℎ ) ,
+
+as claimed.                                                                                                    □
+
+Remark 2. Unless the attention kernel itself is modified to consume low-rank factors directly, compressing
+activations to rank 𝑟 Θ∗ does not reduce peak memory: one still needs O (𝐵𝐻 𝑀 𝑑ΘA ,ℎ ) to materialize 𝑄, 𝐾, 𝑉 for
+a vanilla kernel.
+
+Theorem 5 (Multi-Head Compression Threshold). For a multi-head attention module defined in Definition 1,
+low-rank compression yields memory savings if and only if
+                                                                Θ
+                                                            𝐵𝑀D A
+                                                 𝑟 Θ∗ <           Θ
+                                                                         .
+                                                          𝐻𝐵𝑀 + D A
+                                                                                                  Θ /𝐻}).
+The maximum achievable compression ratio, attained in the rank-one case 𝑟 Θ∗ = 1, is O (min{𝐵𝑀, D A
+
+Proof. From Proposition 2, the off-chip memory required by standard (uncompressed) FlashAttention across
+all heads is
+                                                       Θ
+                                             O (𝐵𝑀D A    ).
+
+
+                                                                                                              21
+                  FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+    In contrast, Theorem 4 shows that under rank-𝑟 Θ∗ compression, the transient memory for all heads becomes
+                                                                                   Θ
+                                          Mflash-svd-attn-multi = 𝐻𝐵𝑀𝑟 Θ∗ + 𝑟 Θ∗ D A ,
+
+which, according to Remark 1, captures only the change-inducing (transient) memory terms.
+   Memory savings occur when this compressed cost is less than the baseline:
+                                                                Θ       Θ
+                                               𝐻𝐵𝑀𝑟 Θ∗ + 𝑟 Θ∗ D A < 𝐵𝑀D A .
+
+Solving for 𝑟 Θ∗ yields
+                                                                      Θ
+                                                                  𝐵𝑀D A
+                                                     𝑟 Θ∗ <            Θ
+                                                                                .
+                                                               𝐻𝐵𝑀 + D A
+    In the extreme low-rank case 𝑟 Θ∗ = 1, the compression ratio becomes
+                                                                  Θ
+                                                              𝐵𝑀D A
+                                                                  Θ
+                                                                            ,
+                                                          𝐻𝐵𝑀 + D A
+                             Θ /𝐻}), depending on whether the sequence length or head dimension dominates
+which scales as O (min{𝐵𝑀, D A
+the denominator.                                                                                       □
+
+Remark 3 (Comparison of Single-Head and Multi-Head Thresholds). At first glance, Theorem 5 for multi-head
+attention appears to impose a stricter compression condition than its single-head counterpart (Theorem 3), due
+to the additional factor of 𝐻 in the denominator:
+                                                                        Θ
+                                                                    𝐵𝑀D A
+                                                   𝑟 Θ(multi)
+                                                       ∗      <           Θ
+                                                                                    .
+                                                                  𝐻𝐵𝑀 + D A
+
+However, this threshold is expressed in terms of the per-head rank 𝑟 Θ(multi)   ∗    , while the single-head condition uses
+                          (single)
+the full attention rank 𝑟 Θ∗ .
+                                  (single)                                             Θ , whereas in the multi-head setting,
+    In the single-head case, 𝑟 Θ∗          applies to the full attention dimension D A
+each head operates on a reduced dimension 𝑑ΘA ,ℎ = D A            Θ /𝐻, and thus its corresponding rank 𝑟 (multi) is typically
+                                                                                                           Θ∗
+much smaller. In fact, they often satisfy the proportional relationship
+                                                   (single)
+                                                  𝑟 Θ∗        = O (𝐻 · 𝑟 Θ(multi)
+                                                                           ∗      ).
+
+Substituting this relation into the multi-head threshold recovers the single-head condition:
+                               (single)            Θ                                          Θ
+                             𝑟 Θ∗              𝐵𝑀D A                         (single)    𝐵𝑀D A
+                                          <           Θ
+                                                                  ⇐⇒       𝑟 Θ∗       <             ,
+                                𝐻             𝐻𝐵𝑀 + D A                                 𝐵𝑀 + 𝑑ΘA ,ℎ
+
+This recovers the single-head threshold exactly (up to constant factors in the O (·) notation), confirming that the
+multi-head threshold is in fact more relaxed, since 𝑑ΘA ,ℎ < D AΘ , making it easier to achieve tangible memory
+
+savings through compression.
+    In practice, multi-head compression often yields superior empirical performance, as it enables head-wise
+rank customization and offers finer-grained control over compression across different attention subspaces.
+We next consider grouped-head compression, where multiple heads are compressed jointly. This PaLU-inspired
+scheme [1] balances memory savings and model capacity by interpolating between single-head and per-head
+compression.
+
+                                                                                                                           22
+                 FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+Theorem 6 (Grouped-Head Compression Memory Upper Bound). Consider a multi-head attention module
+with 𝐻 heads and total attention dimension D A    Θ . Grouping the heads into 𝐺 groups (each of size 𝐻/𝐺) and
+
+compressing each group’s (𝐵𝑀) × (D A   Θ /𝐺) activation to rank 𝑟 ∗ yields a total transient off-chip memory of
+                                                                   Θ
+                                                                            
+                                                                          DAΘ
+                               Mflash-svd-attn-grouped = O 𝐺 𝑟 Θ∗ 𝐵𝑀 + 𝐺
+                                                                               
+                                                                              Θ
+                                                       = O 𝐵𝐺 𝑀 𝑟 Θ∗ + 𝑟 Θ∗ D A   .
+
+   This interpolates between the single-head bound (𝐺 = 1) and the fully factorized per-head bound (𝐺 = 𝐻),
+and captures only the change-inducing (transient) memory terms per Remark 1.
+                                                 Θ /𝐺). A rank-𝑟 ∗ SVD approximation stores
+Proof. Each group activation has shape (𝐵𝑀) × (D A              Θ
+
+                                                        DΘ
+                                                (𝐵𝑀 + 𝐺A ) · 𝑟 Θ∗
+entries per group. Multiplying by 𝐺 groups gives the total
+                                                 DΘ                        Θ
+                                    𝐺 𝑟 Θ∗ (𝐵𝑀 + 𝐺A ) = 𝐵𝐺 𝑀 𝑟 Θ∗ + 𝑟 Θ∗ D A ,
+as claimed.                                                                                                    □
+Theorem 7 (Marginal Memory Gain from Rank Reduction). Reducing the rank of each grouped head from 𝑟 Θ∗
+to 𝑟 Θ∗ − 1 decreases the total off-chip memory usage by
+                                                                            Θ
+                                                                                !!
+                                                                         DA
+                                    ΔMflash-svd-attn-grouped = O 𝐺 𝐵𝑀 +
+                                                                           𝐺
+                                                                           
+                                                                          Θ
+                                                             = O 𝐵𝐺 𝑀 + D A   .
+
+    This quantifies the sensitivity of grouped compression to rank selection and highlights its linear dependency
+on batch size and number of groups.
+Proof. From Theorem 6, grouped compression with rank 𝑟 Θ∗ uses memory
+                                                              DΘ
+                                               𝐺 𝑟 Θ∗ (𝐵𝑀 + 𝐺A ).
+Replacing 𝑟 Θ∗ with 𝑟 Θ∗ − 1 results in
+                                                                   DΘ
+                                            𝐺 (𝑟 Θ∗ − 1) (𝐵𝑀 + 𝐺A ).
+The difference between the two is
+                                                   DΘ             Θ
+                                          𝐺 (𝐵𝑀 + 𝐺A ) = 𝐵𝐺 𝑀 + D A ,
+which establishes the result.                                                                                  □
+Proposition 6 (Grouped-Head Compression Trade-off). Grouping 𝐻 heads into 𝐺 groups (each of size 𝐻/𝐺)
+                                                                      Θ /𝐺) reduces off-chip storage from
+and applying rank-𝑟 Θ∗ SVD per group on activations of size (𝐵𝑀) × (D A
+O (𝐵𝐻 𝑀 𝑑ΘA ,ℎ ) to
+                                             DΘ              Θ           
+                             O 𝐺 𝑟 Θ∗ (𝐵𝑀 + 𝐺A ) = O 𝑟 Θ∗ D A   + 𝐵𝐺𝑟 Θ∗ 𝑀 .
+This interpolates between the single-head bound (𝐺 = 1) and the full per-head bound (𝐺 = 𝐻). Moreover,
+decreasing each group’s rank from 𝑟 Θ∗ to 𝑟 Θ∗ − 1 yields an additional DRAM saving of
+                                                             DΘ          Θ
+                                  ΔMgroup-attn = 𝐺 (𝐵𝑀 + 𝐺A ) = 𝐵𝐺 𝑀 + D A .
+
+                                                                                                              23
+                FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+                                                                  Θ /𝐺). By Theorem 2, compressing one
+Proof. Each of the 𝐺 group activations has nominal size (𝐵𝑀) × (D A
+                                     DΘ
+group to rank 𝑟 Θ∗ requires (𝐵𝑀 + 𝐺A ) 𝑟 Θ∗ elements of DRAM, and there are 𝐺 independent groups. Hence the
+total storage is
+                                                DΘ                           DΘ
+                                     𝐺 (𝐵𝑀 + 𝐺A ) 𝑟 Θ∗ = 𝐺 𝑟 Θ∗ (𝐵𝑀 + 𝐺A ).
+                                                                             DΘ
+Subtracting the cost at rank 𝑟 Θ∗ − 1 from that at 𝑟 Θ∗ gives 𝐺 (𝐵𝑀 + 𝐺A ), establishing the marginal saving in
+rank reduction.                                                                                               □
+
+
+Feed-Forward Network Each Transformer block contains a two-layer, position-wise feed-forward network
+                                         Θ    Θ                     Θ   Θ                                   Θ
+(FFN) with weight matrices 𝑊𝑖 ∈ R DA × DF and 𝑊𝑜 ∈ R DF × DA . Applied to an input 𝑋 ∈ R 𝐵× 𝑀 × DA ,
+                                                     Θ
+the intermediate activation 𝑌 = 𝑋𝑊𝑖 ∈ R (𝐵 𝑀 ) × DF often dominates the per-layer DRAM footprint whenever
+DΘF
+     ≫ DA Θ (e.g., D Θ = 4 D Θ [5, 17, 24, 32]). In what follows, we derive matching upper and lower bounds on
+                     F       A
+the off-chip memory cost of SVD-based compression applied to 𝑌 .
+                                                                         Θ
+Definition 2 (FFN Activation Approximation). Let 𝑋 ∈ R 𝐵× 𝑀 × DA be the input to a two-layer FFN with
+                          Θ Θ                   Θ    Θ
+weight matrices 𝑊𝑖 ∈ R DA ×𝐷F and 𝑊𝑜 ∈ R𝐷F × DA , and let 𝜙(·) be a pointwise nonlinearity. Define the
+                                             Θ
+intermediate activation 𝑌 = 𝑋𝑊𝑖 ∈ R (𝐵 𝑀 ) ×𝐷F , so that the FFN output is 𝑍 = 𝜙(𝑌 ) 𝑊𝑜 . We say 𝑌 admits a
+rank-𝑟 SVD approximation if
+                                 ∗
+                              𝑌 [𝑟Θ ] = 𝑈𝑌 Σ𝑌 𝑉𝑌⊤ ,
+                                                 ∗            ∗   ∗               Θ   ∗
+                                                                                                              (S2)
+                                𝑈𝑌 ∈ R (𝐵𝑀 ) ×𝑟Θ ,    Σ𝑌 ∈ R𝑟Θ ×𝑟Θ ,   𝑉𝑌 ∈ R𝐷F ×𝑟Θ .
+
+Theorem 8 (Vanilla SVD FFN Compression Yields No Memory Savings). Let the feedforward activation
+                      Θ
+matrix 𝑌 ∈ R (𝐵 𝑀 ) ×𝐷F be defined as in Definition 2, and suppose a standard (non-streaming) rank-𝑟 Θ∗ SVD is
+                                                                   Θ
+applied to approximate 𝑌 ≈ 𝑈𝑉 ⊤ , where 𝑈 ∈ R (𝐵 𝑀 ) ×𝑟Θ∗ , 𝑉 ∈ R𝐷F ×𝑟Θ∗ . Then, the off-chip memory required to
+store the intermediate activations remains
+
+                                           Mnaive-svd-ffn = O (𝐵 𝑀 𝐷 ΘF ),
+
+matching the dense baseline Mdense-ffn , and thus yielding no memory savings.
+                                                                                                       Θ
+Proof. In the dense FFN case, the output of the intermediate GELU activation 𝑌 ∈ R (𝐵𝑀 ) ×𝐷F must be
+materialized in memory to support the second linear projection.
+     If we instead apply naive SVD compression to approximate 𝑌 ≈ 𝑈𝑉 ⊤ , the computation still requires
+constructing the full matrix 𝑌 before performing its factorization, as standard SVD operates on the complete
+matrix and has no streaming or tiled structure. Thus, the full activation matrix 𝑌 must still be loaded into memory
+in its entirety prior to any compression.
+     Furthermore, even if the matrix is overwritten post-factorization by its lower-rank factors 𝑈 and 𝑉, this does
+not avoid the initial memory cost incurred by holding 𝑌 . Therefore, the peak transient off-chip memory remains
+at
+                                                   O (𝐵 𝑀 𝐷 ΘF ),
+as in the dense case.
+    Hence, in the absence of streaming or blocking techniques, naive FFN compression yields no memory
+advantage over the dense baseline.                                                                  □
+
+                                                                                                                24
+                   FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+FlashSVDFFN V1 and V2: Rank-Aware Streaming FFN Variants. We present two streaming-friendly FFN
+variants that apply low-rank factorization while balancing compute efficiency and memory usage. We analyze
+the off-chip memory complexity by focusing only on the variable portion stored in HBM, following the scope
+defined in remark 1.
+    FlashSVDFFN V1 (algorithm 2) matain a competitive speed by computing the intermediate projection
+𝑃 = 𝑋𝑈𝑖 ∈ R (𝐵𝑀 ) ×𝑟Θ∗ using GEMM. This projection is then streamed tile-by-tile along with SVD factors
+𝑉𝑖(𝑑) , 𝑈𝑜(𝑑) , 𝑏 𝑖(𝑑) , and accumulated into output tiles 𝑍tile ∈ R 𝐵×𝐵 𝑀 ×𝑟Θ∗ . While this avoids full materialization of
+the FFN output of size 𝐵𝑀 × D Θ       F
+                                        , it introduces transient memory traffic of size O (𝐵𝑀𝑟 Θ∗ ), yielding an off-chip
+footprint of Mflash-svd-ffn-v1 = O (𝐵𝑀𝑟 Θ∗ ) (theorem 9).
+    FlashSVDFFN V2 (algorithm S1) eliminates this memory cost entirely by fusing projection and output logic
+per tile. It streams rows of 𝑋 and corresponding factor slices on-the-fly, avoiding the explicit construction of 𝑃
+and achieving Mflash-svd-ffn-v2 = 0 (theorem 10).
+    Both variants exhibit distinct advantages: V1 enables fast batched GEMM at the expense of small transient
+storage, while V2 achieves full off-chip elimination via streaming-aware execution.
+
+Theorem 9 (Partial Memory Reduction via Tiled Factor Streaming in FlashSVDFFN V1). Algorithm 2 avoids
+                                             Θ
+materializing the full activation 𝑌 ∈ R 𝐵𝑀 ×𝐷F by streaming over the intermediate width 𝑑 in tiles of size 𝐵Θ
+                                                                                                            𝐷F .
+Consequently, the peak off-chip memory required for intermediate activations satisfies
+
+                                                 Mflash-svd-ffn-V1 = O (𝐵𝑀𝑟 Θ∗ ).
+
+                                                                                                                           𝑟 ∗ ×𝐵Θ
+Proof. At each iteration over 𝑑 = 0, . . . , 𝐷 ΘF , Algorithm 2 loads a tile of SVD factors 𝑉𝑖(𝑑) ∈ R Θ                          𝐷   F   ,
+           𝐵Θ ×𝑟 ∗                       𝐵Θ
+𝑈𝑜(𝑑) ∈ R 𝐷F Θ , and bias 𝑏 𝑖(𝑑) ∈ R 𝐷F . It then immediately computes the corresponding intermediate slice
+𝑌 (𝑑) = 𝜙(𝑃𝑉𝑖(𝑑) + 𝑏 𝑖(𝑑) ) and its projection 𝑌 (𝑑) 𝑈𝑜(𝑑) , which are accumulated into the on-chip buffer 𝑍tile . Since
+𝑌 (𝑑) is constructed and consumed on-the-fly, and never fully materialized, the memory footprint is limited to
+                       ∗
+storing 𝑃 ∈ R 𝐵𝑀 ×𝑟Θ and 𝑍tile ∈ R 𝐵𝑀 ×𝑟Θ∗ . Therefore, the total intermediate off-chip memory used is
+
+                                                 Mflash-svd-ffn-V1 = O (𝐵𝑀𝑟 Θ∗ ),
+
+which is much smaller than the dense baseline O (𝐵𝑀 𝐷 ΘF ), but still nonzero.                                                       □
+
+Theorem 10 (Memory-Free FFN Streaming via Fully Fused Tiling). Algorithm S1 executes the entire FFN
+forward pass without materializing any intermediate tensor in off-chip memory. Specifically, the peak off-chip
+memory used for intermediate FFN activations satisfies
+
+                                                       Mflash-svd-ffn-V2 = 0.
+
+Proof. Algorithm S1 eliminates the need to store 𝑃 = 𝑋𝑈𝑖 in off-chip memory by recomputing each component
+𝑃tile [:, :, 𝑘] ← 𝑋 [:, ℓ : ℓ + 𝐵 𝑀 , :] · 𝑈𝑖 [:, 𝑘] on-the-fly for 𝑘 = 0, . . . , 𝑟 Θ∗ − 1. For each block over 𝑑 = 0, . . . , 𝐷 ΘF ,
+                                                                          𝐵×𝐵 𝑀 ×𝐵Θ
+it incrementally constructs the partial activation tensor 𝑌 ∈ R                   𝐷   F   via
+
+                                           𝑌 += 𝑃tile [:, :, 𝑘] · 𝑉𝑖 [𝑘, 𝑑 : 𝑑 + 𝐵Θ
+                                                                                  𝐷F ],
+
+followed by fused activation and projection
+                                                            
+                            𝑍tile += 𝜙 𝑌 + 𝑏 𝑖 [𝑑 : 𝑑 + 𝐵Θ                    Θ
+                                                         𝐷F ] · 𝑈𝑜 [𝑑 : 𝑑 + 𝐵 𝐷F , 𝑘].
+
+
+
+                                                                                                                                  25
+                  FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+Since all computation and accumulation are performed in on-chip SRAM and no intermediate tensor is written
+to M, the memory footprint is limited to streaming only the SVD weights and biases. The final output is
+computed as 𝑂 = 𝑍tile𝑉𝑜 + 𝑏 𝑜 in a single post-processing step.
+   The fused implementation performs the same number of floating-point operations as V1:
+                                                                     
+                                   FLOPs = O 𝐵𝑀𝑟 Θ∗ 𝐷 ΘF + 𝐵𝑀𝑟 Θ∗ 𝐷 ΘA ,
+
+but with strictly lower memory traffic (more details analysis for FLOPS can be found in Theorem 14). Therefore,
+it achieves
+                           Mflash-svd-ffn-V2 = 0 vs. Mflash-svd-ffn-V1 = O (𝐵𝑀𝑟 Θ∗ ),
+while maintaining equal arithmetic complexity.                                                                □
+
+Compression Trade-offs between Attention and FFN. A common misconception is that compressing atten-
+tion alone-via FlashAttention [2]-suffices for end-to-end memory savings. However, this neglects the downstream
+footprint of the feed-forward network (FFN). In fact, aggressively compressing only attention can shift the mem-
+ory bottleneck to the FFN, motivating the need to compress both components. The following result formalizes
+this balance.
+Theorem 11 (FFN Bottleneck under Attention-Only Compression). In standard transformer architectures with
+DΘ
+ F
+   ≥ 4 DAΘ , compressing attention alone (with rank 𝑟 ∗ ≪ D Θ ) results in the FFN layer dominating off-chip
+                                                     Θ      A
+memory usage.
+Proof. By Theorem 2, the memory footprint of SVD-compressed attention is
+                                                                  Θ 
+                                 Mflash-svd-attn = O 𝑟 Θ∗ (𝐵𝑀 + D A ) ,
+
+while the dense FFN incurs
+                                           Mdense-ffn = O (𝐵𝑀D Θ
+                                                               F ).
+For typical models such as BERT, RoBERTa, LLaMA, and OPT [5, 17, 24, 32], we have D Θ
+                                                                                    F
+                                                                                           Θ . Then:
+                                                                                      = 4 DA
+                                                         Θ
+                                                 𝐵𝑀 · 4D A
+                               Mdense-ffn                                  1
+                                             =             Θ)
+                                                              =     𝑟Θ∗    𝑟Θ∗   ≫ 1,
+                              Mflash-svd-attn 𝑟 Θ∗ (𝐵𝑀 + D A          Θ + 4𝐵𝑀
+                                                                   4DA
+
+            𝑟 ∗             𝑟 ∗                                          Θ and 𝑟 ∗ ≪ 𝐵𝑀. Thus, the FFN
+since both 4DΘ Θ ≪ 1 and 4𝐵𝑀
+                          Θ
+                             ≪ 1 hold in typical settings where 𝑟 Θ∗ ≪ D A      Θ
+              A
+dominates off-chip usage.                                                                                     □
+
+This result motivates the design of rank-aware FFN compression, ensuring neither component becomes a
+performance bottleneck.
+Proposition 7 (Per-Rank Sensitivity of FFN Memory). Let the FlashSVDFFN memory cost at rank 𝑟 Θ∗ be
+
+                                Mflash-svd-ffn-V1 (𝑟 Θ∗ ) = O 𝑟 Θ∗ (𝐵𝑀 + D Θ
+                                                                             
+                                                                           F) .
+
+Then the reduction in off-chip memory for decreasing the rank by 1 is
+
+                                          ΔMflash-svd-ffn-V1 = O (D Θ
+                                                                    F ),
+   independent of 𝑟 Θ∗ .
+
+                                                                                                             26
+                 FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+Proof. We have
+
+                            ΔMflash-svd-ffn-V1 = Mffn-V1 (𝑟 Θ∗ ) − Mffn-V1 (𝑟 Θ∗ − 1)
+                                               = 𝑟 Θ∗ (𝐵𝑀 + D Θ
+                                                              F)
+                                                  − (𝑟 Θ∗ − 1) (𝐵𝑀 + D Θ
+                                                                       F)
+                                               = (𝐵𝑀 + D Θ               Θ
+                                                         F ) ∈ O (𝐵𝑀 + D F ).
+
+                                                                                                 □
+
+Proposition 8 (Per-Rank Sensitivity of FFN Memory in FlashSVDFFN-V2). Let the FlashSVDFFN-V2 memory
+cost at rank 𝑟 Θ∗ be
+                                     Mflash-svd-ffn-V2 (𝑟 Θ∗ ) = O (𝑟 Θ∗ · D Θ
+                                                                             F ),
+which removes the dependence on 𝐵𝑀 via full streaming. Then the per-rank reduction is
+
+                                          ΔMflash-svd-ffn-V2 = O (D Θ
+                                                                    F ),                       (S3)
+
+   independent of 𝑟 Θ∗ and 𝐵𝑀.
+Proof. We again compute the difference:
+
+                            ΔMflash-svd-ffn-V2 = Mffn-V2 (𝑟 Θ∗ ) − Mffn-V2 (𝑟 Θ∗ − 1)
+                                               = 𝑟 Θ∗ · D Θ                 Θ
+                                                          F − (𝑟 Θ − 1) · D F
+                                                                  ∗
+
+
+                                               = DΘ        Θ
+                                                  F ∈ O (D F ).
+
+                                                                                                 □
+
+Theorem 12 (Relative Memory Reduction of FFN under Low-Rank Compression). Let the dense FFN memory
+usage be
+                                      Mdense-ffn = O (𝐵𝑀D Θ
+                                                          F ),
+and the FlashSVD-compressed usage at rank 𝑟 Θ∗ be
+
+                                     Mflash-svd-ffn = O 𝑟 Θ∗ (𝐵𝑀 + D Θ
+                                                                       
+                                                                     F) .
+
+Then the memory ratio satisfies
+                                       Mflash-svd-ffn  𝑟 Θ∗  𝑟 ∗ 
+                                                               Θ
+                                                      = Θ +O        .
+                                       Mdense-ffn      DF     𝐵𝑀
+
+Proof. Compute the ratio:
+                                                                      Θ
+                                      Mflash-svd-ffn 𝑟 Θ∗ (𝐵𝑀 + D F )
+                                                    =
+                                      Mdense-ffn           𝐵𝑀D ΘF
+                                                                  Θ
+                                                                    !
+                                                      𝑟Θ ∗     D  F
+                                                    = Θ 1+
+                                                      DF       𝐵𝑀
+                                                      𝑟 Θ∗     𝑟 Θ∗ 
+                                                    = Θ +O             ,
+                                                      DF        𝐵𝑀
+
+where the second term vanishes as 𝐵𝑀 → ∞.                                                        □
+
+                                                                                                27
+                 FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+Theorem 13 (Combined FlashSVD Memory Bound). Compressing both multi-head attention and FFN using
+FlashSVD with rank 𝑟 Θ∗ , the total per-layer off-chip memory is bounded by
+                                                                     Θ
+                                                                       + DΘ
+                                                                            
+                                   Mflash-svd-total = O 𝑟 Θ∗ (𝐵𝑀 + D A    F) ,
+
+assuming FFN follows the V1 layout (with activations of shape (𝐵, 𝑀, D Θ    F
+                                                                              )). This bound also dominates the
+cost for the V2 layout, since V1 includes the intermediate activations from both input and output projections.
+Proof. By Proposition 7, FlashSVD compression of the FFN (V1 variant) requires
+                                   Mflash-svd-ffn = O 𝑟 Θ∗ (𝐵𝑀 + D Θ
+                                                                     
+                                                                   F) ,
+
+and attention requires
+                                                                       Θ 
+                                      Mflash-svd-attn = O 𝑟 Θ∗ (𝐵𝑀 + D A ) ,
+so their sum satisfies
+                                                                      Θ
+                                                                        + DΘ
+                                                                              
+                                   Mflash-svd-total = O 𝑟 Θ∗ (2𝐵𝑀 + D A    F)
+                                                                     Θ
+                                                                       + DΘ
+                                                                            
+                                                    = O 𝑟 Θ∗ (𝐵𝑀 + D A    F) .
+
+      In practice, the FFN width dominates over attention (D Θ    F
+                                                                    ≫ DA  Θ ), so total memory scales primarily with
+
+𝑟 Θ∗ · D Θ
+         F
+           and 𝑟 Θ∗ · 𝐵𝑀. Thus, total resource usage is jointly governed by sequence length and chosen compression
+rank. This further confirms Theorem 11: to achieve balanced memory reduction across all components, one must
+incorporate FFN-specific strategies—such as FlashSVDFFN proposed in our work—beyond uniform low-rank
+compression alone.
+      Since V1 includes all intermediate FFN activations, this result also upper bounds the memory of V2.          □
+
+Decoder Memory Cost Analysis The decoder inference proceeds in two distinct phases—prefill and decod-
+ing—each exhibiting different peak-memory behaviors. To avoid re-computing all past keys and values at every
+step, we employ a KV-cache: once a key–value pair is produced, it is retained on-chip (or in HBM) for all
+subsequent steps.
+
+Prefill Phase During prefill, we process the entire input sequence of length 𝑀 in one shot. At each of the ℓ-th
+decoder layers, the hidden state
+                                                                 Θ
+                                            𝑋prefill ∈ R 𝐵× 𝑀 × DA
+is projected to low-rank queries, keys, and values:
+                                             𝑃𝑞 , 𝑃 𝑘 , 𝑃𝑣 ∈ R 𝐵× 𝑀 ×𝑟Θ∗ .
+We then compute
+                                                               𝑄𝐾 ⊤ 
+                                              𝐴 = softmax             ,
+                                                                𝑑ℎ
+but rather than materializing the full 𝐵 𝐻 𝑀 2 attention matrix and dense 𝑄, 𝐾, 𝑉 factors, a streaming attention
+kernel (e.g. FlashSVDAttn) only allocates 𝑂 (𝐵 𝑀 𝑟 Θ∗ ) buffer at any time. Meanwhile, the KV-cache permanently
+stores the keys and values for all 𝑀 positions, requiring 2 ℓ 𝐵 𝑀 𝑟 Θ∗ elements of memory (for keys and values).
+Thus, the prefill peak memory is dominated by the sum of:
+    • Two large FFN GEMMs per layer (as in the encoder), each with peak memory 𝑂 (𝐵 𝑀 𝑟 Θ∗ + 𝑟 Θ∗ D A
+                                                                                                    Θ ) if
+
+      FlashSVDFFN is applied.
+    • The KV-cache cost 2 ℓ 𝐵 𝑀 𝑟 Θ∗ .
+
+                                                                                                                 28
+                FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+Decoding Phase Once prefill is complete, each new token is generated one at a time. At step 𝑡, we compute a
+single new query
+                                            𝑞 𝑡 ∈ R 𝐵×1×𝑟Θ∗
+and attend against the cached keys 𝐾 ≤𝑡 −1 ∈ R 𝐵× (𝑡 −1) ×𝑟Θ∗ and values 𝑉≤𝑡 −1 through the causal mask. The
+streaming attention now needs buffers of size 𝑂 (𝐵 (𝑡 − 1) 𝑟 Θ∗ ) for the dot-products and softmax, plus space for
+the new key and value. Since 𝑡 grows from 1 to 𝑀, the worst-case buffer remains 𝑂 (𝐵 𝑀 𝑟 Θ∗ ), but this never
+exceeds the prefill cache. The subsequent FFN uses the same rank-aware fusion (FlashSVDFFN) with peak
+                          Θ ).
+memory 𝑂 (𝐵 𝑟 Θ∗ + 𝑟 Θ∗ D A
+
+Overall Bound By (i) streaming attention over low-rank projections and (ii) fusing the FFN, the decoder’s
+peak-memory across both phases is bounded by
+                                                                   Θ 
+                                   𝑂 𝐿 𝐵 𝑀 𝑟 Θ∗ + (𝐵 𝑟 Θ∗ + 𝑟 Θ∗ D A ) ,
+
+ensuring that neither sequence length nor model width blows up the memory footprint beyond linear dependence
+on the chosen low rank.
+
+S2.4.   Computation Complexity Analysis
+In this section, we quantify how rank-𝑟 SVD compression reduces compute and end-to-end kernel latency.
+We begin with idealized FLOP-count bounds, then incorporate I/O and memory-bandwidth effects, and finally
+analyze the trade-offs introduced by reconstruction overhead in both attention and FFN blocks.
+
+FLOP-Count Reduction
+                                                                                      Θ , FFN hidden
+Theorem 14 (Pure FLOP-Count Speedup). Let a Transformer layer with hidden dimension D A
+       Θ
+size D F , sequence length 𝑀, and batch size 𝐵 require
+                                              2
+                                             Θ           Θ
+                                                           DΘ
+                                                                 
+                                         O DA     𝑀 𝐵 + DA  F 𝑀𝐵
+
+FLOPs in the full-rank case. If all self-attention activations and FFN intermediates are compressed to rank 𝑟 Θ∗ ,
+the FLOP count becomes
+                                            Θ
+                                               𝑀 𝐵 + 𝑟 Θ2 ∗ 𝑀 𝐵 + 𝑟 Θ∗ D Θ
+                                                                              
+                                  O 𝑟 Θ∗ D A                             F 𝑀𝐵 .
+
+Thus, the asymptotic speedup factor is
+                                                 © DΘ + DΘ ª
+                                                 ­ A           F®
+                                                Θ­          2   ®.
+                                                          𝑟   ∗ ®
+                                                   𝑟 Θ∗ + DΘΘ
+                                                 ­
+                                                 «           A ¬
+
+                                 Θ , D Θ }, the numerator dominates and the speedup is significant.
+In particular, when 𝑟 Θ∗ ≪ min{D A     F
+
+Proof. In the full-rank Transformer layer, computing self-attention requires forming the 𝑄𝐾 ⊤ and 𝑆𝑉, for
+                  𝑇
+                                               2
+                                              Θ                                          Θ D Θ 𝑀 𝐵 , for a total
+                                                                                                 
+𝑆 = Softmax( 𝑑𝑄𝐾
+               ΘA ,ℎ
+                     ) products at cost O   D A    𝑀 𝐵 , and the two-layer FFN costs O D A   F
+          2
+         Θ              Θ DΘ 𝑀 𝐵 .
+                                    
+of O D A      𝑀 𝐵 + DA       F
+    When all attention activations and FFN intermediates admit rank-𝑟 approximations, each matrix–matrix
+multiply involving a D A  Θ × D Θ or D Θ × D Θ block is replaced by a sequence of three multiplies of shapes
+                                 A       A      F
+
+
+                                                                                                               29
+                FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+  Θ × 𝑟 ∗ , 𝑟 ∗ × 𝑟 ∗ , and 𝑟 ∗ × D Θ (or 𝑟 ∗ × D Θ ), yielding O 𝑟 ∗ D Θ 𝑀 𝐵 + 𝑟 2 𝑀 𝐵 + 𝑟 ∗ D Θ 𝑀 𝐵 total
+                                                                                                            
+DA     Θ     Θ     Θ         Θ      A       Θ       F                    Θ     A       Θ∗        Θ   F
+FLOPs.
+    Comparing these two expressions, when 𝑟 Θ∗ ≪ D A       Θ , D Θ the dominant terms yield an asymptotic speedup
+                                                                 F
+factor                                    2
+                                         Θ
+                                        DA    + DA Θ DΘ               DΘ + DΘ 
+                                                         F                A        F
+                                         Θ                  Θ
+                                                                = Θ             2
+                                                                                     .
+                                  𝑟 Θ∗ D A + 𝑟 Θ∗ + 𝑟 Θ∗ D F
+                                               2                              𝑟
+                                                                       𝑟 Θ∗ + DΘΘ
+                                                                                  ∗
+
+                                                                          A
+
+This confirms the claimed efficiency gain of the low-rank approximation.                                       □
+
+Latency with I/O and Bandwidth
+Theorem 15 (Bandwidth-Bounded Latency). Assume a GPU memory bandwidth of 𝛽 (bytes/s) and that each
+activation element is 4 bytes. Then the end-to-end latency 𝑇 per layer is lower-bounded by
+                                                n FLOPs          4 𝑁bytes o
+                                      𝑇 ≥ max                  ,            ,
+                                                 PeakFLOP/s         𝛽
+                            Θ + 𝐷 Θ ) in the full-rank case and 𝑂 𝑀 𝐵𝑟 ∗ + 𝑟 ∗ D Θ + 𝑟 ∗ 𝐷 Θ under rank-𝑟
+                                                                                            
+where 𝑁bytes = 𝑂 𝐵𝑀 (D A           F                                       Θ     Θ  A    Θ F
+compression.
+Proof. We invoke the standard roofline argument, which lower-bounds end-to-end latency by the worse of
+compute-bound and I/O-bound costs.
+Compute bound. Let FLOPs be the total floating-point operations performed in one layer, and PeakFLOP/s
+be the device’s maximum sustained FLOP rate. Then even if all compute units are perfectly utilized, the time
+cannot be smaller than
+                                               FLOPs
+                                                          .
+                                             PeakFLOP/s
+Bandwidth bound. Similarly, suppose we must read and/or write 𝑁bytes bytes of activation data (each element
+                                                                                                       𝑁
+4 byte) between DRAM and on-chip buffers. With peak bandwidth 𝛽 bytes/s, the I/O time is at least bytes  𝛽 .
+Accounting explicitly for the 4 byte per element gives the form 4 𝑁elements
+                                                                    𝛽       , which we absorb into the notation
+above.
+Data-movement volumes. In the full-rank case, we must transfer all query/key/value and FFN activations of total
+                          Θ             Θ                 Θ      Θ
+                                                                  
+size 𝑁bytes_in = 4 3𝐵 𝑀 D A + 2𝐵 𝑀 D F = O 𝐵 𝑀 (D A + D F ) . up to the SRAM. In case of writting, the
+memory is bounded by 𝑁bytes_out = 2𝐵𝑀 𝐷 ΘA = O (𝐵𝑀 𝐷 ΘA ) Under rank-𝑟 Θ∗ compression, only the low-rank
+factors are moved:
+                                                                 Θ
+                                                                   + 2𝑟 Θ∗ D Θ
+                                                                                
+                               𝑁bytes_in = 4 4𝐵𝑀 𝑟 Θ∗ + 3𝑟 Θ∗ D A             F
+                                                                                                          (S4)
+                                                               Θ
+                                                                 + 𝑟 Θ∗ D Θ
+                                                                            
+                                         = 𝑂 𝑀 𝐵 𝑟 Θ∗ + 𝑟 Θ∗ D A          F .
+   and the 𝑁bytes_out remains the same.
+   Combining the compute-bound and bandwidth-bound terms yields the desired lower bound
+                                       n                                   o
+                                          FLOPs    4 𝑁bytes_in +𝑁bytes_out
+                             𝑇 ≥ max PeakFLOP/s  ,            𝛽              .
+
+                                                                                                               □
+
+
+                                                                                                              30
+                   FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+
+
+Table S2: Computation-efficiency ablation: B=16, varying context length 𝑀, FFN ranks. Shown are Time (ms) and
+Speedup vs. Dense.
+
+                                                Mild Contexts (M ≤ 256)              Long Contexts (M ≥ 512)
+              Version               Rank      M=128      M=128   M=256   M=256     M=512       M=512    M=1024   M=1024
+
+                                              Time Speedup Time Speedup Time Speedup Time Speedup
+              Dense                  Full     0.14      1.00×    0.29    1.00×     0.68       1.00×      1.47    1.00×
+                             768              2.13      0.07×    4.05    0.07×     8.30       0.08×     16.77    0.09×
+                             384              0.68      0.21×    1.26    0.23×     2.46       0.28×      4.99    0.30×
+              FlashSVDFFN V1
+                             192              0.27      0.53×    0.54    0.53×     0.86       0.79×      1.82    0.81×
+                              96              0.19      0.74×    0.23    1.26×     1.67       1.60×      0.78    1.88×
+                             768              3.45      0.04×    7.05    0.04×     13.43      0.05×     27.10    0.05×
+                             384              1.82      0.08×    3.89    0.07×      7.16      0.09×     14.42    0.10×
+              FlashSVDFFN V2
+                             192              1.14      0.12×    2.14    0.13×      4.20      0.16×      8.30    0.18×
+                              96              0.75      0.19×    1.39    0.21×     10.64      0.25×      5.33    0.28×
+   For milder contexts (𝑀 = 128, 256), FlashSVDFFN V1 at low ranks already approaches or exceeds Dense throughput; for long
+                         contexts (𝑀 ≥ 512), the kernel becomes compute-bound and speedups diminish.
+
+
+
+
+         Table S3: FlashSVD Attention Ablation (B=16): time and speedup vs. Dense at mild vs. long contexts.
+
+                                 Mild Contexts (𝑀 ≤ 256)                         Long Contexts (𝑀 ≥ 512)
+              Rank       M=128        M=128           M=256      M=256     M=512           M=512       M=1024    M=1024
+
+                      Time (ms) Speedup Time (ms) Speedup Time (ms) Speedup Time (ms) Speedup
+              Dense      0.38        1.00×            0.74       1.00×     2.31        1.00×           6.98      1.00×
+              64         0.61        0.62×            0.83       0.89×     2.21        1.05×           5.65      1.24×
+              48         0.61        0.62×            0.81       0.92×     2.10        1.10×           5.41      1.29×
+              32         0.60        0.62×            0.74       1.00×     1.79        1.29×           4.57      1.53×
+              16         0.61        0.62×            0.68       1.08×     1.68        1.37×           4.25      1.64×
+For moderate contexts (𝑀 = 128, 256), FlashSVDAttention achieves up to 38% of Dense speed at full rank and even approaches parity
+                at low ranks; at large contexts (𝑀 ≥ 512), it becomes compute-bound, yielding speedups above 1×.
+
+
+
+
+                                                                                                                              31
+                       FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+
+Table S4: Full FlashSVD Attention Rank benchmarking on NVIDIA L40S GPU (𝑑model = 768, 𝑛heads = 12, 𝑑ff = 3072).
+
+                 (a) 𝐵 = 1                                           (b) 𝐵 = 16                                             (c) 𝐵 = 64
+
+M    Rank Time Mem            Err    Params SpeedupM      Rank Time Mem            Err     Params SpeedupM       Rank Time Mem              Err     Params Speedup
+          (ms) (MB)                    (K) vs. Dense           (ms) (MB)                     (K) vs. Dense            (ms) (MB)                       (K) vs. Dense
+    Dense 0.57     26.3   0.0000     2362      1.00×     Dense 0.38 77.7 0.0000 2362                 1.00×     Dense 1.43          240.5   0.0000   2362        1.00×
+     64 0.88       41.5   0.0003     2510      0.65×      64 0.61 88.8 0.0003 2510                   0.62×      64 1.61            254.8   0.0003   2510        0.89×
+128  48 0.86       39.8   0.0204     2031      0.67× 128  48 0.61 86.2 0.0210 2031                   0.62× 128  48 1.57            230.6   0.0208   2031        0.91×
+     32 0.85       39.3   0.0296     1551      0.68×      32 0.60 83.9 0.0305 1551                   0.62×      32 1.41            221.7   0.0300   1551        1.02×
+     16 0.84       38.5   0.0381     1072      0.68×      16 0.61 79.6 0.0377 1072                   0.62×      16 1.29            211.5   0.0371   1072        1.11×
+    Dense 0.55     41.7   0.0000     2362      1.00×     Dense 0.74 123.2 0.0000 2362                1.00×     Dense 3.96          378.6   0.0000   2362        1.00×
+     64 0.85       45.0   0.0003     2510      0.65×      64 0.83 139.2 0.0002 2510                  0.89×      64 3.56            434.2   0.0002   2510        1.11×
+256  48 0.87       43.1   0.0155     2031      0.64× 256  48 0.81 135.9 0.0150 2031                  0.92× 256  48 3.21            425.4   0.0153   2031        1.23×
+     32 0.85       42.2   0.0240     1551      0.65×      32 0.74 130.5 0.0218 1551                  1.00×      32 3.00            407.4   0.0220   1551        1.32×
+     16 0.87       40.5   0.0283     1072      0.64×      16 0.68 124.7 0.0270 1072                  1.08×      16 2.79            387.7   0.0271   1072        1.42×
+    Dense 0.57     50.6   0.0000     2362      1.00×     Dense 2.31 298.5 0.0000 2362                1.00×     Dense 10.40 1090.7 0.0000            2362        1.00×
+     64 0.85       50.4   0.0002     2510      0.67×      64 2.21 236.6 0.0002 2510                  1.05×      64 8.66 829.2 0.0002                2510        1.20×
+512  48 0.62       48.0   0.0104     2031      0.92× 512  48 2.10 231.5 0.0113 2031                  1.10× 512  48 8.31 816.3 0.0112                2031        1.25×
+     32 0.57       46.5   0.0150     1551      1.00×      32 1.79 221.4 0.0162 1551                  1.29×      32 7.16 779.4 0.0161                1551        1.45×
+     16 0.57       45.0   0.0185     1072      1.00×      16 1.68 212.1 0.0197 1072                  1.37×      16 6.72 742.9 0.0196                1072        1.55×
+    Dense 0.37     92.0   0.0000     2362      1.00×     Dense 6.98 946.3 0.0000           2362      1.00×     Dense 29.19 3681.9 0.0000            2362        1.00×
+     64 0.55       65.6   0.0002     2510      0.66×      64 5.65 434.2 0.0002             2510      1.24×      64 23.45 1622.1 0.0002              2510        1.24×
+1024 48 0.57       62.7   0.0088     2031      0.64× 1024 48 5.41 426.0 0.0087             2031      1.29× 1024 48 22.46 1595.5 0.0086              2031        1.30×
+     32 0.55       59.6   0.0124     1551      0.66×      32 4.57 407.5 0.0123             1551      1.53×      32 19.35 1523.4 0.0122              1551        1.51×
+     16 0.57       58.5   0.0148     1072      0.65×      16 4.25 389.1 0.0149             1072      1.64×      16 18.61 1449.6 0.0148              1072        1.57×
+
+
+
+
+         Table S5: Full FlashSVDFFN Rank benchmarking on NVIDIA L40S GPU (𝑑model = 768, 𝑑ff = 3072).
+
+                 (a) 𝐵 = 1                                           (b) 𝐵 = 16                                             (c) 𝐵 = 64
+
+M    Version Rank Time Mem             Err    SpeedupM    Version Rank Time Mem              Err     SpeedupM    Version Rank Time           Mem       Err   Speedup
+                  (ms) (MB)                   vs. Full                 (ms) (MB)                     vs. Full                 (ms)           (MB)            vs. Full
+     Dense      Full   0.10   19.4   0.0000   1.00×        Dense     Full   0.14    61.0    0.0000    1.00×       Dense     Full    0.69 186.5 0.0000 1.00×
+    Flash-v1    768    0.35   30.3   0.0008   0.29×       Flash-v1   768    2.13    56.4    0.0008    0.07×      Flash-v1   768      8.28 137.4 0.0008 0.08×
+128 Flash-v2    768    1.12   30.4   0.0008   0.09× 128   Flash-v2   768    3.45    48.6    0.0008    0.04×128   Flash-v2   768     13.33 101.1 0.0008 0.05×
+    Flash-v1    384    0.27   24.1   0.7148   0.38×       Flash-v1   384    0.68    44.8    0.7101    0.21×      Flash-v1   384      2.56 107.4 0.7114 0.27×
+    Flash-v2    384    0.62   23.8   0.7148   0.17×       Flash-v2   384    1.82    41.0    0.7101    0.08×      Flash-v2   384      7.26  88.9 0.7114 0.09×
+     Dense      Full   0.11   23.2   0.0000   1.00×        Dense     Full   0.29    85.5    0.0000    1.00×       Dense     Full    1.47 282.5 0.0000 1.00×
+    Flash-v1    768    0.39   32.1   0.0008   0.27×       Flash-v1   768    4.05    75.3    0.0008    0.07×      Flash-v1   768     16.71 208.5 0.0008 0.09×
+256 Flash-v2    768    1.11   30.6   0.0008   0.09× 256   Flash-v2   768    7.05    65.5    0.0008    0.04×256   Flash-v2   768     27.17 173.9 0.0008 0.05×
+    Flash-v1    384    0.29   26.0   0.7115   0.36×       Flash-v1   384    1.26    65.3    0.7136    0.23×      Flash-v1   384      5.05 191.6 0.7102 0.29×
+    Flash-v2    384    0.62   24.8   0.7115   0.17×       Flash-v2   384    3.89    57.5    0.7136    0.07×      Flash-v2   384     14.45 154.8 0.7103 0.10×
+     Dense      Full   0.10   27.3   0.0000   1.00×        Dense     Full 0.68 150.5 0.0000           1.00×       Dense     Full    10.40 1090.7 0.0000 1.00×
+    Flash-v1    768    0.61   34.9   0.0008   0.17×       Flash-v1   768 8.30 118.8 0.0008            0.08×      Flash-v1   768      8.66 829.2 0.0002 1.20×
+512 Flash-v2    768    1.16   32.9   0.0008   0.09× 512   Flash-v2   768 13.43 101.6 0.0008           0.05×512   Flash-v2   768     54.82 317.0 0.0008 0.05×
+    Flash-v1    384    0.27   28.0   0.7133   0.37×       Flash-v1   384 2.46 106.9 0.7105            0.28×      Flash-v1   384      9.91 358.8 0.7090 0.27×
+    Flash-v2    384    0.63   26.9   0.7133   0.16×       Flash-v2   384 7.16 88.8 0.7105             0.09×      Flash-v2   384     29.21 286.8 0.7090 0.09×
+      Dense     Full   0.10   35.5   0.0000   1.00×       Dense      Full 1.47 282.5 0.0000 1.00×      Dense                Full 29.19 3681.9 0.0000            1.00×
+     Flash-v1   768    1.12   40.8   0.0008   0.09×      Flash-v1    768 16.77 209.4 0.0008 0.09×     Flash-v1              768 74.28 749.3 0.0008              0.08×
+1024 Flash-v2   768    2.34   38.6   0.0008   0.04× 1024 Flash-v2    768 27.10 173.1 0.0008 0.05×1024 Flash-v2              768 108.50 604.4 0.0008             0.05×
+     Flash-v1   384    0.38   34.5   0.7098   0.26×      Flash-v1    384 4.99 191.4 0.7134 0.30×      Flash-v1              384 21.40 694.8 0.7133              0.27×
+     Flash-v2   384    1.31   32.6   0.7098   0.07×      Flash-v2    384 14.42 154.8 0.7134 0.10×     Flash-v2              384 58.20 550.8 0.7133              0.10×
+
+
+
+
+                                                                                                                                                           32
+   FlashSVD: Memory-Efficient Inference with Streaming for Low-Rank Models
+
+
+
+
+Table S6: Finetuned FlashSVD shows Strong Potential in Edge Deployment (batch_size=32)
+
+                                         SST-2
+                        Rank         Acc (%) Trans. Peak        Lat
+                        dense         92.52   143.3 560.9      66.9
+                        32-192        88.30   107.7    330.8   74.4
+                    32-192 (SVD)      88.19   203.7    426.9   88.9
+                         16-96        86.81   105.8    263.9   70.3
+                     16-96 (SVD)      86.81   201.9    359.9   78.7
+                                   Unfinetuned SST-2
+                        Rank         Acc (%) Trans. Peak        Lat
+                        32-192        58.82   110.1    328.6 92.7
+                    32-192 (SVD)      58.82   206.1    424.6 131.4
+                         16-96        50.89   109.1    265.2 94.7
+                     16-96 (SVD)      50.89   205.1    361.2 124.9
+                                STS-B (pearson accuracy)
+                        dense         81.41   281.3 699.0      98.8
+                        Rank         Acc (%) Trans. Peak        Lat
+                       32-192         71.49   206.3    429.4   112.5
+                    32-192 (SVD)      71.49   398.3    621.5   118.0
+                       40-240         80.52   207.8    460.8   114.8
+                    40-240 (SVD)      80.52   399.8    652.8   128.9
+                                   Unfinetuned STS-B
+                        Rank         Acc (%) Trans. Peak        Lat
+                       32-192          0.76   215.2    433.7   126.0
+                    32-192 (SVD)       0.78   407.1    625.7   137.4
+                       40-240         13.51   216.3    466.1   136.7
+                    40-240 (SVD)      13.50   408.3    658.0   160.1
+
+
+
+
+                                                                                         33
+

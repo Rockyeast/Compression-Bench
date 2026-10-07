@@ -1,0 +1,965 @@
+                                        Eigen Attention: Attention in Low-Rank Space for KV Cache Compression
+
+
+                                                    Utkarsh Saxena, Gobinda Saha, Sakshi Choudhary, Kaushik Roy
+                                                                           Purdue University
+                                                           {saxenau, gsaha, choudh23, kaushik}@purdue.edu
+
+
+
+
+                                                              Abstract                            such as summarizing lengthy documents, retrieving
+                                                                                                  information to answer questions about extensive
+                                            Large language models (LLMs) represent a
+                                                                                                  texts, and analyzing code. To make applications
+                                            groundbreaking advancement in the domain
+arXiv:2408.05646v2 [cs.LG] 8 Nov 2024
+
+
+
+
+                                            of natural language processing due to their           enabled by LLMs more accessible, developing tech-
+                                            impressive reasoning abilities. Recently, there       niques to serve these models efficiently is crucial.
+                                            has been considerable interest in increasing the      One standard technique to accelerate LLM infer-
+                                            context lengths for these models to enhance           ence on GPUs is caching the intermediate atten-
+                                            their applicability to complex tasks. However,        tion keys and values through a KV cache to avoid
+                                            at long context lengths and large batch sizes,        expensive re-computation for every generated to-
+                                            the key-value (KV) cache, which stores the
+                                                                                                  ken. However, it is observed that at long context
+                                            attention keys and values, emerges as the new
+                                            bottleneck in memory usage during inference.
+                                                                                                  lengths, the KV cache becomes the new memory
+                                            To address this, we propose Eigen Attention,          and latency bottleneck (Pope et al., 2022). Further-
+                                            which performs the attention operation in             more, while batching multiple requests together
+                                            a low-rank space, thereby reducing the KV             amortizes the weight access cost of LLMs, it ex-
+                                            cache memory overhead.          Our proposed          acerbates the KV cache memory overhead. Con-
+                                            approach is orthogonal to existing KV cache           sider the weight and KV cache memory footprint
+                                            compression techniques and can be used                for the Llama-2 7B model with a batch size of
+                                            synergistically with them. Through extensive
+                                                                                                  16 and a context length of 32k tokens. Here, the
+                                            experiments over OPT, MPT, and Llama
+                                            model families, we demonstrate that Eigen             weight memory occupies 14 GB, while the KV
+                                            Attention results in up to 40% reduction in           cache requires a significantly higher memory of
+                                            KV cache sizes and up to 60% reduction                256 GB at 16-bit precision. In essence, increasing
+                                            in attention operation latency with minimal           the context/sequence length of LLMs has trans-
+                                            drop in performance. Code is available at             formed LLM inference into a memory-bound prob-
+                                            https://github.com/UtkarshSaxena1/EigenAttn.          lem. The entire KV cache must be bought on-chip
+                                                                                                  from the off-chip GPU memory for each newly
+                                        1   Introduction
+                                                                                                  generated token while the computation core stays
+                                        The recent boom in artificial intelligence applica-       idle, waiting for data.
+                                        tions and their widespread public adoption can be            Existing methods to address the KV cache bot-
+                                        attributed to the human-like capabilities of large        tleneck can be broadly classified into four distinct
+                                        language models (LLMs). LLMs have demon-                  categories. First, some approaches focus on reduc-
+                                        strated remarkable performance across a wide              ing the number of KV cache heads in the multi-
+                                        range of natural language processing (NLP) tasks          head attention block through grouped query and
+                                        (lmsys.org, 2024). The maximum number of to-              multi-query attention (Ainslie et al., 2023; Shazeer,
+                                        kens these models can process simultaneously to           2019). Second, a few methods aim to alleviate
+                                        understand and generate text is referred to as the        the memory overhead by utilizing a low-precision
+                                        context/sequence length, and this closely deter-          quantized KV cache (Hooper et al., 2024; Zirui Liu
+                                        mines their performance limits. Hence, there has          et al., 2024). Third, certain strategies involve evict-
+                                        been considerable interest in increasing the con-         ing KV cache values associated with unimportant
+                                        text length to enhance their capabilities (Zhang          tokens, thereby caching only the keys and values of
+                                        et al., 2024a; Ding et al., 2024; Achiam et al., 2023).   important tokens determined through some metrics
+                                        Longer context lengths open up new possibilities,         (Zhang et al., 2023; Adnan et al., 2024). Finally,
+           ( x )
+                                                                     ( x )
+                              ( x )                                                     ( x )
+                           Standard                                                   Eigen
+           ( x )           Attention       ( x )                     ( x )           Attention      ( x )
+
+ ( x )                                                    ( x )
+           ( x )           KV Cache                                  ( x )           KV Cache
+
+                             ( x )                                                      ( x )
+                             (a)                                                        (b)
+
+Figure 1: Comparison between (a) Standard Attention and (b) Eigen Attention. Eigen Attention utilizes lower
+dimensional (r ≪ d) query, key, and value projection matrices than the standard attention operation, leading to KV
+cache compression and compute FLOPs benefits.
+
+Table 1: KV cache size, number of parameters, and total FLOPs for Standard vs Eigen Attention computed for
+sequence length n, hidden dimension d in standard attention and hidden dimension r (≪ d) in Eigen Attention.
+                                                     Standard Attention   Eigen Attention
+                             KV Cache Size                 2.n.d               2.n.r
+                               # Parameters                  4.d2              4.d.r
+                                                           2
+                          FLOPs (generation phase)      4.d + 2.n.d        4.d.r + 2.n.r
+
+
+
+some approaches tackle the issue from a systems            matrix are the principal basis vectors for keys and
+perspective by utilizing the CPU and disk memory           queries. Similarly, UV contains the important ba-
+for the KV cache or by extending virtual memory            sis vectors for the value matrix. We project the
+and incorporating paging techniques into the atten-        attention inputs into a low-rank space defined by
+tion mechanism (Kwon et al., 2023a).                       the eigenvectors UK and UV by assimilating these
+                                                           projections into the corresponding weight matrices
+   In contrast to the above-mentioned techniques,
+                                                           WQ , WK , WV and WO offline. During infer-
+we propose Eigen Attention, a strategy to alleviate
+                                                           ence, the low-dimensional WK UK and WV UV
+the KV cache overhead through low-rank approx-
+                                                           are multiplied with the input vector X to generate
+imation. Eigen Attention leverages the observa-
+                                                           lower-dimensional K and V matrices. While the
+tion that attention inputs in LLMs (i.e., key, query,
+                                                           primary goal of Eigen Attention is to reduce the
+and value) can be reasonably approximated using
+                                                           memory overhead of the KV cache, the proposed
+a few principal basis vectors or eigenvectors (Yu
+                                                           low-rank approximation also leads to a compute-
+and Wu, 2023). Expressing keys and values as a
+                                                           efficient implementation of the attention block (Sec-
+linear combination of these principal vectors essen-
+                                                           tion 5.2). For the standard dimension d and the
+tially reduces their dimension, leading to a lower
+                                                           compressed dimension r(≪ d), Table 1 shows the
+memory footprint of the KV cache. To achieve this,
+                                                           reduction in KV cache size and floating point oper-
+we use a very small subset of training data as a
+                                                           ations (FLOPs) achieved through Eigen Attention.
+calibration dataset to generate a set of query, key,
+                                                           In summary, we make the following contributions:
+and value matrices for the trained model. Subse-
+quently, we obtain the basis vectors through Sin-             • We propose Eigen Attention, a novel mecha-
+gular Value Decomposition (SVD) on these ma-                    nism to efficiently serve LLMs by compress-
+trices and choose the most important directions                 ing the KV cache through low-rank approxi-
+through a pre-defined error threshold. Eigen At-                mations.
+tention is a post-training technique that can be ap-
+plied without requiring any additional fine-tuning.           • We demonstrate that the low-rank approxima-
+Moreover, our approach is orthogonal to existing                tion employed by Eigen Attention enhances
+techniques for KV cache compression and can be                  the compute efficiency of the attention block.
+used in conjunction with them. Figure 1 illustrates
+the differences between standard attention and our            • Extensive experiments across various models
+proposed Eigen Attention. Columns of the UK                     and language tasks show that Eigen Attention
+      compresses the KV cache by up to 40% along       Then, similar to Equation 2, the heads’ outputs are
+      with upto 60% reduction in the attention oper-   concatenated and multiplied with WO to produce
+      ation latency.                                   the final output of the attention block.
+
+2     Background                                       3   Related Works
+Multi-Head Attention. A typical LLM consists           KV Cache Compression. As mentioned in Sec-
+of L decoder layers, each with two components:         tion 2, the KV cache size is computed as 2 ∗ b ∗ n ∗
+multi-head attention (MHA) and the fully con-          d ∗ h ∗ L ∗ p. KV cache compression methods target
+nected feed-forward network (FFN). For an input        these factors to reduce its overall memory footprint.
+token embedding X ∈ Rn×d , the MHA block               Multi-query attention (Shazeer, 2019) and grouped
+performs attention operations in parallel across h     query attention (Ainslie et al., 2023) reduce the
+heads. Here, n is the sequence length, and d is        number of attention heads h. Quantization based
+the hidden dimensionality of the model. For each       methods reduce the precision p (Yang et al., 2024;
+attention head i ∈ {1, 2, ...h}, X is transformed      Kang et al., 2024; Zirui Liu et al., 2024; Hooper
+into key, query, and value matrices as follows:        et al., 2024). Notably, works like KIVI (Zirui Liu
+                                                       et al., 2024) and KV Quant (Hooper et al., 2024)
+    Qi = XWiQ , Ki = XWiK , Vi = XWiV (1)              have demonstrated that the precision of K and V
+                                                       matrices can be reduced to as low as 2-bits. Several
+Here, WiQ ∈ Rd×dh , WiK ∈ Rd×dh , WiV ∈                works attempt to reduce the sequence length n by
+Rd×dh are learnable weight matrices with dh =          only caching K and V corresponding to a subset
+d
+h . The attention operation A at each head i is        of tokens (Beltagy et al., 2020). Another strategy
+computed, and the results from all heads are con-      is to cache K and V according to token importance
+catenated to obtain the final output of the MHA        (Zhang et al., 2023; Adnan et al., 2024; Liu et al.,
+block, as shown in Equation 2.                         2024; Niu et al., 2024; Li et al., 2024; Zhang et al.,
+                                    Qi KT
+                                          
+ hi = A(Qi , Ki , Vi ) = Softmax √ i Vi ,              2024b). H2 O (Zhang et al., 2023) finds important
+                                       dh              tokens by monitoring accumulated attention scores.
+                                     O                 KeyFormer (Adnan et al., 2024) improves H2 O by
+ MHA(Q, K, V) = [h1 , h2 , .., hh ]W
+                                              (2)      considering the importance of discarded tokens as
+                                                       well. Recently, (Wu and Tu, 2024) demonstrated
+   LLM Inference. The inference consists of the        that the cached K and V can be reused across the
+prefill and generation phases. In the prefill phase,   decoder layers, essentially reducing L. In contrast
+the keys Ki and Vi values are computed for an          to these techniques, Eigen Attention reduces the
+input token embedding X ∈ Rb×n×d with batch            embedding dimension d of each cached K and V
+size b (as shown in Equation 1) and cached in mem-     vector. It is orthogonal to the existing KV cache
+ory for the generation phase. The total size of KV     compression techniques and can be used in con-
+cache (in bits) can be derived by 2∗b∗n∗d∗h∗L∗p,       junction with them.
+where L corresponds to the number of decoder lay-         Low-Rank Approximation. Various works
+ers in the LLM, and p corresponds to the precision     in literature have leveraged low-rank approxi-
+of cached vectors.                                     mation for performing efficient LLM inference.
+   In the generation phase, the model uses and up-     Recent works (Yu and Wu, 2023; Feng et al.,
+dates the KV cache to generate the output auto-        2022) have shown that while the weight matrices
+regressively, one token at a time. Note that this      for transformers-based models are not inherently
+phase is memory-bound. For an incoming token           sparse, the activations are. LoRD (Kaushal et al.,
+embedding x ∈ Rb×1×d , the key ki and value vi         2023) leverages this observation to compress the
+computed through Equation 1 are appended to the        weight matrix of LLMs by representing it as a prod-
+KV cache:                                              uct of two low-rank matrices. LoSparse (Li et al.,
+                                                       2023) combines pruning and low-rank approxima-
+    Ki ← Concat(Ki , ki ), Vi ← Concat(Vi , vi )
+                                                       tion and expresses the weight matrix as a sum of
+  The query qi obtained through Equation 1 is          a low-rank matrix and a sparse matrix. Fisher-
+used to compute the attention output for each head:    weighted SVD (Hsu et al., 2022) proposes to uti-
+                               p                     lize Fisher information to weigh the importance of
+         hi = Softmax qi KTi / dh Vi            (3)    weights before performing SVD-based low-rank
+Normalized cumulative eigenvalue
+
+
+
+
+                                                                       Normalized cumulative eigenvalue
+                                   1.0                                                                    1.0
+                                                                                                                                                                 110                                            100
+
+                                                                                                          0.8
+
+
+
+
+                                                                                                                                                Head dimension
+
+
+
+
+                                                                                                                                                                                               Head dimension
+                                   0.8                                                                                                                           105                                             80
+
+                                                                                                                                                                                                                 60
+                                   0.6                                                                    0.6                                                    100
+                                                                                                                                                                                                                 40
+                                                           value                                          0.4                     value                           95
+                                   0.4                                                                                                                                                                           20
+                                                           key                                                                    key
+                                                                                                          0.2                                                     90                                              0
+                                         0                       128                                            0                       128                            0   10      20 30 40                           0   10      20 30 40
+                                             Eigen value index                                                      Eigen value index                                           Layer index                                    Layer index
+
+                                    a Layer #15 Head #16                                                   b Layer #25 Head #16                                             c Value                                        d Key
+
+Figure 2: Eigenvalue spectrum analysis for OPT-30b model. (a), (b) The Y-axis is the normalized cumulative
+eigenvalue value after performing SVD on the key value representation matrix, and the X-axis is an index of the
+largest eigenvalue. (c), (d) Dimensions of the low-rank matrices with normalized cumulative eigenvalue of 0.9.
+
+
+approximation. In this work, we focus on reducing                                                                                                                  criteria (Saha et al., 2021),
+the KV cache’s memory footprint by storing low-
+dimensional keys and values to efficiently enable                                                                                                                                   ||(RKQ
+                                                                                                                                                                                        i  )r ||2F ≥ ϵth ||RKQ
+                                                                                                                                                                                                            i  ||2F                          (5)
+long sequence lengths for LLMs.
+                                                                                                                                                                   ϵth is the threshold hyperparameter determining
+4                                    Methodology                                                                                                                   the degree of low-rank approximation. We create a
+                                                                                                                                                                   unified basis for key and query to aid in low-rank
+This section describes Eigen Attention, which
+                                                                                                                                                                   attention, as shown in Section 4.2. The orthogonal
+achieves KV cache compression by performing the
+                                                                                                                                                                   basis vectors spanning the low-rank space for key
+attention operation in a low-rank space determined
+                                                                                                                                                                   and query are given by UKQ   i    = [u1 , u2 , ..., ur ],
+by a few basis vectors. We first discuss generating
+                                                                                                                                                                   which we represent concisely as UK     i . Similarly,
+these principal basis vectors and then describe our                                                                                                                                V
+                                                                                                                                                                   we generate Ui for the value representation ma-
+proposed approach detailed in Algorithm 1.
+                                                                                                                                                                   trix RVi . Please refer to Appendix A.1 for more
+4.1                                      Basis Vector Generation                                                                                                   details on SVD. Note that a unique low-rank basis
+The first step towards computing attention in low-                                                                                                                 is obtained for each head in the attention layer, and
+rank space is determining the principle basis vec-                                                                                                                 we keep the rank r the same across heads by taking
+tors that span this low-dimensional space. To                                                                                                                      the maximum rank across heads. Figure 2 (a), (b)
+achieve this, we create representation matrices RQ                                                                                                                 show the spectrum of eigenvalue distribution of the
+                                                  l,i ,
+   K         V                                                                                                                                                     keys and values for OPT-30b, with keys having a
+Rl,i and Rl,i corresponding to query, key, and
+                                                                                                                                                                   lower rank than the values. In Figure 2 (c), (d), we
+value respectively, for each layer l and attention
+                                                                                                                                                                   plot rank r obtained by keeping ϵth as 0.9 for dif-
+head i. We drop the layer index l for ease of clar-
+                                                                                                                                                                   ferent layers of the model. As shown, some layers’
+ity. These representation matrices are obtained by
+                                                                                                                                                                   dimensions can be reduced to nearly zero.
+performing a forward pass for ns samples taken
+from the calibration dataset, as shown in Equation                                                                                                                 4.2      Eigen Attention
+4. Note that this calibration dataset is a subset of
+WikiText (Merity et al., 2016), which is commonly                                                                                                                  To understand our proposed low-rank attention,
+used for pretraining LLMs.                                                                                                                                         consider the basis vectors UK       V
+                                                                                                                                                                                                  i , Ui such that
+                                                                                                                                                                      K/V T    K/V
+                                                                                                                                                                   (Ui ) .Ui = I due to orthogonality. The at-
+                                             RQ      1 T     2 T          ns T
+                                              i = [(Qi ) , (Qi ) , ..., (Qi ) ]                                                                                    tention inputs can be projected to the low-rank
+                                                                          ns T
+                                             RK      1 T     2 T
+                                              i = [(Ki ) , (Ki ) , ..., (Ki ) ]                                                           (4)                      space spanned by these vectors as,
+                                             RVi = [(Vi1 )T , (Vi2 )T , ..., (Vins )T ]
+                                                                                                                                                                                        Q′i = Qi UK   K T
+                                                                                                                                                                                                  i (Ui )
+                                               Q/K/V
+Here, Ri          ∈ R(ns .n)×dh . The key and                                                                                                                                           K′i = Ki UK   K T
+                                                                                                                                                                                                  i (Ui )                                    (6)
+query representation matrices are concatenated as                                                                                                                                       Vi′ = Vi UVi (UVi )T
+RKQ
+  i   = [RQ     K
+           i , Ri ] followed by an SVD operation
+                                             SVD
+RKQ
+  i  −−→ Σdi=1
+             h
+                σi ui viT . We obtain a r-rank ap-                                                                                                                    Here, {Q′i , K′i , Vi′ } ∈ Rn×dh are low rank atten-
+               KQ
+proximation (Ri )r according to the following                                                                                                                      tion inputs with rank r. Then, we compute Eigen
+Attention as follows:                                      Algorithm 1 Eigen Attention
+                        ′                                  Input: LLM Decoder layers {L}L       l=1 , error budget
+              Q′i KiT
+A′ = Softmax( √       )Vi′                                     eb , step size ϵs and inputs to first decoder X1 .
+                  dh                                        1: procedure E IGENATTENTION ()
+              Qi UK     K T T
+                   i (Ui ) K                                2:      for l = 1...L do
+   = Softmax(         √       )Vi UVi (UVi )T
+                       dh                                   3:          Xl+1 , RKQ , RV ← forward(Ll , Xl )
+                                           (7)              4:          ϵlth ← 1.0
+                                                            5:          while e ≤ eb do
+                                K/V     K/V
+   For an appropriate rank r, Ui (Ui )T ≈ I                 6:               ϵlth ← ϵlth − ϵs
+                                                                                              KQ l
+(Yu and Wu, 2023). Hence, attention with low-rank           7:               UK l ← SVD(Rl      , ϵth )
+inputs (i.e., Eigen Attention) can approximate the          8:               Ul ← SVD(Rl , ϵlth )
+                                                                                V            V               ▷ eq.5
+full rank attention (A′ ≈ A). Further, the basis            9:
+                                                                                  Q
+                                                                             Wl ← Wl U l  Q K
+
+vectors UK           V
+           i and Ui used to compute Eigen At-              10:               WlK ← WlQ UK     l
+tention can be seamlessly merged with the weight           11:               WlV ← WlQ UVl
+projection matrices of the attention layer:
+                                                           12:               WlO ← (UVl )T WlQ              ▷ eq. 8
+                    ′                                      13:                  ′
+                                                                             Xl+1 ← forward(Ll , Xl )
+                WiQ ← WiQ UK
+                           i                                                      ||X′   −Xl+1 ||2
+                   ′                                       14:           eb = l+1                   ▷ error
+                WiK ← WiK UK i
+                                                                                 ||Xl+1 ||2
+                                                     (8)   15:        end while
+                  V′    V    V
+                Wi ← Wi Ui                                 16:    end for
+                   ′
+                WiO ← (UVi )T WiO                          17:    return {L}Ll=1          ▷ Low-rank Layers
+                                                           18: end procedure
+            ′      ′        ′                    ′
+Here, {WiQ , WiK , WiV } ∈ Rdh ×r and WiO ∈
+Rr×dh . This transformation reduces the output di-         RoPE rotation matrix. The query, key dot product
+mension of projection matrices, effectively decreas-       with Eigen Attention is given by,
+ing the embedding dimension of keys, queries, and
+values. Consequently, both the number of parame-             Qpos pos T      T  K T  K
+                                                              i (Ki ) = Qi RR (U ) (U Ki ) (10)
+ters and floating-point operations (FLOPs) in the at-
+tention layer are reduced. More importantly, Eigen         We store the low-dimensional representation of the
+Attention significantly lowers the KV cache mem-           key (i.e., UK Ki ) in the KV cache but perform
+ory footprint (refer Table 1).                             an additional transformation through (UK )T be-
+                                                           fore applying RoPE (Figure 6). To mitigate the
+4.3   Rotational Position Embedding                        parameter overhead associated with this additional
+Positional information can be incorporated in text         transformation, we propose to share UK across all
+processed by LLMs in several ways. Different               the attention heads. Similar to the standard Eigen
+models employ absolute or relative positional em-          Attention, we merge UK into WiK , with the value
+beddings at different levels of model computations.        computation unchanged.
+Recent LLM demonstrations employ rotary posi-
+tional embeddings (RoPE) (Su et al., 2024). RoPE           4.4   Layer-wise Rank Allotment
+transforms the keys and queries before performing          Eigen Attention introduces layer-wise threshold
+the attention operation as shown below:                    ϵth , which determines the accuracy of low-rank ap-
+                                                           proximation according to Equation 5. We observe
+          Qpos
+           i   = Qi R; Kpos
+                        i   = Ki R                   (9)   that the same ϵth across attention layers introduces
+                                                           different errors at the output of the LLM decoder
+LLMs with RoPE are trained with a fixed dimen-             layer. This implies that the layers that incur lower
+sional R, making them incompatible with any mod-           errors due to the low-rank approximation can be
+ification to the embedding dimension of the keys or        further compressed by lowering the ϵth . To achieve
+queries. To integrate RoPE with Eigen Attention,           this, we introduce a layer-wise threshold selection
+we introduce minor modifications. Specifically, we         methodology based on the normalized output error
+leave the query to be full rank and transform the          of each decoder layer. The threshold ϵth is reduced
+key back to a high dimension before applying the           by a step size ϵs until the decoder layer output
+Table 2: Perplexity (PPL, lower is better) results on Wikitext and C4 and Accuracy (Acc, higher is better) results on
+lm-eval-harness tasks: PiQA, WinoGrande, Arc-e, Arc-c, HellaSwag. Results are evaluated at different levels of KV
+cache compression obtained by Eigen Attention. The baseline represents standard attention with an uncompressed
+KV cache. The performance degradation from the baseline is shown in brackets.
+                                              PPL ↓                                          Acc ↑
+Model      Params   KV Cache
+                                   Wikitext              C4         PiQA     WinoG   Arc-e    Arc-c   HellaS     Avg-Acc
+                     Baseline        9.56              10.69        0.78      0.68   0.70      0.35    0.54        0.61
+                      0.8x       9.61 (+0.05)      10.75 (+0.06)    0.78      0.67   0.70      0.34    0.54    0.61 (-0.00)
+            30b
+                      0.7x       9.94 (+0.38)      10.98 (+0.29)    0.78      0.66   0.69      0.35    0.54    0.60 (-0.01)
+                      0.6x      10.80 (+1.24)      11.47 (+0.78)    0.76      0.64   0.69      0.32    0.52    0.59 (-0.02)
+ OPT
+                     Baseline        9.34              10.28        0.79      0.69   0.72      0.37    0.56        0.63
+                      0.8x       9.36 (+0.02)      10.29 (+0.01)    0.79      0.69   0.72      0.37    0.56    0.63 (-0.00)
+            66b
+                      0.7x       9.51 (+0.17)      10.40 (+0.12)    0.78      0.68   0.72      0.37    0.56    0.62 (-0.01)
+                      0.6x       9.68 (+0.34)      10.54 (+0.26)    0.78      0.68   0.70      0.36    0.55    0.62 (-0.01)
+                     Baseline        7.68               9.60        0.79      0.69   0.75      0.41    0.57        0.64
+                      0.8x       8.02 (+0.34)      10.14 (+0.54)    0.79      0.68   0.74      0.39    0.56    0.63 (-0.01)
+            7b
+                      0.7x       8.45 (+0.77)      10.80 (+1.20)    0.78      0.68   0.72      0.38    0.54    0.62 (-0.02)
+                      0.6x       9.61 (+1.93)      12.26 (+2.66)    0.76      0.68   0.69      0.35    0.52    0.60 (-0.04)
+ MPT
+                     Baseline        6.40               8.44        0.80      0.70   0.79      0.47    0.60        0.67
+                      0.8x       6.48 (+0.08)       8.55 (+0.11)    0.81      0.71   0.79      0.47    0.60    0.68 (+0.01)
+            30b
+                      0.7x       6.66 (+0.26)       8.82 (+0.38)    0.80      0.71   0.78      0.46    0.59    0.67 (-0.00)
+                      0.6x       7.01 (+0.61)       9.38 (+0.94)    0.79      0.70   0.77      0.44    0.57    0.66 (-0.01)
+                     Baseline        5.47               6.97        0.78      0.69   0.76      0.43    0.57        0.65
+                      0.8x       5.96 (+0.49)       7.82 (+0.85)    0.76      0.66   0.72      0.40    0.54    0.61 (-0.04)
+            7b
+                      0.7x       6.28 (+0.81)       8.55 (+1.58)    0.75      0.63   0.70      0.38    0.52    0.60 (-0.05)
+                      0.6x       7.48 (+2.01)      10.07 (+3.10)    0.74      0.63   0.65      0.33    0.48    0.56 (-0.09)
+                     Baseline        4.88               6.47        0.79      0.72   0.79      0.48    0.60        0.68
+                      0.8x       5.06 (+0.18)       6.77 (+0.30)    0.78      0.72   0.78      0.45    0.59    0.66 (-0.02)
+Llama-2     13b
+                      0.7x       5.32 (+0.44)       7.19 (+0.72)    0.77      0.70   0.77      0.45    0.57    0.65 (-0.03)
+                      0.6x       6.10 (+1.22)       9.34 (+2.87)    0.73      0.65   0.70      0.36    0.48    0.58 (-0.10)
+                     Baseline        3.32               5.52        0.82      0.78   0.83      0.54    0.65        0.72
+                      0.8x       3.44 (+0.12)       5.74 (+0.22)    0.81      0.76   0.81      0.51    0.63    0.71 (-0.01)
+            70b
+                      0.7x       3.60 (+0.28)       5.95 (+0.43)    0.81      0.76   0.81      0.51    0.61    0.70 (-0.02)
+                      0.6x       3.78 (+0.46)       6.23 (+0.71)    0.80      0.75   0.81      0.50    0.59    0.69 (-0.03)
+                     Baseline        6.14               8.88        0.80      0.73   0.80      0.51    0.60        0.69
+                      0.8x       6.72 (+0.58)       9.93 (+1.05)    0.78      0.73   0.78      0.48    0.57    0.67 (-0.02)
+            8b
+                      0.7x       7.22 (+1.08)      10.91 (+2.03)    0.78      0.71   0.77      0.45    0.55    0.65 (-0.04)
+                      0.6x       8.51 (+2.37)      13.20 (+4.32)    0.76      0.67   0.74      0.42    0.50    0.62 (-0.07)
+Llama-3
+                     Baseline        2.85               6.73        0.82      0.81   0.87      0.60    0.66        0.75
+                      0.8x       3.22 (+0.37)       7.12 (+0.39)    0.82      0.80   0.85      0.59    0.66    0.74 (-0.01)
+            70b
+                      0.7x       3.59 (+0.74)       7.48 (+0.75)    0.82      0.79   0.84      0.57    0.65    0.73 (-0.02)
+                      0.6x       5.54 (+2.69)      10.39 (+3.66)    0.78      0.73   0.77      0.45    0.54    0.65 (-0.10)
+
+
+
+reaches a specified layerwise error budget. This                   (Dodge et al., 2021) datasets. The zero-shot tasks
+condenses the layer-wise rank search to two hyper-                 are obtained from lm-eval-harness framework (Gao
+parameters (i.e., error budget eb , and step size ϵs ),            et al., 2023): PiQA (Bisk et al., 2020), Wino-
+which is kept the same for all LLM layers. Error                   grande (WinoG) (Sakaguchi et al., 2021), Arc-
+budget eb can be increased to increase KV cache                    easy/challenge (Clark et al., 2018), and HellaSwag
+compression (Table 9). For all our experiments, we                 (HellaS) (Zellers et al., 2019).
+keep ϵs = 0.02.                                                       To emphasize that our approach is orthogonal to
+                                                                   existing compression techniques, we implement it
+5     Experiments                                                  alongside Grouped Query Attention (Ainslie et al.,
+                                                                   2023) (present in Llama-2 70b and Llama-3) and
+5.1     Setup                                                      Quantization (Zirui Liu et al., 2024).
+We evaluate Eigen Attention across three model
+                                                                   5.2     Results
+families: OPT (Zhang et al., 2022), MPT
+(MosaicML-MPT), and Llama (Touvron et al.,                         We demonstrate the compression benefits achieved
+2023; Llama-3), each with distinct position encod-                 by Eigen Attention through our results in Table
+ing schemes. OPT employs learnable position em-                    2 on various families and sizes of models for a
+beddings, MPT utilizes AliBi (Press et al., 2021),                 number of language tasks. In particular, we report
+and the Llama model family employs RoPE (Su                        perplexity (PPL) on Wikitext and C4 datasets and
+et al., 2024). We conduct evaluations on both lan-                 accuracy (Acc) on various zero-shot benchmarks at
+guage generation and zero-shot tasks. The lan-                     three KV cache compression ratios: 0.8x, 0.7x, and
+guage generation tasks include perplexity evalu-                   0.6x. As expected, increasing the degree of KV
+ation on Wikitext-2 (Merity et al., 2016) and C4                   cache compression increases the perplexity while
+Table 3: Perplexity and Accuracy results after fine-tuning. The baseline represents standard attention with an
+uncompressed KV cache. Degradation from baseline is shown in brackets.
+
+                                            PPL ↓                                              Acc ↑
+  Model          KV Cache
+                               Wikitext               C4        PiQA      WinoG       Arc-e      Arc-c      HellaS     Avg-Acc
+                  Baseline       7.68                 9.6       0.79       0.69       0.75       0.41        0.57         0.64
+  MPT-7b
+                   0.6x      9.21 (+1.53)       11.44 (+2.14)   0.79       0.69       0.72       0.39        0.55     0.63 (-0.01)
+                  Baseline       5.47                6.97       0.78       0.69       0.76       0.43        0.57         0.65
+Llama-2-7b
+                   0.6x      6.55 (+1.07)        8.55 (+1.58)   0.78       0.67       0.74       0.41        0.54     0.63 (-0.02)
+                  Baseline       4.88                6.47       0.79       0.72       0.79       0.48        0.60         0.68
+Llama-2-13b
+                   0.6x      5.64 (+0.76)        7.77 (+1.30)   0.78       0.68       0.75       0.44        0.58     0.65 (-0.03)
+                  Baseline       6.14                8.88       0.80       0.73       0.80       0.51        0.60         0.69
+Llama-3-8b
+                   0.6x      7.60 (+1.47)       11.44 (+2.56)   0.80       0.70       0.79       0.48        0.58     0.67 (-0.02)
+
+
+                                                                 Table 4: Comparison of Eigen Attention with H2 O.
+                                                                 Combination of Eigen Attention and H2 O leads to the
+                                                                 best tradeoff between accuracy and KV cache size.
+
+                                                                       Model          Method          KV Cache   Avg. 0-shot Acc ↑
+                                                                                        H2 O             0.2x          0.54
+                                                                                        H2 O             0.4x          0.64
+                                                                  Llama-2-7b
+                                                                                     Eigen Attn          0.6x          0.63
+                                                                                  Eigen Attn + H2 O      0.24x         0.62
+                                                                                        H2 O             0.2x          0.56
+          (a) Llama-2-7b          (b) Llama-2-13b                                       H2 O             0.4x          0.67
+                                                                  Llama-3-8b
+                                                                                     Eigen Attn          0.6x          0.67
+                                                                                  Eigen Attn + H2 O      0.24x         0.65
+Figure 3: PPL on Wikitext with different KV cache sizes
+in GB (n = 2048) obtained via different quantization
+precision and group size. For Eigen Attention, we com-           Table 5: Average latency per attention layer during to-
+press the KV cache to 0.6x and then apply quantization.          ken generation phase.
+
+                                                                            Model         Baseline Attn      Eigen Attn 0.6x
+                                                                           OPT-66b          1.57 ms          0.62 ms (-60%)
+                                                                         Llama-2-70b        0.79 ms           0.77 ms (-3%)
+reducing accuracy on benchmark tasks. On aver-                           Llama-3-70b        0.74 ms          0.80 ms (+8%)
+age, perplexity increases by 0.32, 0.69, and 1.79
+while accuracy drops by 1%, 2%, and 3% at 0.8x,
+0.7x, and 0.6x KV cache compression, respectively.               Llama-2, and Llama-3 models and report the results
+Within a model family, we find larger models to be               in Table 3. Fine-tuning helps improve the perfor-
+more resilient to KV cache compression. Notably,                 mance of Eigen Attention models, making them
+the OPT-66b model incurs only 1% degradation in                  perform closer to the baseline. The perplexity gap
+zero-shot accuracy with a 40% compression for the                to baseline reduces from 2.56 (before fine-tuning)
+KV cache. Within the Llama-2 family, the average                 to 1.55 after fine-tuning. Similarly, the average
+PPL gap to baseline reduces from 2.56 in the 7b                  zero-shot accuracy gap is reduced from 7% (before
+model to 0.59 in the 70b parameter model. Across                 fine-tuning) to within 2% of baseline. We find the
+these three distinct model families, we find the KV              most improvements in Llama-3-8b, while the least
+cache of MPT models to be the most compress-                     improvements with MPT-7b LLM.
+ible while the Llama-3 models to be the least. For                  Eigen Attention with Quantization: We com-
+an iso-parameter size of 70b, the Llama-2 model                  pare performance after quantizing key and value
+is more resilient to KV cache compression than                   in standard and Eigen Attention. Note that the
+the Llama-3 model, with both employing grouped                   KV cache in Eigen Attention is first compressed
+query attention.                                                 to 0.6x before applying quantization. Figure 3
+   Eigen Attention followed by Fine-tuning: We                   shows perplexity for the Llama-2-7b and Llama-2-
+attempt to mitigate the increase in perplexity and               13b models on the Wikitext (Merity et al., 2016)
+the degradation in accuracy observed with the                    dataset across various KV cache sizes obtained by
+smaller LLMs by fine-tuning. We use LoRA (Hu                     performing different levels of quantization. Simi-
+et al., 2022) to fine-tune these models on the Alpaca            lar to KIVI (Zirui Liu et al., 2024) and KV-Quant
+dataset (Taori et al., 2023) for 2000 steps. Specifi-            (Hooper et al., 2024), we perform per channel quan-
+cally, we fine-tune the query, key, value, and output            tization for key and per token quantization for value.
+projection matrices in the attention layer for MPT,              We implement integer quantization at different pre-
+Table 6: Total inference latency (in seconds) for Llama-    Table 7: Perplexity and zero-shot accuracy when using
+3-8b model at different prompt and generation length.       different calibration datasets for MPT-7b model.
+
+              Prompt   Generated   Baseline    Eigen Attn         Calib.               Wikitext     C4    Zero-shot
+ Batch Size                                                                 KV Cache
+              tokens    tokens      Attn         (0.6x)           dataset               (PPL)     (PPL)   Acc. (%)
+     1         8192      2048         76        82 (+8%)                      0.8        8.03      9.96     0.63
+     1         8192     16384        785       880 (+12%)           C4        0.7        8.57     10.47     0.63
+     1         8192     32768       2048      2350 (+13%)                     0.6        9.63     11.44     0.62
+    32         2048       512        180       156 (-13%)                     0.8        8.12     10.07     0.64
+    32         2048      2048        826       859 (+4%)          Alpaca      0.7        3.02     10.88     0.62
+    32         2048      4096       OOM           2366                        0.6       10.86     12.42     0.61
+
+
+
+cision and group sizes, leading to varied KV cache          of Eigen Attention and standard attention baseline
+sizes (Table 8). For iso-KV cache size, the key and         for different models. In Table 5, we show aver-
+value are quantized to lower precision in quantized         age latency per attention layer during the token
+standard attention as compared to quantized Eigen           generation phase for generating 128 tokens with a
+Attention. We make two observations: (1) at large           2048-token synthetic prompt on 2 NVIDIA A100
+KV cache size, the quantized standard attention out-        GPUs. We observe an impressive 60% latency
+performs quantized Eigen Attention because less             improvement for the OPT-66b model, which can
+error is incurred due to quantization compared to           be attributed to the FLOPs reduction from Eigen
+the low-rank decomposition of attention matrices,           Attention and the reduced latency in fetching the
+(2) as quantization precision is reduced to lower           compressed KV cache from memory. For mod-
+the KV cache size, quantized Eigen Attention out-           els with RoPE embedding (i.e., Llama-2-70b and
+performs quantized standard attention. This is due          Llama-3), we perform an additional transformation
+to a much more severe quantization in standard at-          before the attention dot product (Figure 6), which
+tention, which induces higher approximation error           diminishes the latency gains achieved with Eigen
+than Eigen Attention.                                       Attention. For Llama-2-70b, we observe only a 3%
+   Eigen Attention with token pruning: We com-              latency improvement, while for Llama-3-70b, there
+pare Eigen Attention with a popular token pruning           is a latency penalty of 8%. We further analyze end
+approach H2 O (Zhang et al., 2023), which only              to end inference latency at different context lengths
+keeps K and V corresponding to a subset of tokens           and batch sizes in Table 6 for Llama-3-8b on a sin-
+within the KV Cache. Table 4 shows the aver-                gle NVIDIA A100 GPU. We see that increasing
+age zero shot accuracy comparison at different KV           the context length increases the latency overhead
+cache compression ratios. We observe that H2 O at           with Eigen Attention due to the presence of addi-
+0.4x KV cache achieves similar accuracy to Eigen            tional transformation to manage RoPE embedding.
+Attention at 0.6x KV cache. Superior performance            For the maximum sequence length of 40k, there is
+of H2 O over Eigen Attention can be attributed to           a 13% latency overhead with Eigen Attention for
+the dynamic nature of the algorithm. While Eigen            Llama-3-8b. When batch size is increased, the KV
+Attention compresses KV cache based on statistics           cache size increases which increases the memory
+derived offline, H2 O is able to achieve better gener-      bounded nature of inference. In this scenario, addi-
+alization by making decisions to eject tokens from          tional transformation required by Eigen Attention
+KV cache at runtime. However, both Eigen Atten-             leads to much lesser latency overhead and often
+tion and H2 O compress KV cache along different             faster inference than baseline attention. Most no-
+dimensions and can be combined to achieve further           tably, at high batch size and context length, baseline
+compression as seen in Table 4. The combination             attention leads to out of memory (OOM) error on
+of Eigen Attention and H2 O achieves the best per-          GPU while Eigen Attention does not. This high-
+formance highlighting the orthogonality of both             lights the main contribution of our work: to enable
+approaches. By reducing the hidden dimension of             long context inference by compressing KV cache.
+K and V by 60% using Eigen Attention and us-
+ing H2 O to keep only 40% of tokens in KV cache,            5.3     Ablation Studies
+we are able to compress KV cache to 0.24x while             We analyze our approach by varying the number of
+achieving accuracy comparable to Eigen Attention            calibration samples used to compute the represen-
+at 0.6x and H2 O at 0.4x KV cache.                          tation matrix for low-rank approximation and the
+   Latency Comparisons: We compare the latency              number of steps used to fine-tune the models.
+                                                                          100                                  100
+
+
+
+
+                                                                                                    Rank (r)
+                                                               Rank (r)
+                                                                           50                                   50
+
+
+
+                                                                            0                                    0
+                                                                                0   10 20 30 40                      0   10 20 30 40
+                                                                                      Layer index                          Layer index
+
+                                                                                    a Value                              b Key
+
+            (a)                      (b)                   Figure 5: Layerwise rank assignment for key and value
+                                                           determined by Eigen Attention for OPT-30b with 40%
+Figure 4: Ablation Study. (a) Average accuracy (Avg-       compressed KV cache.
+Acc) on zero-shot tasks trained on Llama-2-7b with an
+increasing number of calibration samples. (b) Perplexity
+(PPL) vs fine-tuning steps on the C4 dataset for MPT       increase of 0.61 in the PPL. We posit that this is
+and Llama family of models.                                due to model overfitting on finetuning data.
+
+                                                           5.4              Layerwise Rank Visualization
+   Impact of calibration dataset: Table 7 shows            Figure 5 shows the rank r assigned to key and
+the performance of MPT-7b model when different             query projection layers by Eigen Attention at 40%
+calibration datasets are used for obtaining low rank       KV cache compression. We observe that the initial
+space of K, V vectors. We select samples from              layers (with the exception of first layer) are com-
+C4 (Dodge et al., 2021) and Alpaca (Taori et al.,          pressed more than the later layers. Also, keys are
+2023) datasets for obtaining the low rank basis. We        assigned a lower rank and are compressed more
+see that compressing using C4 calibration dataset          than values, which concurs with our eigenvalue
+achieves better perplexity on the C4 dataset itself        spectrum analysis in Figure 2. Specifically, for
+while achieving slightly lower perplexity on Wiki-         40% KV cache compression, keys are compressed
+text dataset (results in Table 2). Performance on          by 54% while values are compressed by only 26%.
+zero shot tasks remains similar regardless of the
+calibration dataset choice.                                6              Conclusion
+   Number of Calibration Samples: Figure 4(a)              In this work, we propose Eigen Attention, a novel
+shows average accuracy (Avg-Acc) on zero-shot              technique that reduces the memory overhead asso-
+benchmarks with 0.6x KV cache for different num-           ciated with KV cache in LLMs. Eigen Attention
+bers of calibration samples used to generate the           is inspired by the observation that keys, queries,
+representation matrix for low-rank approximation.          and values can be approximated using a few basis
+Increasing the number of calibration samples en-           vectors, enabling the possibility of performing the
+hances the Avg-Acc, as more samples lead to a              attention operation in a low-rank space with mini-
+more generalized set of basis vectors. However,            mal performance loss. To achieve this, we project
+more samples also increase the size of representa-         the attention inputs into low-rank subspaces defined
+tion matrices (Equation 4), requiring significantly        by a set of principal basis vectors computed offline
+higher GPU memory for performing SVD. Using                using a calibration dataset in a one-shot manner.
+more than 128 calibration samples leads to out-of-         These projections are integrated into the weight
+memory errors. We average representations from             matrices, which are utilized during inference to
+samples to handle this, thereby reducing represen-         generate lower dimensional key and value matrices,
+tation matrix dimensions. For instance, represen-          thereby reducing the KV cache memory footprint.
+tations from every 2 (4) samples are averaged for          Our approach is orthogonal to existing KV cache
+256 (512) samples.                                         compression strategies and can be used in synergy.
+   Fine-tuning Steps: In Figure 4(b), we evaluate          Extensive experiments across a range of LLMs and
+perplexity (PPL) for the C4 dataset evaluated on the       language tasks demonstrate that Eigen Attention
+MPT and Llama models for a range of fine-tuning            reduces the KV cache memory footprint by 40%
+steps. With just 500 steps, the PPL improves by            with minimal performance loss and achieves up to
+1.2 on average across all the models. 2000 steps           a 60% improvement in attention operation latency
+are ideal, beyond which we observe an average              compared to the standard attention baseline.
+Limitations                                                Yiran Ding, Li Lyna Zhang, Chengruidong Zhang,
+                                                             Yuanyuan Xu, Ning Shang, Jiahang Xu, Fan Yang,
+Eigen Attention takes a step towards efficiently en-         and Mao Yang. 2024. Longrope: Extending llm con-
+abling longer context lengths, thereby opening av-           text window beyond 2 million tokens. arXiv preprint
+enues for enhancing the capabilities of the current          arXiv:2402.13753.
+state-of-the-art LLMs. While we demonstrate low-           Jesse Dodge, Maarten Sap, Ana Marasović, William
+rank basis generation using the Wikitext dataset              Agnew, Gabriel Ilharco, Dirk Groeneveld, Margaret
+(Merity et al., 2016), we do not extensively study            Mitchell, and Matt Gardner. 2021. Documenting
+the best dataset for basis generation. Additionally,          large webtext corpora: A case study on the colossal
+                                                              clean crawled corpus. Preprint, arXiv:2104.08758.
+although our proposed approach has the potential
+to make LLMs ubiquitous, it does not mitigate the          Ruili Feng, Kecheng Zheng, Yukun Huang, Deli Zhao,
+risks of misuse of these models for malicious activ-         Michael Jordan, and Zheng-Jun Zha. 2022. Rank
+ities. A strong commitment to user data protection,          diminishing in deep neural networks. In Proceedings
+                                                             of the 36th International Conference on Neural In-
+robust ethical guidelines, and transparency mecha-
+                                                             formation Processing Systems, NIPS ’22, Red Hook,
+nisms is essential to address this issue effectively.        NY, USA. Curran Associates Inc.
+
+Acknowledgements                                           Leo Gao, Jonathan Tow, Baber Abbasi, Stella Biderman,
+                                                             Sid Black, Anthony DiPofi, Charles Foster, Laurence
+This work was supported by the Center for the                Golding, Jeffrey Hsu, Alain Le Noac’h, Haonan Li,
+Co-Design of Cognitive Systems (COCOSYS), a                  Kyle McDonell, Niklas Muennighoff, Chris Ociepa,
+DARPA sponsored JUMP center of Semiconduc-                   Jason Phang, Laria Reynolds, Hailey Schoelkopf,
+                                                             Aviya Skowron, Lintang Sutawika, Eric Tang, An-
+tor Research Corporation (SRC), National Science             ish Thite, Ben Wang, Kevin Wang, and Andy Zou.
+Foundation and United States Department of En-               2023. A framework for few-shot language model
+ergy.                                                        evaluation.
+
+                                                           Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh,
+References                                                   Michael W. Mahoney, Yakun Sophia Shao, Kurt
+                                                             Keutzer, and Amir Gholami. 2024. Kvquant: To-
+Josh Achiam, Steven Adler, Sandhini Agarwal, Lama            wards 10 million context length llm inference with
+  Ahmad, Ilge Akkaya, Florencia Leoni Aleman,                kv cache quantization. Preprint, arXiv:2401.18079.
+  Diogo Almeida, Janko Altenschmidt, Sam Altman,
+  Shyamal Anadkat, et al. 2023. Gpt-4 technical report.    Yen-Chang Hsu, Ting Hua, Sungen Chang, Qian Lou,
+  arXiv preprint arXiv:2303.08774.                           Yilin Shen, and Hongxia Jin. 2022. Language model
+                                                             compression with weighted low-rank factorization.
+Muhammad Adnan, Akhil Arunkumar, Gaurav Jain,                In International Conference on Learning Representa-
+ Prashant J. Nair, Ilya Soloveychik, and Purushotham         tions.
+ Kamath. 2024. Keyformer: Kv cache reduction
+ through key tokens selection for efficient generative     Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan
+ inference. Preprint, arXiv:2403.09054.                      Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and
+                                                             Weizhu Chen. 2022. LoRA: Low-rank adaptation of
+Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury       large language models. In International Conference
+   Zemlyanskiy, Federico Lebrón, and Sumit Sanghai.          on Learning Representations.
+   2023. Gqa: Training generalized multi-query trans-
+   former models from multi-head checkpoints. arXiv        Hao Kang, Qingru Zhang, Souvik Kundu, Geonhwa
+   preprint arXiv:2305.13245.                                Jeong, Zaoxing Liu, Tushar Krishna, and Tuo Zhao.
+Iz Beltagy, Matthew E. Peters, and Arman Cohan. 2020.        2024. Gear: An efficient kv cache compression
+   Longformer: The long-document transformer. CoRR,          recipe for near-lossless generative inference of llm.
+   abs/2004.05150.                                           Preprint, arXiv:2403.05527.
+
+Yonatan Bisk, Rowan Zellers, Jianfeng Gao, Yejin Choi,     Ayush Kaushal, Tejas Vaidhya, and Irina Rish. 2023.
+  et al. 2020. Piqa: Reasoning about physical com-           Lord: Low rank decomposition of monolingual
+  monsense in natural language. In Proceedings of the        code llms for one-shot compression. Preprint,
+  AAAI conference on artificial intelligence, volume 34,     arXiv:2309.14021.
+  pages 7432–7439.
+                                                           Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot,       Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E.
+  Ashish Sabharwal, Carissa Schoenick, and Oyvind           Gonzalez, Hao Zhang, and Ion Stoica. 2023a. Ef-
+  Tafjord. 2018. Think you have solved question an-         ficient memory management for large language
+  swering? try arc, the ai2 reasoning challenge. arXiv      model serving with pagedattention.     Preprint,
+  preprint arXiv:1803.05457.                                arXiv:2309.06180.
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying              Reiner Pope, Sholto Douglas, Aakanksha Chowdhery,
+ Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E.               Jacob Devlin, James Bradbury, Anselm Levskaya,
+ Gonzalez, Hao Zhang, and Ion Stoica. 2023b. Effi-          Jonathan Heek, Kefan Xiao, Shivani Agrawal, and
+ cient memory management for large language model           Jeff Dean. 2022. Efficiently scaling transformer in-
+ serving with pagedattention. In Proceedings of the         ference. Preprint, arXiv:2211.05102.
+ ACM SIGOPS 29th Symposium on Operating Systems
+ Principles.                                              Ofir Press, Noah A Smith, and Mike Lewis. 2021.
+                                                            Train short, test long: Attention with linear biases
+Yixiao Li, Yifan Yu, Qingru Zhang, Chen Liang,              enables input length extrapolation. arXiv preprint
+  Pengcheng He, Weizhu Chen, and Tuo Zhao. 2023.            arXiv:2108.12409.
+  LoSparse: Structured compression of large language
+  models based on low-rank and sparse approximation.      Gobinda Saha, Isha Garg, and Kaushik Roy. 2021. Gra-
+  In Proceedings of the 40th International Conference       dient projection memory for continual learning. In
+  on Machine Learning, volume 202 of Proceedings            International Conference on Learning Representa-
+  of Machine Learning Research, pages 20336–20350.          tions.
+  PMLR.
+                                                          Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavat-
+Yuhong Li, Yingbing Huang, Bowen Yang, Bharat               ula, and Yejin Choi. 2021. Winogrande: An adver-
+  Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle Cai,        sarial winograd schema challenge at scale. Commu-
+  Patrick Lewis, and Deming Chen. 2024. Snapkv:             nications of the ACM, 64(9):99–106.
+  Llm knows what you are looking for before genera-
+  tion. arXiv preprint arXiv:2404.14469.                  Noam Shazeer. 2019. Fast transformer decoding:
+                                                            One write-head is all you need. arXiv preprint
+Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang,             arXiv:1911.02150.
+   Wei-Ming Chen, Wei-Chen Wang, Guangxuan
+   Xiao, Xingyu Dang, Chuang Gan, and Song Han.           Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan,
+   2024. Awq: Activation-aware weight quantization           Wen Bo, and Yunfeng Liu. 2024. Roformer: En-
+   for llm compression and acceleration. Preprint,           hanced transformer with rotary position embedding.
+   arXiv:2306.00978.                                         Neurocomputing, 568:127063.
+Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao          Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann
+  Wang, Victor Xie, Zhaozhuo Xu, Anastasios Kyril-          Dubois, Xuechen Li, Carlos Guestrin, Percy Liang,
+  lidis, and Anshumali Shrivastava. 2024. Scis-             and Tatsunori B. Hashimoto. 2023. Stanford alpaca:
+  sorhands: Exploiting the persistence of importance        An instruction-following llama model. https://
+  hypothesis for llm kv cache compression at test time.     github.com/tatsu-lab/stanford_alpaca.
+  Advances in Neural Information Processing Systems,
+  36.                                                     Hugo Touvron, Louis Martin, Kevin Stone, Peter Al-
+                                                            bert, Amjad Almahairi, Yasmine Babaei, Nikolay
+Llama-3. Introducing meta llama 3: The most capable
+                                                            Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti
+  openly available llm to date. Accessed: 2010-06-07.
+                                                            Bhosale, Dan Bikel, Lukas Blecher, Cristian Canton
+lmsys.org. 2024. Lmsys chatbot arena leaderboard.           Ferrer, Moya Chen, Guillem Cucurull, David Esiobu,
+                                                            Jude Fernandes, Jeremy Fu, Wenyin Fu, Brian Fuller,
+Sourab Mangrulkar, Sylvain Gugger, Lysandre De-             Cynthia Gao, Vedanuj Goswami, Naman Goyal, An-
+  but, Younes Belkada, Sayak Paul, and Benjamin             thony Hartshorn, Saghar Hosseini, Rui Hou, Hakan
+  Bossan. 2022. Peft: State-of-the-art parameter-           Inan, Marcin Kardas, Viktor Kerkez, Madian Khabsa,
+  efficient fine-tuning methods. https://github.            Isabel Kloumann, Artem Korenev, Punit Singh Koura,
+  com/huggingface/peft.                                     Marie-Anne Lachaux, Thibaut Lavril, Jenya Lee, Di-
+                                                            ana Liskovich, Yinghai Lu, Yuning Mao, Xavier Mar-
+Stephen Merity, Caiming Xiong, James Bradbury, and          tinet, Todor Mihaylov, Pushkar Mishra, Igor Moly-
+   Richard Socher. 2016. Pointer sentinel mixture mod-      bog, Yixin Nie, Andrew Poulton, Jeremy Reizen-
+   els. arXiv preprint arXiv:1609.07843.                    stein, Rashi Rungta, Kalyan Saladi, Alan Schelten,
+MosaicML-MPT. Introducing mpt-7b: A new stan-               Ruan Silva, Eric Michael Smith, Ranjan Subrama-
+ dard for open-source, commercially usable llms. Ac-        nian, Xiaoqing Ellen Tan, Binh Tang, Ross Tay-
+ cessed: 2010-06-07.                                        lor, Adina Williams, Jian Xiang Kuan, Puxin Xu,
+                                                            Zheng Yan, Iliyan Zarov, Yuchen Zhang, Angela Fan,
+Yue Niu, Saurav Prakash, and Salman Avestimehr. 2024.       Melanie Kambadur, Sharan Narang, Aurelien Ro-
+  Atp: Enabling fast llm serving via attention on top       driguez, Robert Stojnic, Sergey Edunov, and Thomas
+  principal keys. Preprint, arXiv:2403.02352.               Scialom. 2023. Llama 2: Open foundation and fine-
+                                                            tuned chat models. Preprint, arXiv:2307.09288.
+Adam Paszke, Sam Gross, Francisco Massa, Adam
+  Lerer, James Bradbury, Gregory Chanan, Trevor           Thomas Wolf, Lysandre Debut, Victor Sanh, Julien
+  Killeen, Zeming Lin, Natalia Gimelshein, Luca             Chaumond, Clement Delangue, Anthony Moi, Pier-
+  Antiga, et al. 2019. Pytorch: An imperative style,        ric Cistac, Tim Rault, Rémi Louf, Morgan Funtow-
+  high-performance deep learning library. Advances in       icz, Joe Davison, Sam Shleifer, Patrick von Platen,
+  neural information processing systems, 32.                Clara Ma, Yacine Jernite, Julien Plu, Canwen Xu,
+    Teven Le Scao, Sylvain Gugger, Mariama Drame,            which contains the sorted singular values. For Z
+    Quentin Lhoest, and Alexander M. Rush. 2020. Hug-        with aPrank r ≤ min(m, n), it can be expressed as
+    gingface’s transformers: State-of-the-art natural lan-
+                                                             Z = ri=1 σi ui viT , where ui ∈ U, vi ∈ V and
+    guage processing. Preprint, arXiv:1910.03771.
+                                                             σi ∈ Σ. For a k-rank
+                                                                             Pk approximation      with k < r,
+Haoyi Wu and Kewei Tu. 2024. Layer-condensed kv                                         T
+                                                             we have Zk = i=1 σi ui vi such that the top k
+  cache for efficient inference of large language models.    values from Σ are chosen to represent Zk , a low-
+  Preprint, arXiv:2405.10637.
+                                                             rank approximation of Z.
+June Yong Yang, Byeongwook Kim, Jeongin Bae,
+  Beomseok Kwon, Gunho Park, Eunho Yang, Se Jung             A.2        Eigen Attention with RoPE
+  Kwon, and Dongsoo Lee. 2024. No token left be-             We introduce some modifications to Eigen Atten-
+  hind: Reliable kv cache compression via importance-
+  aware mixed precision quantization. Preprint,              tion algorithm to handle compatibility with LLMs
+  arXiv:2402.18096.                                          employing RoPE empedding (Section 4.3). The
+                                                             comparison of Eigen Attention with standard atten-
+Hao Yu and Jianxin Wu. 2023. Compressing trans-
+  formers: Features are low-rank, but weights are not!
+                                                             tion in the presence of RoPE is shown in Figure 6.
+  Proceedings of the AAAI Conference on Artificial
+  Intelligence, 37(9):11007–11015.
+
+
+
+
+                                                                                           RoPE
+Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali                                                                       Standard
+                                                                                                                     Attention
+  Farhadi, and Yejin Choi. 2019. Hellaswag: Can a
+
+
+
+
+                                                                                           RoPE
+  machine really finish your sentence? arXiv preprint
+  arXiv:1905.07830.
+                                                                                                                     KV-Cache
+Peitian Zhang, Zheng Liu, Shitao Xiao, Ninglu Shao,
+  Qiwei Ye, and Zhicheng Dou. 2024a. Soaring from
+                                                                                                             (a)
+  4k to 400k: Extending llm’s context with activation
+  beacon. arXiv preprint arXiv:2401.03462.
+                                                                                                                       Eigen
+                                                                                                      RoPE            Attention
+Susan Zhang, Stephen Roller, Naman Goyal, Mikel
+  Artetxe, Moya Chen, Shuohui Chen, Christopher De-
+  wan, Mona Diab, Xian Li, Xi Victoria Lin, et al. 2022.                                                                    RoPE
+                                                                                                      RoPE
+
+
+
+
+  Opt: Open pre-trained transformer language models.
+  arXiv preprint arXiv:2205.01068.
+
+Yichi Zhang, Bofei Gao, Tianyu Liu, Keming Lu,                                                                        KV-Cache
+  Wayne Xiong, Yue Dong, Baobao Chang, Junjie Hu,
+  Wen Xiao, et al. 2024b. Pyramidkv: Dynamic kv                                                              (b)
+  cache compression based on pyramidal information
+  funneling. arXiv preprint arXiv:2406.02069.                Figure 6: Comparison between (a) Standard Attention
+Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong              and (b) Eigen Attention for LLMs with RoPE (Touvron
+  Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuan-           et al., 2023). Eigen Attention stores low dimensional
+  dong Tian, Christopher Ré, Clark Barrett, Zhangyang        representation of key and value in KV cache and applies
+  Wang, and Beidi Chen. 2023. H2 o: Heavy-hitter ora-        an additional transformation before applying RoPE.
+  cle for efficient generative inference of large language
+  models. Preprint, arXiv:2306.14048.
+
+Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong,           A.3        Quantization Results
+   Zhaozhuo Xu, Vladimir Braverman, Beidi Chen, and
+  Xia Hu. 2024. Kivi : Plug-and-play 2bit kv cache           Table 8: Perplexity (PPL) on Wikitext after applying
+   quantization with streaming asymmetric quantiza-          quantization to eigen attention and standard attention.
+   tion.
+                                                                Model           Method            Precision    Group Size   KV Cache size (GB)   PPL (Wikitext)
+                                                                                                      3           128             0.18                5.77
+                                                                                                      4           128             0.24                5.66
+A     Appendix                                                              Eigen Attention
+                                                                                                      4
+                                                                                                      4
+                                                                                                                   32
+                                                                                                                   16
+                                                                                                                                  0.26
+                                                                                                                                  0.29
+                                                                                                                                                      5.64
+                                                                                                                                                      5.64
+                                                             Llama-2-13b
+                                                                                                      2           512             0.20                6.11
+                                                                                                      2            32             0.24                5.15
+A.1     SVD for Matrix Approximation                                       Standard Attention
+                                                                                                      2            16             0.29                5.03
+                                                                                                      3           128             0.31                4.97
+                                                                                                      4            16             0.19                6.53
+Singular Value Decomposition (SVD) can be used                              Eigen Attention
+                                                                                                      4           128             0.15                6.55
+                                                                                                      3            32             0.13                6.61
+to obtain a low-rank approximation for any matrix             Llama-2-7b                              3
+                                                                                                      2
+                                                                                                                   64
+                                                                                                                  512
+                                                                                                                                  0.12
+                                                                                                                                  0.13
+                                                                                                                                                      6.64
+                                                                                                                                                      7.02
+Z ∈ Rm×n by factorizing it into three matrices as                          Standard Attention         2
+                                                                                                      3
+                                                                                                                   32
+                                                                                                                  128
+                                                                                                                                  0.16
+                                                                                                                                  0.20
+                                                                                                                                                      5.79
+                                                                                                                                                      5.58
+
+Z = UΣV. Here, U ∈ Rm×m and V ∈ Rn×n
+are orthogonal matrices, and Σ is a diagonal matrix             Section 5.2 shows results for performing quanti-
+zation with Eigen Attention and standard attention.                          for the models are linked for perusal: OPT-30b,
+The data corresponding to Figure 3 is provided in                            OPT-66b, MPT-7b, MPT-30b, Llama-2-7b, Llama-
+Table 8.                                                                     2-13b, Llama-2-70b, Llama-3-8b and, Llama-3-
+                                                                             70b.
+A.4        Hyperparameters
+                                                                             A.6   Future Work
+Table 9: Error budget eb for Eigen Attention. KV cache                       We describe two key future directions for Eigen
+size is computed for a sequence length of 2048.                              Attention: (1) integrating Eigen Attention with effi-
+ Model      Parameters   KV cache compression   KV cache size (GB)    eb
+                                                                             cient LLM serving frameworks like vLLM (Kwon
+                                 0.8x                  2.10          0.008   et al., 2023b), which employ additional approxi-
+               30b               0.7x                  1.87          0.015
+                                 0.6x                  1.60          0.024
+                                                                             mation techniques (e.g., weight quantization (Lin
+  OPT
+               66b
+                                 0.8x
+                                 0.7x
+                                                       3.69
+                                                       3.22
+                                                                     0.005
+                                                                     0.012
+                                                                             et al., 2024)) to achieve high throughput inference,
+                                 0.6x
+                                 0.8x
+                                                       2.80
+                                                       0.80
+                                                                     0.015
+                                                                     0.011
+                                                                             and (2) finding the best combination of various
+               7b                0.7x                  0.70          0.015   compression techniques described in Section 3 to
+                                 0.6x                  0.60          0.019
+  MPT
+                                 0.8x                  2.12          0.002   achieve extreme KV cache compression.
+               30b               0.7x                  1.83          0.003
+                                 0.6x                  1.59          0.004
+                                 0.8x                  0.83          0.025
+               7b                0.7x                  0.71          0.070
+                                 0.6x                  0.59          0.090
+                                 0.8x                  1.29          0.035
+ Llama-2       13b               0.7x                  1.12          0.050
+                                 0.6x                  0.93          0.070
+                                 0.8x                  3.44          0.005
+               70b               0.7x                  3.60          0.010
+                                 0.6x                  3.78          0.017
+                                 0.8x                  6.72          0.045
+               8b                0.7x                  7.22          0.060
+                                 0.6x                  8.51          0.090
+ Llama-3
+                                 0.8x                  3.22          0.025
+               70b               0.7x                  3.59          0.035
+                                 0.6x                  5.54          0.070
+
+
+
+   We use the Hugging Face Transformers library
+(Wolf et al., 2020) to implement Eigen Attention
+in PyTorch (Paszke et al., 2019). All the experi-
+ments were performed on NVIDIA A100 (80GB)
+GPUs. All models are downloaded from Hugging
+Face Hub. We show results on: OPT-30b, OPT-
+66b, MPT-7b, MPT-30b, Llama-2-7b, Llama-2-
+13b, Llama-2-70b, Llama-3-8b and, Llama-3-70b.
+   All the models are compressed using 512 (ns )
+samples of sequence length (n) 2048 from Wiki-
+text dataset (Merity et al., 2016). Eigen Attention
+introduces a hyperparameter for error budget (eb ),
+which is tuned to achieve the required KV cache
+compression, as listed in Table 9. We keep ϵs =
+0.02 for all our runs.
+   For fine-tuning, we use lora_r = 64,
+lora_alpha = 64, sequence_length = 2048,
+lora_dropout = 0.05 and use the default val-
+ues from the Hugging Face PEFT library (Man-
+grulkar et al., 2022) for all the other hyperparam-
+eters. We observe that fine-tuning on the Alpaca
+dataset (Taori et al., 2023) performs better than C4
+(Dodge et al., 2021).
+
+A.5        Artifact Licenses
+According to their license, all the LLMs used in this
+paper fall under acceptable use cases. The licenses
+

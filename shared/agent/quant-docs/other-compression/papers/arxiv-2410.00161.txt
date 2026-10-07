@@ -1,0 +1,1627 @@
+                                                  KV-C OMPRESS : PAGED KV-C ACHE C OMPRESSION WITH
+                                                  VARIABLE C OMPRESSION R ATES PER ATTENTION H EAD
+
+
+                                                                                                  Isaac Rehg
+                                                                                                Cloudflare, inc.
+                                                                                            irehg@cloudflare.com
+arXiv:2410.00161v2 [cs.CL] 7 Oct 2024
+
+
+
+
+                                                                                                  A BSTRACT
+                                                     Context lengths of Large Language Models (LLMs) have exploded in recent years, with 128k-token
+                                                     context becoming a standard and million-token context becoming a reality. Efficiently supporting
+                                                     long-context inference remains challenging as the memory that must be allocated in key-value
+                                                     (KV) cache for a generation scales with its context length, limiting the number of long-context
+                                                     requests that can be served concurrently under a given memory budget. KV cache compression can
+                                                     mitigate this issue by removing under-utilized KVs from each attention head’s cache and reducing
+                                                     its memory footprint. Higher theoretical compression rates can be achieved when the number of
+                                                     removed KVs varies across attention heads [1], but application of such a strategy within existing
+                                                     inference frameworks adds fragmentation and cannot realize the theoretical compression rates in
+                                                     physical memory. We introduce KV-Compress, a novel compression method that evicts contiguous
+                                                     KV blocks within a PagedAttention [2] framework, reducing the memory footprint of the KV cache
+                                                     proportionally to this theoretical compression rate. Our method achieves state-of-the-art performance
+                                                     on LongBench [3] for both Mistral-7B-Instruct-v0.2 and Llama-3.1-8B-Instruct while lowering the
+                                                     total number of compressed KVs by 4x compared with prior methods. Evaluations on Llama-3.1-8B-
+                                                     Instruct and Llama-3.1-70B-Instruct-FP8 achieve compression rates up to 8x with negligible impact
+                                                     on performance, and up to 64x while retaining over 90% of full-cache performance for all but three
+                                                     of the suite’s subsets. We benchmark an integration of our method with vLLM that increases total
+                                                     throughput by up to 5.18x by enabling larger decoding batches 1 .
+
+                                        1       Introduction
+                                        Context length has become a key factor in the utility of LLM services with a growing number of providers offering
+                                        128k and up context windows. Context windows have been growing in the open-source model ecosystem as well, with
+                                        the newest round of llama models natively supporting 131k context windows [4] and third party finetuning continuing
+                                        to expand context windows of models after release, even up to 1 million tokens [5].
+                                        Supporting these longer context windows at a large scale is difficult since the number of key and value vectors (KVs)
+                                        that must be cached when decoding a prompt scales with its total token length. This means that as the context length
+                                        grows, the maximum batch size that can be used when decoding sequences of this length decreases proportionally. In
+                                        deployments that are constrained by global GPU memory this can severely limit the system’s total throughput, measured
+                                        in generated tokens per second.
+                                        KV cache compression improves the scaling between context-length and KV cache memory by evicting a proportion of
+                                        less-important KVs from cache. But despite a growing body of research in this space, the integration of these methods
+                                        into efficient inference platforms such as vLLM and TRT-LLM has been slow.
+                                        Most existing methods determine the importance of KVs by comparing their aggregate attention over a number of
+                                        observed queries. Early approaches use a running aggregate of attention from all past queries [6, 7], while more
+                                        recent work has aggregated attention from only the final prompt tokens within a limited observation window and
+                                        seen improvements in overall performance as a result [8, 9]. We compare the both approaches, controlling for other
+                                            1
+                                                Code is open-sourced and available at https://github.com/IsaacRe/vllm-kvcompress/tree/main
+                                       LongBench subtask performance                                                        NVIDIA L4 throughput for varied input length
+                 105                                 (a)                                                                                          (b)
+                                                                                                                           500
+                                                                                                              1800         1000
+                 100                                                                                                       2000
+                                                                                                              1600         4000
+                 95                                                                                                        6000
+                                                                                                              1400         vanilla vLLM
+
+
+
+
+                                                                                       throughput (tok/sec)
+ % performance
+
+
+
+
+                 90                                                                                           1200
+                                                                                                                                                                        4.93x     5.18x
+                 85                                                                                           1000                                           3.90x
+                                                                                                                                                   3.44x
+                 80          Single-Doc. QA                                                                   800                         2.54x
+                             Multi-Doc. QA                                                                                  2.00x
+                 75          Summarization                                                                    600
+                             Few-shot Learning                                                                  1.38x
+                             Synthetic                                                                        400
+                 70          Code
+                                                                                                              200
+                       1.0       2.0        4.0         8.0       16.0   32.0   64.0                                 1.0        2.0          4.0      8.0        16.0      32.0      64.0
+                                                  compression rate                                                                              compression rate
+
+Figure 1: Llama-3.1-8B-Instruct performance for different rates of compression. 1a plots average LongBench subtask
+performance for each subtask category, measured as a percentage of the accuracy achieved without compression. 1b
+displays the throughput that can be achieved on an NVIDIA L4 for the same range of compression rates. Plots are
+shown for varying input lengths.
+
+
+differences in implementation, and find that aggregating over all past queries outperforms an observation window in
+many LongBench [3] subsets, despite having a lower average performance rating. Results suggest that there is still
+room for improvement in state-of-the-art eviction methods by modifying the range of queries over which attention for a
+given key is aggregated when determining eviction.
+Another commonality in prior work is the use of a uniform eviction rate across attention heads of the KV cache. Evicting
+the same number of KVs ensures that the size of each head’s cache remains the same, limiting its fragmentation. Recent
+work has found that allowing the rate of eviction to vary across attention heads leads to improved performance and
+enables higher theoretical compression rates [1]. In current inference frameworks, however, a naive application of such
+an eviction scheme only increases fragmentation and is ineffective at reducing the KV cache memory footprint. We
+design a modification of PagedAttention [2] that can handle the KV cache fragmentation introduced by variable-head-
+rate compression and reduce memory footprint proportionally to the theoretical compression rate.
+Building on this work, we introduce KV-Compress, a modification of Ada-SnapKV [1] that evicts KV blocks–rather
+than single KVs–making it compatible with our paged-attention framework. Our method includes further algorithmic
+improvements including a variable rate of eviction per layer, the use of squared past attention to inform evictions, and
+an extension to grouped-query-attention (GQA) models that handles their cache more effectively. Evaluation on both
+established benchmarks and state-of-the-art models demonstrates improved performance over existing compression
+methods.
+Finally, we present an integration of our proposed KV cache compression strategy into vLLM and demonstrate that our
+method can be used to increase total throughput of state-of-the-art systems for LLM inference several times over when
+availability of global device memory is a bottleneck.
+Our contributions are as follows:
+
+                  1. An analysis of the effect that a limited observation window and its size have on compression performance.
+
+                  2. We propose query-group-compression, a simple yet effective method to compress the KV cache of GQA
+                     models without repeating it into the dimension of total query heads, yielding an additional 4x compression
+                     over existing methods on Mistral and Llama-3.1 benchmarks.
+
+                  3. An implementation of PagedAttention [2] that can represent and compute attention against KV cache containing
+                     variable numbers of KVs per head, making variable-head-rate compression practical.
+
+                  4. Drawing from these findings we present KV-Compress, a modification of Ada-SnapKV [1] designed to
+                     compress a paged KV cache with variable rates of compression across layers and heads. Our method achieves
+                     state-of-the-art performance on the LongBench suite [3] for Mistral-7B-Instruct-v0.2 and Llama-3.1-8B-
+                     Instruct.
+
+
+                                                                                       2
+            Single-Doc. QA             Multi-Doc. QA   Summarization   Few-shotLearning   Synthetic     Code
+
+
+
+
+                                       2W QA
+
+
+
+
+                                       M
+                                       G
+                                   H
+
+
+
+
+                                        SA A
+                                        Tr
+                                         M
+
+
+
+
+                                         Q
+                                                                                                                  Ave.
+          N
+
+
+
+
+                                         PC
+                                         ov
+                  Q
+
+                          M
+
+
+
+
+                                         ul
+                                   ot
+
+
+
+
+                                          TR
+
+
+
+
+                                                                                                            RB
+                                           iv
+                                           M
+                                           ik
+           rtv
+
+
+
+
+                                            PR
+                                            us
+
+
+
+
+                                                                                                      Lc
+                                            M
+                   as
+
+
+
+
+                                            tiN
+                                            po
+                          F-
+
+
+
+
+                                             Re
+
+
+
+
+                                             ou
+                                              ia
+                                              iM
+
+
+
+
+                                               Su
+                                                                                                                  Score
+
+
+
+
+                                               EC
+                                               iq
+
+
+
+
+                                               Su
+                      p
+
+
+
+
+                                                                                                             -P
+             Q
+
+
+
+
+                                                                                                        c
+                                                e
+                              en
+
+
+                                                t
+
+
+
+
+                                                Q
+                                                 po
+                     er
+
+
+
+
+                                                 ew
+
+
+
+
+                                                  nt
+                                                  ue
+              A
+
+
+
+
+                                                   m
+                                                   Q
+
+
+
+
+                                                   m
+                                                     rt
+                                                     A
+
+
+
+
+                                                      s
+Full Cache 30.49 44.83 52.88 54.96 45.70 28.41 34.41 25.63 27.05 72.50 91.65 43.70 6.76 97.50 63.39 56.73         46.30
+                                                      C=128
+H2O        25.98 29.21 41.47 50.54 39.35 29.27 23.70 22.79 22.29 39.00 90.48 40.59 7.75 99.50 56.41 48.18         41.66
+SnapKV     29.31 30.39 48.04 51.26 41.35 27.27 22.59 22.82 22.33 61.50 90.60 40.09 8.25 99.50 60.89 50.80         44.19
+Pyramid    28.86 30.72 48.90 52.41 39.74 24.36 22.57 22.91 22.16 64.50 88.65 39.42 7.72 99.50 56.73 49.38         43.66
+KVC        29.25 33.61 49.72 52.64 44.05 27.53 23.90 23.48 22.91 67.00 91.47 41.02 7.00 100.0 60.82 53.10         45.47
+                                                      C=256
+H2O        28.23 31.68 45.23 51.16 41.29 27.90 25.18 22.59 23.41 39.00 90.62 41.51 7.21 99.50 59.86 50.11         42.78
+SnapKV     28.66 35.83 50.04 52.32 42.02 29.84 24.38 23.78 23.71 70.00 91.44 41.01 7.27 99.50 61.88 53.20         45.93
+Pyramid    28.13 38.49 49.65 52.99 43.65 27.36 24.28 23.63 23.80 69.50 91.14 41.72 7.50 99.50 60.47 53.76         45.97
+KVC        28.91 37.56 51.73 51.22 43.00 28.06 25.42 23.48 24.14 69.00 91.86 42.17 7.40 99.50 62.37 54.30         46.26
+                                                      C=512
+H2O        28.48 34.42 46.85 50.33 43.56 26.80 26.66 23.08 25.04 41.00 91.63 41.26 7.44 99.50 61.57 51.60         43.70
+SnapKV     31.20 40.69 51.60 53.40 42.63 29.33 26.41 23.69 25.12 70.50 91.73 41.33 7.72 99.50 63.62 55.48         47.12
+Pyramid    30.58 40.57 52.54 52.57 44.03 27.48 26.52 23.86 25.22 70.00 92.09 41.70 7.29 99.50 62.68 54.02         46.92
+KVC        30.68 41.05 53.91 54.07 43.55 29.50 27.32 23.87 25.36 71.50 91.86 42.94 7.29 99.50 64.18 56.51         47.69
+                                                      C=1024
+H2O        28.43 38.86 48.95 53.38 43.86 26.61 28.49 23.87 26.19 45.50 91.66 42.32 8.11 99.50 63.18 54.50         45.21
+SnapKV     30.37 44.85 52.20 52.87 44.99 28.87 29.12 24.33 26.40 70.00 91.73 43.03 7.45 99.50 64.11 56.57         47.90
+Pyramid    31.04 45.59 52.93 53.52 44.81 29.20 28.67 24.42 26.45 70.00 91.65 42.74 8.10 99.50 64.47 56.36         48.09
+KVC        30.64 43.56 53.94 54.54 44.86 29.18 29.11 24.10 26.28 72.00 91.76 43.04 7.55 99.50 64.35 57.95         48.27
+
+Table 1: Comparison for Llama-3.1-8B-Instruct over 16 LongBench subsets. Highest score for each column shown in
+bold. For cache size of C, all baseline methods keep C × 32 × 32 KVs in cache while our method (KVC) keeps only
+C × 32 × 8 KVs. Table format taken from [1].
+
+
+      5. We provide an integration of our method with vLLM and present the first end-to-end benchmarks of an
+         eviction-based KV cache compression method within a paged-attention-enabled framework for efficient LLM
+         inference, to the best of our knowledge. Results demonstrate increased throughput by factors of up to 5.18x.
+
+
+2     Related Work
+
+2.1   KV Cache Quantization
+
+Prior works on KV cache compression attempt to reduce the memory footprint of the KV cache of a transformer
+language model to enable faster inference over longer contexts. One common approach is KV cache quantization,
+where compression involves converting all KVs in cache to a reduced-precision representation [10, 11, 12]. On the
+other hand, eviction-based methods reduce cache size by removing KVs that are identified as inconsequential to future
+decoding. In this work we limit our analysis to methods of the latter category.
+
+2.2   Token Pruning
+
+Earlier work has shown that sparsity in the attention mechanism of transformer-based language models can be leveraged
+to reduce the number of tokens processed across all layers of the model [13]. The tokens selected for pruning should be
+inconsequential–meaning the degree of attention to their keys is low–so that their removal does not adversely affect the
+output.
+One approach is to prune tokens in a layer-wise manner during the initial processing of an input context [14]. At each
+layer, attention allocated to input tokens is summed over all attention heads and the generated KVs for the tokens with
+lowest total attention are removed. This has the advantage of speeding up input processing as well as decoding, but has
+the potential for error to compound as pruning decisions made at earlier layers do not account for the attention in the
+later layers they are affecting.
+
+
+                                                              3
+2.3   KV Eviction
+
+
+
+
+Since the advent of LLMs and long-context there has been increased interest in methods that prune KVs from cache
+after input processing, or "prefill", with a focus on more efficient decoding. Evicting KVs from cache lowers its memory
+footprint, enabling the support of larger batches/context windows, and can speed up decoding as the number of KVs to
+retrieve when computing attention is reduced.
+Approaches vary in where/when KV pruning is applied, but most rely on an aggregation of attention that a particular
+key–or group of keys–has received over past queries. This metric is used when considering KVs for removal from
+cache, with KVs who receive the least attention being removed first.
+Full Observation Window H2O [7] determines evictions based on a running sum of attention each KV has received,
+evicting KVs with the lowest total attention and retaining "heavy-hitter" KVs that receive the most attention. In this case
+the token positions of evicted KVs are allowed to vary, but the total number of evicted KVs across all layers and heads
+is fixed. Scissorhands [6] follow a similar approach, but evict based on a metric of how "pivotal" each KV is–framed as
+the number of the occurrences where attention with that key has exceeded some threshold. Like H2O, they evict the
+same number of KVs across attention heads, but vary eviction rate across layers proportionally to a "persistence ratio"
+determined by an initial profiling phase. FastGen [15] combines the "heavy-hitter" approach of H2O with heuristic
+eviction policies that retain only KVs for special tokens, punctuation or local attention, profiling attention over the input
+prompt to determine which strategy to employ.
+Though decoding-time efficiency can be improved by these techniques, the preliminary task of aggregating attention of
+each key over all queries can make prefill prohibitively expensive as doing so requires writing the full attention matrix
+to global memory. Efficient attention implementations such as Flash Attention [16] explicitly avoid this in order to
+speed up inference and reduce global memory requirements. Because of this, performance gains made at decoding time
+from employing such approaches are unlikely to outweigh the performance loss experienced during prefill, especially
+for long contexts.
+Limited Observation Window SnapKV [8] mitigates this issue by limiting the aggregation to queries generated for the
+final tokens of the input prompt. This limited observation window reduces scaling of the eviction metric calculation
+from O(L2 ) to O(L) and improves accuracy of the compression. To improve accuracy of eviction metrics obtained from
+their limited observation window the authors apply maxpooling over the sequence dimension, so that keys neighboring
+a heavy-hitter of the same attention head are retained as well. This approach works well for prompts consisting of
+long context followed by a request or question since the attention patterns observed over the prompt queries–occurring
+within the observation window–are generally similar to those exhibited by queries in the generated response. Like H2O,
+they allow different eviction schedules to be specified per layer and head, but require that the number of KVs evicted
+for each layer and head be the same.
+Following this work, PyramidKV [9], adopts the limited observation window of SnapKV but configures variable rates
+of eviction per layer. The authors recognize that attention is more evenly distributed at early layers, motivating them to
+configure lower eviction rates at early layers and evicting more aggressively at later layers. The exact eviction rate
+is determined initially for the first and last layers during a profiling phase, and eviction rates for remaining layers are
+inferred using a novel interpolation technique.
+Variable-Head-Rate Eviction More recent work has identified a key point of rigidity in prior methods–namely, a
+uniform compression rate across all the heads within each layer [17, 1]. One such approach develops variations of both
+SnapKV and PyramidKV that evict KVs across heads in each layer, potentially evicting a variable number of KVs per
+head, naming the new methods Ada-SnapKV and Ada-PyramidKV, respectively [1]. They find that this modification
+yields improved performance–measured over 16 subsets of LongBench [3]–for both approaches. Their reported results
+remain theoretical, however, since existing inference frameworks cannot efficiently represent a KV cache with variable
+number of KVs per head without suffering from memory fragmentation. As a result, evicting along one head without
+evicting along all other heads only adds fragmentation to the allocated tensor without reducing its footprint in device
+memory. Our approach uses a modification of PagedAttention to represent and compute attention over a paged KV
+cache where the fragmentation added by variable-head-rate eviction is reduced, allowing us to realize the theoretical
+compression rate in physical memory.
+Dynamic Memory Compression [17] introduces a learned approach where the base model is trained to either add
+each new KV to cache or "accumulate" it into an existing KV slot via a weighted average, where decisions are made
+separately across heads. At inference time their approach uses PagedAttention to efficiently facilitate attention over
+variably compressed attention heads.
+
+
+                                                             4
+                                       LongBench subtask performance                                                       NVIDIA H100 throughput for varied input length
+                 105                                 (a)                                                                                          (b)
+                                                                                                                           500
+                                                                                                              2750         1000
+                 100                                                                                                       2000
+                                                                                                              2500         4000
+                                                                                                                           6000
+                 95                                                                                           2250         vanilla vLLM
+
+
+
+
+                                                                                       throughput (tok/sec)
+                                                                                                                                                             2.06x      2.12x     2.14x
+ % performance
+
+
+
+
+                 90                                                                                           2000
+                                                                                                                                                   1.80x
+                                                                                                              1750                        1.51x
+                 85                                                                                                         1.01x
+                             Single-Doc. QA                                                                   1500
+                             Multi-Doc. QA                                                                       0.77x
+                 80
+                             Summarization                                                                    1250
+                             Few-shot Learning
+                 75          Synthetic                                                                        1000
+                             Code
+                       1.0       2.0        4.0         8.0       16.0   32.0   64.0                                 1.0        2.0          4.0      8.0        16.0      32.0      64.0
+                                                  compression rate                                                                              compression rate
+
+
+Figure 2: Llama-3.1-70B-Instruct-FP8 performance for different rates of compression. 2a plots average LongBench
+subtask performance for each subtask category, measured as a percentage of the accuracy achieved without compression.
+2b displays the throughput that can be achieved on an NVIDIA H100 for the same range of compression rates. Plots are
+shown for varying input lengths.
+
+
+Related to these approaches, ThinK [18] was developed to prune the channels of remaining KVs after other eviction-
+based compression methods have been carried out. The method achieves an additional 30-40% compression before
+observing further performance degradation.
+
+3                Preliminaries
+The methods outlined in this paper build off of prior work around KV cache compression and their application is made
+possible through a modification of PagedAttention [2]. We will briefly go over these topics before diving into our
+methodology.
+
+3.1               Multi-head Attention
+
+Transformer decoders use attention layers to build a contextualized representation of an input sequence before sampling
+the next token. Attention operates on sequences of query, key and value vectors, Q, K and V . The attention matrix for
+a sequence is computed as
+                                                                        √ 
+                                                       A = softmax QK T / d                      for QL×d , KL×d , VL×d                                                                     (1)
+where L is the sequence length and d is the magnitude of the q, k, v vectors. The attention output is then computed as
+the inner product of the attention matrix and V . Causal masking is applied before the softmax, so that
+                                                  √ 
+                                            QK T / d     = − inf , ∀i < j ,                                        (2)
+                                                                                  ij
+
+
+making A lower-triangular after applying the softmax.
+In practice, most transformer models employ multi-head attention (MHA), where attention occurs in parallel over a
+series of H attention "heads". In this case, a separate set of queries, keys and values are computed for each head so that
+A has shape H × L × L.
+
+3.2               Paged Attention
+
+When conducting LLM inference, key vectors and value vectors (KVs) are generated for every attention head at each
+layer to be used when computing the attention output for all future tokens of that layer and head. During decoding it is
+common to cache these KVs to avoid recomputing them during each decoding step. In the simplest case, the key and
+value cache for each layer takes the shape B × H × L × d where B is the decoding batch size, H is the number of
+
+
+                                                                                       5
+                                                      vLLM                                                                                                   KV-Compress
+                              KV cache *                                    Block tables                                                      KV cache *                                Context lengths
+             s
+           ad
+         he
+
+
+
+
+                                                                                                                                                                           block
+
+
+
+
+
+                                                                                                                                                                                                 s
+                                                                                                                                                                                               ad
+                                                                  batch
+
+                                                                                                                                                                            size
+
+
+
+
+                                                                                                                                                                                             he
+                                                                   size
+                                                                                                                                                                                                          batch
+
+                                                                                                                                                                                                           size
+                                                                                                                                           Block Allocator
+                                                                           sequence blocks
+
+
+                                                                                                                                             total blocks
+
+
+layers
+
+                                                                                                                                             Block tables                           layers
+                                                                                                                        sequence blocks
+                                                              block
+
+
+
+
+
+                                                                                                                    s
+                                                               size
+
+
+
+
+                                                                                                                  ad
+                                                                                                                he
+                                                                           Context lengths
+
+
+                                                                           batch
+                      batch
+
+                      Block Allocator                                       size                        size
+
+
+
+
+                         total blocks                                                                                                           layers
+
+
+
+           * d-dimension ommitted in KV-cache visualization                                    = stored on system                  = stored on device
+
+
+
+Figure 3: Comparison of block management in vanilla vLLM versus with KV-Compress. In vLLM (left) each cache
+block stores KVs for every attention head of every layer, while with KV-Compress (right) each block only holds KVs
+for a single head. The KV-Compress block tables are therefore expanded by l × H so that the unique block for each
+specific KV head and layer can be retrieved. Due to the larger number of blocks, we move block management to the
+GPU so scheduling operations can be done in parallel. Note that every cell of KV cache in the above diagram represents
+a d-dimensional vector, while all others represent scalars.
+
+
+attention heads, L is the current max sequence length and d is the magnitude of key and value vectors. In this case total
+memory allocation scales with the maximum sequence length in the decoding batch and the more that sequence length
+varies across batch elements, the more fragmentation is introduced and the less efficient global memory utilization is.
+PagedAttention [2] solves this problem by introducing a paged KV cache where physical memory is allocated in blocks
+of size b, such that each block contains KVs across all heads for b tokens of a particular sequence and we only allocate
+KVs blocks for each sequence’s currently generated KVs. This approach is used inference frameworks such as vLLM,
+and is depicted in figure 3 (left).
+PagedAttention uses a block table, T with shape
+
+
+                                                                                                                        Lmax
+                                                                                                                B×           ,                                                                              (3)
+                                                                                                                         b
+
+where Lmax is the maximum allowed sequence length, to index into the corresponding KV cache block for each block
+of a given sequence. Because each token generates a single key and value vector for every attention head of every layer,
+the layout of KVs is identical across all layers and heads. PagedAttention, therefore, uses a shared index to reference a
+particular token’s KVs across all layers and heads of the paged KV cache, so that a single cache block contains the set
+of KVs generated across all layers and heads for each token in that block. Each block then contains l × H × b key and
+value vectors, where l is the number of layers in the model. The physical key cache, K, and value cache, V consist of l
+tensors, each with shape N × H × b × d, where N is the total number of allocable cache blocks.
+To retrieve key and value vectors, k and v for layer m and head h of a token in sequence s at position i in the paged KV
+cache, you first retrieve the block number for the physical cache block containing that token’s KVs. This can be done
+by computing
+                                                                    
+                                                                     i
+                                               n = Ts,u for u =          .                                            (4)
+                                                                     b
+
+We then index into our physical cache with
+
+                                                                                             (m)                        (m)
+                                                                              k = Kn,h,o ,                v = Vn,h,o                for      o = i mod b                                                    (5)
+
+
+                                                                                                                        6
+where K (m) and V (m) are the physical key and value cache of layer m, respectively and o is the positional offset of
+token i within block n. With this approach the number of allocated but unused KV slots is at most lBH(b − 1) and
+variance in the context lengths of sequences in the decoding batch does not increase cache fragmentation.
+Since the memory allocation for every sample in a batch is no longer fixed, batch size can be scaled dynamically based
+on the token length of batch elements. To handle this dynamic scaling, frameworks will generally perform an initial
+scheduling step to determine whether new input prompts can be prefilled and added to the decoding batch or whether
+current batch elements need to be preempted to make room for new decoded tokens. In vLLM, during the scheduling
+step a block manager allocates available blocks of cache to store new tokens that will be generated during the next
+prefill or decoding step. If there are no available blocks, one or more sequences will be selected for preemption and the
+block manager will free their allocated blocks. The block manager tracks running context length of all sequences in the
+decoding batch and manages a list of free and allocated blocks to determine scheduling and preemption of sequences
+during each scheduling step. Because block tables generally reside in system memory, scheduling can be CPU intensive
+for large batch sizes.
+
+3.3   KV Cache Compression
+
+KV cache compression has been explored as another means to handling KV cache memory allocation more efficiently,
+by evicting KVs in cache that are predicted to receive low attention in the future and can therefore be removed with
+negligible impact on the output. By removing a constant number of KVs from each attention head of a given layer’s KV
+cache the L-dimension of the KV cache tensor for that layer can be decreased and total memory allocation reduced.
+For a particular compression scheme, its compression rate is commonly defined as the ratio of KVs in cache before
+compression to KVs in cache after compression. In past work, the number of KVs in cache is usually fixed during
+experimentation using a configured number of maximum cache tokens, C. In such cases the number of KVs in cache is
+limited to the number of KVs that would be generated by the model if a prompt of length C were to be processed and
+cached without compression.
+To determine which KVs to evict, a metric is employed to predict the effect that removing a given KV will have on the
+inference given the attention observed between that key and queries within some range. A commonly used eviction
+metric is a sum over attention of past queries to each key. H2O and SnapKV both take this approach, with H2O
+aggregating attention over all observed queries and SnapKV aggregating attention over only the last w prompt queries.
+We can define the metrics obtained from aggregating over attention of all queries as
+
+                                                        (f ull)
+                                                                      X
+                                                   Mhj            =        Ahij                                       (6)
+                                                                      i
+
+
+and can define the metrics obtained from aggregating over a limited observation window spanning the last w prompt
+queries as
+
+                                                   L
+                                           (w)
+                                                   X
+                                        Mhj =            Ahij ,       for s = L − w .                                 (7)
+                                                   i=s
+
+
+Keys within the observation window are safe from eviction since they will have fewer attention observations to sum
+over due to the causal masking of A.
+SnapKV applies additional max-pooling over L to improve performance, computing metrics as
+
+
+                                                   (pool)          j+p/2      (w)
+                                                 Mh,j       = max Mh,t                                                (8)
+                                                                  t=j−p/2
+
+
+for pooling size p.
+Running the compression for a particular layer involves sorting M along the sequence length dimension and then
+selecting KVs corresponding to the first e metrics along each attention head for eviction. The compressed cache can
+then be obtained by concatenating the remaining key and value vectors along each attention head, yielding a tensor of
+shape H × (L − e) × d.
+
+
+                                                                  7
+                                      Single-Doc. QA                         Multi-Doc. QA                         Summarization
+                        110                                    110                                    110
+                        100                                    100                                    100
+        % performance
+
+
+
+                        90                                     90                                     90
+                        80                                     80                                     80
+                                   narrativeqa                            hotpotqa                               gov_report
+                        70         qasper                      70         2wikimqa                    70         qmsum
+                                   multifieldqa_en                        musique                                multi_news
+                        60                                     60                                     60
+                              1.0 2.0 4.0 8.0 16.0 32.0 64.0         1.0 2.0 4.0 8.0 16.0 32.0 64.0         1.0 2.0 4.0 8.0 16.0 32.0 64.0
+                                    Few-shot Learning                           Synthetic                                Code
+                        110                                    110                                    110
+                        100                                    100                                    100
+        % performance
+
+
+
+
+                        90                                     90                                     90
+                        80                                     80                                     80
+                                   trec
+                        70         triviaqa                    70         passage_count               70         lcc
+                                   samsum                                 passage_retrieval_en                   repobench-p
+                        60                                     60                                     60
+                              1.0 2.0 4.0 8.0 16.0 32.0 64.0         1.0 2.0 4.0 8.0 16.0 32.0 64.0         1.0 2.0 4.0 8.0 16.0 32.0 64.0
+                                      compression rate                       compression rate                       compression rate
+
+
+Figure 4: Llama-3.1-8B-Instruct percent of full-cache performance by compression rate on all LongBench subtasks.
+Results are grouped by subtask category.
+
+
+3.4   Grouped-Query Attention
+
+Most modern LLM architectures employ grouped-query-attention (GQA) [19] as a means of speeding up inference and
+                                                                                                               n
+reducing the size of KV cache. GQA works by reducing the number of key-value heads, nk to a fraction nk = rq of the
+number of query heads, nq and evenly dividing the query heads into nk groups with r heads, each. Each group of query
+heads is assigned a single key-value head that produces key and value vectors for every query head in the group during
+the multi-head attention operation. Naive implementations of GQA accomplish this by performing an interleaved repeat
+of the generated KV tensors over the attention head dimension before conducting scaled-dot-product attention. Efficient
+inference frameworks, on the other hand, generally rely on specialized kernels such as those of FlashAttention [16] or
+PagedAttention [2] that can lookup the proper key and value vector for queries of a given query group without explicitly
+allocating space for repeated KVs. Applying GQA with such an implementation can, in fact, be seen as a form of KV
+cache compression where the compression rate is equal to r, the ratio of query heads to key-value heads, since the GQA
+model will cache 1r as many KVs during inference as a comparable MHA model.
+
+4     Method
+The method presented in this paper is a modification of Ada-SnapKV [1]. We first discuss query-group compression,
+then detail our adaptation of PagedAttention that makes variable-head-rate eviction practical. Finally we go over the
+remaining algorithm choices made in our final method.
+
+4.1   Query Group Compression
+
+While GQA has seen widespread adoption over the last year in models such as Llama and Mistral, existing methods
+for KV cache compression were not designed with a GQA KV cache in mind. Implementations of both SnapKV and
+PyramidKV, for example, cache and compress KV tensors after repetition is carried out for alignment with the query
+tensor. This means that: 1. The compression rate must exceed the ratio of query heads to KV heads in order to improve
+upon the compression that would be achieved by using a more efficient framework where KVs are not physically
+repeated in memory. 2. There is a great deal of redundancy in cache before compression occurs (in the case of Mistral
+and Llama-3, 34 of KVs are duplicates) and this redundancy is not being taken advantage of in the compression.
+
+
+                                                                                  8
+We seek a compression method where KVs are evicted from a non-repeated cache that is applicable to current GQA
+models run in state-of-the-art inference frameworks. This can be done with a straightforward modification to existing
+eviction-based methods, where the metrics used to determine KV eviction are aggregated for each key over queries
+in that key’s respective query group. We can then continue with compression of the non-repeated cache, using the
+aggregate metric to inform eviction decisions.
+Following this modification, equation 6 becomes
+
+                         (f ull)
+                                       X X
+                       Mhk ,j      =               Ahij ,   for Hk = { ∀ h : rhk ≤ h < r(hk + 1) }                    (9)
+                                        i   h∈Hk
+
+
+where we add an additional summation over the metrics computed for all queries in the current key’s query group, Hk .
+Similarly, equation 7 becomes
+
+                                       L
+                         (w)
+                                       X X
+                        Mhk ,j =                  Ahij ,    for s = L − w                                           (10)
+                                       i=s h∈Hk
+                                                             Hk = { ∀ h : rhk ≤ h < r(hk + 1) } .                   (11)
+
+4.2     Supporting Variable-Head-Rate Eviction
+
+Ada-SnapKV explores evicting a variable number of KVs from each attention head of the KV cache. Selecting KVs to
+evict in this case can be done by sorting metrics over a flattened tensor where head and sequence length dimensions
+are combined, then selecting KVs corresponding to the first eH metrics for eviction. Unlike Ada-SnapKV, we seek to
+additionally support variable rates of compression across layers, following this same methodology. In this section we
+discuss the steps taken to make such compression feasible.
+
+4.2.1    Block Layout and Parallel Allocation
+The application of variable-head-rate eviction within existing inference frameworks is ineffective as it only reduces the
+cache size proportionally to the attention head with lowest compression rate and all evictions beyond this rate merely
+increase cache fragmentation. We note this is conceptually similar to how sequences of variable length in a decoding
+batch create fragmentation in a non-paged KV cache, as the cache size scales with maximum sequence length.
+To reconcile with this added fragmentation we can adapt PagedAttention to page out cache on a per-head, per-layer–as
+well as per sequence–basis. We expand the block tables of each sequence to include block tables for each layer and
+attention head of the cache, so that they can be retrieved for each KV head during attention without the use of fixed
+memory offsets.
+This gives us block tables of shape
+
+
+                                                                    Lmax
+                                                      B×l×H ×            ,                                          (12)
+                                                                     b
+compared to the layout used in vanilla PagedAttention, B × Lmax
+                                                            b .
+Each block now only contains KVs for a single KV head of a single layer. We utilize a single, contiguous physical
+cache allocation for all layers, of shape N × b × d, compared to the l layer-specific physical cache allocations of shape
+N × H × b × d used by most paged-attention frameworks.
+Since the scheduling step in paged-attention frameworks happens off-device, its runtime scales linearly as the number of
+blocks being allocated increases. In the KV-Compress block layout this presents an issue, as the number of blocks is lH
+times larger than that of standard frameworks. With a naive extension of vLLM’s scheduler, we observe prohibitively
+expensive scheduling loops–in some cases taking longer to complete than the model forward pass. To remedy this we
+design an on-device block allocation system where both block tables and context lengths for each attention head of
+each sequence’s cache are stored on device. This allows us to parallelize both the counting of allocated blocks and the
+allocation of new blocks.
+When scheduling for prefill we can compute the necessary blocks from the token length, alone, since each sequence will
+initially allocate the same number of blocks per head. When scheduling decoding of running sequences we compute
+
+
+                                                                9
+   Inputs: KV metrics, Logical KV indices (below), Num blocks to evict = 2
+
+
+
+                                                                                                                                                                                     Head 0             Head 1        Head 0
+               Head 0         Head 1                                     Head 0                              Head 0
+
+
+
+                                                                                                                                                                                    0.1   0.4    0.6   1.2     2.3   1.7   2.5
+              0.1            1.2   2.3                                  0.4         2.5                     0.6   1.7
+
+
+                                                                                                                                                                               5     4     0      2     0       1     3     1
+               4    5        0     1                                     0          1                       2     3
+
+
+
+
+                         Sort by (sequence, head, metric)                                                                                                    Sort by (sequence, head, logical index)
+
+
+
+                                                                  Head 0                         Head 1                                                                                   Eviction range
+
+                                                                                                                                                                                              Head 0                  Head 1
+                                                   0.1        0.4       0.6         1.7   2.5   1.2   2.3
+
+
+                                                                                                                                                                              0.4   2.5   0.6    1.7   0.1           1.2   2.3
+                                         5          4         0          2           3    1     0     1
+
+
+                                                                                                                                                                               0     1     2      3        4    5     0     1
+
+                        Reshape to [ # blocks X block size ]
+
+
+
+                                                   Head 0                     H 1
+                                                                                                                                                           Move non-evicted KVs out of eviction range
+
+                                                        0.4       1.7         1.2
+
+
+                                                                                                                        Flatten
+                                             0.1        0.6       2.5         2.3
+
+
+                                                                                                                                                                              1.7   2.5   0.6          0.1           1.2   2.3
+
+
+
+                                                                                                                                                                               0     1     2      3        4    5     0     1
+                         Sort blocks by (sequence, metric)
+
+
+                                             Head 0            H 1           H 0
+
+                                                                                                                                                           Mark blocks in eviction range to be freed
+                                                     0.4          1.2         1.7
+
+
+
+
+                                          0.1        0.6        2.3          2.5                                                                                                              Head 0                  Head 1
+
+
+
+
+                                                                                                                                                                              1.7   2.5                              1.2   2.3
+
+
+
+                                                                                                                                                                               0     1     2      3        4    5     0     1
+                             Select blocks for eviction
+
+
+                                             Head 0            H 1           H 0
+
+
+                                                                                                                                                           Free evicted blocks of KV metrics/cache
+                                                     0.4          1.2         1.7
+
+
+
+
+                                          0.1        0.6        2.3          2.5                                                                  Head 0           Head 1                        Head 0                          Head 0
+
+
+
+                                                                                                                                                                  1.2   2.3                     1.7    2.5
+
+
+
+                                                                                                                                                  4   5            0    1                        0     1                         2    3
+
+
+
+
+Figure 5: Visualization of our compression algorithm for a simplified example with two KV heads and a block size of
+two. KV metrics are visualized for a given cache state, highlighting blocks of a particular sequence in the decoding
+batch that is scheduled to evict two blocks. Logical indices are displayed under the corresponding metrics slot.
+
+
+the required additional block allocations for all sequences in parallel from the on-device context lengths tensor. When
+preempting, we compute the number of freed blocks across all layers and heads in parallel, for each preempted sequence.
+We use a flat on-device tensor of length N to track allocation of blocks in the unified KV cache. Before the forward
+pass, block tables and context lengths are passed directly from the block manager to the model runner. Our block
+management layout is visualized in figure 3 (right).
+
+4.2.2   Evicting from a Paged KV Cache
+
+To support KV cache compression within a paged-attention framework, we need to be able to evict blocks rather than
+KVs, as this is what determines total memory footprint of the KV cache. We seek an algorithm to evict entire blocks of
+KVs such that the sum eviction metric over all KVs in the evicted cache block of a particular head is equivalent to the
+sum eviction metric that would result from evicting b KVs from that head in a fully unconstrained manner.
+More concretely, for a KV head, h with N allocated KV blocks, we want an ordering, Sh , of sets of b KVs along h,
+satisfying
+
+
+                                 Sh = (K (1) , K (2) , ..., K (N ) ) s.t.                                                               K (i) = b ,                            ∀i                                                         (13)
+                                                                                                                                   K (i) ∩ K (j) = ∅ ,      ∀i ̸= j                                                                       (14)
+                                                                                                                                    X              X
+                                                                                                                                           mf ≤        mg , ∀i < j                                                                        (15)
+                                                                                                                                       f ∈K (i)        g∈K (j)
+
+
+where mi denotes the eviction metric for a KV, i.
+By setting a small enough block size, b, we can then achieve comparable performance to the more flexible approach
+where eviction counts are not limited to multiples of b.
+
+
+                                                                                                                                  10
+To satisfy the requirements for Sh , KVs will need to be rearranged in physical cache, as it is improbable that the next-b
+most suitable KVs for eviction will all occur within the same block initially. Our algorithm for determining block
+eviction and carrying out this reorganization is displayed in figure 5. As we walk through the algorithm we will use the
+superscript, (t) , to denote variables at each step, t.
+We start with our unified physical key and value caches, Ku and Vu , both of shape N × b × d and our metrics tensor,
+M of shape N × b, following the same layout as Ku and Vu along dimensions N and b. We also need the ordering of
+KVs along each head, represented as a vector of size N in the same layout as M , mapping KVs of each head to their
+position in this ordering. We call this the logical index of a KV, and though it is initially defined as the token position at
+which the KV was generated, this will change once we rearrange the cache during compression.
+Because the metrics and KV cache follow a row-major layout in memory, we can view them as a two-dimension N b × d
+tensor and one-dimensional N b tensor, respectively, where the metrics and KVs within the same block are adjacent in
+memory.
+Figure 5.1 displays an example metrics tensor, M (1) , following this view, with metrics for a particular sequence
+highlighted. This simplified example visualizes compression of a single layer model with only two KV heads. The
+sequence has been previously compressed and has five and two KVs along its first and second KV heads, respectively.
+Logical indices are displayed below each metric slot. The physical KV cache (not shown) follows the same layout, with
+each metric corresponding to a previously allocated key or value vector.
+Our goal is to minimize the metrics of evicted KVs, so we first need to identify, for each head, h, the the maximum-
+valued metric that will be evicted when evicting e blocks from that head’s   m(h, e). Let Ch be the the number of
+                                                                         cache,
+KVs allocated for h, so that the number of allocated blocks is given by Cbh . We have
+
+                                                                                    
+                                                                                 Ch
+                                         dom(m) =          ∀h, e : 1 ≤ e <                  .                            (16)
+                                                                                  b
+
+Since we are free to rearrange KVs in cache, m(h, e) is simply the (be)th smallest metric in the cache of head h. We
+                                                                                                                 (2)
+can compute m(h, e) over its full domain by first sorting M (1) by (head, metric) to get M (2) , then reshaping MN b×1
+       (3)
+into MN ×b to get
+
+                                                                    (3)
+                                                    m(h, e) = Moh +e−1,b−1                                               (17)
+
+where oh is the offset in physical blocks to the first metric block for head h. The empty slot in the last allocated block is
+treated as having a metric of zero, so that it comes before all non-empty metrics of its head when sorted. This ensures
+that the maximum metric for the first evicted block of each head is only aggregated over the smallest a metrics, where
+a = Ch mod b is the number of KVs that reside in the last allocated block and must be evicted before that head’s first
+whole cache block can be freed.
+                                                                                           (3)
+The columns of M (3) now define per-head KV eviction schedules, as each Mi,: contains the next b lowest metrics for
+corresponding head, h, when i − oh of its blocks have already been evicted. Next, we use m(h, e) for each block of
+                                                                                        (3)
+eviction candidates to inform our eviction rates across heads. This is done by sorting MN ×b along the N -dimension by
+               (3)
+the values, M:,b−1 , to get M (4) . This preserves the block-contiguity of M (3) and gives us an ordering of candidate
+block evictions by lowest max metric across heads. It’s this layout that lets us obtain our final KV eviction schedule for
+a particular sequence, given its budget of total retained cache blocks for that compression iteration.
+For each sequence, s we take its budgeted number of total block evictions, Es and mark all KVs in the first Es blocks
+for eviction, computing the eviction mask
+
+                                              (5)
+                                                            1(Os ≤ i < Os + Es )
+                                                      X
+                                           Wi,: =                                                                        (18)
+                                                       s
+
+where Os is the offset in physical blocks to the first metric block for sequence s.
+In the example our sequence is forced to evict two cache blocks, and the most suitable block evictions as determined by
+our algorithm both come from the first KV head. Had the sequence been forced to evict an additional block it would
+evict the lone block of its second head.
+
+
+                                                               11
+                                                     (6)
+Once we have this mask we can reshape it into WN b×1 and sort by logical index to get W (7) , which follows the
+original layout of M (2) . Note that in this layout the KVs that were scheduled for eviction are no longer contiguous in
+memory, and their eviction alone will not enable the freeing of any cache blocks since every block in our example still
+contains at least one non-evicted KV. To resolve this issue we need to reorganize our KVs in physical memory so that
+the eviction status of KVs in each block is homogeneous. We know that such a reordering is possible, as scheduling
+was conducted such that the sum count of evicted KVs and empty cache slots is evenly divisible by the block size.
+
+Algorithm 1 MoveCache algorithm for reorganizing evicted KVs into contiguous blocks
+Input: K cache K, V cache V , metrics m, logical indices p, eviction mask w, evicted block count e, block size b
+ 1: procedure M OVE C ACHE(K, V, m, p, w, e, b)
+ 2:    i←0
+ 3:    j ← |p| − 1
+ 4:    end ← j − eb                                                                         ▷ Define the eviction range
+ 5:    while j > end do
+ 6:       while wi = 0 do                                                 ▷ Find next evicted K outside eviction range
+ 7:            i←i+1
+ 8:       end while
+ 9:       if wj = 0 then                                              ▷ We have a non-evicted K inside eviction range
+10:            src ← pj
+11:            dst ← pi
+12:            Kdst,: ← Ksrc,:                                                                     ▷ Move KV vectors
+13:            Vdst,: ← Vsrc,:
+14:            mdst ← msrc                                                              ▷ Move corresponding metrics
+15:       end if
+16:       j ←j−1
+17:    end while
+18: end procedure
+
+
+Our MoveCache algorithm, outlined in algorithm 1 and depicted in figure 5.8, resolves this problem by defining an
+eviction range spanning the last Es blocks of a sequence, then iterating backwards over KVs wintin this range by
+decreasing logical index, moving any non-evicted KVs it encounters in place of the next evicted KV occurring outside
+the eviction range. Once iteration over the eviction range has completed, reorganization is complete, and we can map
+blocks within the eviction range of the reordered metrics back to the corresponding block in the original physical cache
+layout, to be freed and made available for future allocation.
+
+4.2.3   Limiting Overhead
+The main source of overhead in our compression algorithm comes from sorting over KV metrics. We use PyTorch’s
+sort API to compute each compression step where a reordering is required. These calls add overhead in the form of an
+increased memory footprint and added latency during compression. From profiling on an NVIDIA L4, we observe
+an additional memory allocation of around 8 times the size of the sorted tensor, and find that runtime begins to scale
+linearly when size exceeds 1.7e8. To both minimize the memory that needs to be reserved for the sort operations and
+prevent them from exhausting GPU resources we limit the number of KVs that can be compressed during a given
+compression iteration, as each KV corresponds to an element in the metrics tensor that will need sorting.
+Whenever a round of compression is initiated, we iterate over the current set of running sequences, ordered by time of
+last compression (with uncompressed sequences coming first), adding to the compression batch and tracking the total
+number of KVs currently allocated to sequences in this batch as we go. When we encounter a sequence that would
+cause the batch’s total allocated KVs to exceed our configured limit, we discard it and move forward with compression
+of the current batch of selected sequences.
+Setting this limit too low can prevent sequences from being scheduled for compression if their total number of allocated
+KVs exceeds it. A simple solution is to configure the limit to be at least equal to Lmax × l × H, where Lmax is the
+maximum supported input token length. This ensures that the total number of KVs generated for a sequence at any
+given point stay below the compression limit, so that its compression is guaranteed once all other sequences have been
+compressed.
+To further reduce overhead we seek to limit the number of compression iterations that occur, relative to the number of
+model forward passes. We identify several approaches to controlling the scheduling of compression steps:
+
+
+                                                           12
+                                      Single-Doc. QA                         Multi-Doc. QA                         Summarization
+                        105                                    105                                    105
+                        100                                    100                                    100
+                        95                                     95                                     95
+        % performance
+
+
+                        90                                     90                                     90
+                        85                                     85                                     85
+                        80         narrativeqa                 80         hotpotqa                    80         gov_report
+                        75         qasper                      75         2wikimqa                    75         qmsum
+                                   multifieldqa_en                        musique                                multi_news
+                        70                                     70                                     70
+                              1.0 2.0 4.0 8.0 16.0 32.0 64.0         1.0 2.0 4.0 8.0 16.0 32.0 64.0         1.0 2.0 4.0 8.0 16.0 32.0 64.0
+                                    Few-shot Learning                           Synthetic                                Code
+                        105                                    105                                    105
+                        100                                    100                                    100
+                        95                                     95                                     95
+        % performance
+
+
+
+
+                        90                                     90                                     90
+                        85                                     85                                     85
+                        80         trec                        80                                     80
+                        75         triviaqa                    75         passage_count               75         lcc
+                                   samsum                                 passage_retrieval_en                   repobench-p
+                        70                                     70                                     70
+                              1.0 2.0 4.0 8.0 16.0 32.0 64.0         1.0 2.0 4.0 8.0 16.0 32.0 64.0         1.0 2.0 4.0 8.0 16.0 32.0 64.0
+                                      compression rate                       compression rate                       compression rate
+
+
+Figure 6: Llama-3.1-70B-Instruct-FP8 percent of full-cache performance by compression rate on all LongBench
+subtasks. Results are grouped by subtask category
+
+
+      1. Compress every c model iterations, for some fixed compression interval, c.
+      2. Compress whenever the count of total uncompressed tokens passes some threshold.
+      3. Compress when one or more sequences are newly prefilled.
+      4. Compress when we would otherwise be forced to preempt a running sequence.
+
+After experimenting with these approaches, we find the combination of 3 and 4 to be the most effective, and use this in
+our final method.
+
+4.3   Metric Calculation
+
+In this section we discuss in detail our method for computing the metrics for each KV that are used to determine our
+eviction schedule.
+Squared Attention Metric Most prior work sum attention values between each key and queries within the observation
+window to get each KVs eviction metric. In this case the eviction schedule can be thought of as attempting to minimize
+L1 error in future attention. Alternatively, we can seek to minimize the L2 error over future attention by using a sum of
+squared attention to compute eviction metrics. We experiment with both approaches and find that squared attention
+perform better, so we take this route in our approach.
+Observation Window In prior work, aggregating attention to compute KV metrics for eviction has had two approaches:
+Aggregate over all past observed KVs, as in H2O; or aggregate over a partial window of queries as in SnapKV. To
+explore the tradeoffs of these two approaches, we design two distinct versions of our method.
+KVC-full aggregates squared attention over all observed queries. We find it beneficial to exclude queries of the first
+v tokens following that KV’s token from the aggregation, as the local attention patterns that occur between keys and
+queries within close proximity of one another are generally not representative of the attention patterns that will occur
+between the same key and future queries to that are generated outside of that key’s immediate locality. We adapt
+equation 9 to define our metrics as
+
+
+                                                                                 13
+                                              L
+                                (f ull)
+                                              X       X
+                          Mhk ,j          =                 (Ahij )2 ,   for Hk = { ∀ h : rhk ≤ h < r(hk + 1) }            (19)
+                                              i=j+v h∈Hk
+
+for an excluded query window, v.
+KVC-w aggregates squared attention over queries within a limited observation window of final tokens of the input
+prompt. Metrics are computed following equation 8, with the slight modification of squaring the attention values before
+summation.
+Continual Compression Our compression method can be easily adapted to conduct KV cache compression during
+decoding, either during regular intervals of decoding steps or on an as-needed basis. When compression is continued
+during decoding, we accumulate squared attention from queries of newly generated tokens directly into the KV metrics
+computed during prefill. In this case the metric for a KV generated at position j at decoding step t is given by
+
+                                                   L c +t
+                         (cc)             (pool)
+                                                   X        X
+                       Mkh ,j = Mhk ,j +                        (Ahij )2 ,        for Hk = { ∀ h : rhk ≤ h < r(hk + 1) }   (20)
+                                                   i=Lc h∈Hk
+
+
+where Lc is the length of input context and M (pool) is the set of metrics computed during prefill.
+
+5         Experiments
+5.1        Baselines
+
+We evaluate performance of KV-Compress on the same 16 subsets of the LongBench test suite used in prior work [8, 9, 1].
+Following prior work we measure performance for varying levels of maximum cache size, C = {128, 256, 512, 1024},
+evicting KVs such that the total number of KVs over all layers and heads is equivalent to the number of KVs that would
+be generated by an input with token length C.
+We evaluate our compression on both Mistral-7B-Instruct-v0.2 and Llama-3.1-8B-Instruct, comparing performance
+against the following baseline methods introduced in prior work:
+            • H2O [7]
+            • SnapKV [8]
+            • PyramidKV [9]
+            • Ada-SnapKV and Ada-PyramidKV [1]
+For Mistral baselines, we take the results published by [1] after spot-checking to verify reproducibility. For Llama
+baselines, we use the implementation of [9] to run and evaluate all methods, adapting their code to support transformers
+version 4.44.2 for compatibility with the rope-scaling configuration of Llama-3.1 2 .
+For both Llama and Mistral, we evaluate KV-Compress model outputs using the same methods followed in [8] and [9].
+Because no implementation for Ada-SnapKV/PyramidKV was available at the time of release, we compare only against
+their published results on Mistral-7B-Instruct-v0.2.
+All baselines aside from H2O employ an observation window when collecting eviction metrics. We follow [8] in setting
+observation window size to w = 8 and pooling size to p = 7 for all baseline evaluations.
+We evaluate KV-Compress variations KVC-full and KVC-w against the above baselines. We denote the type of
+aggregation used to obtain KV metrics for KV-Compress by appending a suffix to the method (-L2 for squared sum and
+-L1 for standard sum). If not explicitly specified, KV-Compress uses w = 8 and L2 aggregation.
+
+5.2        Settings
+
+We run all KV-Compress experiments using our vLLM integration forked from v0.6.0, running in eager mode with
+a block size of 16. For all L4/Llama-8B experiments, we use default gpu memory utilization of 0.9 and set max-
+model-length to 19,000. For all H100/Llama-70B experiments, we set gpu memory utilization to 0.96 and limit
+      2
+          Code is available at https://github.com/IsaacRe/PyramidKV
+
+
+                                                                             14
+max-model-length to 33,000 to account for global memory limitations. For all other configurations we use default run
+parameters of v0.6.0.
+KVC-full uses a excluded query window of v = 10 in all experiments and KVC-w uses a pooling size of p = 7. When
+running KVC-full on an H100 we find it necessary to limit gpu memory utilization to 0.6 to reserve space for the
+expensive metric collection. To limit required memory for metric collection we compute the aggregate over one query
+block at a time, using a block size of 1024.
+In all baseline comparisons we run a single iteration of compression following prefill, using the specified max-cache-size,
+C.
+For throughput benchmarks, we use vLLM’s benchmarking script, modified to configure compression rate and other
+operational parameters. For these experiments, max-cache-size is configured per-sample as min(128, 1r Lc ), for
+compression rate r and input context length Lc . We schedule iterations of compression after each prefill and whenever
+preemption would otherwise be forced. We compare against baseline performance of a clean install of vLLM v0.6.0 on
+equivalent hardware, keeping all parameters unrelated to compression the same. Each benchmarking run is conducted
+over 256 input prompts. We vary the input prompt length per-run, but keep the number of output tokens fixed at 500.
+Each data point for Llama-3.1-8B is averaged over three separate runs. Experiments for Llama-3.1-70B were conducted
+with a single run due to compute limitations.
+
+5.3   LongBench
+
+Table 2 shows results on the LongBench suite with Mistral-7B-Instruct-v0.2. We benchmark four variations of KV-
+Compress against prior methods. We find L2 aggregation to demonstrate clear superiority over the L1 aggregation used
+in prior work and find that a smaller observation window of w = 8 performs better that w = 32 in most cases. We also
+evaluate KVC-full-L2, a variation that uses full query range aggregation, similar to H2O, but with a small excluded
+query window. This variant actually performs the best in many subtasks, despite seeing large degradation for others,
+such as SAMSum, especially at high compression rates. Though the quadratic scaling of compute cost for running this
+algorithm makes it impractical for most cases, these results suggest that the effect of the range of queries used when
+scheduling key-value eviction should be studied more carefully.
+We evaluate with Llama-3.1-8B-Instruct using the most performant of our methods, KVC-w8-L2, which uses an
+observation window of size w = 8 and uses an aggregation of squared attention when determining KV eviction.
+Results are shown in table 1. In this case we reach state-of-the-art results nearly across the board for the most extreme
+max-cache-size configuration, C = 128. Indeed the only subsets we don’t achieve the highest performance in are
+NarrativeQA, PassageCount and LCC.
+We achieve state-of-the-art results for average LongBench performance across all max-cache-size configurations for
+both Mistral and Llama, with Mistral state-of-the-art being shared between w32-L2 and w8-L2 variants.
+It should be noted that our state-of-the-art performance is achieved while using 14 as many KVs as the baseline methods
+we test against. These baselines conduct compression after repeating KVs so that their shape matches the number of
+query heads, while our methods compress over a non-repeated KV cache where shape is determined by the number of
+key-value heads. This means that for the same maximum cache size our method holds 1r as many KVs as the baselines,
+where r is the ratio of query heads to key-value heads. For both Mistral-7B and Llama-3.1-8B, r = 32/8 = 4 so that
+our method achieves a 4x higher compression rate for equivalent maximum cache size configurations.
+
+5.4   Throughput Benchmarks
+
+Reducing KV cache memory enables larger batching, leading to improved total throughput in cases where available
+device memory is a limiting factor. This is commonly the case in single-instance LLM deployments, where most vRAM
+is allocated to model parameters.
+To evaluate whether our method can improve throughput of a PagedAttention framework, we test our modification
+of vLLM against vanilla vLLM v0.6.0 across two single-instance configurations: Llama-3.1-8B-Instruct run on an
+NVIDIA L4, and Llama-3.1-70B-Instruct-FP8 run on an NVIDIA H100. Both configurations experience vRAM
+scarcity due to the large model size relative to global memory of the device used, and so are ideal for benchmarking our
+approach.
+In Figure 1b we plot total throughput by compression rate for Llama-3.1-8B on a single L4, over a range of input
+context lengths. We reach throughput multipliers of 4.93x and 5.18x over vanilla vLLM for compression rates of 32
+and 64, respectively, for context length Lc = 6000. For shorter contexts we continue to see significant improvement
+
+
+                                                           15
+            Single-Doc. QA           Multi-Doc. QA    Summarization      Few-shotLearning     Synthetic      Code
+
+
+
+
+                                 2W QA
+
+
+
+
+                                 M
+                                 G
+                                 H
+
+
+
+
+                                  SA A
+                                  Tr
+                                   M
+
+
+
+
+                                   Q
+                                                                                                                        Ave.
+          N
+
+
+
+
+                                   PC
+                                   ov
+                   Q
+
+                           M
+
+
+
+
+                                   ul
+                                   ot
+
+
+
+
+                                    TR
+
+
+
+
+                                                                                                                RB
+                                     iv
+                                     M
+                                     ik
+           rtv
+
+
+
+
+                                      PR
+                                      us
+
+
+
+
+                                                                                                          Lc
+                                      M
+                    as
+
+
+
+
+                                      tiN
+                                      po
+                            F-
+
+
+
+
+                                       Re
+
+
+
+
+                                       ou
+                                        ia
+                                        iM
+
+
+
+
+                                         Su
+                                                                                                                        Score
+
+
+
+
+                                         EC
+                                         iq
+
+
+
+
+                                         Su
+                       p
+
+
+
+
+                                                                                                                 -P
+              Q
+
+
+
+
+                                                                                                            c
+                                          e
+                            en
+
+
+                                          t
+
+
+
+
+                                          Q
+                                           po
+                      er
+
+
+
+
+                                           ew
+
+
+
+
+                                            nt
+                                            ue
+               A
+
+
+
+
+                                             m
+                                             Q
+
+
+
+
+                                             m
+                                               rt
+                                               A
+
+
+
+
+                                                s
+Full Cache 26.63 32.99 49.34 42.77 27.35 18.77 32.87 24.24 27.10 71.00 86.23 42.96 2.75 86.98 55.33 52.87               42.51
+                                                            C=128
+H2O     21.19 21.66 38.60        30.63 20.65 12.19   20.65 22.42 21.81   39.00 82.52 40.68   2.98 79.56   49.13 46.76   34.40
+SnapKV 19.17 21.40 42.93         36.76 22.44 15.86   19.16 21.84 21.55   47.50 84.15 40.24   2.30 68.26   50.69 47.13   35.09
+Pyramid 20.16 21.77 43.55        36.78 23.12 14.39   19.53 22.03 21.47   51.00 84.62 40.24   2.79 70.77   50.57 46.53   35.58
+Ada-SKV 20.63 22.58 45.68        37.90 23.49 16.55   19.99 22.28 21.55   59.50 85.00 40.62   3.09 69.36   50.98 48.17   36.71
+Ada-PKV 20.50 21.71 45.61        36.81 23.57 15.84   19.75 22.13 22.00   60.50 84.04 40.51   3.21 73.60   51.24 48.02   36.81
+w32-L1     20.15 20.30 45.32     37.70 24.29 15.20   19.92 21.98 21.36   51.75 84.72 39.96   3.46 68.05   51.55 47.93   35.85
+w32-L2     19.74 22.79 46.27     38.31 24.78 15.40   20.52 22.77 21.62   63.25 85.31 40.16   3.50 70.78   52.43 49.61   37.33
+w8-L2      22.58 25.04 48.11     35.50 24.01 14.44   22.19 22.84 21.98   68.50 84.28 39.87   3.43 66.81   53.02 49.70   37.64
+full-L2    22.20 25.34 42.45     40.16 24.54 17.62   25.40 22.05 25.18   70.50 84.87 35.36   3.33 44.05   50.78 45.41   36.20
+                                                            C=256
+H2O     21.54 22.92 42.56        31.07 22.53 13.76   22.52 22.40 23.09   40.50 84.20 40.77   3.41 86.10   50.98 48.17   36.03
+SnapKV 22.37 23.74 48.13         38.56 22.43 15.66   21.91 23.13 23.15   61.50 85.45 41.42   3.09 84.54   53.22 50.24   38.66
+Pyramid 20.09 24.00 47.33        38.24 22.48 16.02   21.40 22.45 22.63   63.00 84.93 40.98   3.40 82.48   52.78 49.36   38.22
+Ada-SKV 22.55 25.78 48.33        40.30 24.24 16.64   21.63 23.03 23.19   67.00 85.78 41.53   3.47 87.07   53.86 51.13   39.72
+Ada-PKV 22.64 24.64 47.40        40.25 23.62 16.83   21.82 23.34 22.70   66.50 84.99 41.34   2.78 86.90   53.17 49.52   39.28
+w32-L1     22.05 24.45 48.98     38.47 24.36 16.16   21.94 22.99 23.10   62.75 85.58 41.37   2.83 79.99   53.05 51.43   38.72
+w32-L2     22.82 26.41 48.28     39.85 25.30 16.39   22.74 23.29 23.33   67.25 85.32 41.63   2.97 85.52   53.86 51.80   39.80
+w8-L2      25.31 25.61 48.09     39.57 24.82 15.77   23.33 23.68 23.47   70.00 86.17 42.76   3.04 79.96   54.58 52.51   39.92
+full-L2    25.39 27.23 44.24     43.47 24.55 19.05   27.42 22.94 26.14   70.50 84.86 37.39   3.40 54.84   53.32 48.84   38.35
+                                                            C=512
+H2O     21.72 26.03 44.81        32.33 23.16 14.86   23.65 22.84 24.70   42.00 85.22 41.57   3.40 86.45   53.04 49.68   37.22
+SnapKV 24.60 27.81 48.98         39.46 25.25 16.98   23.70 22.96 24.37   67.00 85.88 41.26   2.78 86.56   54.81 51.71   40.26
+Pyramid 23.23 27.94 48.87        40.50 24.36 16.74   23.22 23.16 24.37   67.00 85.73 41.74   3.16 85.67   54.16 50.34   40.01
+Ada-SKV 23.39 28.72 48.96        40.60 25.20 17.25   23.15 23.48 24.41   68.00 86.39 41.69   2.73 88.92   54.69 51.51   40.57
+Ada-PKV 24.03 28.98 48.39        39.25 24.50 18.38   23.13 23.90 24.30   68.00 85.89 41.89   2.98 87.71   54.46 51.39   40.45
+w32-L1     23.73 28.54 48.65     40.42 26.33 18.12   23.92 23.29 24.65   67.25 86.09 41.86   2.81 85.92   54.55 51.85   40.50
+w32-L2     24.52 28.59 50.55     41.22 26.61 18.35   24.49 24.16 24.94   70.00 86.12 42.06   2.75 88.43   55.26 52.92   41.31
+w8-L2      25.12 29.90 48.79     39.79 27.00 17.82   25.43 23.49 25.20   70.00 86.15 43.29   2.42 85.13   56.12 53.35   41.19
+full-L2    25.23 29.97 46.90     41.55 25.60 19.59   29.25 23.24 26.55   70.50 85.91 39.50   4.60 63.25   54.04 50.50   39.76
+                                                            C=1024
+H2O     23.90 28.62 46.46        37.03 24.74 15.04   25.30 23.11 25.92   46.00 85.93 41.80   3.24 86.57   54.46 51.01   38.70
+SnapKV 25.47 29.57 49.33         40.90 25.53 19.01   25.94 23.89 26.21   69.50 86.48 42.10   2.98 88.56   55.57 51.92   41.44
+Pyramid 24.21 29.86 48.93        40.75 25.05 18.77   25.73 24.06 25.65   68.50 86.31 42.25   2.97 87.17   54.75 52.10   41.07
+Ada-SKV 24.79 31.94 48.45        40.73 26.22 19.11   25.61 23.92 26.03   70.00 86.32 42.35   2.91 88.31   55.44 52.55   41.54
+Ada-PKV 25.09 30.94 48.18        40.00 26.52 19.10   24.93 23.71 25.86   70.00 86.34 42.64   2.56 86.92   54.93 51.90   41.23
+w32-L1     24.77 29.83 49.27     41.52 26.09 18.58   26.01 23.37 25.99   69.00 86.22 42.49   3.19 89.81   55.61 52.60   41.52
+w32-L2     25.43 31.89 49.32     42.12 26.26 18.44   27.00 23.84 26.37   70.50 86.38 43.46   2.77 88.31   56.38 52.64   41.94
+w8-L2      25.30 31.72 48.54     42.14 27.00 17.93   26.77 24.24 26.00   71.00 86.10 43.67   2.61 86.56   57.46 54.09   41.95
+full-L2    26.16 30.69 48.64     41.80 26.27 19.58   31.41 23.72 26.88   71.00 85.68 41.87   4.86 72.46   55.56 51.58   41.14
+
+Table 2: Comparison of baseline methods against four KV-Compress variants for Mistral-7B-Instruct-v0.2 over 16
+LongBench subsets. Results for H2O, SnapKV, PyramidKV (Pyramid), Ada-SnapKV (Ada-SKV) and Ada-PyramidKV
+(Ada-PKV) were taken from [1]. Highest score for each column shown in bold. For cache size of C, all baseline
+methods keep C × 32 × 32 KVs in cache while our method keeps only C × 32 × 8 KVs. Table format taken from [1].
+
+
+even at smaller compression rates, observing multipliers of 2x and 2.54x for compression rates of 2 and 4, respectively,
+with Lc = 500.
+Figure 2b shows the same plot for an FP8 quantization of Llama-3.1-70B run on a single H100. The 70B model
+achieves a more reasonable throughput multipliers of 2.14x and 1.8x over vanilla vLLM, at compression rates of 64 and
+8, respectively.
+
+
+5.5   LongBench with Continual Compression
+
+To determine the feasibility of conducting inference at the compression rates used in our throughput benchmarks, we
+measure performance on LongBench using the same configuration as our throughput benchmarks. We use a fixed
+
+
+                                                              16
+                                 NVIDIA L4 - Llama-3.1-8B-Instruct                                                 NVIDIA H100 - Llama-3.1-70B-Instruct-FP8
+                          500
+                                              (a)                                                    250         500
+                                                                                                                                     (b)
+              120
+                          1000                                                                                   1000
+                          2000                                                                                   2000
+              100         4000                                                                       200         4000
+                          6000                                                                                   6000
+                          vanilla vLLM                                                                           vanilla vLLM
+              80
+                                                                                                     150
+ batch size
+
+
+
+
+                                                                                        batch size
+              60
+                                                                                                     100
+              40
+                                                                                                     50
+              20
+
+               0                                                                                      0
+                    1.0        2.0       4.0       8.0       16.0    32.0   64.0                           1.0        2.0       4.0       8.0       16.0   32.0   64.0
+                                            compression rate                                                                       compression rate
+
+
+Figure 7: Maximum decoding batch size by compression rate. Plots shown for multiple input token length configurations.
+
+
+compression rate and compress after every model iteration (including decoding steps) to test worst case performance
+when compression is allowed to occur anytime after prefill.
+We evaluate performance of each subtask under each compression rate as a percentage of full-cache performance on that
+subtask. In figure 1a we plot percent performance averaged over all subtasks in a category for Llama-3.1-8B-Instruct.
+It’s immediately clear that summarizaton tasks are the most difficult, with performance degrading sharply even for the
+smallest compression rates. Full plots of each subtask’s individual performance can be found in figure 4
+Category-average and individual subtask results for Llama-3.1-70B-Instruct-FP8 are found in figures 2a and 6, re-
+spectively. We notice that the 70B model is much less sensitive to the compression than 8B. We see that nearly all
+non-summarization subtasks (aside from Qasper) mainain over 90% performance even for a 64x compression rate (the
+maximum tested). however, that it is able to maintain its performance better than the 70B model, with a majority of
+tasks retaining over 95% performance even at 64x compression. Even on the problematic Qasper dataset it is able to
+retain 90% for all tested compression rates. Summarization tasks GovReport and QMSum remain difficult, however,
+with performance degrading quickly, even at low compression rates.
+In past work, prompts for the LongBench coding subtasks have been templated to append the following line to the input
+context:
+
+                    Next line of code:
+
+For Llama-3.1-70B-Instruct-FP8, we find this confuses the model, leading to lower performance in the full-cache case.
+Interestingly, we find that KV cache compression resolves this issue, yielding improvement in overall performance.
+Still, to provide the strongest full-cache baseline possible, we remove this appended line from the templates of subtasks
+in the coding category for all experiments with the 70B model.
+
+5.6            Analysis of Decoding Batch Size
+
+KV-Compress is able to boost throughput of vLLM by increasing the availability of free cache blocks and allowing
+more sequences to be loaded into the decoding batch at once and decoded in parallel.
+To study the effect of our compression on batch size more directly, we plot by compression rate the maximum decoding
+batch size that was reached during each benchmarking run in figures 7a and 7b for Llama-3.1 8B and 70B, respectively.
+We again visualize across multiple input context lengths. While one might expect a strictly linear relationship between
+maximum batch size and compression rate, we note that larger input context lengths require a larger compression rate
+before near-proportional increases in batch size are observed. This is because our integration requires that a sequence be
+prefilled before being compressed. Even if we have room in cache for 10 more compressed sequences, if we cannot load
+one more uncompressed sequences into cache then we will still be unable to add to our batch. Having a distribution of
+input context lengths in the model’s requests (as will be the case in practice) should alleviate this issue to some extent.
+Nonetheless, we are able to reach batch sizes of over 100 for both configurations in spite of the limited memory
+available.
+
+
+                                                                                   17
+                                           NVIDIA L4 - Llama-3.1-8B-Instruct                                                       NVIDIA H100 - Llama-3.1-70B-Instruct-FP8
+                                                       (a)                                                                                            (b)
+                                                                               1x
+                       1750                                                    2x
+                                                                               4x                                     2500
+                                                                               8x
+                       1500                                                    16x
+                                                                               32x                                                                                        1x
+throughput (tok/sec)
+
+
+
+
+                                                                                               throughput (tok/sec)
+                                                                               64x                                                                                        2x
+                       1250                                                                                           2000                                                4x
+                                                                               vanilla vLLM
+                                                                                                                                                                          8x
+                       1000                                                                                                                                               16x
+                                                                                                                                                                          32x
+                                                                                                                      1500                                                64x
+                       750                                                                                                                                                vanilla vLLM
+                       500
+                                                                                                                      1000
+                       250
+                              0     2000    4000    6000 8000        10000   12000    14000                                  0   2000   4000   6000      8000 10000 12000 14000 16000
+                                                      input length                                                                                    input length
+
+
+                                  Figure 8: Total throughput by input token length. Plots shown for compression rates from 1-64x.
+
+
+5.7                      Effect of Context Length on Throughput
+
+To better understand the interplay between context length, compression rate and throughput, in figures 8a and 8b we
+plot throughput of both models by context length for several compression rate configurations side-by-side.
+We plot over input context lengths Lc = {500, 1000, 2000, 4000, 6000, 8000, 10000, 12000} to observe how throughput
+behaves as input context approaches the limit of allocable cache tokens. We observe that the relative throughput under
+compression begins decreasing as new input context length approaches this limit and new sequences must wait longer
+before being added to the decoding batch.
+
+6                       Conclusion
+We have presented KV-Compress, a framework for compression of a paged KV cache. With our modifications to
+prior work, including aggregating squared attention, allowing variable eviction rates across both layers and heads, and
+evicting from a non-repeated KV cache, KV-Compress leads by a comfortable margin on the established benchmarks
+for cache compression with Mistral-7B-Instruct-v0.2 and Llama-3.1-8B-Instruct. We have shown that our method can
+reach compression rates of 8-64x without significantly impacting model performance, and that, with such compression
+rates, we can boost throughput of state-of-the-art inference frameworks many times over.
+
+References
+     [1] Yuan Feng, Junlin Lv, Yukun Cao, Xike Xie, and S. Kevin Zhou. Ada-kv: Optimizing kv cache eviction by
+         adaptive budget allocation for efficient llm inference, 2024.
+     [2] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez,
+         Hao Zhang, and Ion Stoica. Efficient memory management for large language model serving with pagedattention,
+         2023.
+     [3] Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du, Xiao Liu, Aohan
+         Zeng, Lei Hou, Yuxiao Dong, Jie Tang, and Juanzi Li. Longbench: A bilingual, multitask benchmark for long
+         context understanding, 2024.
+     [4] Meta. Introducing llama 3.1: Our most capable models to date, Jul 2024.
+     [5] Michael Feil. Synthetic data generation for contexts up to 1 million tokens using short-context models, Jun 2024.
+     [6] Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie, Zhaozhuo Xu, Anastasios Kyrillidis, and
+         Anshumali Shrivastava. Scissorhands: Exploiting the persistence of importance hypothesis for llm kv cache
+         compression at test time, 2023.
+     [7] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong
+         Tian, Christopher Ré, Clark Barrett, Zhangyang Wang, and Beidi Chen. H2 o: Heavy-hitter oracle for efficient
+         generative inference of large language models, 2023.
+
+
+                                                                                              18
+ [8] Yuhong Li, Yingbing Huang, Bowen Yang, Bharat Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle Cai, Patrick
+     Lewis, and Deming Chen. Snapkv: Llm knows what you are looking for before generation, 2024.
+ [9] Zefan Cai., Yichi Zhang, Bofei Gao, Yuliang Liu, Tianyu Liu, Keming Lu, Wayne Xiong, Yue Dong, Baobao
+     Chang, Junjie Hu, and Wen Xiao. Pyramidkv: Dynamic kv cache compression based on pyramidal information
+     funneling, 2024.
+[10] Tianyi Zhang, Jonah Yi, Zhaozhuo Xu, and Anshumali Shrivastava. Kv cache is 1 bit per channel: Efficient large
+     language model inference with coupled quantization, 2024.
+[11] Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W. Mahoney, Yakun Sophia Shao, Kurt Keutzer,
+     and Amir Gholami. Kvquant: Towards 10 million context length llm inference with kv cache quantization, 2024.
+[12] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Daniel Y. Fu, Zhiqiang Xie, Beidi
+     Chen, Clark Barrett, Joseph E. Gonzalez, Percy Liang, Christopher Ré, Ion Stoica, and Ce Zhang. Flexgen:
+     High-throughput generative inference of large language models with a single gpu, 2023.
+[13] Saurabh Goyal, Anamitra R. Choudhury, Saurabh M. Raje, Venkatesan T. Chakaravarthy, Yogish Sabharwal, and
+     Ashish Verma. Power-bert: Accelerating bert inference via progressive word-vector elimination, 2020.
+[14] Hanrui Wang, Zhekai Zhang, and Song Han. Spatten: Efficient sparse attention architecture with cascade token
+     and head pruning. In 2021 IEEE International Symposium on High-Performance Computer Architecture (HPCA).
+     IEEE, February 2021.
+[15] Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Jiawei Han, and Jianfeng Gao. Model tells you what to
+     discard: Adaptive kv cache compression for llms, 2024.
+[16] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-efficient
+     exact attention with io-awareness, 2022.
+[17] Piotr Nawrot, Adrian Łańcucki, Marcin Chochowski, David Tarjan, and Edoardo M. Ponti. Dynamic memory
+     compression: Retrofitting llms for accelerated inference, 2024.
+[18] Yuhui Xu, Zhanming Jie, Hanze Dong, Lei Wang, Xudong Lu, Aojun Zhou, Amrita Saha, Caiming Xiong, and
+     Doyen Sahoo. Think: Thinner key cache by query-driven pruning, 2024.
+[19] Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebrón, and Sumit Sanghai. Gqa:
+     Training generalized multi-query transformer models from multi-head checkpoints, 2023.
+
+
+
+
+                                                        19
+

@@ -1,0 +1,525 @@
+                                                     TIDE: Token-Informed Depth Execution for
+                                                       Per-Token Early Exit in LLM Inference
+
+
+                                                                 Jaber Jaber∗                               Osama Jaber
+                                                                RightNow AI                                 RightNow AI
+                                                            jaber@rightnowai.co                         osama@rightnowai.co
+arXiv:2603.21365v1 [cs.LG] 22 Mar 2026
+
+
+
+
+                                                                                         Abstract
+                                                     Large language models run every token through every layer, regardless of difficulty.
+                                                     A function word like “the” receives the same 32-layer treatment as a reasoning
+                                                     step in a math derivation. We present T IDE, a post-training system that attaches
+                                                     tiny learned routers at periodic checkpoint layers and, at inference time, selects
+                                                     the earliest layer whose hidden state has converged for each token. T IDE requires
+                                                     no model retraining, works with any HuggingFace causal LM, auto-detects GPU
+                                                     architecture, and supports float32, float16, and bfloat16 through fused CUDA
+                                                     kernels. On an NVIDIA A100 with DeepSeek R1 Distill 8B, T IDE achieves 100%
+                                                     prefill exit rate (5% of tokens exit at layer 11, the remaining at layer 31), reduces
+                                                     prefill latency by 7.2%, and increases single-batch throughput by 6.6%. During
+                                                     autoregressive decoding, 98–99% of tokens exit early while the model correctly
+                                                     solves a multi-step math problem with 95 unique output tokens. On Qwen3 8B
+                                                     (36 layers), throughput improves by 8.1% at batch size 8. Calibration on 2,000
+                                                     WikiText samples takes under 3 minutes and produces a ∼4 MB router checkpoint.
+                                                     The system comprises 1,308 lines of Python and 1,081 lines of CUDA/C++ with 74
+                                                     passing tests. Code and package: https://github.com/RightNow-AI/TIDE
+
+
+                                         1       Introduction
+                                         Transformer-based language models allocate identical compute to every token at every position.
+                                         A 32-layer model performs 32 matrix multiplications per token whether that token carries critical
+                                         semantic content or is a stopword repeated thousands of times in the training corpus. At scale,
+                                         this uniform allocation is wasteful: prior work on representation similarity (Schuster et al., 2022)
+                                         shows that for a large fraction of tokens, intermediate hidden states become nearly identical to the
+                                         final hidden state well before the last layer. The compute spent on those remaining layers produces
+                                         negligible change in the output distribution.
+                                         The cost is concrete. Serving a 70B-parameter model on 8 GPUs costs $3–5 per hour. Prefill latency
+                                         for a 4,096-token prompt on an A100 takes 100–200 ms, and autoregressive decode dominates end-
+                                         to-end latency for long outputs. Reducing depth per token by even a few layers translates directly to
+                                         lower latency, higher throughput, and reduced energy consumption.
+                                         Early exit methods exist but face three gaps. First, encoder-only approaches like DeeBERT (Xin et al.,
+                                         2020) and FastBERT (Liu et al., 2020) target BERT classification and do not generalize to autoregres-
+                                         sive generation with KV caches. Second, methods that require early-exit pretraining (Elhoushi et al.,
+                                             ∗
+                                                 Correspondence: jaber@rightnowai.co
+
+
+                                         37th Conference on Neural Information Processing Systems (NeurIPS 2023).
+2024; Chen et al., 2023b) demand access to the training pipeline and hundreds of GPU-hours, making
+them impractical for users of pretrained checkpoints from model hubs. Third, confidence-based
+heuristics (Zhou et al., 2020; Schuster et al., 2022) use the model’s own softmax entropy as an exit
+signal, which is unreliable for generation where entropy is naturally high.
+T IDE takes a different approach. We train lightweight binary classifiers (routers) on top of frozen
+model hidden states, using cosine similarity between each checkpoint layer and the final layer as the
+convergence signal. Each router is a two-layer MLP with a bottleneck dimension of 128, totaling
+d × 128 + 128 parameters per checkpoint (524,416 parameters for d=4,096). Training takes 100
+epochs of binary cross-entropy on 2,000 WikiText samples, completing in under 3 minutes on a single
+GPU. The resulting router checkpoint is ∼4 MB.
+The key insight is that convergence is a property of the token, not the model. The same model will
+show different convergence patterns for different inputs. A learned router captures this token-level
+signal more reliably than a global heuristic like softmax entropy or patience-based counting.
+Our contributions:
+
+1. A post-training early exit system for autoregressive LLMs that requires no model modification
+   and works with any HuggingFace causal language model (Section 3).
+2. A universal model adapter that auto-probes transformer structure across 17 attribute paths, covering
+   LLaMA, GPT-2, GPT-NeoX, Phi, Falcon, OPT, and any other architecture (Section 3.2).
+3. Fused CUDA kernels for RMSNorm + router evaluation in a single launch, with native fp16/bf16
+   support and 8 template specializations for common hidden dimensions (Section 3.4).
+4. A post-hoc exit strategy for autoregressive generation that preserves KV cache integrity and is
+   compatible with all versions of the transformers library (Section 3.3).
+5. Empirical evaluation on DeepSeek R1 Distill 8B and Qwen3 8B showing 100% prefill exit rate,
+   99% decode exit rate, and up to 8.1% throughput improvement on an A100 (Section 5).
+6. An open-source release with 74 tests, PyPI packaging (pip install tide-inference), and
+   GPU auto-detection from V100 through Blackwell (Section 5.6).
+
+2   Related Work
+Early exit in encoder models. DeeBERT (Xin et al., 2020) adds classifiers at each BERT layer
+and exits when confidence exceeds a threshold. FastBERT (Liu et al., 2020) uses self-distillation to
+train branch classifiers. PABEE (Zhou et al., 2020) introduces patience-based exit: a token exits after
+k consecutive layers agree on the prediction. BranchyNet (Teerapittayanon et al., 2016) pioneered
+exit branches in CNNs and early DNNs. These methods target discriminative tasks and do not handle
+autoregressive generation or KV caches.
+
+Early exit in decoder models. CALM (Schuster et al., 2022) applied confidence-based early exit
+to encoder-decoder T5 models and showed 2–3× speedup on translation. LayerSkip (Elhoushi et al.,
+2024) trains decoder-only models with early-exit loss from scratch using a layer dropout schedule.
+EE-LLM (Chen et al., 2023b) integrates early exit into the pretraining pipeline of large language
+models. Shan et al. (Shan et al., 2024) study early exit as a natural capability of pretrained LLMs
+without additional training. T IDE differs from all of these: it requires no retraining, uses learned
+routers rather than confidence heuristics, and supports any pretrained checkpoint.
+
+Adaptive computation. Graves (Graves, 2016) introduced Adaptive Computation Time (ACT),
+which learns a halting probability per step. Universal Transformers (Dehghani et al., 2019) apply
+ACT to shared-weight transformer layers. Mixture-of-Depths (Raposo et al., 2024) routes tokens
+to skip entire layers during training. ADEPT (Yoo et al., 2026) uses a draft model to decide token
+depth. Han et al. (Han et al., 2022) survey dynamic neural networks broadly. T IDE applies depth-wise
+sparsity post-training, without modifying the model architecture or training procedure.
+
+Speculative decoding. Speculative decoding (Leviathan et al., 2023; Chen et al., 2023a) uses a
+small draft model to generate candidate tokens, then verifies them in parallel with the full model.
+EAGLE (Li et al., 2024) autoregressively generates draft tokens from features. SpecEE (Xu et al.,
+
+
+                                                  2
+                 Table 1: Comparison of early exit systems for transformer models.
+
+        System                                          Decoder Post-training Per-token CUDA Universal
+        DeeBERT (Xin et al., 2020)             ✗                     ✓               ✓             ✗     ✗
+        CALM (Schuster et al., 2022)        Enc-Dec                  ✗               ✓             ✗     ✗
+        LayerSkip (Elhoushi et al., 2024)      ✓                     ✗               ✓             ✗     ✗
+        EE-LLM (Chen et al., 2023b)            ✓                     ✗               ✓             ✗     ✗
+        SkipDecode (Del Corro et al., 2023)    ✓                     ✓               ✗             ✗     ✗
+        MoD (Raposo et al., 2024)              ✓                     ✗               ✓             ✗     ✗
+        T IDE (ours)                           ✓                     ✓               ✓             ✓     ✓
+
+
+                 Calibration (one-time)                               Inference (per request)
+
+                                            1                                Full forward pass 1
+                      Collect hidden states
+                     WikiText-103, 2,000 texts                           all L layers, KV cache intact
+
+
+                        Cosine similarity 2                                Evaluate routers ϕk2
+                     cos(hk , hL ) > 0.98 ?                              at each checkpoint post-hoc
+
+                                                 load
+                                            3                                                      3
+                       Train router MLPs                                    Select earliest exit
+                    BCE loss, Adam, 100 epochs                            first k where ϕk (h) > θ
+
+                      router.pt (∼4 MB)                                    LMHead(Norm(hk ))
+
+
+Figure 1: T IDE system overview. Left: one-time calibration collects hidden states from a frozen
+model, computes per-token cosine similarity to the final layer, and trains a binary router MLP at
+each checkpoint. Right: at inference, the full forward pass runs (preserving the KV cache), then
+routers evaluate each checkpoint post-hoc and select the earliest converged layer for logit computation.
+Numbered steps show execution order.
+
+
+2025) combines speculative decoding with early exit. These methods add a separate draft model.
+T IDE achieves early exit within the target model itself, with no auxiliary model overhead.
+
+KV cache optimization. Layer-Condensed KV Cache (Wu and Tu, 2024) shares KV pairs across
+layers to reduce memory. SkipDecode (Del Corro et al., 2023) skips lower layers during decode,
+accepting the KV cache discontinuity. T IDE runs all layers in post-hoc mode (preserving cache
+integrity) while selecting the exit layer’s hidden state for logit computation.
+
+Routing and conditional computation. Mixture-of-Experts models (Shazeer et al., 2017; Fedus et
+al., 2022) route tokens to different width experts. Conditional computation (Bengio et al., 2013) and
+its survey (Scardapane et al., 2024) study gating mechanisms broadly. Liu et al. (Liu et al., 2024)
+unify layer skipping with learned policies. T IDE applies depth-wise routing: tokens exit at different
+layers rather than being routed to different experts within a layer. The two approaches are orthogonal
+and composable. Zhou et al. (Zhou et al., 2024) survey efficient LLM inference methods broadly.
+Table 1 summarizes the key differences between T IDE and prior early exit systems.
+
+3     Method
+
+T IDE operates in two stages: offline calibration (once per model) and online inference (every request).
+Figure 1 shows the full pipeline. Algorithm 1 details the post-hoc exit evaluation used during
+generation.
+
+3.1   Calibration
+
+Given a pretrained model with L layers and checkpoint interval c, we place routers at layers
+{c−1, 2c−1, . . .}. Calibration proceeds in three steps:
+
+
+                                                              3
+Step 1: Collect hidden states. We run the model on 2,000 texts from WikiText-103 with
+                                                      (i)
+output_hidden_states=True, collecting hidden vectors hk ∈ Rd at each checkpoint layer
+k and the final layer L for every token i.
+Step 2: Compute convergence labels. For each token i at checkpoint k, we compute cosine
+similarity:
+                                           (i)  (i)
+                                  (i)    hk · hL
+                                sk =      (i)    (i)
+                                                                                     (1)
+                                       ∥hk ∥ ∥hL ∥
+                  (i)      (i)
+and assign label yk = 1[sk > τ ] where τ =0.98 by default.
+Step 3: Train routers. Each router ϕk is a two-layer MLP:
+                          ϕk (h) = σ(Wup SiLU(Wdown RMSNorm(h)))                                   (2)
+
+where Wdown ∈ Rb×d , Wup ∈ R1×b , b=128 is the bottleneck dimension, and σ is the sigmoid
+function. We train with Adam (lr=10−3 ) for 100 epochs using binary cross-entropy loss. On an
+A100, calibration for DeepSeek R1 Distill 8B on 339,853 tokens completes in 170 s.
+
+3.2   Universal Model Adapter
+
+To support arbitrary HuggingFace models without per-architecture code, T IDE includes a
+UniversalAdapter that probes model structure at initialization. It searches 17 known attribute
+paths across 5 component types:
+
+• Layers: 5 paths (model.layers, transformer.h, transformer.layers, gpt_neox.layers,
+  model.decoder.layers) plus largest-ModuleList fallback.
+• Final norm: 5 paths plus sibling-of-layers heuristic.
+• LM head: 2 paths plus vocab-size shape matching.
+• Embedding: 5 paths plus vocab-size shape matching.
+• Hidden dimension: model.config.hidden_size (universal across all HuggingFace models).
+
+This covers LLaMA, Mistral, Qwen, GPT-2, GPT-NeoX, Phi, Falcon, OPT, and Gemma without
+per-model adapter code. Users can also register custom adapters via register_adapter().
+
+3.3   Post-Hoc Generation
+
+During autoregressive generation, each decode step runs the full model forward pass with
+output_hidden_states=True. After the forward completes, routers evaluate each checkpoint
+layer’s hidden state and select the earliest layer where the score exceeds threshold θ. T IDE computes
+the logits from that layer’s hidden state rather than the final layer’s.
+This design has two advantages. First, all layers run on every step, so the KV cache is always
+fully populated. This eliminates the cache corruption issue that plagues exception-based or hook-
+based early exit approaches. Second, it is compatible with any version of the transformers
+library, including v5.3+ which wraps decoder layers with output-capturing decorators that intercept
+exceptions.
+
+3.4   CUDA Kernels
+
+T IDE includes four fused CUDA kernels registered via TORCH_LIBRARY:
+
+1. Fused LayerNorm + Route: RMSNorm, down-projection, SiLU, up-projection, and sigmoid in a
+   single kernel launch. Tiled dot products and warp-level reductions via __shfl_xor_sync.
+2. Batch Compact: Separates continuing and exiting tokens using warp balloting (__ballot_sync)
+   for small batches and prefix-sum scatter for large batches.
+3. Exit Scatter: Copies exited hidden states to their original positions in the output buffer.
+4. Exit Projection: Fused RMSNorm + scatter for exited tokens.
+
+
+                                                  4
+Algorithm 1 Post-hoc exit evaluation during generation
+Require: Model M , routers {ϕk }, threshold θ, input x
+ 1: out ← M (x, output_hidden_states=True)
+ 2: H ← out.hidden_states {[h0 , h1 , . . . , hL ]}
+ 3: for k in sorted checkpoint layers do
+ 4:   if k < kmin then
+ 5:      continue
+ 6:   end if
+ 7:   s ← ϕk (H[k+1])
+ 8:   if s > θ for all tokens in batch then
+ 9:      return LMHead(RMSNorm(H[k+1]))
+10:   end if
+11: end for
+12: return out.logits {no early exit}
+
+
+Table 2: Kernel template specializations. Each entry compiles a dedicated kernel for the given
+hidden/bottleneck dimension pair.
+
+                        Target Model                 Hidden Dim   Bottleneck
+                        Phi-2 / TinyLlama              2048           64
+                        Phi-2 / TinyLlama              2048          128
+                        Phi-3-mini                     3072          128
+                        LLaMA-8B / Mistral-7B          4096          128
+                        LLaMA-8B / Mistral-7B          4096          256
+                        LLaMA-13B                      5120          128
+                        LLaMA-70B / Qwen-72B           8192          128
+                        LLaMA-70B / Qwen-72B           8192          256
+
+
+
+All kernels are templated on scalar_t with explicit instantiations for float, __half, and
+__nv_bfloat16. Accumulation stays in float32. Router weights remain in float32 (tiny, always in
+L2 cache). The fused layernorm-route kernel includes 8 template specializations for common hidden
+dimensions (2048, 3072, 4096, 5120, 8192) and bottleneck dimensions (64, 128, 256), plus a generic
+fallback. Table 2 lists the full set of specializations.
+
+
+4   Technical Details
+
+Block reduction broadcast. The block_reduce_sum primitive, shared across all kernels via
+dtype_utils.cuh, performs warp-level reduction followed by cross-warp reduction in shared
+memory. A critical detail: after the final warp reduces across warps, only thread 0 holds the result.
+We broadcast it by writing to shared[0] and issuing __syncthreads(), ensuring all 256 threads
+in the block read the correct variance for RMSNorm normalization.
+
+
+Library loading. Because the CUDA extension uses TORCH_LIBRARY registration (not PyInit),
+standard import TIDE._C may fail. T IDE falls back to torch.ops.load_library() to load the
+compiled .so, then dispatches via torch.ops.tide.*. This works across pip install (wheel),
+pip install -e (editable), and build_ext –inplace installations.
+
+
+GPU auto-detection. setup.py detects the target GPU architecture in pri-
+ority order:         TIDE_CUDA_ARCH env var,             TORCH_CUDA_ARCH_LIST env var,
+torch.cuda.get_device_capability() at build time, or a broad fallback (sm_70 through
+sm_120 with PTX). If compilation fails (missing compiler, wrong CUDA version), T IDE falls back
+to pure Python with no CUDA kernels.
+
+
+                                                 5
+                    Table 3: Prefill exit rates on 16 real text prompts (A100, bf16).
+
+            Model                     Layers     θ Tokens Exit% Distribution
+            DeepSeek R1 Distill 8B    32       0.85       322   100%   L11:16, L31:306
+            DeepSeek R1 Distill 8B    32       0.50       322   100%   L11:16, L31:306
+            Qwen3 8B                  36       0.85       155   100%   L35:155
+            Qwen3 8B                  36       0.50       155   100%   L11:11, L23:5, L35:139
+
+
+Table 4: Prefill latency and throughput (A100, bf16, 20 runs). ∆ is relative to vanilla model baseline.
+
+                 Model               Metric                Baseline      T IDE       ∆
+                 DeepSeek R1 8B Latency (θ=0.85) 39.08 ms     36.94 ms −5.5%
+                 DeepSeek R1 8B Latency (θ=0.50) 39.08 ms     36.26 ms −7.2%
+                 DeepSeek R1 8B Throughput BS=1 973 tok/s 1,037 tok/s +6.6%
+                 DeepSeek R1 8B Throughput BS=8 8,668 tok/s 7,252 tok/s −16.3%
+                 Qwen3 8B            Latency (θ=0.85) 46.82 ms     44.14 ms −5.7%
+                 Qwen3 8B            Throughput BS=1 258 tok/s     271 tok/s +5.0%
+                 Qwen3 8B            Throughput BS=8 1,781 tok/s 1,926 tok/s +8.1%
+
+
+
+5     Experimental Evaluation
+
+Setup. All experiments run on a single NVIDIA A100-SXM4-40GB (sm_80, 80 GB HBM2e) with
+CUDA 12.4, PyTorch 2.10, and transformers 5.3. Models are loaded in bfloat16. Calibration
+uses 2,000 WikiText-103 samples with checkpoint interval c=4 and convergence threshold τ =0.98.
+Latency measurements average 20 runs after 3 warmup iterations. We evaluate on 16 prompts: 8
+reasoning/math and 8 general knowledge.
+
+
+5.1   Prefill Exit Rates
+
+Table 3 shows that 100% of tokens find an exit point across all tested thresholds. On DeepSeek R1
+Distill 8B, 5% of tokens (16 out of 322) exit at layer 11, only one-third through the 32-layer model.
+Qwen3 8B shows exits distributed across three checkpoint layers at aggressive thresholds.
+
+
+5.2   Latency and Throughput
+
+Table 4 presents latency and throughput measurements. T IDE reduces prefill latency by 5.5–7.2%
+on DeepSeek R1 and 5.7% on Qwen3. The improvement comes from the post-hoc output selection:
+exited tokens bypass the final-layer normalization path, and the fused CUDA kernel evaluates all
+routers in fewer kernel launches than separate PyTorch operations would require.
+At batch size 8 on Qwen3, throughput improves by 8.1% (1,781 to 1,926 tokens/sec). DeepSeek
+R1 shows 6.6% improvement at batch size 1 but negative scaling at batch size 8 (−16.3%), likely
+because the output_hidden_states overhead grows superlinearly with batch size for this model’s
+attention implementation.
+
+
+5.3   Generation Quality
+
+Table 5 shows decode-time exit rates on a multi-step math word problem (“A store sells apples for
+$2 each and oranges for $3 each. If I buy 10 fruits and spend $24, how many of each did I buy?”),
+generating 256 tokens with temperature 0.
+At θ=0.85, 98.4% of decode tokens exit early (all at layer 31). The output correctly sets up and
+solves the system of equations with 95 unique tokens (vs. 99 for the baseline). Lowering θ to 0.50
+pushes the exit rate to 99.6% with no quality degradation: the same 95 unique tokens and correct
+mathematical reasoning.
+
+
+                                                      6
+Table 5: Decode exit rates and output quality on a math word problem (DeepSeek R1 Distill 8B, 256
+tokens, temperature=0, A100).
+
+                      θ           Exit Rate    Unique Tokens            Correct          Exit Layer
+                      1.0 (off)        0%                      99               ✓        —
+                      0.85          98.4%                      95               ✓        L31
+                      0.70          99.2%                      95               ✓        L31
+                      0.50          99.6%                      95               ✓        L31
+
+
+                                      “the” “cat” “sat”
+                                          Layers 1 – 7
+
+                                     Router ϕ8 : score > θ ?
+                                                                                      exit L8 → skip 24 layers
+               8+16+32
+                                              Layers 9 – 15                     ŷ1
+                = 56 ops
+                 (vs. 96)
+                                              Router ϕ16
+                                                                                      exit L16 → skip 16 layers
+                                                    L17 – 32                    ŷ2
+
+                                                               full depth (32 layers)
+                                                      ŷ3
+
+
+Figure 2: Per-token early exit in a 32-layer model. Token “the” converges at layer 8 and skips the
+remaining 24 layers. Token “cat” exits at layer 16. Only “sat” requires full depth. T IDE evaluates the
+routers ϕk post-hoc after the full forward pass completes.
+
+
+5.4   Per-Token Exit Visualization
+
+Figure 2 illustrates the core mechanism on a 32-layer model. Three tokens enter the model; a router
+at layer 8 identifies “the” as converged and records its exit. The remaining two tokens continue to
+layer 16, where “cat” exits. Only “sat” (a semantically loaded token) runs through all 32 layers.
+The total compute is 8 + 16 + 32 = 56 layer-ops instead of 3 × 32 = 96, a 42% reduction for
+this example. In practice, with the strict convergence threshold τ =0.98, most exits cluster at the
+penultimate checkpoint (L31 for a 32-layer model), but early exits at L11 account for 5% of tokens
+on DeepSeek R1 Distill 8B.
+
+5.5   Convergence Analysis
+
+Calibration on 2,000 WikiText samples with τ =0.98 reveals that 100% of tokens converge at the
+penultimate checkpoint in every model tested. DeepSeek R1 Distill 8B: 339,853 tokens, all converging
+at L31. Qwen3 8B: 314,530 tokens, all at L35. GPT-2 (124M, 12 layers): 78,843 tokens, all at L11.
+The strict threshold explains why most exits cluster at the last checkpoint. Lowering τ to 0.95 or 0.90
+would label more tokens as converged at earlier layers, enabling deeper exit distributions.
+
+5.6   Open-Source Release
+
+T IDE is released as pip install tide-inference on PyPI and at https://github.com/
+RightNow-AI/TIDE under the Apache 2.0 license. The package totals 3,097 lines (1,308 Python,
+1,081 CUDA/C++, 708 tests) with 74 passing tests covering adapters, calibration, CUDA kernel
+numerical equivalence across fp32/fp16/bf16, and end-to-end runtime. GPU architecture is auto-
+detected at install time, supporting V100 through Blackwell. If CUDA compilation fails, the system
+falls back to pure Python.
+
+
+6     Limitations and Future Work
+
+T IDE’s post-hoc mode runs all layers on every step, selecting only which layer’s output to use. This
+produces correct results and preserves the KV cache, but does not achieve wall-clock layer skipping.
+A true skip mode (physically bypassing layers) would require managing cache discontinuities and is
+a target for future work.
+
+
+                                                       7
+The convergence threshold τ =0.98 is conservative. Nearly all tokens converge only at the penultimate
+checkpoint, concentrating exits at one layer. A schedule that decreases τ for deeper checkpoints, or
+per-layer threshold tuning, could unlock earlier exits.
+We evaluate on 8B-class models with 32–36 layers. The exit rate should increase with model depth
+(70B+ models have 80+ layers with more redundant computation), but we have not yet validated this
+empirically on multi-GPU setups.
+The output_hidden_states overhead becomes a bottleneck at large batch sizes, as shown by the
+negative throughput delta at BS=8 for DeepSeek R1 (Table 4). A hybrid approach that activates
+hidden state collection only at checkpoint layers would reduce this cost.
+
+7   Conclusion
+T IDE demonstrates that post-training per-token early exit is practical for autoregressive LLM inference.
+On DeepSeek R1 Distill 8B, 100% of prefill tokens exit early and 99% of decode tokens exit at
+layer 31 while preserving correct mathematical reasoning. The system works with any HuggingFace
+model, auto-detects GPU architecture from V100 through Blackwell, and ships as a 3,097-line
+open-source package with 74 passing tests. Code: https://github.com/RightNow-AI/TIDE.
+PyPI: pip install tide-inference.
+
+References
+Yoshua Bengio, Nicholas Léonard, and Aaron Courville. Estimating or propagating gradients through
+  stochastic neurons for conditional computation. arXiv:1308.3432, 2013.
+
+Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre, and John
+  Jumper. Accelerating large language model decoding with speculative sampling. arXiv:2302.01318,
+  2023.
+
+Yanxi Chen, Xuchen Pan, Yaliang Li, Bolin Ding, and Jingren Zhou. EE-LLM: Large-scale training
+  and inference of early-exit large language models with 3D parallelism. arXiv:2312.04916, 2023.
+
+Mostafa Dehghani, Stephan Gouws, Oriol Vinyals, Jakob Uszkoreit, and Łukasz Kaiser. Universal
+ Transformers. ICLR, 2019.
+
+Luciano Del Corro, Allie Del Giorno, Sahaj Agarwal, Bin Yu, Ahmed Awadallah, and Subhabrata
+  Mukherjee. SkipDecode: Autoregressive skip decoding with batching and caching for efficient
+  LLM inference. arXiv:2307.02628, 2023.
+
+Mostafa Elhoushi, Akshat Shrivastava, Diana Liskovich, Basil Hosmer, Bram Wasti, Liangzhen
+ Lai, Anas Mahmoud, Bilge Acun, Saurabh Agarwal, Ahmed Roman, et al. LayerSkip: Enabling
+ early-exit inference and self-speculative decoding. ACL, 2024.
+
+William Fedus, Barret Zoph, and Noam Shazeer. Switch Transformers: Scaling to trillion parameter
+ models with simple and efficient sparsity. JMLR, 23(120):1–39, 2022.
+
+Alex Graves. Adaptive computation time for recurrent neural networks. arXiv:1603.08983, 2016.
+
+Yizeng Han, Gao Huang, Shiji Song, Le Yang, Honghui Wang, and Yulin Wang. Dynamic neural
+  networks: A survey. IEEE Transactions on Pattern Analysis and Machine Intelligence, 44(11):7436–
+  7456, 2022.
+
+Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative
+  decoding. ICML, 2023.
+
+Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. EAGLE: Speculative sampling requires
+  rethinking feature uncertainty. ICML, 2024.
+
+Weijie Liu, Peng Zhou, Zhiruo Wang, Zhe Zhao, Haotang Deng, and Qi Ju. FastBERT: a self-distilling
+ BERT with adaptive inference time. ACL, 2020.
+
+
+                                                   8
+Yijin Liu, Fandong Meng, and Jie Zhou. Accelerating inference in large language models with a
+  unified layer skipping strategy. arXiv:2404.06954, 2024.
+Jiaming Xu, Jiayi Pan, Yongkang Zhou, Siming Chen, Jinhao Li, Yaoxiu Lian, Junyi Wu, and Guohao
+   Dai. SpecEE: Accelerating large language model inference with speculative early exiting. ISCA,
+   2025.
+David Raposo, Sam Ritter, Blake Richards, Timothy Lillicrap, Peter Conway Humphreys, and Adam
+  Santoro. Mixture-of-Depths: Dynamically allocating compute in transformer-based language
+  models. arXiv:2404.02258, 2024.
+Simone Scardapane, Alessandro Baiocchi, Alessio Devoto, Valerio Marsocci, Pasquale Minervini,
+  and Jary Pomponi. Conditional computation in neural networks: principles and research trends.
+  arXiv:2403.07965, 2024.
+Tal Schuster, Adam Fisch, Jai Gupta, Mostafa Dehghani, Dara Bahri, Vinh Q. Tran, Yi Tay, and
+  Donald Metzler. Confident Adaptive Language Modeling. NeurIPS, 2022.
+Weiqiao Shan, Long Meng, Tong Zheng, Yingfeng Luo, Bei Li, Junxin Wang, Tong Xiao, and Jingbo
+ Zhu. Early exit is a natural capability in transformer-based models: An empirical study on early
+ exit without joint optimization. arXiv:2412.01455, 2024.
+Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le, Geoffrey Hinton, and
+  Jeff Dean. Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. ICLR,
+  2017.
+Surat Teerapittayanon, Bradley McDanel, and H. T. Kung. BranchyNet: Fast inference via early
+  exiting from deep neural networks. ICPR, 2016.
+Haoyi Wu and Kewei Tu. Layer-Condensed KV Cache for efficient inference of large language
+  models. ACL, 2024.
+Ji Xin, Raphael Tang, Jaejun Lee, Yaoliang Yu, and Jimmy Lin. DeeBERT: Dynamic early exiting for
+   accelerating BERT inference. ACL, 2020.
+Sangmin Yoo, Srikanth Malla, Chiho Choi, Wei D. Lu, and Joon Hee Choi. ADEPT: Adaptive
+  dynamic early-exit process for transformers. arXiv:2601.03700, 2026.
+Wangchunshu Zhou, Canwen Xu, Tao Ge, Julian McAuley, Ke Xu, and Furu Wei. BERT loses
+ patience: Fast and robust inference with early exit. NeurIPS, 2020.
+Zixuan Zhou, Xuefei Ning, Ke Hong, Tianyu Fu, Jiaming Xu, Shiyao Li, Yuming Lou, Luning
+  Wang, Zhihang Yuan, Xiuhong Li, et al. A survey on efficient inference for large language models.
+  arXiv:2404.14294, 2024.
+
+
+
+
+                                                9
+

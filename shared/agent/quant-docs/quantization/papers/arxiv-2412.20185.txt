@@ -1,0 +1,1432 @@
+                                                  DecDEC: A Systems Approach to Advancing Low-Bit LLM Quantization
+
+                                                                    Yeonhong Park*         Jake Hyun*      Hojoon Kim          Jae W. Lee
+                                                                                          Seoul National University
+arXiv:2412.20185v2 [cs.LG] 24 Jun 2025
+
+
+
+
+                                                                    Abstract                               limitations and inference latency. The importance of quanti-
+                                                                                                           zation is pronounced for on-device deployments, where strict
+                                         Quantization of Large Language Models (LLMs) has recently         memory budgets often make model compression mandatory
+                                         gained popularity, particularly for on-device settings with       rather than optional. These scenarios typically require careful
+                                         limited hardware resources. While efficient, quantization in-     tuning of quantization levels to achieve an optimal balance
+                                         evitably degrades model quality, especially in aggressive low-    between model size and quality [8, 14, 15, 58, 61].
+                                         bit settings such as 3-bit and 4-bit precision. In this paper,
+                                                                                                              While quantization may allow gigantic LLMs to fit into
+                                         we propose DecDEC, an inference scheme that improves the
+                                                                                                           small-memory devices, it often leads to model quality degra-
+                                         quality of low-bit LLMs while preserving the key benefits
+                                                                                                           dation due to the inevitable loss of information. This is espe-
+                                         of quantization: GPU memory savings and latency reduction.
+                                                                                                           cially true for low-bit settings, such as 3-bit and 4-bit quanti-
+                                         DecDEC stores the residual matrix—the difference between
+                                                                                                           zation, which are often used to accommodate the parameter
+                                         full-precision and quantized weights—in CPU, and dynam-
+                                                                                                           sizes of LLMs [19,30,35]. This raises a key research question
+                                         ically fetches the residuals for only a small portion of the
+                                                                                                           that this paper addresses: given a quantized LLM configured
+                                         weights. This portion corresponds to the salient channels,
+                                                                                                           with the best possible effort under the memory budget, is there
+                                         marked by activation outliers, with the fetched residuals help-
+                                                                                                           a way to recover the quality loss caused by quantization?
+                                         ing to correct quantization errors in these channels. Salient
+                                                                                                              Leveraging external memory offers a potential solution
+                                         channels are identified dynamically at each decoding step by
+                                                                                                           to this problem. Specifically, on heterogeneous computing
+                                         analyzing the input activations—this enables adaptation to
+                                                                                                           platforms where the CPU and GPU are connected via a
+                                         the dynamic nature of activation distribution, thus maximiz-
+                                                                                                           PCIe interconnect—a common architecture in desktops and
+                                         ing the effectiveness of error compensation. We demonstrate
+                                                                                                           laptops—CPU memory becomes a viable option. Additional
+                                         the effectiveness of DecDEC by augmenting state-of-the-art
+                                                                                                           information that may be used to mitigate quantization errors
+                                         quantization methods. For example, DecDEC reduces the per-
+                                                                                                           can be stored in CPU memory and fetched at runtime, avoid-
+                                         plexity of a 3-bit Llama-3-8B-Instruct model from 10.15 to
+                                                                                                           ing any additional GPU memory overhead.
+                                         9.12—outperforming its 3.5-bit counterpart—while adding
+                                         less than 0.0003% to GPU memory usage and incurring only             However, utilizing CPU memory for GPU inference
+                                         a 1.7% inference slowdown on NVIDIA RTX 4050 Mobile.              presents a critical challenge: the slow data transfer between
+                                                                                                           the CPU and GPU can create a bottleneck for inference la-
+                                                                                                           tency. To mitigate this issue, the volume of data transferred
+                                         1     Introduction                                                must be carefully controlled. Therefore, designing a system
+                                                                                                           that effectively utilizes CPU memory requires the identifi-
+                                         Recent advancements in Large Language Models (LLMs)               cation of the minimal set of additional information that can
+                                         based on the Transformer architecture [59] have shown great       substantially enhance the quality of quantized models, while
+                                         potential to reshape our daily lives [7,39,43,55,56]. However,    keeping the impact on latency minimal.
+                                         their deployment costs pose a significant challenge, as large        A clue for this problem comes from the well-known fact
+                                         model sizes increase memory requirements and latency, limit-      that not all channels in the weight matrix are equally impor-
+                                         ing their use cases [60]. Quantization is a promising solution    tant for quantization. Some channels, referred to as salient
+                                         for reducing the LLM deployment costs [27, 69]. By lower-         channels, are more critical, primarily due to the presence of
+                                         ing the model precision, quantization addresses both memory       activation outliers [6, 10, 24]. When certain input activation
+                                                                                                           values are particularly large, the quantization errors in the cor-
+                                             * Equal contribution                                          responding weight channels—those multiplied by these large
+activation values—are amplified, making the channels salient.                                   computer      science       researcher
+By identifying these channels and selectively fetching error               Linear 4
+                                                                            (down proj)
+
+compensation terms from CPU memory, we can maximize                       Activation Func
+                                                                                                Decoder       Decoder       Decoder
+the quality boost while minimizing data transfer.                          Linear 3
+                                                                           (gate/up proj)
+
+
+
+
+                                                                                                       ...
+
+
+
+
+                                                                                                                 ...
+
+
+
+
+                                                                                                                                  ...
+   Hence, the identification of the salient channels is essen-            Normalization
+
+tial for overcoming the bandwidth limitation, allowing for                                      Decoder       Decoder       Decoder
+                                                                           Linear 2                                                      ...
+                                                                           (output proj)
+the transfer of only impactful information. Previous works
+                                                                          Self-Attention
+that attempt to improve quantization algorithms by address-                                     Decoder       Decoder       Decoder
+                                                                           Linear 1
+ing activation outliers analyze the activation value distribu-             (Q/K/V proj)
+                                                                                                              computer       science
+                                                                          Normalization         I     am a
+tion on a calibration data to predetermine the salient chan-
+                                                                                                    Prefill              Decode
+nels [10,26,32,35]. This approach is suboptimal as it statically
+designates certain channels as salient throughout the infer-                                Figure 1: LLM inference.
+ence, while the real distribution of activation values—and thus
+the distribution of salient channels—changes dynamically at
+each decoding step. Accounting for this dynamic nature is               LLM inference involves two phases: prefill and decode.
+crucial for the accurate identification of salient channels.        In the prefill phase, all input tokens (e.g., ’I’, ’am’, ’a’) are
+   Thus, in this paper, we introduce DecDEC (Decoding with          processed in parallel to generate a single output token (e.g.,
+Dynamic Error Compensation), an inference scheme for quan-          ’computer’). The decode phase begins subsequently, where
+tized LLMs that dynamically identifies salient channels and         the output token of the previous step is fed back into the
+compensates for quantization errors in these channels, in real      model to generate the next token, repeated until the end of the
+time. DecDEC enhances model quality while fully preserving          sequence. This sequential nature of the decode phase makes
+the two main benefits of quantization: GPU memory savings           it the primary latency bottleneck.
+and latency reduction. To achieve this, DecDEC stores the               The decode phase is particularly memory-bound, as only
+residuals of the quantized weight matrices in CPU memory,           one token is processed at a time, reducing the linear layers to
+fetching only the parts that correspond to the dynamically          GEMV operations. In data center settings, this issue can be
+identified salient channels for error compensation. Although        alleviated by batching together multiple queries [31,66]. How-
+small in size, these residuals provide a significant quality        ever, this usually cannot be applied to on-device inference,
+boost. This dynamic error compensation is performed concur-         where LLMs serve only individual users.
+rently with inference by an optimized GPU kernel, ensuring
+that all additional operations are seamlessly integrated into the
+existing workflow, minimizing inference slowdown. Below             2.2       LLM Quantization
+are the key contributions of our work:                              Quantization for LLMs—a popular compression technique
+    • We provide an in-depth analysis on the dynamic nature         that reduces both memory usage and inference latency—can
+      of activation outliers in LLM inference.                      be categorized into two main types [27,69]: weight-activation
+                                                                    quantization [10, 33, 36, 49, 64, 65] and weight-only quanti-
+    • We present DecDEC, an inference scheme that enhances          zation [9, 11, 12, 17, 19, 29, 30, 32, 35, 57]. Each are suited to
+      quantized LLMs by dynamically identifying salient chan-       different inference scenarios. Weight-activation quantization
+      nels and compensating quantization errors in them.            is primarily used in datacenter settings, where both mem-
+                                                                    ory and computational costs must be minimized to improve
+    • We introduce a tuner for DecDEC that recommends sys-
+                                                                    throughput. Quantizing both weights and activations allows
+      tem parameters to satisfy a target latency bound.
+                                                                    for the efficient use of low-precision arithmetic units (e.g.,
+    • We evaluate DecDEC across five different consumer-            INT4, INT8, FP8) available on modern GPUs [1]. In contrast,
+      grade GPUs, demonstrating significant quality improve-        for on-device inference, weight-only quantization is the pre-
+      ment with minimal memory and latency overhead.                ferred approach [30, 69]. In this apporach, quantized weights
+                                                                    are loaded from memory and dequantized on-the-fly to full
+                                                                    precision (i.e., FP16), before being multiplied with the full-
+2     Background
+                                                                    precision activations [44]. Though it only reduces memory
+                                                                    traffic, this is sufficient to speed up on-device inference where
+2.1    LLM Inference
+                                                                    memory is the bottleneck, as discussed in Section 2.1.
+Figure 1 presents a description of the modern LLM architec-            Weight-only quantization can be further divided into two
+ture and its inference flow. LLMs consist of multiple Trans-        sub-categories: quantization-aware training (QAT) [11,29,36],
+former decoder blocks [59], each containing multiple linear         and post-training quantization (PTQ) [9, 12, 17, 19, 30, 32, 35,
+layers, which account for most of the inference time, along-        57]. While QAT yields better results by retraining to reduce
+side other components like self-attention and normalization.        quantization errors, its cost makes it impractical for many end-
+    (LP)DDR ~70 GB/s              ~32 GB/s         ~1 TB/s   GDDR                          -3   0    -1   3       -3.2 0.2 -1.0 3.1
+            I
+    C (= G- G)
+                        CPU         PCIe     GPU             I J
+                                                             G,                             3   3    -2   1       2.8 3.7 -2.0 1.3
+                                                                     1.1 -0.2 -3.0 0.7 *
+                 Selected Residuals (C⨀E)                                                   2   -1   1    1       1.7 -1.1 1.2 0.5
+
+ Figure 2: CPU-augmented inference for quantized LLMs.                                     -4 -3     0    2       -4.0 -2.7 0.4 2.1
+
+                                                                            x                    #
+                                                                                                 W                       W
+users [30,69]. As a result, PTQ—requiring no retraining—has
+                                                                      Figure 3: Activation outlier issue in weight quantization.
+become the preferred method for on-device LLM inference.
+Therefore, in this paper, we specifically focus on weight-only
+PTQ for on-device inference.                                        tized LLMs is determining a subset of residuals, or mask M.
+                                                                    A good mask M should: 1) select portions of the residuals
+3     Augmenting Quantized LLM with CPU                             that contribute most to improving model quality within the
+                                                                    bandwidth constraints, and 2) maintain a structured form that
+      Memory
+                                                                    minimizes indexing overhead and ensures effective residual
+In this section, we propose leveraging CPU memory—an of-            transfer, while enabling efficient processing on the GPU.
+ten underutilized resource in LLM inference, as GPUs are the
+de facto standard processors for this workload—as a means to        3.2 Opportunity: Not All Residuals Are
+augment quantized LLMs. Section 3.1 introduces the concept
+                                                                        Equally Important
+of CPU-augmented quantized LLMs while Section 3.2 and
+Section 3.3 explore its opportunities and challenges.               Some residuals are more important than others—an opportu-
+                                                                    nity that can be leveraged to determine M. This opportunity
+3.1      Concept                                                    arises from the presence of activation outliers (i.e., activation
+                                                                    values with large magnitudes), a well-known phenomenon in
+Goal. We aim to leverage CPU memory to improve quantized            LLM inference [6, 10, 24, 26, 32, 35]. When certain activation
+LLM quality without additional GPU memory costs. Quanti-            values are noticeably large, even small quantization errors
+zation trades model quality for a smaller memory footprint.         in the corresponding weight channels can be multiplied and
+In constrained settings, practitioners optimize this trade-off      amplified, leading to considerable perturbations in the out-
+within a fixed GPU memory budget by selecting a uniform             put. Figure 3 illustrates this issue. In this example, the third
+bitwidth or applying fine-grained strategies such as layer-         input channel (third row) of the weight matrix is multiplied
+wise [8, 14, 15] or channel-wise [58, 61] allocation. Our goal      by the activation outlier, -3.0. We refer to such channels as
+is to then further improve quality post hoc by utilizing CPU        salient channels. Constructing M at the input channel granu-
+memory, without increasing GPU memory usage.                        larity based on the magnitude of input activations can satisfy
+Basic Mechanism. Figure 2 illustrates our concept of leverag-       two key conditions for an effective mask: selecting impactful
+ing CPU memory to enhance quantized LLMs. We primarily              portions of the residuals and maintaining a structured form.
+target desktop or laptop platforms, where the GPU is con-              Indeed, compensating for errors in salient channels using
+nected to the CPU via a PCIe interconnect. As in conventional       the corresponding residuals is highly effective. Figure 4 illus-
+inference systems, the quantized weight parameters (c  W) and       trates how the quantization error, defined as the mean squared
+activations (x) are kept in GPU memory. The difference here         error between the computation result with FP16 weights (Wx)
+is that R—the residual between the original full-precision          and quantized weights (c   Wx), is reduced by sequentially re-
+weights and the quantized weights—is stored in CPU mem-             placing the input channels of the quantized weight with their
+ory. During the decode phase, residuals are fetched from the        corresponding FP16 values. For this analysis, we evaluate 3-
+CPU to help compensate for quantization errors, potentially         bit and 4-bit versions of the LLaMA-3-8B-Instruct model [16],
+improving model quality. Due to the limited bandwidth of            quantized using the state-of-the-art method AWQ [35], with a
+PCIe, which is typically an order of magnitude lower than           text sample from the C4 dataset [47] as the input prompt. All
+GPU memory bandwidth (e.g., 32 GB/s vs. 1 TB/s), fetching           four linear layers in the 8th, 16th, and 24th decoder blocks
+the entire residual matrix would incur a prohibitive latency        are included in this evaluation. The quantization errors for
+bottleneck. Therefore, only a small subset of residuals should      both the 3-bit and 4-bit models drop rapidly when we pro-
+be fetched in a selective manner. In short, this process aug-       gressively compensate for channels in descending order of
+ments each linear operation of quantized LLM from c     Wx to       their activation magnitudes (solid red and solid blue lines).
+ W + R ⊙ M)x, where M is a binary mask that sparsifies R.
+(c                                                                  This trend closely follows the activation magnitude distribu-
+Key Research Question. A key research question in design-           tion (solid black line), which represents the sorted activation
+ing an effective CPU-augmented inference system for quan-           magnitudes in descending order. In contrast, the reduction in
+                                 QKV                   Output                  Gate/Up                 Down                                              100                                                     1.0
+                                                                      10                 4                     0.4                                        80                                                     0.8                Top 1%
+
+
+
+
+                                                                                                                                                                                                   Recall Rate
+                        10                   0.4                0.5                                                                                                                                                                 Top 5%
+
+
+
+
+                                                                                                                                            8th Block
+8th Block
+
+
+                                         5                                                   0.5                                                          60                                                     0.6
+
+
+
+
+                                                                                                                                              Steps
+  Error
+
+
+                        5                    0.2                      5                  2                     0.2                                        40                                                     0.4
+                        0                0 0.0                  0.0 0                    0 0.0                 0.0                                        20                                                     0.2
+
+
+
+
+                                                                                                                     Activation Magnitude
+                             0    2k               0      2k               0      2k               0     10k                                               0                                                     0.0
+                                                                                         4                     0.5
+                                                                                                                                                               0   128      256       384      512                     0 20 40 60 80 100
+24th Block 16th Block
+
+
+
+
+                        10               4 0.5                        10                                                                                                  Channels                                           Steps
+                                                                0.5                                                                                      100                                                     1.0
+             Error
+
+
+
+
+                                         2                            5                  2 0.5                                                            80                                                     0.8               Top 1%
+
+
+
+
+                                                                                                                                                                                                   Recall Rate
+                                                                                                                                            16th Block
+                                                                                                                                                          60                                                     0.6               Top 5%
+
+
+
+
+                                                                                                                                              Steps
+                        0                0 0.0                  0.0 0                    0 0.0                 0.0
+                             0    2k               0      2k               0      2k               0     10k                                              40                                                     0.4
+                        10               4 0.5                        20                      2                                                           20                                                     0.2
+                                                                1                                                                                          0                                                     0.0
+  Error
+
+
+
+
+                        5                2                            10                 2    1                1                                               0   128      256       384      512                     0 20 40 60 80 100
+                                                                                                                                                                          Channels                                           Steps
+                        0                0 0.0                  0     0                  0    0                0                                         100                                                     1.0
+                             0    2k               0      2k               0      2k               0     10k                                              80                         Channel 306                 0.8               Top 1%
+
+
+
+
+                                                                                                                                                                                                   Recall Rate
+                                                                                                                                            24th Block
+                                                         # of FP16 Channels                                                                               60                                                     0.6               Top 5%
+
+
+
+
+                                                                                                                                              Steps
+                        3-bit (Sorted)                 4-bit (Sorted)               Sorted Activation Magnitude                                           40                                                     0.4
+                        3-bit (Random)                 4-bit (Random)                                                                                     20                                                     0.2
+                                                                                                                                                           0                                                     0.0
+                                                                                                                                                               0   128      256       384      512                     0 20 40 60 80 100
+   Figure 4: Quantization error reduction trends observed when                                                                                                            Channels                                           Steps
+                                                                                                                                                                            (a)                                               (b)
+   replacing the input channels of quantized weights with FP16
+   values sequentially in sorted order (solid lines) and random                                                                               Figure 5: (a) Distribution of activation outliers (top 5%) and
+   order (dotted lines) for the 8th, 16th and 24th decoder block                                                                              (b) Recall rate of static analysis-based outlier identification
+   of Llama-3-8B-Instruct. The distribution of activation magni-                                                                              for the true top 1% and 5% outliers, across 100 decoding steps.
+   tudes in sorted order is also shown (black lines).                                                                                         The down projection layers in the 8th , 16th , and 24th decoder
+                                                                                                                                              blocks of Llama-3-8B-Instruct model are used for profiling.
+   quantization error is significantly slower when input channels
+   are compensated in random order, as shown by the dotted                                                                                    rate remains low (∼20%) for both the top 1% and top 5%
+   lines. This highlights the importance of prioritizing salient                                                                              outliers. This highlights a clear limitation of static analysis,
+   channels based on activation magnitude.                                                                                                    as it misses the majority of outliers at runtime, emphasizing
+                                                                                                                                              the need for dynamic identification of salient channels.
+   3.3 Challenge: Dynamic Nature of Activation
+       Outliers                                                                                                                               4           DecDEC Design
+   Identifying salient channels is challenging because the distri-                                                                            4.1              Overview
+   bution of activation outliers changes dynamically by nature.
+   While it is possible to infer salient channels by statically                                                                               In this section, building on the opportunity outlined in Sec-
+   analyzing activation value statistics on a small calibration                                                                               tion 3.2 and addressing the challenge described in Section 3.3,
+   set [10, 26, 32, 35], such static approaches are suboptimal. Fig-                                                                          we propose DecDEC, a CPU-augmented inference system
+   ure 5(a) shows the distribution of activation outliers—defined                                                                             for quantized LLMs that performs decoding with dynamic er-
+   as activations with the top 5% magnitudes—in the down pro-                                                                                 ror compensation. Figure 6 presents an overview of DecDEC.
+   jection layer of the 8th , 16th , and 24th decoder blocks of the                                                                           During the decode phase, DecDEC augments each linear layer,
+   Llama-3-8B-Instruct model over 100 decoding steps, using                                                                                   essentially a GEMV operation, with dynamic error compen-
+   a text sample for C4 dataset as the input prompt [47]. For                                                                                 sation. To produce the final output o, DecDEC adds an error
+   visibility, only the first 512 channels are shown. While some                                                                              compensation term odec to the base GEMV result ob = c       Wx.
+   channels (e.g., Channel 306 in 24th block, highlighted by an                                                                               odec is computed by multiplying the input vector with a subset
+   arrow) consistently exhibit high activation magnitudes and                                                                                 of weight residuals selectively fetched from the CPU. This se-
+   remain persistent outliers, the outlier distribution generally                                                                             lection is performed dynamically, fully accounting for the vari-
+   shows significant irregularity across decoding steps.                                                                                      ability of input vectors. To maximize the number of residual
+      To quantify the dynamic nature of activation outliers, we                                                                               values fetched under PCIe bandwidth constraints, DecDEC
+   calculate the recall rate of the top 1% and top 5% outliers                                                                                stores and retrieves a quantized version of the residuals (R),b
+   identified through static analysis using a calibration set, com-                                                                           comprising the quantized values Qr (R) and associated meta-
+   pared to the true top 1% and top 5% outliers (ground truth)                                                                                data, instead of the full-precision residuals (R). Here, Qr is a
+   observed at each decoding step. We use a subset of the Pile                                                                                quantizer that maps full precision residuals to low-bit form
+   dataset [21] for calibration, following prior work [35]. Specif-                                                                           and differs from the base quantizer used for the weights, Qb .
+   ically, we profile the average of the mean square of each                                                                                     The dynamic error compensation process consists of four
+   activation value and use this as a metric for identifying out-                                                                             sequential steps. 1 First, by investigating the input activation
+   liers. Figure 5(b) presents the results, showing that the recall                                                                           vector, DecDEC creates sc_indices, a list of salient channel
+                                                                      𝑑#$%                                                                                             𝐨𝐛
+                                                                                                                                                                    (1, 𝑑#$% )
+
+
+
+
+                                            Quantization
+        Linear 4
+
+
+
+
+                           GPU Memory
+                                                                                                                                           Base GEMV
+
+
+
+
+                                             metadata
+       (down proj)
+                                        "
+                                        𝐖                  𝑑!"
+
+
+
+
+                                                       …
+
+
+
+
+                                                                         …
+    Activation Func
+        Linear 3
+      (gate/up proj)
+      Normalization
+                                                                     𝑄! (𝐖)
+                                                                                                                              Dynamic Error Compensation
+                                                                      𝑑!"
+
+
+
+
+                                                                                                                                                              ➌ Residual
+                                                                 𝐱                                                                                                                                        𝐨
+
+
+
+
+                                                                                                       ➊ Channel
+                                                                                           Selection
+                                                                                                                                       …
+
+
+
+
+                                                                                                                                                                                        Addition
+                                                                         …
+
+
+
+
+                                                                                                                                                       GEMV
+        Linear 2
+                                                                      𝑑#$%
+                                                                                                                                𝐱[sc_indices]                                                          (1, 𝑑#$% )
+
+
+
+
+                                                                                                                                                                                                   ➍
+       (output proj)
+                           CPU Memory
+
+                                                                                                                   sc_indices          ➋ Residual                           𝐨𝐝𝐞𝐜
+                                            Quantization
+      Self-Attention
+                                             metadata
+                                                                                                                                                                           (1, 𝑑#$% )
+        Linear 1                        $
+                                        𝐑                      𝑑!"                                                 [0, 8, …, 𝑑!" -2]
+                                                                                                                                           Fetch
+
+
+
+
+                                                                                 …
+                                                       …
+
+
+
+
+                                                                         …
+        (Q/K/V proj)                                                                                                      𝑘
+      Normalization
+                                                                     𝑄" (𝐑)               𝑄! (𝐑)[sc_indices, ∶]                                      Within GPU                          From CPU via PCIe
+
+
+
+                                                                                     Figure 6: DecDEC overview.
+
+                                                     *"#$                                                               only a single scalar scale factor as metadata for each output
+                                                                                                                        channel. The residual quantizer for the i-th output channel
+                                                                                                                        (Qr,i ) is defined as:
+  !" (#)                                                                               Sent
+                                                                                                                                                                
+                                                                                                                                                                 r
+                                                                                                                                                                           
+                                                           …
+             *%&
+
+                       …
+                           …
+                                        …
+
+
+
+                                                                     …
+                                                                             …
+                                                                                 …
+
+
+
+
+  (4-bit)                                                                             to GPU                                       Qr,i (r) = clip round_to_int     , −7, 7 .
+                                                                                                                                                                 Si
+                                                                                                                        Si , the scale factor, is determined through a grid search as
+                                                                                                                        the value that minimizes the mean squared error between the
+ %&'()%                                                    …
+ (FP16)                                                                                                                 original and quantized weights.
+                                                                                                                            Using this quantizer, each floating-point residual value r
+                                                                                                                        is projected to an integer between -7 and 7. At runtime, the
+              Figure 7: Quantization of weight residual.
+                                                                                                                        selected input channels of the quantized residuals (highlighted
+                                                                                                                        in Figure 7) and all the scale factors are fetched from the CPU.
+indices. The number of salient channels to compensate, k,                                                               Each input channel of the quantized residuals, as well as the
+is a preconfigured parameter. This step is essentially a Top-                                                           scales, are stored contiguously in CPU memory, enabling
+K operation that selects the values in the input activation                                                             coalesced data transfers.
+vector with the largest magnitudes. 2 Next, a portion of
+the quantized residuals corresponding to the salient channels,                                                          4.3        Efficient Implementation of Dynamic
+Qr (R)[sc_indices, :] (along with the necessary quantization                                                                       Error Compensation
+metadata), is fetched from the CPU via PCIe. 3 The fetched
+residuals are then multiplied by the sparsified activation vector                                                       The top priority in implementing dynamic error compensa-
+(x[sc_indices]), producing odec . 4 Finally, the resultant                                                              tion is ensuring low latency, allowing its execution to remain
+odec is added to the base GEMV result ob , producing the final                                                          hidden within the base GEMV execution time. To fetch a
+output, o. All steps run in parallel with the base GEMV on a                                                            sufficient number of residual channels within this short time
+different GPU stream, and must be highly efficient to remain                                                            window, DecDEC introduces three key software optimization
+hidden within base GEMV runtime.                                                                                        strategies: 1) zero-copy residual fetching, 2) fast approximate
+   The following sections provide details of each component                                                             Top-K for channel selection, and 3) kernel fusion.
+of DecDEC. Section 4.2 explains how DecDEC performs                                                                     Zero-Copy Residual Fetch. DecDEC leverages CUDA zero-
+the residual quantization. Section 4.3 details the GPU imple-                                                           copy [41], instead of commonly used API functions such as
+                                                                                                                        cudaMemcpy() or cudaMemcpyAsync(), to fetch the residu-
+mentation of the dynamic error compensation. Section 4.4
+illustrates how DecDEC configures system parameters, in-                                                                als from CPU. These APIs rely on the direct memory ac-
+cluding k, the number of channels to compensate.                                                                        cess (DMA) engine for data transmission, which is efficient
+                                                                                                                        at transferring large data blocks but suboptimal for smaller
+                                                                                                                        transfers due to the DMA setup overheads. Fetching residuals,
+4.2       Residual Quantization                                                                                         however, falls into the latter category. The granularity of resid-
+                                                                                                                        ual fetching occurs at the row level of the quantized residual
+Figure 7 depicts the quantization scheme for the residuals.                                                             matrix. With 4-bit quantization and typical row lengths of a
+DecDEC employs 4-bit quantization for each output channel                                                               few thousand to tens of thousands, each data block transfer
+(i.e., column) of the residuals. To minimize metadata, sym-                                                             is only a few tens of KBs. For optimal PCIe bandwidth uti-
+metric uniform quantization is used. This approach requires                                                             lization, the data block size should ideally be at least a few
+                                      !!" (= 4096)                                                                                          1024
+              1024
+"        Chunk 0                Chunk 1               Chunk 2               Chunk 3                                             ❶ Scatter elements into buckets
+
+                                                                                                                                   …                                         …
+                                                                                               Bucket 0         Bucket 1                  Bucket 8         Bucket 9                 Bucket 31
+       Bucket-based      Bucket-based      Bucket-based      Bucket-based                       [!#! , ∞)        [!$! , !)! )               [!%! , !&! )    [!'! ,!%! )                   !
+                                                                                                                                                                                      [0,!(# )
+     Approximate Top-K Approximate Top-K Approximate Top-K Approximate Top-K                                                       …                                         …
+       sc_indices         …           …               …           …                           ❷ Gather elements
+                                                                                                                                           …                              ❸ Fill the remaining
+                     #!"#$% (= 32)                                                          starting from bucket 0 until                            …                        by random selection
+                                          ) (= 128)                                           the total reaches #!"#$%                       30
+                                            (a)                                                                                                (b)
+
+                                             Figure 8: Fast approximate Top-K operation of DecDEC.
+
+     '   '            '        '   '
+    "%& "()          "*+ !"#$ "*, "*%                           "*'   !"!
+                …                                 …                                   number of elements in the current bucket exceeds the remain-
+                                                                                      ing spots for kchunk , as in the case of bucket 9 in Figure 8(b),
+0             #$%('(ℎ*$+,- $".(1) )                             #$%($".(1))           random selection is used to fill the remaining spots. This ran-
+                                                                                      dom selection adds an additional layer of approximation but
+Figure 9: DecDEC ’s approximate Top-K bucket boundaries.                              significantly reduces latency by avoiding exact sorting.
+                                                                                         Determining proper bucket boundaries is crucial to mini-
+hundred KBs (e.g., 256 KB) [40, 46]. In zero-copy access, the                         mize the approximation error introduced by random selection
+GPU directly sends cacheline-sized memory requests, making                            ( 3 in Figure 8(b)). DecDEC profiles the distribution of ac-
+it suitable for fine-grained data access. While zero-copy ac-                         tivation values using a small calibration set and aims to set
+cess has the disadvantage of occupying GPU cores to generate                          boundary values that balance Top-K accuracy with the ability
+memory requests—potentially slowing down other concur-                                to handle a broader range of values. Placing finer-grained
+rently running kernels—this is not a major issue for DecDEC.                          buckets around the expected k-th largest value generally im-
+The concurrent kernel for our case, the base GEMV, is typi-                           proves accuracy, but limits the system’s ability to handle out-
+cally memory-bound, so using fewer cores for this kernel is                           of-distribution values. To address this, DecDEC uses an of-
+unlikely to have significant impact on its execution time.                            fline analysis to determine two key boundaries, bk0 and bk15 ,
+Fast Approximate Top-K for Channel Selection. For chan-                               from which the other boundaries are inferred (as shown in
+nel selection, instead of an exact Top-K operation, DecDEC                            Figure 9). Let the distribution of activation values from the
+employs an approximate Top-K method that is fast and GPU-                             calibration set be X ∈ RN×din , where N is the size of the set.
+friendly while maintaining precision. Figure 8 illustrates the                        The boundary bk15 is set to the maximum of the k-th largest
+approach using an example where 128 elements are selected                             value across all vectors in abs(X). The interval between 0 and
+from a 4096-dimensional activation vector (din = 4096, k =                            bk15 is uniformly divided into 16 buckets (bk15 , bk16 , . . . , bk30 ),
+128). As shown in Figure 8(a), instead of a single global selec-                      focusing on the range where the k-th largest value is most
+tion, DecDEC partitions the input into four contiguous 1024-                          likely to occur. To handle out-of-distribution cases which can
+dimensional chunks and performs a local Top-kchunk selection                          cause significant degradation in selection precision, DecDEC
+within each chunk. In this example, kchunk = k/4 = 32. The lo-                        assigns an additional 16 buckets for values beyond bk15 . Specif-
+cally selected elements are then concatenated to form the final                       ically, bk0 is set to the maximum value in all abs(X), and the
+result. Although this introduces approximation, it significantly                      range between bk0 and bk15 is also uniformly divided to form
+reduces latency by avoiding global synchronization—each                               the remaining 16 buckets.
+local selection is handled independently by a thread block. A                         Kernel Fusion. DecDEC extensively fuses all dynamic er-
+larger chunk size can improve efficiency but may increase the                         ror compensation operations into a single kernel. Figure 10
+approximation error; we set the chunk size to 1024 to balance                         visualizes the execution flow of the fused kernel, using an ex-
+this trade-off effectively.                                                           ample where two thread blocks process a weight matrix of size
+   For each local selection, DecDEC uses a variant of the                             4096×6144. In this example, only one channel is selected per
+bucket-based Top-K algorithm [2]. Figure 8(b) illustrates this                        each of the four chunks (i.e., kchunk = 1, k = 4). Initially, each
+process. 1 First, the 1024 elements in a chunk are scattered                          thread block sequentially processes two chunks, selecting a
+into buckets based on their magnitudes, with bucket bound-                            total of two channels (Step 1 in Figure 6(b)). The indices for
+aries (bk0 , bk1 , ..., bk30 ). The number of buckets is set to 32,                   the selected channels (sc_indices) as well as the correspond-
+matching the number of threads in a warp, allowing for effi-                          ing activation values (x[sc_indices]) are stored in GPU
+cient thread-level parallelism so that each thread processes                          memory. Thread blocks are then synchronized using the grid-
+a different bucket. 2 Next, elements are gathered, starting                           wide synchronization feature of the cooperative group [42].
+from bucket 0, until the total count reaches kchunk . 3 If the                        This synchronization is required because each thread block
+                                          !! 4 sc_indices [3072: ]                            !! " sc_indices : 3072            Choosing ntb and kchunk is challenging due to the large de-
+                                              #$12)#[3072: ]                                      #$12)#[: 3072]
+
+
+
+
+                                                                                      From
+                                                                                      CPU
+                                                                                                                                                                                                  qkv
+                                                                                                                            sign space. The ntb value for each type of linear layer (ntb ,
+
+
+
+
+                                                                                             Fetch & GEMV
+                 Block 0
+GPU Mem. Thread Thread
+
+
+
+                                                                                                                              o    gu d
+                                                                                                                            ntb , ntb , ntb ) has multiple viable candidates, constrained by
+
+
+
+
+                                                                        grid.sync()
+                                            Selection
+
+
+
+
+                                                                                                Residual
+                                             Channel
+                                                                                                                            the dimensions of the corresponding weight matrices. For ex-
+                                                                                                            Atomic                                                                                 qkv
+                                                                                                                            ample, in Llama-3-8B, there are 9 possible candidates for ntb
+                 Block 1
+
+
+
+
+                                                                                              `              Add
+                                             `
+                                                                                                                            (1, 2, 3, 4, 5, 6, 8, 12, 24), while other layers also have multiple
+                                                                ¥
+                                                                                                                            options. Selecting kchunk presents a greater challenge due to
+                                                                                                                            its broader range of possibilities. The kchunk value for each
+                                                 Buffer
+
+
+
+                                                           sc_indices                                                                                   qkv            gu
+                                                                ¥
+                                                                                                                                                               o
+                                                                                                                            type of linear layer (kchunk , kchunk                d
+                                                                                                                                                                    , kchunk , kchunk ) can be any in-
+                           !$% (= 4096)                                                                     !!"# (= 6144)
+                                &                         ;[sc_indices]                                     "! (= ")        teger less than a maximum determined by the available shared
+                                                                                                                            memory. Although platform-dependent, this upper bound is
+            Figure 10: Fused kernel for dynamic error compensation.                                                         large (e.g., 367 with 48 KB per-block shared memory), lead-
+                                                                                                                            ing to an expansive search space. This creates a combinatorial
+                                                                                                                            explosion of configuration options. Technical details on how
+processes a segment of all selected channels—not just a dis-                                                                to identify candidate values of kchunk and ntb for a given model
+joint subset—when fetching quantized residuals from the                                                                     and platform are presented at the end of this section.
+CPU and performing GEMV (Steps 2 and 3 in Figure 6(b)).
+                                                                                                                                To address this issue, we provide a DecDEC tuner that sug-
+For example, thread block 0 processes Qr (R)[sc_indices][:
+                                                                                                                            gests ntb and kchunk values based on a target slowdown rate.
+3072] as opposed to Qr (R)[sc_indices[: 2]][:]. The thread
+                                                                                                                            The tuner maximizes kchunk while keeping the total execution
+block-level synchronization allows all thread blocks to have
+                                                                                                                            time—including base GEMV and dynamic error compensa-
+access to the complete set of sc_indices and x[sc_indices].
+                                                                                                                            tion across all linear layers—within the specified slowdown
+This partitioning scheme allows for efficient reduction in the
+                                                                                                                            relative to the baseline (i.e., without compensation). This tun-
+residual GEMV without requiring extensive global synchro-
+                                                                                                                            ing is a one-time process for a given model-device pair.
+nization. The results from the residual GEMV are directly
+                                                                                                                            Parameter Tuning Process. Figure 11(a) illustrates the tun-
+added to the result of the base GEMV (ob ) using atomic prim-
+                                                                                                                            ing process, which consists of two phases: Phase 1 determines
+itives, yielding the final output (o) (Step 4 in Figure 6(b)).
+                                                                                                                            the ntb values, and Phase 2 determines the kchunk values.
+GPU Memory Overhead. The buffer for sc_indices and
+x[sc_indices] in the fused kernel is the only additional GPU                                                                    In Phase 1, the tuner simplifies the search for ntb values
+memory usage of DecDEC. Zero-copy from the CPU does                                                                         for each layer by replacing it with the search for a single
+                                                                                                                            metaparameter, ntb      max . nmax represents the upper limit on the
+not consume GPU memory. The bucket boundary values are                                                                                                     tb
+not stored on the GPU; instead, only bk0 and bk15 are passed                                                                number of thread blocks to use for dynamic error compen-
+to the kernel as arguments. A single buffer can be reused for                                                               sation. Each layer’s ntb is then set to the largest candidate
+                                                                                                                            below ntb  max . Determining nmax involves testing values up to
+all linear layers if it is sized in accordance with the largest k.                                                                                             tb
+In the extreme case of fetching 10% of the channels across                                                                  half of the total SM count, to reduce the search space. In
+all layers in Llama-3-8B, the maximum k would be 1433,                                                                      the example shown in Figure 11, the GPU has 56 SMs, so
+                                                                                                                            values up to 28 are tested. For each tested ntb            max , a coarse-
+for the down projection layer. This calls for an 8.6 KB buffer
+(1433×(4+2)), which is less than 0.0003% of the model size,                                                                 grained kchunk search checks how many uniform increments
+assuming 3-bit precision—essentially a negligible overhead.                                                                 to kchunk can be applied across all layers without exceed-
+                                                                                                                            ing the target slowdown rate. Figure 11(b) shows an ex-
+                                                                                                                            ample of a coarse-grained kchunk search for ntb            max = 24 (i.e.,
+ 4.4                        Parameter Tuner                                                                                    qkv o      gu d
+                                                                                                                            (ntb , ntb , ntb , ntb ) = (24, 16, 23, 14)), yielding 19 valid steps.
+ Necessity of Parameter Tuner. Effective use of DecDEC                                                                      If no steps can be made for any ntb         max value, the tuner fixes
+
+ requires careful tuning two key parameters:                                                                                kchunk to 0 for the layer with the smallest weight matrix and re-
+                                                                                                                            peats the process, as smaller matrices are often most sensitive
+                         • ntb : Specifies the number of thread blocks used for dy-                                         to increases in kchunk .
+                           namic error compensation. Since DecDEC runs in par-                                                                                                   max with the most
+                                                                                                                                After Phase 1, the tuner selects the ntb
+                           allel with the base GEMV, allocating too many thread
+                                                                                                                            steps and proceeds to a fine-grained kchunk search in Phase 2.
+                           blocks to dynamic error compensation can slow down
+                                                                                                                            Figure 11(c) shows the fine-grained k search for the selected
+                           the base GEMV computation, while allocating too few                                                max = 24. In this phase, not all k
+                                                                                                                            ntb                                        chunk values may increase
+                           may underutilize PCIe bandwidth, as zero-copy transfers
+                                                                                                                            together. At each step, the tuner increments kchunk for as many
+                           require GPU cores to issue memory requests.
+                                                                                                                            layers as possible, prioritizing those with smaller increases in
+                                                                                                                                                                                gu
+                         • kchunk : Specifies how many channels are compensated                                             execution time. For example, in Step 1, kchunk is incremented
+                                                                                                                                                     d
+                                                                                                                            first, followed by kchunk . Step 1 stops at this point, as further
+                           per chunk (1024 channels). A larger kchunk improves
+                                                                                                                                               qkv           o
+                           model quality but may increase inference latency.                                                increases to kchunk and kchunk        would exceed the target; thus
+                              Phase 1. Determine $>? (or $@AB
+                                                          >? )                                              Phase 2. Determine !9:;<=                         Result
+                                                                    $%&
+         !" #$%&' = 56                                        Pick !"#  that allows the most steps                                                      H.I
+                                                                                                                                                      */G      24
+         +,-./' !0$12$1&: 10%                                                                                                                           )*+
+                                                                                                                                                      */G
+                                                                                                                                                                   )*+
+                                                                                                                                                               24 !EF18* 19
+                                                                                                                        Fine-grained
+ (a)                                                                                                                                                     ,
+                                                                                                                                                       */G         ,
+                                                                                                                                                               16 !EF18* 19
+         Coarse-grained               Coarse-grained             Coarse-grained             Coarse-grained             !9:;<= Search                    -1
+                                                                                                                                                       */G
+                                                                                                                                                                    -1
+                                                                                                                                                               23 !EF18* 25
+         &=>?@A Search                &=>?@A Search       …      &=>?@A Search        …     &=>?@A Search
+                                                                                                                                                         6         6
+               %&'
+             ()#$  = 1)                    %&'
+                                         ()#$  = 2)                 %&'
+                                                                  ()#$  = 24)                   %&'
+                                                                                              ()#$  = 28)                                              */G     14 !EF18* 29
+
+                                              Baseline
+   +&,         -%
+         (
+ (!)* , !)*          .
+            , !)* , !)* ): (24, 16, 23, 14)
+                                  Step 0 Step 1 Step 2            … Step 19 Step 20       Step 0 Step 1 Step 2            …    Step 6   Step7     …      Step 10 Step 11
+                            )*+
+       QKV proj           ! EF18*
+                                     0      1      2                   19      20           19 ④       20
+                                                                  …                             + 5.0                     …                       …
+  B!" = 4096, B(%) = 6120 Latency   30     30     31                   40      45           40         45
+                            ,
+     Output proj !EF18* 0                   1      2                   19      20           19 ③       20
+                                                                  …                             + 5.0                     …                       …
+  B!" = 4096, B(%) = 4096 Latency   20     21     23                   31      36           31         36
+                            -1
+    Gate/Up proj !EF18* 0                   1      2                   19      20           19 ①       20 ②       21             25②
+                                                                                                                                            26
+                                                                  …                             + 0.0      + 1.0          …          + 2.0        …
+ B!" = 4096, B(%) = 28672 Latency 140     140    140                  141     141          141        141        142            142        144
+                            6        0      1      2                   19      20           19 ②       20 ①       21             25 ①       26                 29       30
+      Down proj           !EF18*
+                                                                  …                             + 1.0      + 0.0          …          + 0.0        …               + 1.0
+ B!" = 14336, B(%) = 4096 Latency   70     70     70                   72      73           72         73         73             74         74                 75       76
+                           Sum 260 261 264                        … 282       290          282        283        284      …     285        285    …           286
+                                                  (b)                                                                            (c)
+
+          Figure 11: Parameter tuning process for DecDEC, assuming a total of 56 SMs and a target slowdown rate of 10%.
+
+                                            o       qkv                                          GPU Name        Memory Size     Memory BW       # SM     PCIe BW        R bw
+their final values are set (i.e., kchunk , kchunk = 19). This process
+                                                                                                                                 Desktop
+repeats until no further increments can be made for any layer.                                   RTX 4090              24 GB      1,008 GB/s     128          32 GB/s        32
+Technical Details: ntb and kchunk Candidates. The ntb values                                     RTX 4080S             16 GB       736 GB/s      80           32 GB/s        23
+considered during parameter tuning are those that have a                                         RTX 4070S             12 GB       504 GB/s      56           32 GB/s        16
+                                                                                                                                 Laptop
+meaningful impact on at least one of the two parts of the                                        RTX 4070M             8 GB        256 GB/s       36          16 GB/s        16
+kernel execution: the approximate Top-K selection and the                                        RTX 4050M             6 GB        192 GB/s       20          16 GB/s        12
+residual fetching. In the approximate Top-K selection part,
+the minimum processing granularity per thread block is one                                                             Table 1: GPU specifications.
+chunk. Therefore, increasing ntb beyond the number of chunks
+does not have additional effect on performance. Thus, the set
+                                                                                               Here, 128 bytes are used for integer counters that track the
+of ntb values relevant to this part is:
+                                                                                             number of elements that fall into each of the 32 buckets;
+                                            din                                                128 × kchunk bytes are used to temporarily store the indices of
+                   A= n 1≤n≤                        .
+                                           1024                                                elements assigned to each bucket; and 2 × 1024 bytes account
+                                                                                               for the input activation values in the chunk. The total must
+For residual fetching part, 4-bit residuals are transferred over
+                                                                                               remain below the per-block shared memory limit (e.g., 49,152
+PCIe in coalesced segments of 256 values (128 bytes), result-
+                                                                                               bytes), which constrains the maximum allowable kchunk value.
+ing in a total of s = dout /256 segments. These segments are
+distributed across ntb thread blocks, with each block process-
+ing ⌈s/ntb ⌉ segments. If multiple ntb values result in the same                               5     Evaluation
+number of segments per block (⌈s/ntb ⌉), only the smallest
+such value is considered and the rest are redundant. Exclud-                                   5.1      GPU Kernel Benchmarks
+ing these cases, the candidate set relevant to this part is:
+                                                                                           Methodology. In this section, we evaluate the DecDEC GPU
+                                       s                                                       kernel on three consumer-grade GPUs: two desktop GPUs,
+            B = n 1 ≤ n ≤ s,                 =n .
+                                     ⌈s/n⌉                                                     RTX 4070 Super (RTX 4070S) and RTX 4090, and one laptop
+                                                                                               GPU, RTX 4050 Mobile (RTX 4050M), with their specifica-
+The final candidate set for ntb is the union of the two (i.e.,
+                                                                                               tions detailed in Table 1. Here, Rbw denotes the ratio of mem-
+N = A ∪ B).
+                                                                                               ory bandwidth to CPU-to-GPU (PCIe) bandwidth. The evalua-
+  Meanwhile, kchunk is bounded by the shared memory limit.
+                                                                                               tion considers GEMV operations of output, gate/up and down
+During the approximate Top-K selection part of the ker-
+                                                                                               projection layers in Llama-3-8B-Instruct [16], assuming 3-bit
+nel, shared memory usage increases with the value of kchunk .
+                                                                                               bitwidth. For the base GEMV, we use the LUTGEMM kernel,
+Specifically, the shared memory usage for this part is:
+                                                                                               [44], a state-of-the-art GEMV kernel for uniform quantization.
+                    128 + 128 × kchunk + 2 × 1024 bytes.                                       Kernel times are measured using NVIDIA Nsight Systems.
+                          4096 x 4096                                  14336 x 4096                                                4096 x 28672
+             ntbo = 2   ntbo = 4  o ntb = 8   ntbo = 16    ntbd = 2   ntbd = 4    ntbd = 8    ntbd = 16    ntbgu = 2   ntbgu = 4   ntbgu = 8
+                                                                                                                                           gu  ntb = 16 ntbgu = 28 ntbgu = 56
+        1.5
+        1.4
+        1.3
+4090
+
+
+
+        1.2
+        1.1
+        1.0
+            0 8 16 24 0 8 16 24 0 8 16 24 0 8 16 24       0 8 16 24 0 8 16 24 0 8 16 24 0 8 16 24         0 8 16 24 0 8 16 24 0 8 16 24 0 8 16 24 0 8 16 24 0 8 16 24
+        1.5
+        1.4
+4070S
+
+
+
+
+        1.3
+        1.2                                                                                                                                                            N/A
+        1.1
+        1.0
+            0 16 32 48 0 16 32 48 0 16 32 48 0 16 32 48   0 16 32 48 0 16 32 48 0 16 32 48 0 16 32 48     0 16 32 48 0 16 32 48 0 16 32 48 0 16 32 48 0 16 32 48
+        1.5
+        1.4
+4050M
+
+
+
+
+        1.3
+        1.2                                                                                                                                                 N/A        N/A
+        1.1
+        1.0
+           0 24 48 72 0 24 48 72 0 24 48 72 0 24 48 72    0 24 48 72 0 24 48 72 0 24 48 72 0 24 48 72     0 24 48 72 0 24 48 72 0 24 48 72 0 24 48 72
+              kchunk     kchunk     kchunk     kchunk       kchunk     kchunk     kchunk       kchunk       kchunk     kchunk      kchunk       kchunk
+
+  Figure 12: Execution time of base GEMV + DecDEC with varying kchunk and ntb , normalized to base GEMV execution time.
+
+
+ Expected Behavior. The execution time of the DecDEC                                         the knee point to appear too early or disappear, leading to sub-
+ kernel is expected to follow a piecewise linear function of                                 optimal performance. However, increasing ntb can sometimes
+ kchunk with two distinct segments. In the first segment, corre-                             worsen results by slowing down the base GEMV, as discussed
+ sponindg to small kchunk values, the latency remains nearly                                 in Section 4.4. This effect is particularly noticeable on GPUs
+ constant at the base GEMV time, as the compensation oper-                                   with fewer SMs, such as the 4050M. For instance, on the
+ ations are fully hidden under the GEMV execution. In the                                    4050M, ntb = 8 yields the best results, whereas increasing ntb
+ second segment, once kchunk exceeds a certain threshold—                                    to 16 leads to worse performance. Third, larger weight sizes
+ the knee point—the execution time linearly increases with                                   enable higher kchunk with minimal latency overhead, due to
+ kchunk , inidcating that the compensation operations are no                                 increased time slack. With sufficiently large weight sizes (e.g.,
+ longer fully hidden. Theoretically, the knee point is expected                              4096×28672) and a properly tuned ntb , the actual knee point
+ to occur when kchunk = 1024 × 1/Rbw × 3/4, representing the                                 approaches the theoretical value. For example, on an RTX
+ maximum amount of data transfer that can overlap with the                                   4050M with a 4096×28672 matrix and ntb = 8, the observed
+ base GEMV. Here, the base GEMV time is approximated by                                      knee point is around kchunk = 60, compared to a theoretical
+ dividing the weight matrix size by the GPU memory band-                                     prediction of 64.
+ width, and PCIe bandwidth is assumed to be fully utilized.
+ The factor 3/4 accounts for the 3-bit quantization; for other
+ bitwidths, this factor should be adjusted accordingly (e.g.,                                5.2        Impact on Model Quality
+ 4/4 = 1 for 4-bit quantization).
+                                                                                             Methodology. We demonstrate DecDEC ’s quality improve-
+ Results. Figure 12 shows the execution time of DecDEC ker-                                  ments on 3-bit, 3.5-bit, and 4-bit versions of two instruction-
+ nel (base GEMV + dynamic error compensation), normalized                                    tuned LLMs: Llama-3-8B-Instruct [16] (hereafter referre to
+ to the standalone execution time of the base GEMV, across                                   as Llama-3) and Phi-3-medium-4k-instruct (14B model, here-
+ varying ntb and kchunk . Each subfigure also includes a ver-                                after referred to as Phi-3) [39]. For the 3.5-bit version, we
+ tical dotted line to mark the theoretical knee point derived                                adopt a block-wise bitwidth allocation, applying 3-bit quan-
+ from the analytical model (i.e., 1024 × 1/Rbw × 3/4). All cases                             tization to half of the decoder blocks and 4-bit quantization
+ exhibit the expected two-segment piecewise linear behavior                                  to the remaining blocks. This follows a KL divergence-based
+ when ntb is properly set, except for the 4096 × 4096 case on                                sensitivity metric from prior work [8].
+ RTX 4090, the fastest GPU evaluated. In this case, the base                                    As base quantization methods, we choose two state-
+ GEMV execution time is so short that even a small kchunk                                    of-the-art LLM quantization methods: AWQ [35] and
+ incurs overhead.                                                                            SqueezeLLM [30]. AWQ is a uniform quantization method
+    From the other cases, three key observations can be made.                                that mitigates quantization errors by applying per-channel
+ First, a lower Rbw —indicating lower memory bandwidth and                                   scaling to protect salient channels, which are identified
+ higher PCIe bandwidth—shifts the knee point to the right.                                   through an offline analysis on a calibration dataset.
+ Thus, RTX 4050M, with the lowest Rbw , supports the largest                                 SqueezeLLM employs a clustering-based non-uniform quan-
+ kchunk before the knee point, while RTX 4090, with the highest                              tization method that considers the sensitivity of each weight.
+ ratio, supports the smallest. This trend is consistent with the or-                            We evaluate DecDEC-augmented models across varying
+ dering predicted by theoretical knee points. Second, the knee                               kchunk , the number of channels compensated per chunk (1024
+ point is highly sensitive to ntb , highlighting the importance of                           channels). We uniformly set kchunk to 8, 16, 32, 64 and 128 for
+ careful tuning. Generally, higher ntb values such as 8 or 16 de-                            all layers. Based on the results in Section 5.1, values up to 64
+ lay the knee point. In contrast, small ntb values (e.g., 2) cause                           fall within the practical range—where latency overhead from
+                         Llama-3-8B-Instruct                   Phi-3-medium-4k-instruct                            Llama-3-8B-Instruct                Phi-3-medium-4k-instruct
+               11.0
+                           AWQ           SqueezeLLM 6.0             AWQ          SqueezeLLM                           AWQ           SqueezeLLM 8.0          AWQ         SqueezeLLM
+                                                                                                            7.5
+               10.5
+                                                          5.5                                               7.0
+               10.0                                                                                                                               7.5
+Perplexity
+
+
+
+
+                                                                                                    Score
+                9.5                                       5.0                                               6.5
+                9.0                                                                                                                               7.0
+                                                          4.5                                               6.0
+                8.5
+                8.0                                       4.0                                               5.5                                   6.5
+                       0 8 16 32 64 128 0 8 16 32 64 128        0 8 16 32 64 128 0 8 16 32 64 128                 0 8 16 32 64 128 0 8 16 32 64 128     0 8 16 32 64 128 0 8 16 32 64 128
+                          kchunk           kchunk                  kchunk            kchunk                         kchunk            kchunk              kchunk           kchunk
+                                 3-bit           3.5-bit              4-bit           FP16                                  3-bit           3.5-bit          4-bit           FP16
+
+    Figure 13: Perplexity on WikiText. The x markers correspond                                      Figure 15: MT-Bench scores. The x markers correspond to
+    to baselines without DecDEC (kchunk = 0). Lower is better.                                       baselines without DecDEC (kchunk = 0). Higher is better.
+
+                       Llama-3-8B-Instruct                 Phi-3-medium-4k-instruct
+               70
+                          AWQ           SqueezeLLM 80               AWQ         SqueezeLLM           9.93 for Llama-3 and from 5.92 to 5.45 for Phi-3. Meanwhile,
+                                                                                                     the impact on 4-bit models is relatively less pronounced. This
+               65                                                                                    is expected, as 4-bit models are already close to full-precision,
+                                                          75
+Accuracy (%)
+
+
+
+
+               60                                                                                    leaving less room for improvement. The 3.5-bit models follow
+               55                                         70                                         an intermediate trend.
+                                                                                                     BBH and MT-Bench. Results on BBH (Figure 14) follow the
+               50
+                                                          65                                         same trends as the perplexity results. The MT-Bench results
+               45                                                                                    (Figure 15), on the other hand, demonstrate some different
+               40                                         60                    49                   patterns. In cases where vanilla quantized models without
+                      0 8 16 32 64 128 0 8 16 32 64 128         0 8 16 32 64 128 0 8 16 32 64 128
+                        kchunk            kchunk                  kchunk             kchunk          DecDEC (k = 0) already achieve scores very close to those of
+                                                                                                     the FP16 model—such as all 4-bit cases and the AWQ 3.5-bit
+                                3-bit           3.5-bit              4-bit            FP16           model of Phi-3—the scores remain unchanged, oscillating
+                                                                                                     around the baseline score. For the remaining cases, DecDEC
+    Figure 14: Accuracy on BBH. The x markers correspond to                                          significantly improves scores even with a small kchunk (e.g.,
+    baselines without DecDEC (kchunk = 0). Higher is better.                                         8), like in other benchmarks; further increases in kchunk , how-
+                                                                                                     ever, do not always yield noticeable improvements. These
+                                                                                                     patterns may be attributed to the coarse-grained rubric of this
+    dynamic error compensation may remain low depending on                                           benchmark, which assigns integer scores ranging from 0 to
+    the platforms—while kchunk = 128 is included for complete-                                       10 for each task. This coarse-grained scoring may miss subtle
+    ness in evaluating upper-bound behavior.                                                         improvements when the potential gain is small.
+    Benchmarks. Following previous literature [9, 12, 30, 35], we                                    Effectiveness of DecDEC’s Channel Selection. Figure 16
+    use perplexity on WikiText [38] as the primary metric, as it                                     compares DecDEC with three variants using different chan-
+    reliably reflects quantized LLM quality [13, 35]. Addition-                                      nel selection mechanisms. To assess the benefits of dynamic
+    ally, we use BIG-Bench Hard (BBH) [54], a collection of 23                                       selection, we include Random (blue line), which selects chan-
+    challenging tasks in BIG-Bench [52], to assess the models’                                       nels randomly, and Static (yellow line), which statically select
+    capabilities in problem solving. Chain-of-Thought (CoT) is                                       channels by Hessian-based ranking with a calibration set (us-
+    enabled for all BBH evaluations [62]. Lastly, we evaluate                                        ing exact sorting) following prior work [32]. To isolate the
+    multi-turn conversation using MT-Bench [68], where a strong                                      effect of DecDEC’s Top-K approximation, we include Exact
+    LLM judges 80 responses, scoring each from 0 to 10. We use                                       (red line), which uses true Top-K channels. Alongside per-
+    GPT-4o as the judge and report the average of three runs.                                        plexity results, we also report the average recall rate of Static
+    Perplexity on WikiText. Figure 13 shows the perplexity re-                                       and DecDEC relative to Exact.
+    sults. Across all cases, a clear trend is observed: perplexity                                      While Static improves over Random, it underperforms
+    consistently decreases (i.e., model quality improves) as kchunk                                  DecDEC. DecDEC achieves lower perplexity than Static
+    increases. In particular, for 3-bit models, significant improve-                                 while using 4× or even 8× fewer channels (e.g., kchunk = 32
+    ments occur even at kchunk = 8. AWQ’s perplexity decreases                                       or 16 vs. 128), highlighting the effectiveness of incorpo-
+    from 10.15 to 9.63 for Llama-3 and from 5.96 to 5.53 for                                         rating input-awareness. Meanwhile, the perplexity gap be-
+    Phi-3, while SqueezeLLM’s perplexity drops from 10.49 to                                         tween DecDEC and Exact is minimal, with almost overlap-
+                      Llama-3-8B-Instruct                      Phi-3-medium-4k-instruct                               Llama-3-8B-Instruct                        Phi-3-medium-4k-instruct
+                                                       3-bit                                                        AWQ 3-bit          SqueezeLLM 3-bit           AWQ 3-bit          SqueezeLLM 3-bit
+                                                                                                       kchunk 2-bit 4-bit 8-bit FP16 2-bit 4-bit 8-bit FP16 2-bit 4-bit 8-bit FP16 2-bit 4-bit 8-bit FP16
+                         AWQ          SqueezeLLM                       AWQ          SqueezeLLM           2                      9.83                   10.10                  5.56                   5.63
+              10.7                                           6.2                                         4                9.72 9.72              9.97 9.97              5.51 5.51              5.55 5.56
+              10.3                                           5.9
+Perplexity
+
+
+
+
+                                                                                                         8          9.63 9.58 9.58         9.93 9.79 9.78         5.45 5.45 5.45         5.53 5.47 5.47
+               9.9                                           5.6                                         16 9.63 9.47 9.43 9.43 9.95 9.75 9.59 9.58 5.47 5.36 5.35 5.35 5.51 5.44 5.36 5.37
+               9.5                                           5.3                                         32 9.49 9.29 9.25 9.25 9.80 9.54 9.36 9.36 5.36 5.24 5.23 5.23 5.41 5.31 5.23 5.24
+               9.1                                           5.0                                         64 9.31 9.07 9.03           9.59 9.29 9.11          5.22 5.08 5.06        5.28 5.14 5.06
+
+               8.7                                           4.7                                        128 9.12 8.84
+                                                                                                        256 8.94
+                                                                                                                                     9.36 9.01
+                                                                                                                                     9.14
+                                                                                                                                                             5.04 4.86
+                                                                                                                                                             4.83
+                                                                                                                                                                                   5.10 4.91
+                                                                                                                                                                                   4.91
+               1.0                                           1.0
+               0.8                                           0.8
+Recall Rate
+
+
+
+
+               0.6                                           0.6                                            Table 2: Impact of residual bitwidth. Lower is better.
+               0.4                                           0.4
+               0.2                                           0.2
+               0.0                                           0.0
+                     0 8 16 32 64 128 0 8 16 32 64 128             0 8 16 32 64 128 0 8 16 32 64 128   laptop GPUs—RTX 4070 Mobile (4070M), and 4050 Mo-
+                         kchunk            kchunk                      kchunk          kchunk
+                                                       4-bit                                           bile (4050M). The specifications for these GPUs are listed in
+                         AWQ          SqueezeLLM                       AWQ          SqueezeLLM         Table 1. We run the tuner for DecDEC with four target slow-
+               8.8                                           4.8                                       down rates (2.5%, 5%, 10%, 20%), and evaluate perplexity
+               8.7                                           4.7
+Perplexity
+
+
+
+
+               8.6                                           4.6                                       on WikiText as well as end-to-end inference latency with the
+               8.5                                           4.5                                       resulting configurations. For the base GEMV kernel, we use
+               8.4                                           4.4
+               8.3                                           4.3                                       LUTGEMM [44] for AWQ and Any-Precision LLM [45] for
+               1.0                                           1.0                                       SqueezeLLM—both state-of-the-art kernels for uniform and
+               0.8                                           0.8
+Recall Rate
+
+
+
+
+               0.6                                           0.6                                       non-uniform quantization, respectively. We integrate DecDEC
+               0.4                                           0.4                                       into a PyTorch-based inference pipeline optimized with the
+               0.2                                           0.2
+               0.0                                           0.0                                       torch.compile feature [5] and measure the average time taken
+                     0 8 16 32 64 128 0 8 16 32 64 128             0 8 16 32 64 128 0 8 16 32 64 128
+                         kchunk            kchunk                      kchunk          kchunk          per token generation over 1024 tokens.
+                                  Random            Static             Exact          DecDEC              For the 3.5-bit models, we do not run the tuner separately.
+                                                                                                       Instead, we construct the configuration by combining the
+   Figure 16: Comparison against random, static, and exact chan-                                       tuning results with the 3-bit and 4-bit models. Specifically,
+   nel selection. Perplexity is shown on the top rows (lower is                                        we use the configuration from tuning with the 3-bit model for
+   better), and recall is shown on the bottom rows (higher is bet-                                     layers quantized to 3 bits, and the configuration from tuning
+   ter). The x markers in black correspond to baselines without                                        with the 4-bit model for layers quantized to 4 bits—both
+   DecDEC (kchunk = 0).                                                                                assuming the same target slowdown rate.
+                                                                                                       Results. Table 3 lists the configurations obtained from the
+                                                                                                       tuner along with the actual end-to-end slowdowns compared
+   ping curves. These results are explained by the recall rates:                                       to the baseline. We report only the results for 3-bit as similar
+   while DecDEC achieves around 80% recall relative to Exact,                                          trends are observed for the 3.5-bit and 4-bit configurations. In
+   the recall of Static falls significantly short, at around 30% or                                    all cases, the actual slowdown is below the target rate. This
+   below.                                                                                              is expected as the tuner configures parameters conservatively.
+   Impact of Residual Bitwidth. Table 2 presents the impact                                            The tuner targets only the kernel times of linear operations,
+   of residual bitwidth selection. In addition to the default 4-                                       while other operations outside the linear layers (e.g., atten-
+   bit setting, we evaluate 2-bit, 8-bit, and full-precision (FP16)                                    tion, normalization) also contribute to overall inference time.
+   residuals with varying kchunk for 3-bit models by perplexity on                                     Consistent with the observations in Section 5.1, in general,
+   WikiText. Cells with the same color indicate cases where the                                        selected k values are higher for GPUs with greater PCIe-to-
+   total data transfer via PCIe is approximately equivalent. For                                       GPU memory bandwidth ratio (4050M > 4070M ≃ 4070S
+   example, kchunk = 8 with 4-bit residuals requires a similar data                                    > 4080S > 4090).
+   transfer amount as the following combinations: kchunk = 16                                             Figure 17 shows the trends of end-to-end inference latency
+   at 2-bit, kchunk = 4 at 8-bit, and kchunk = 2 at FP16. The best                                     versus perplexity. All Phi-3 cases, as well as AWQ 3.5-bit,
+   results within each color group are highlighted. Across all                                         4-bit, and SqueezeLLM 4-bit cases of Llama-3 face out-of-
+   cases, a residual bitwidth of 4 either achieves the best or comes                                   memory issues on the 4050M, and are thus excluded. Simi-
+   very close to it, supporting our default setting.                                                   larly, the AWQ 4-bit case of Phi-3 for 4070M is also excluded.
+                                                                                                       In each line in Figure 17, the x marker represents the baseline,
+                                                                                                       while subsequent markers show the results for DecDEC on
+   5.3               End-to-End Evaluation
+                                                                                                       the four target slowdown rates, in increasing order.
+   Methodology. In this section, we present case studies demon-                                           For all cases, DecDEC demonstrates promising Pareto-
+   strating how DecDEC advances model quality while minimiz-                                           optimal trade-offs between model quality and inference la-
+   ing latency increases across three desktop GPUs—RTX 4090,                                           tency. The results for target slowdown rates of 2.5% and 5%
+   4080 Super (4080S), and 4070 Super (4070S)—as well as two                                           are particularly impressive, while 10%–20% show diminish-
+                                    Llama-3-8B-Instruct                                            Phi-3-medium-4k-instruct
+                                   AWQ                  SqueezeLLM                                  AWQ                   SqueezeLLM
+                                                              3-bit              6.00                                           3-bit
+                  10.5                                                                                3-bit
+                                   3-bit
+                                                                                 5.75
+                  10.0
+                                                                                 5.50                                                                 4090
+                                                                                                      3.5-bit
+     Perplexity
+
+
+
+
+                                                                                                                                                      4080S
+                   9.5                                                           5.25                                            3.5-bit              4070S
+                                   3.5-bit                    3.5-bit                                                                                 4070M
+                                                                                 5.00                                                                 4050M
+                   9.0                                                                                   4-bit
+                                                                4-bit            4.75                                              4-bit
+                                     4-bit
+                   8.5                                                           4.50
+                                       FP16                      FP16                                         FP16                      FP16
+                                                                                 4.25
+                         0     8      16      24   0      8      16     24              0      8    16 24 32         0    8    16 24 32
+                             time / token (ms)         time / token (ms)                     time / token (ms)           time / token (ms)
+Figure 17: Perplexity against time per token on various NVIDIA GPUs. The x markers indicate baseline values, where DecDEC
+is not applied (kchunk = 0). Subsequent markers show DecDEC results on target slowdown rates 2.5%, 5%, 10%, and 20%.
+
+                                                    Llama-3-8B-Instruct                                                  Phi-3-medium-4k-instruct
+                                          AWQ 3-bit                   SqueezeLLM 3-bit                         AWQ 3-bit                    SqueezeLLM 3-bit
+  GPU  Target                   Tuner Results      Slowdown      Tuner Results      Slowdown         Tuner Results        Slowdown      Tuner Results      Slowdown
+       2.5%                     24 / (4, 4, 8, 9)     1.3%       56 / (2, 0, 2, 2)     2.0%         20 / (8, 6, 13, 13)      1.5%      47 / (5, 2, 7, 10)     1.8%
+        5%                     24 / (5, 7, 9, 10)     2.2%       56 / (1, 1, 2, 6)     4.0%        47 / (10, 11, 13, 13)     3.8%      35 / (6, 6, 9, 10)     3.5%
+  4090
+        10%                  24 / (10, 11, 11, 11)    4.9%       38 / (5, 4, 5, 7)     6.1%        35 / (15, 15, 15, 14)     7.8%    47 / (10, 11, 13, 11)    7.3%
+        20%                  24 / (15, 15, 16, 15)   10.4%    28 / (10, 10, 10, 10)   10.8%        20 / (18, 19, 18, 18)    15.0%    35 / (16, 16, 15, 14)   15.3%
+       2.5%                      6 / (9, 5, 9, 6)     1.1%    24 / (10, 11, 14, 16)    0.6%        30 / (18, 17, 18, 20)     1.7%    30 / (14, 14, 15, 16)    2.0%
+        5%                    16 / (10, 10, 11, 9)    2.5%    24 / (14, 14, 14, 14)    2.2%        30 / (21, 21, 23, 21)     3.9%    30 / (17, 17, 20, 19)    3.7%
+ 4080S
+        10%                  24 / (18, 20, 23, 18)    5.5%    24 / (18, 19, 18, 17)    4.7%        35 / (24, 25, 24, 24)     8.3%    35 / (22, 22, 23, 21)    7.6%
+        20%                  24 / (26, 27, 25, 24)   11.5%    38 / (23, 24, 22, 23)   10.8%        35 / (30, 32, 28, 29)    16.2%    35 / (27, 27, 25, 25)   15.1%
+       2.5%                  28 / (25, 26, 26, 26)    2.0%    19 / (16, 15, 24, 21)    1.5%        20 / (31, 31, 37, 32)     2.1%    20 / (25, 26, 30, 28)    2.1%
+        5%                   24 / (31, 31, 35, 29)    3.7%    24 / (21, 22, 24, 24)    3.0%        20 / (35, 35, 37, 34)     4.2%    20 / (30, 30, 30, 29)    4.2%
+ 4070S
+        10%                  24 / (35, 35, 36, 34)    7.1%    24 / (28, 30, 30, 27)    6.2%        24 / (39, 40, 41, 38)     8.5%    24 / (34, 35, 35, 33)    8.6%
+        20%                  28 / (44, 44, 41, 42)   13.9%    24 / (35, 36, 34, 35)   12.4%        20 / (45, 46, 44, 45)    17.0%    20 / (40, 41, 38, 39)   16.9%
+       2.5%                  16 / (38, 39, 39, 40)    1.7%    12 / (28, 28, 35, 29)    1.6%        18 / (41, 41, 41, 42)     2.1%    17 / (33, 35, 35, 34)    2.1%
+        5%                   16 / (42, 43, 42, 42)    3.4%    16 / (33, 34, 36, 33)    3.1%        18 / (44, 46, 43, 44)     4.4%    18 / (37, 38, 37, 37)    4.3%
+ 4070M
+        10%                  16 / (46, 46, 44, 45)    6.6%    16 / (37, 38, 37, 37)    6.1%        18 / (46, 48, 46, 46)     8.3%    18 / (40, 41, 39, 39)    8.5%
+        20%                  16 / (50, 50, 49, 50)   13.4%    16 / (42, 42, 41, 41)   12.7%        18 / (53, 53, 50, 51)    17.2%    18 / (44, 44, 43, 43)   16.7%
+       2.5%                   8 / (55, 56, 58, 55)    1.7%     7 / (45, 45, 50, 44)    1.7%               OOM                  -             OOM                -
+        5%                    8 / (59, 59, 59, 58)    3.3%     9 / (48, 48, 48, 48)    3.3%               OOM                  -             OOM                -
+ 4050M
+        10%                  10 / (62, 62, 62, 62)    6.6%    10 / (52, 53, 52, 52)    6.3%               OOM                  -             OOM                -
+        20%                  10 / (70, 70, 68, 68)   13.5%    10 / (59, 60, 57, 58)   12.6%               OOM                  -             OOM                -
+
+                                  qkv               gu
+Table 3: Tuner results (ntbmax /(kchunk    o
+                                        , kchunk , kchunk    d
+                                                          , kchunk )) for four target slowdown rates (2.5%, 5%, 10%, 20%) and corresponding actual
+slowdown rates for 3-bit Llama-3 and Phi-3. Phi-3 is out of memory (OOM) on the 4050M GPU.
+
+
+ing returns. On platforms with high PCIe-to-GPU memory                                      without DecDEC due to memory limits. This case highlights
+bandwidth ratios, such as the 4070S, 4070M, and 4050M,                                      DecDEC’s effectiveness in pushing the boundaries of quan-
+DecDEC at 2.5% slowdown on 3-bit models sometimes out-                                      tized LLMs within memory capacity constraints.
+performs 3.5-bit baselines. In these cases, DecDEC yields
+Pareto-dominant solutions by excelling in model quality, la-
+tency, and memory. Examples include AWQ Llama-3 (4070M,                                     5.4     Evaluation across GPU Generations
+4050M) and AWQ Phi-3 (4070S, 4070M). A particularly note-                                   We evaluate the robustness of DecDEC across GPU genera-
+worthy case is the AWQ 3-bit Llama-3 on 4050M, where                                        tions, as both GPU memory bandwidth and PCIe bandwidth,
+DecDEC reduces perplexity from 10.15 to 9.12 with only a                                    two key factors influencing its effectiveness, may increase
+1.7% latency slowdown (highlighted by a red circle). This out-                              with newer architectures. To this end, we use three consumer-
+performs the 3.5-bit baseline, which is infeasible on 4050M                                 grade GPUs from the same product class across different
+               Phi-3-medium-4k-instruct                  Llama-3-70B-Instruct                  6   Related Work
+             6.0        3-bit             5080    6.9             3-bit           GH200
+                                          4080S                                   H100
+             5.7                          3080    6.6                                          GPU Implementations for Weight-Only Quantization. Nu-
+                                                                                               merous studies have proposed efficient GPU implementa-
+Perplexity
+
+
+
+
+             5.4                3.5-bit           6.3
+             5.1                                                     3.5-bit                   tions tailored for weight-only quantization of LLMs. LUT-
+                                                  6.0
+             4.8                      4-bit                                    4-bit           GEMM [44] replaces the expensive dequantization with sim-
+                                                  5.7                                          ple LUT operations. Marlin [20] supports FP16-INT4 GEMM
+             4.5                                  5.4                            FP16
+                                          FP16                                                 across various batch sizes, and Quant-LLM [63] introduces a
+             4.2
+                    9    12      15        18           18   21           24   27         30   GPU kernel that efficiently handles non-power-of-2 bitwidths
+             time / token (ms)                 time / token (ms)                               (e.g., 6-bit). FLUTE [23] provides a specialized kernel for non-
+   (a) DecDEC Across GPU Generations (b) DecDEC on Server-Grade GPUs                           uniform quantization. Any-Precision LLM [45] suggests a
+                                                                                               memory-efficient kernel for adaptive bitwidth selection. These
+   Figure 18: Perplexity vs. time per token: (a) across different                              implementations can seamlessly integrate with DecDEC, ben-
+   GPU generations and (b) on server-grade GPUs.                                               efiting from its dynamic error compensation.
+                           Memory Bandwidth              PCIe Bandwidth                R bw
+                                                                                               LLM Inference with External Memory. Several works ad-
+       RTX 5080               960 GB/s                      64 GB/s                    15      dress GPU memory limitations in LLM inference by leverag-
+       RTX 4080S              736 GB/s                      32 GB/s                    23      ing external memories like CPU memory or disk. DeepSpeed-
+       RTX 3080               760 GB/s                      32 GB/s                    24      Inference [4] and FlexGen [50] focus on throughput-oriented,
+                                                                                               out-of-core LLM inference. Pre-gated MoE [28] retrieves
+         Table 4: 80-class GPU specifications across generations.                              the parameters of only the activated experts in MoE models
+                                                                                               from CPU memory. LLM-in-a-Flash [3] introduces a flash
+                                                                                               memory-based inference system exploiting activation sparsity.
+   generations—RTX 3080, 4080S, and 5080—whose specifi-                                        InfiniGen [34] offloads the key-value cache to CPU memory.
+   cations are listed in Table 4. The Rbw values (lower is better)                             PowerInfer [51] proposes a GPU-CPU hybrid inference en-
+   remain essentially unchanged from the 3080 to the 4080S and                                 gine that leverages activation sparsity in ReLU-based models.
+   even decrease from the 4080S to the 5080. Figure 18(a) plots                                Though these approaches share the same goal as DecDEC in
+   the perplexity of AWQ-quantized Phi-3 with DecDEC aug-                                      aiming to extend GPU memory, they address distinct scenar-
+   mentation against end-to-end latency on these GPUs, using                                   ios with different challenges and opportunities.
+   the methodology described in Section 5.3. The improvements
+                                                                                               LLM Compression Methods. In addition to quantization,
+   delivered by DecDEC are comparable across all three cards,
+                                                                                               pruning can improve the efficiency of LLM inference [18, 37,
+   confirming its robustness across generations.
+                                                                                               53]. Other techniques, including knowledge distillation [22,
+                                                                                               25] and low-rank decomposition [48, 67], offer additional
+   5.5             Applicability to Server-Grade GPUs                                          ways to compress LLMs. These methods are orthogonal to
+                                                                                               quantization and, consequently, to DecDEC.
+   Although DecDEC primarily targets single-batch inference on
+   client (edge) devices, this section evaluates its effectiveness
+   on server-grade GPUs. We measure perplexity versus end-to-
+                                                                                               7   Conclusion
+   end latency using an AWQ-quantized Llama-3-70B-Instruct
+   model augmented with DecDEC on the H100 SMX5 and
+   GH200, following the methodology described in Section 5.3.                                  We propose DecDEC, an inference scheme for low-bit LLMs
+   Both GPUs provide 3.36 TB/s of memory bandwidth; how-                                       that improves model quality by correcting quantization errors
+   ever, the GH200’s 450 GB/s NVLink-C2C far exceeds the                                       through selective retrieval of residuals stored in CPU mem-
+   H100’s 64 GB/s PCIe, yielding a much lower Rbw .                                            ory. By focusing on dynamically identified salient channels
+                                                                                               at each decoding step, DecDEC maximizes error compensa-
+      Figure 18(b) shows the results. DecDEC improves per-
+                                                                                               tion within a limited transfer volume. DecDEC significantly
+   plexity on both GPUs with minimal latency overhead. How-
+                                                                                               improves quality of quantized LLMs with minimal overheads.
+   ever, the GH200’s advantage is smaller than the Rbw gap sug-
+   gests. DecDEC assumes a DRAM-bound GEMV, where real-
+   locating SMs for error compensation do not impact GEMV
+   latency. On server GPUs, however, quantized GEMV (e.g.,                                     Acknowledgments
+   LUTGEMM [44]) is L1-bound, not DRAM-bound. Since L1
+   throughput scales with active SMs, reallocating SMs increases                               This work was supported by the National Research Founda-
+   GEMV latency, limiting DecDEC’s benefit despite low Rbw .                                   tion of Korea (NRF) grants funded by the Korea government
+   Enhancing quantized GEMV kernels for server-grade GPUs                                      (MSIT) (RS-2024-00340008, RS-2024-00405857). Jae W.
+   by mitigating L1 bottlenecks could unlock further gains.                                    Lee is the corresponding author.
+References                                                           Neelakantan, Pranav Shyam, Girish Sastry, Amanda
+                                                                     Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen
+[1] NVIDIA         H100         Tensor     Core        GPU.          Krueger, Tom Henighan, Rewon Child, Aditya Ramesh,
+    https://resources.nvidia.com/                                    Daniel M. Ziegler, Jeffrey Wu, Clemens Winter, Christo-
+    en-us-data-center-overview-mc/                                   pher Hesse, Mark Chen, Eric Sigler, Mateusz Litwin,
+    en-us-data-center-overview/                                      Scott Gray, Benjamin Chess, Jack Clark, Christopher
+    nvidia-tensor-core-gpu-datasheet, 2024.                          Berner, Sam McCandlish, Alec Radford, Ilya Sutskever,
+                                                                     and Dario Amodei. Language models are few-shot
+[2] Tolu Alabi, Jeffrey D. Blanchard, Bradley Gordon, and            learners. In Advances in Neural Information Processing
+    Russel Steinbach. Fast k-selection algorithms for graph-         Systems, volume 33, 2020.
+    ics processing units. ACM J. Exp. Algorithmics, 2012.
+                                                                 [8] Yaohui Cai, Zhewei Yao, Zhen Dong, Amir Gholami,
+[3] Keivan Alizadeh, Seyed Iman Mirzadeh, Dmitry Be-                 Michael W Mahoney, and Kurt Keutzer. Zeroq: A novel
+    lenko, S. Khatamifard, Minsik Cho, Carlo C Del Mundo,            zero shot quantization framework. In Proceedings of the
+    Mohammad Rastegari, and Mehrdad Farajtabar. LLM                  IEEE/CVF Conference on Computer Vision and Pattern
+    in a flash: Efficient large language model inference with        Recognition, 2020.
+    limited memory. In Proceedings of the 62nd Annual
+    Meeting of the Association for Computational Linguis-        [9] Jerry Chee, Yaohui Cai, Volodymyr Kuleshov, and
+    tics, 2024.                                                      Christopher De Sa. QuIP: 2-bit quantization of large lan-
+                                                                     guage models with guarantees. In Advances in Neural
+[4] Reza Yazdani Aminabadi, Samyam Rajbhandari, Am-                  Information Processing Systems, 2023.
+    mar Ahmad Awan, Cheng Li, Du Li, Elton Zheng,
+    Olatunji Ruwase, Shaden Smith, Minjia Zhang, Jeff           [10] Tim Dettmers, Mike Lewis, Younes Belkada, and Luke
+    Rasley, and Yuxiong He. Deepspeed-inference: enabling            Zettlemoyer. Llm.int8(): 8-bit matrix multiplication for
+    efficient inference of transformer models at unprece-            transformers at scale. In Proceedings of the 36th Inter-
+    dented scale. In Proceedings of the International Con-           national Conference on Neural Information Processing
+    ference on High Performance Computing, Networking,               Systems, 2024.
+    Storage and Analysis, 2022.
+                                                                [11] Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and
+[5] Jason Ansel, Edward Yang, Horace He, Natalia                     Luke Zettlemoyer. QLoRA: Efficient finetuning of quan-
+    Gimelshein, Animesh Jain, Michael Voznesensky, Bin               tized LLMs. In Thirty-seventh Conference on Neural
+    Bao, Peter Bell, David Berard, Evgeni Burovski, Geeta            Information Processing Systems, 2023.
+    Chauhan, Anjali Chourdia, Will Constable, Alban Des-
+                                                                [12] Tim Dettmers, Ruslan A. Svirschevski, Vage Egiazar-
+    maison, Zachary DeVito, Elias Ellison, Will Feng, Jiong
+                                                                     ian, Denis Kuznedelev, Elias Frantar, Saleh Ashkboos,
+    Gong, Michael Gschwind, Brian Hirsh, Sherlock Huang,
+                                                                     Alexander Borzunov, Torsten Hoefler, and Dan Alis-
+    Kshiteej Kalambarkar, Laurent Kirsch, Michael Lazos,
+                                                                     tarh. SpQR: A sparse-quantized representation for near-
+    Mario Lezcano, Yanbo Liang, Jason Liang, Yinghai Lu,
+                                                                     lossless LLM weight compression. In The Twelfth In-
+    C. K. Luk, Bert Maher, Yunjie Pan, Christian Puhrsch,
+                                                                     ternational Conference on Learning Representations,
+    Matthias Reso, Mark Saroufim, Marcos Yukio Siraichi,
+                                                                     2024.
+    Helen Suk, Shunting Zhang, Michael Suo, Phil Tillet,
+    Xu Zhao, Eikan Wang, Keren Zhou, Richard Zou, Xi-           [13] Tim Dettmers and Luke Zettlemoyer. The case for 4-bit
+    aodong Wang, Ajit Mathews, William Wen, Gregory                  precision: k-bit inference scaling laws. In Proceedings
+    Chanan, Peng Wu, and Soumith Chintala. Pytorch 2:                of the 40th International Conference on Machine Learn-
+    Faster machine learning through dynamic python byte-             ing, 2023.
+    code transformation and graph compilation. In Pro-
+    ceedings of the 29th ACM International Conference on        [14] Zhen Dong, Zhewei Yao, Daiyaan Arfeen, Amir Gho-
+    Architectural Support for Programming Languages and              lami, Michael W Mahoney, and Kurt Keutzer. Hawq-v2:
+    Operating Systems, 2024.                                         Hessian aware trace-weighted quantization of neural net-
+                                                                     works. In Advances in Neural Information Processing
+[6] Yelysei Bondarenko, Markus Nagel, and Tijmen                     Systems, 2020.
+    Blankevoort. Quantizable transformers: Removing out-
+    liers by helping attention heads do nothing. In Advances    [15] Zhen Dong, Zhewei Yao, Amir Gholami, Michael Ma-
+    in Neural Information Processing Systems, 2023.                  honey, and Kurt Keutzer. Hawq: Hessian aware quan-
+                                                                     tization of neural networks with mixed-precision. In
+[7] Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie                 2019 IEEE/CVF International Conference on Computer
+    Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind                 Vision, 2019.
+[16] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey,                 Association for Computational Linguistics: ACL 2023,
+     Abhishek Kadian, Ahmad Al-Dahle, Aiesha Letman,                  2023.
+     Akhil Mathur, Alan Schelten, Amy Yang, and et al An-
+     gela Fan. The llama 3 herd of models, 2024.                 [26] Wei Huang, Haotong Qin, Yangdong Liu, Yawei Li, Xi-
+                                                                      anglong Liu, Luca Benini, Michele Magno, and Xiao-
+[17] Vage Egiazarian, Andrei Panferov, Denis Kuznedelev,              juan Qi. Slim-llm: Salience-driven mixed-precision
+     Elias Frantar, Artem Babenko, and Dan Alistarh. Ex-              quantization for large language models. 2024.
+     treme compression of large language models via addi-
+                                                                 [27] Wei Huang, Xingyu Zheng, Xudong Ma, Haotong Qin,
+     tive quantization. In Proceedings of the 41st Interna-
+                                                                      Chengtao Lv, Hong Chen, Jie Luo, Xiaojuan Qi, Xiang-
+     tional Conference on Machine Learning, 2024.
+                                                                      long Liu, and Michele Magno. An empirical study of
+[18] Elias Frantar and Dan Alistarh. Sparsegpt: massive               llama3 quantization: From llms to mllms, 2024.
+     language models can be accurately pruned in one-shot.       [28] Ranggi Hwang, Jianyu Wei, Shijie Cao, Changho
+     In Proceedings of the 40th International Conference on           Hwang, Xiaohu Tang, Ting Cao, and Mao Yang. Pre-
+     Machine Learning, 2023.                                          gated moe: An algorithm-system co-design for fast
+[19] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan          and scalable mixture-of-expert inference. In 2024
+     Alistarh. OPTQ: Accurate quantization for generative             ACM/IEEE 51st Annual International Symposium on
+     pre-trained transformers. In The Eleventh International          Computer Architecture, 2024.
+     Conference on Learning Representations, 2023.               [29] Jeonghoon Kim, Jung Hyun Lee, Sungdong Kim, Joon-
+                                                                      suk Park, Kang Min Yoo, Se Jung Kwon, and Dongsoo
+[20] Elias Frantar, Roberto L. Castro, Jiale Chen, Torsten
+                                                                      Lee. Memory-efficient fine-tuning of compressed large
+     Hoefler, and Dan Alistarh. Marlin: Mixed-precision
+                                                                      language models via sub-4-bit integer quantization. In
+     auto-regressive parallel inference on large language
+                                                                      Advances in Neural Information Processing Systems,
+     models. In Proceedings of the 30th ACM SIGPLAN
+                                                                      2023.
+     Annual Symposium on Principles and Practice of Paral-
+     lel Programming, 2025.                                      [30] Sehoon Kim, Coleman Hooper, Amir Gholami, Zhen
+                                                                      Dong, Xiuyu Li, Sheng Shen, Michael W Mahoney, and
+[21] Leo Gao, Stella Biderman, Sid Black, Laurence Gold-
+                                                                      Kurt Keutzer. SqueezeLLM: Dense-and-sparse quanti-
+     ing, Travis Hoppe, Charles Foster, Jason Phang, Horace
+                                                                      zation. In Proceedings of the 41st International Confer-
+     He, Anish Thite, Noa Nabeshima, Shawn Presser, and
+                                                                      ence on Machine Learning, 2024.
+     Connor Leahy. The pile: An 800gb dataset of diverse
+     text for language modeling, 2020.                           [31] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+                                                                      Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez,
+[22] Yuxian Gu, Li Dong, Furu Wei, and Minlie Huang.                  Hao Zhang, and Ion Stoica. Efficient memory man-
+     MiniLLM: Knowledge distillation of large language                agement for large language model serving with page-
+     models. In The Twelfth International Conference on               dattention. In Proceedings of the 29th Symposium on
+     Learning Representations, 2024.                                  Operating Systems Principles, 2023.
+[23] Han Guo, William Brandon, Radostin Cholakov,                [32] Changhun Lee, Jungyu Jin, Taesu Kim, Hyungjun Kim,
+     Jonathan Ragan-Kelley, Eric P. Xing, and Yoon Kim.               and Eunhyeok Park. Owq: Outlier-aware weight quan-
+     Fast matrix multiplications for lookup table-quantized           tization for efficient fine-tuning and inference of large
+     LLMs. In Findings of the Association for Computational           language models. In Proceedings of the AAAI Confer-
+     Linguistics: EMNLP 2024, 2024.                                   ence on Artificial Intelligence, 2024.
+[24] Jung Hwan Heo, Jeonghoon Kim, Beomseok Kwon,                [33] Janghwan Lee, Minsoo Kim, Seungcheol Baek, Seok
+     Byeongwook Kim, Se Jung Kwon, and Dongsoo Lee.                   Hwang, Wonyong Sung, and Jungwook Choi. Enhanc-
+     Rethinking channel dimensions to isolate outliers for            ing computation efficiency in large language models
+     low-bit weight quantization of large language models.            through weight and activation quantization. In Proceed-
+     In The Twelfth International Conference on Learning              ings of the 2023 Conference on Empirical Methods in
+     Representations, 2024.                                           Natural Language Processing, 2023.
+[25] Cheng-Yu Hsieh, Chun-Liang Li, Chih-kuan Yeh,               [34] Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong
+     Hootan Nakhost, Yasuhisa Fujii, Alex Ratner, Ranjay Kr-          Sim. InfiniGen: Efficient generative inference of large
+     ishna, Chen-Yu Lee, and Tomas Pfister. Distilling step-          language models with dynamic KV cache management.
+     by-step! outperforming larger language models with less          In 18th USENIX Symposium on Operating Systems De-
+     training data and smaller model sizes. In Findings of the        sign and Implementation, 2024.
+[35] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-          [46] Carl Pearson, Abdul Dakkak, Sarah Hashash, Cheng Li,
+     Ming Chen, Wei-Chen Wang, Guangxuan Xiao, Xingyu                   I-Hsin Chung, Jinjun Xiong, and Wen-Mei Hwu. Evalu-
+     Dang, Chuang Gan, and Song Han. Awq: Activation-                   ating characteristics of cuda communication primitives
+     aware weight quantization for on-device llm compres-               on high-bandwidth interconnects. In Proceedings of the
+     sion and acceleration. In Proceedings of Machine Learn-            2019 ACM/SPEC International Conference on Perfor-
+     ing and Systems, 2024.                                             mance Engineering, 2019.
+
+[36] Zechun Liu, Barlas Oguz, Changsheng Zhao, Ernie               [47] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine
+     Chang, Pierre Stock, Yashar Mehdad, Yangyang Shi,                  Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei
+     Raghuraman Krishnamoorthi, and Vikas Chandra. LLM-                 Li, and Peter J. Liu. Exploring the limits of transfer
+     QAT: Data-free quantization aware training for large               learning with a unified text-to-text transformer. J. Mach.
+     language models. In Findings of the Association for                Learn. Res., 2020.
+     Computational Linguistics: ACL 2024, 2024.
+                                                                   [48] Varun Srivastava Rajarshi Saha and Mert Pilanci. Matrix
+[37] Xinyin Ma, Gongfan Fang, and Xinchao Wang. Llm-                    Compression via Randomized Low Rank and Low Pre-
+     pruner: On the structural pruning of large language mod-           cision Factorization. In Advances in Neural Information
+     els. In Advances in Neural Information Processing                  Processing Systems, 2023.
+     Systems, 2023.
+                                                                   [49] Wenqi Shao, Mengzhao Chen, Zhaoyang Zhang, Peng
+[38] Stephen Merity, Caiming Xiong, James Bradbury, and                 Xu, Lirui Zhao, Zhiqian Li, Kaipeng Zhang, Peng Gao,
+     Richard Socher. Pointer sentinel mixture models, 2016.             Yu Qiao, and Ping Luo. Omniquant: Omnidirectionally
+                                                                        calibrated quantization for large language models. 2023.
+[39] Microsoft. Phi-3 technical report: A highly capable
+     language model locally on your phone, 2024.                   [50] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan
+                                                                        Li, Max Ryabinin, Beidi Chen, Percy Liang, Christopher
+[40] Seung Won Min, Kun Wu, Sitao Huang, Mert Hi-                       Ré, Ion Stoica, and Ce Zhang. Flexgen: high-throughput
+     dayetoğlu, Jinjun Xiong, Eiman Ebrahimi, Deming                   generative inference of large language models with a
+     Chen, and Wen-mei Hwu. Large graph convolutional                   single gpu. In Proceedings of the 40th International
+     network training with gpu-oriented data communication              Conference on Machine Learning, 2023.
+     architecture. In Proc. VLDB Endow., 2021.
+                                                                   [51] Yixin Song, Zeyu Mi, Haotong Xie, and Haibo Chen.
+[41] NVIDIA.              CUDA       C++      Best   Practices          Powerinfer: Fast large language model serving with
+     Guide.         https://docs.nvidia.com/cuda/                       a consumer-grade gpu. In Proceedings of the ACM
+     cuda-c-best-practices-guide/index.html,                            SIGOPS 30th Symposium on Operating Systems Princi-
+     2024.                                                              ples, 2024.
+
+[42] NVIDIA.                CUDA       C++      Programming        [52] Aarohi Srivastava, Abhinav Rastogi, Abhishek Rao, Abu
+     Guide.         https://docs.nvidia.com/cuda/                       Awal Md Shoeb, Abubakar Abid, Adam Fisch, Adam R
+     cuda-c-programming-guide/, 2024.                                   Brown, Adam Santoro, Aditya Gupta, Adrià Garriga-
+                                                                        Alonso, et al. Beyond the imitation game: Quantifying
+[43] OpenAI. Gpt-4 technical report, 2024.                              and extrapolating the capabilities of language models.
+                                                                        2022.
+[44] Gunho Park, Baeseong Park, Minsub Kim, Sungjae
+     Lee, Jeonghoon Kim, Beomseok Kwon, Se Jung Kwon,              [53] Mingjie Sun, Zhuang Liu, Anna Bair, and J. Zico Kolter.
+     Byeongwook Kim, Youngjoo Lee, and Dongsoo Lee.                     A simple and effective pruning approach for large lan-
+     Lut-gemm: Quantized matrix multiplication based on                 guage models. 2023.
+     luts for efficient inference in large-scale generative lan-
+     guage models. In The Twelfth International Conference         [54] Mirac Suzgun, Nathan Scales, Nathanael Schärli, Sebas-
+     on Learning Representations, 2024.                                 tian Gehrmann, Yi Tay, Hyung Won Chung, Aakanksha
+                                                                        Chowdhery, Quoc V Le, Ed H Chi, Denny Zhou, , and
+[45] Yeonhong Park, Jake Hyun, SangLyul Cho, Bonggeun                   Jason Wei. Challenging big-bench tasks and whether
+     Sim, and Jae W. Lee. Any-precision llm: Low-cost de-               chain-of-thought can solve them. 2022.
+     ployment of multiple, different-sized llms. In Proceed-
+     ings of the 41st International Conference on Machine          [55] Gemini Team. Gemini 1.5: Unlocking multimodal un-
+     Learning, 2024.                                                    derstanding across millions of tokens of context, 2024.
+[56] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier            large-scale transformers. In Advances in Neural Infor-
+     Martinet, Marie-Anne Lachaux, Timothée Lacroix, Bap-             mation Processing Systems, 2022.
+     tiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar,
+     Aurelien Rodriguez, Armand Joulin, Edouard Grave,           [66] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soo-
+     and Guillaume Lample. LLaMA: Open and efficient                  jeong Kim, and Byung-Gon Chun. Orca: A distributed
+     foundation language models, 2023.                                serving system for Transformer-Based generative mod-
+                                                                      els. In 16th USENIX Symposium on Operating Systems
+[57] Albert Tseng, Jerry Chee, Qingyao Sun, Volodymyr                 Design and Implementation, 2022.
+     Kuleshov, and Christopher De Sa. QuIP$\#$: Even
+     better LLM quantization with hadamard incoherence           [67] Zhihang Yuan, Yuzhang Shang, Yue Song, Qiang Wu,
+     and lattice codebooks. In Forty-first International Con-         Yan Yan, and Guangyu Sun. Asvd: Activation-aware
+     ference on Machine Learning, 2024.                               singular value decomposition for compressing large lan-
+                                                                      guage models, 2023.
+[58] turboderp.     ExLlamaV2.       https://github.com/
+     turboderp/exllamav2.
+                                                                 [68] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan
+                                                                      Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin, Zhuo-
+[59] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob                 han Li, Dacheng Li, Eric P. Xing, Hao Zhang, Joseph E.
+     Uszkoreit, Llion Jones, Aidan N. Gomez, Łukasz Kaiser,           Gonzalez, and Ion Stoica. Judging llm-as-a-judge with
+     and Illia Polosukhin. Attention is all you need. In              mt-bench and chatbot arena. In Proceedings of the 37th
+     Proceedings of the 31st International Conference on              International Conference on Neural Information Pro-
+     Neural Information Processing Systems, 2017.                     cessing Systems, 2024.
+
+[60] Zhongwei Wan, Xin Wang, Che Liu, Samiul Alam,               [69] Xunyu Zhu, Jian Li, Yong Liu, Can Ma, and Weiping
+     Yu Zheng, Jiachen Liu, Zhongnan Qu, Shen Yan, Yi Zhu,            Wang. A survey on model compression for large lan-
+     Quanlu Zhang, Mosharaf Chowdhury, and Mi Zhang.                  guage models, 2024.
+     Efficient large language models: A survey, 2024.
+
+[61] Zhe Wang, Jie Lin, Xue Geng, Mohamed M. Sabry
+     Aly, and Vijay Chandrasekhar. Rdo-q: Extremely fine-
+     grained channel-wise quantization via rate-distortion
+     optimization. In Computer Vision – ECCV 2022, 2022.
+
+[62] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten
+     Bosma, Brian Ichter, Fei Xia, Ed H. Chi, Quoc V. Le,
+     and Denny Zhou. Chain-of-thought prompting elicits
+     reasoning in large language models. In Proceedings of
+     the 36th International Conference on Neural Informa-
+     tion Processing Systems, 2024.
+
+[63] Haojun Xia, Zhen Zheng, Xiaoxia Wu, Shiyang Chen,
+     Zhewei Yao, Stephen Youn, Arash Bakhtiari, Michael
+     Wyatt, Donglin Zhuang, Zhongzhu Zhou, Olatunji
+     Ruwase, Yuxiong He, and Shuaiwen Leon Song. Quant-
+     LLM: Accelerating the serving of large language mod-
+     els via FP6-Centric Algorithm-System Co-Design on
+     modern GPUs. In 2024 USENIX Annual Technical Con-
+     ference, 2024.
+
+[64] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu,
+     Julien Demouth, and Song Han. SmoothQuant: Ac-
+     curate and efficient post-training quantization for large
+     language models. In Proceedings of the 40th Interna-
+     tional Conference on Machine Learning, 2023.
+
+[65] Zhewei Yao, Reza Yazdani Aminabadi, Minjia Zhang,
+     Xiaoxia Wu, Conglong Li, and Yuxiong He. Zeroquant:
+     Efficient and affordable post-training quantization for
+

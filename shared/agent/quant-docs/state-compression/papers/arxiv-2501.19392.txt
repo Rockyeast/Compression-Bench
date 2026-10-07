@@ -1,0 +1,3140 @@
+                                                             Cache Me If You Must: Adaptive Key-Value Quantization
+                                                                           for Large Language Models
+
+
+                                                  Alina Shutova * 1 Vladimir Malinovskii * 2 1 Vage Egiazarian * 3 Denis Kuznedelev 2 Denis Mazur 4 5
+                                                                           Nikita Surkov 6 Ivan Ermakov 5 Dan Alistarh 3
+
+
+                                                                     Abstract                                                          60      KVQuant (2.33 bit)    AQUA-KV (ours, 2.09 bit)          Baseline (BF16)
+arXiv:2501.19392v4 [cs.LG] 28 Feb 2025
+
+
+
+
+                                                 Efficient real-world deployments of large lan-                                                                                                        52.8 52.9
+
+
+
+
+                                                                                                             Average LongBench Score
+                                                                                                                                       50                                  47.8 48.1            46.1
+                                                 guage models (LLMs) rely on Key-Value (KV)                                                        44.3 44.6
+                                                 caching for processing and generating long out-                                       40                           37.2
+                                                 puts, reducing the need for repetitive computation.                                   30
+
+                                                 For large contexts, Key-Value caches can take                                              20.6
+                                                                                                                                       20
+                                                 up tens of gigabytes of device memory, as they
+                                                                                                                                       10
+                                                 store vector representations for each token and
+                                                 layer. Recent work has shown that the cached                                          0
+                                                                                                                                                    3                       8                           70
+                                                 vectors can be compressed through quantization,                                     # Parameters (B)
+                                                 pruning or merging, but these techniques often              Figure 1. Comparison of AQUA-KV to alternative Key-Value
+                                                 compromise quality towards higher compression               Cache compression methods for Llama 3.x models in terms of
+                                                 rates. In this work, we aim to improve Key                  average LongBench score on 14 english tasks (see Section 4).
+                                                 & Value compression by exploiting two obser-
+                                                 vations: 1) the inherent dependencies between               caching is typically employed, where keys and values are
+                                                 keys and values across different layers, and 2)             saved for later use. Unfortunately, KV-caching comes with
+                                                 high-compression mechanisms for internal net-               its own pitfalls: KV caches are large, especially when han-
+                                                 work states. We propose AQUA-KV, an adaptive                dling long sequences (Bai et al., 2023; Xiao et al., 2023).
+                                                 quantization for Key-Value caches that relies on            Thus, the memory footprint of a full-length Key-Value cache
+                                                 compact adapters to exploit existing dependencies           can reach tens of gigabytes of device memory, sometimes
+                                                 between Keys and Values, and aims to “optimally”            more than the model itself1 . This massive memory consump-
+                                                 compress the information that cannot be predicted.          tion increases the cost of deployment, and also slows down
+                                                 AQUA-KV significantly improves compression                  inference, as the whole process can become memory-bound
+                                                 rates, while maintaining high accuracy on state-            for large caches (Hooper et al., 2024).
+                                                 of-the-art LLM families. On Llama 3.2 LLMs, we              Previous work has proposed methods to compress KV
+                                                 achieve near-lossless inference at 2-2.5 bits per           caches using various methods such as quantization and prun-
+                                                 value with under 1% relative error in perplexity            ing (Li et al., 2024a), that can significantly reduce the mem-
+                                                 and LongBench scores. AQUA-KV is one-shot,                  ory footprint of KV caches. Yet, as we increase the degree
+                                                 simple, and efficient: it can be calibrated on a sin-       of compression, e.g. 2 bits per value, existing compression
+                                                 gle GPU within 1-6 hours, even for 70B models.              techniques begin to lose significant information, resulting
+                                         1. Introduction                                                     in poor accuracy (Li et al., 2024c).
+                                         Large Language Models (LLMs) are revolutionizing natural            In this work, we aim to improve KV cache compression by
+                                         language processing, but come with major computational              taking advantage of the inherent structure and dependencies
+                                         costs, in particular due to the input-quadratic complexity of       in the cache tensors. Specifically, we analyze the Key-Value
+                                         attention-based Transformer models (Vaswani, 2017). To              cache behavior for state-of-the-art LLMs and find several
+                                         achieve faster inference and avoid wasteful recomputation           strong inter-dependencies 1) between cached vectors from
+                                         of attention scores during autoregressive generation, KV            adjacent layers, but also 2) between the keys and values
+                                                                                                             within one layer.
+                                             *                     1
+                                           Equal contribution        HSE University 2 Yandex 3 ISTA
+                                         4            5       6                                                  1
+                                         SberDevices MIPT T-Bank. Correspondence to: Dan Alistarh                  For the popular Llama 3.2 3B model (Dubey et al., 2024)
+                                         <dan.alistarh@ist.ac.at>.                                           with a maximum context length of 217 tokens (≈131K), the 16-bit
+                                                                                                             cache takes up 15 GB per sequence. For Llama 3.1 70B and Qwen
+                                         Preprint, under review                                              2.5 72B, it is 42.9 GB per sequence.
+
+                                                                                                         1
+                     Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+Starting from these observations, we formulate a practi-               of attention sinks (Xiao et al., 2023) and large outlier val-
+cal compression algorithm that explicitly leverages these              ues (Liu et al., 2024c; Hooper et al., 2024; Liu et al., 2024a),
+inter-dependencies, by training compact linear predictors              which may not be present in the weights. Next, we detail
+that capture mutual information between cache components.              the main approaches for KV-cache quantization.
+Further, to offset prediction errors, we use data-free vector          KV-Cache quantization approaches can be roughly catego-
+quantization to achieve a superior compression-accuracy                rized based on quantization granularity and error handling.
+trade-off for the same bit-width. Our method requires only
+minimal calibration, is compatible with arbitrary quantiza-            Quantization Granularity. Several approaches have been
+tion schemes and can be further combined with orthogonal               developed with varying quantization granularities. For in-
+compression techniques such as pruning.                                stance, ZipCache (He et al., 2024) and WKVQuant (Yue
+                                                                       et al., 2024) implement channel-separable token-wise
+In summary, our contributions are as follows:                          quantization, while KVQuant (Hooper et al., 2024) and
+1. We analyze the structure of key-value caches in modern              KIVI (Liu et al., 2024c) employ a hybrid approach, using
+   LLMs and highlight several sources of mutual informa-               per-channel quantization for key tensors while applying per-
+   tion that can be leveraged for compression.                         token quantization for value tensors. QJL (Zandieh et al.,
+                                                                       2024) introduces a specialized JL transform for key ten-
+2. We propose AQUA-KV — a novel compression frame-
+                                                                       sors combined with per-token quantization for value tensors.
+   work that exploits inter- and intra-layer dependencies to
+                                                                       Methods like MiKV (Yang et al., 2024b), QAQ (Dong et al.,
+   improve quantization accuracy. AQUA-KV works in one
+                                                                       2024), and SKVQ (Duanmu et al., 2024) employ variable
+   shot, based on a lightweight calibration procedure, and
+                                                                       bit widths to balance accuracy and memory reduction.
+   shows competitive size-accuracy trade-offs. Additionally,
+   it is compatible with arbitrary quantization techniques,            Error Handling. Among the strategies used to address
+   and can be combined with additional compression, such               quantization errors, GEAR (Kang et al., 2024) compensates
+   as pruning.                                                         for errors using a low-rank matrix; to handle outliers, which
+3. We validate the effectiveness of AQUA-KV on modern                  can significantly impact model performance, IntactKV (Liu
+   LLM families in terms of both perplexity and zero-shot              et al., 2024b) maintains full precision for outlier values.
+   accuracy on long-range benchmarks, where AQUA-KV                    QuaRot (Ashkboos et al., 2024) transforms weight matrices
+   significantly improves accuracy across model types and              using Hadamard orthogonal matrices to “smoothen” quanti-
+   bitwdiths, particularly for 2-bit compression.                      zation outliers without affecting model output. Palu (Chang
+                                                                       et al., 2024) compresses KV cache through low-rank projec-
+4. We test AQUA-KV compatibility with various quantiza-                tion, while ZDC (Zhang & Shen, 2024) aims to eliminate
+   tion and pruning schemes, from simple uniform quanti-               compression overhead through a novel zero-delay compres-
+   zatin, to modern data-free vector quantizers (Malinovskii           sion scheme. Most methods maintain a window of recent
+   et al., 2024b) and hybrid quantization & pruning regimes.           historical KV cache in full precision to preserve accuracy.
+5. We develop a reference implementation for AQUA-KV                   Cross-Layer Merging. An alternative compression ap-
+   calibration and inference, which is available online2 .             proach, which has been relatively less investigated, has been
+2. Background and Related Work                                         to define layer groups, and keep a single KV-Cache per
+                                                                       layer group, reusing the one cache across all layers in the
+2.1. KV-Cache Compression                                              group. KVSharer (Yang et al., 2024c) observes that, sur-
+                                                                       prisingly, sharing the caches that are most dissimilar, by
+So far, the main focus of work on LLM compression has
+                                                                       the Euclidean distance, performs better than sharing similar
+been on the weight quantization, e.g. (Frantar et al., 2022;
+                                                                       ones. (This is identified using a calibration dataset.) Fur-
+Lin et al., 2023; Tseng et al., 2024a; Egiazarian et al., 2024).
+                                                                       ther, MiniCache (Liu et al., 2024a) merges pairs of layers,
+Recently, there has been a growing demand for KV-cache
+                                                                       and stores a common interpolated directional vector and
+compression, especially in tasks requiring long contexts.
+                                                                       token-wise scalar scales. Additionally, outlier tokens are
+The dynamic nature of KV-caching poses unique challenges:
+                                                                       retained to increase accuracy. During inference, keys and
+while for weights it is acceptable to use “slow but accu-
+                                                                       values of the two layers are restored from the shared vector
+rate” compression such as codebook-based methods (Tseng
+                                                                       representation using saved scales.
+et al., 2024a; Egiazarian et al., 2024)—given that weights
+are only decoded at inference time—for the KV-cache, both              KV Cache Pruning. Pruning methods aim to determine
+compression and decompression speeds matter, since we                  unnecessary parts of KV Caches and either evict them en-
+are dynamically adding new entries to the cache as well as             tirely, or offload to cheaper memory (e.g. CPU). Current
+decoding them at inference time. Another issue is posed by             research focuses on token-level pruning, e.g. determining
+the inherent structure in caches, in particular, the existence         which tokens should be discarded or offloaded. They can be
+   2
+                                                                       split into static methods and dynamic methods.
+       https://github.com/goodevening13/aquakv
+
+                                                                   2
+                     Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+Static methods use predefined position heuristics to deter-            Finally, our approach is conceptually related to Residual
+mine important tokens. An example is Fastgen (Ge et al.,               Vector Quantization (RVQ) (Gray & Neuhoff, 1998), but
+2023), which employs knowledge of attention structure in               using learned predictors instead of standard quantization.
+attention heads, acquired during prefill, to identify one of the
+                                                                       Linearity between adjacent layers. Prior work (Razzhi-
+tailored attention structures for each head. This knowledge
+                                                                       gaev et al., 2024) has shown that there is a almost linear
+is then used during inference to efficiently evict unnecessary
+                                                                       relationship between activations in sequential layers in trans-
+tokens. StreamingLLM (Xiao et al., 2023) notices that ini-
+                                                                       former language models due to the presence of skip connec-
+tial tokens (attention sinks) and recent tokens consistently
+                                                                       tions. We leverage this property for the design of KV-cache
+exhibit high importance. The method retains several tokens
+                                                                       predictors.
+in the beginning and a number of recent tokens, thus main-
+taining constant-size KV cache, facilitating deployment in             3. Method
+memory-constrained scenario.
+                                                                       The core idea of AQUA-KV is to leverage inter-
+Dynamic methods calculate importances dynamically, typ-
+                                                                       dependencies between consecutive KV-caches to improve
+ically using runtime information about attention distribu-
+                                                                       compression. For this, we train compact predictors that
+tion. H2O (Zhang et al., 2023) calculates token importances
+                                                                       “guess” the value of a Key & Value pair using other
+dynamically during inference using accumulated attention
+                                                                       cache entries, then quantize the residual information
+scores. It selects the least important tokens during each
+                                                                       that could not be predicted. This way, we only store the
+forward pass (if the cache is larger than desired) and thus
+                                                                       information that cannot be recovered from other sources.
+maintains constant cache size. SnapKV (Li et al., 2024b)
+calculates token importances using attention features; un-             In Section 3.1, we analyze the dependencies between var-
+like H2O, SnapKV thresholds token importances, allowing                ious KV cache components to determine the type of pre-
+prompt compression during prefill.                                     dictors that achieves the best size-accuracy trade-off. In
+                                                                       Section 3.2, we formulate a practical one-shot algorithm
+For our work we choose to conduct experiments using H2O
+                                                                       that fits these predictors for use in KV cache compression.
+pruning as it is a well-established plug-and-play method.
+                                                                       Finally, in Section 3.3 we describe a number of important
+However, we emphasize that our method is orthogonal to
+                                                                       implementation details for using AQUA-KV in practice.
+pruning and AQUA-KV can be combined with any cache
+eviction strategy. AQUA-KV integrates both Quantization
+                                                                       3.1. Analysis of Inter-Layer Dependencies
+and Cross-Layer Merging strategies. It can be regarded as
+more advanced Layer Merging approach via training a small              The efficacy of our approach depends on choosing which
+supplementary model, referred to as predictor, capturing               types of inter-dependencies to exploit. To make this choice,
+inter-layer dependencies of KV caches.                                 we analyze the dependencies between cached vectors at
+Vector Quantization recently emerged as a popular option               different layers or tokens, and between (key & value) vectors
+for LLM quantization (Egiazarian et al., 2024; Tseng et al.,           within the same layer. Note that we do not expect the values
+2024b; van Baalen et al., 2024) since it allows to jointly             in these vectors to be equal or even numerically close—
+quantize multiple individual model dimensions and can lead             indeed, a simple examination shows that this is not the case.
+to state-of-the-art accuracy-vs-compression (Tseng et al.,             Instead, we look for consistent dependencies between these
+2024c; Malinovskii et al., 2024a). However, the extremely              components that can be extracted with simple models.
+large computational cost of encoding makes such methods                To measure dependencies between vectors at nearby layers,
+impractical in the context of KV-cache compression.                    we adopt an approach similar to probing (Alain & Bengio,
+We resolve this issue, and leverage the power of VQ in an              2016): we train linear “probe” models whose goal is to
+efficient way, by adapting the HIGGS weight quantization               predict the contents of a particular cache component, e.g. i-
+technique (Malinovskii et al., 2024b) to KV-Cache compres-             th layer keys or values, based on inputs from various sources.
+sion. HIGGS combines group-wise vector quantization with               As potential sources, we consider the previous layer keys
+a Randomized Hadamard Transformation (RHT): the RHT                    and values, adjacent tokens, and different vector types (i.e.
+projects the original values onto a “rotated” space, where             using the keys to predict values and vice versa).
+they will be normally-distributed. In the quantization step,           We can then measure the relative prediction error for such
+the rotated values are grouped and rounded to the nearest              probes, based on small amounts of calibration data. More
+points on a lattice, which is specifically optimized for ac-           specifically, we measure the explained variance ratio to
+curate quantization of normally-distributed vectors. This              account for unequal scales of keys and values between lay-
+allows HIGGS to achieve fast data-free weight quantiza-                ers. Intuitively, if a predictor captures 90% of the variance,
+tion. The technique requires several modifications to be               it means that the subsequent quantization only needs to
+applied to Key-Value caches, which we detail in Section 4.2.           capture the remaining 10% of variance. For compression
+
+                                                                   3
+                         Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+                              Predict Keys
+0.75
+0.50
+0.25
+0.00   L-3 L-2 L-1 all       T-3 T-2 T-1 all   KL 1 VL 1KVL 1 VL
+                             Predict Values
+0.75
+0.50
+0.25
+0.00   L-3 L-2 L-1 all       T-3 T-2 T-1 all   KL 1 VL 1KVL 1 KL
+Figure 2. Mean Explained Variance Ratios by linear probes from         Figure 3. An intuitive scheme of the AQUA-KV inference.
+previous blocks (L), tokens (T) and role on Llama-3.2-3B.              Only the quantized residuals are saved for each block.
+
+methods that are scale-independent 3 (Horváth et al., 2023)           dependency to the fact that transformer architecture is resid-
+this would mean that the resulting quantization will also              ual, and therefore, adjacent hidden states are only off by a
+have roughly 10 times smaller error.                                   single transformer layer. Since Key-Value representations
+                                                                       are constructed as linear projections of adjacent residual
+Note that not all predictors will be practical for Key-Value
+                                                                       hidden states, they are also interdependent.
+compression. For instance, if a predictor uses a subsequent
+block or future token KV vectors as inputs for the current             More distant layers are also predictive of the current layer,
+ones, it would be difficult to inference the model with such           but the dependency quickly deteriorates with the distance.
+KV cache as it goes against the order in which the blocks              More importantly, there is almost no difference between
+execute. Hence, we consider the following:                             using multiple past layers and just the previous layer, which
+                                                                       allows us to simplify the algorithm. See Appendices B & D
+• Previous blocks: same token vectors for -1, -2, -3 blocks;
+                                                                       for additional exploration and downstream results.
+• Previous tokens: same layer, -1, -2, -3 previous tokens;
+                                                                       We also observe strong dependencies between keys and
+• Different role: using keys to predict values and vice versa.         values within the same layer. This is also not unexpected,
+                                                                       as these vectors are linear down-projections from the same
+We report these errors in Figure 2. For comparison, 1-bit              input vector within the attention layer. The reason why there
+and 2-bit quantizers usually explain 0.75 and 0.89 variance,           is no additional information between matching keys/values
+respectively. Intuitively, if a probe can predict the L-th block       is that in modern LLMs the key/value dimensions are both
+keys with the same relative error as the 1- or 2-bit quantizer,        significantly smaller than the input vector dimension due to
+it means that using the probe can “save” approximately this            Grouped Query Attention (GQA, Ainslie et al. 2023).
+many bits per value when quantizing residuals. While this
+                                                                       In contrast, we found relatively little predictive power from
+is not a strict guarantee, we found that it holds well for
+                                                                       past tokens. While there is mutual information between
+real-world LLMs, as can be seen in Sections 4.1 and 4.2.
+                                                                       adjacent tokens, using a single previous token is not enough
+We train linear probes for Llama-3.2-3B Key-Value cache                to capture this dependency, and using many multiple tokens
+on a sample of RedPajama (Weber et al., 2024) sequences,               or a more expressive probe would make the resulting KV
+then evaluate relative error on hold-out sequences from                cache compression inefficient.
+the same source. For readability, the detailed experiment
+                                                                       Some of our observations above correlate with the results
+configuration is deferred for Appendix A.
+                                                                       from Liu et al. (2024a), who were able to completely “share”
+The findings in Figure 2 demonstrate strong dependencies               some of the cache entries. However, such direct merging is
+between several cache components. For attention keys, us-              a drastic approach, that can lead to significant accuracy loss.
+ing just one previous layer already achieves errors similar to         From the perspective of Figure 2, this is because the infor-
+2-bit quantization. For values, the dependency on previous             mation recovered by a probe is not enough by itself, never
+layer is also strong: though less accurate than for keys, the          exceeding the equivalent of a 2-bit quantizer. In contrast,
+previous layer values consistently explains more than half             we employ a more fine-grained approach that combines
+of the variance for the same token. We attribute this strong           predictors with residual quantization that can achieve more
+   3
+                                                                       accurate compression.
+   Formally, a scale-independent quantizer Q(·) satisfies
+∀X, ∀α>0, ||Q−1 (Q(αX))−αX||2 = α||Q−1 (Q(X))−X||2 .
+Modern quantizers satisfy this due to the use of scales.
+
+                                                                   4
+                    Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+Algorithm 1 AQUA-KV Calibration                                      inference. The first layer key-value cache is compressed
+Require: model, data, quantization method Q                          as is, and each subsequent layer trains using previous layer
+ 1: X ← model.input embeddings(data)                                 key-value reconstructions as inputs. The full calibration
+ 2: Kold , Vold ← ∅                                                  procedure is described in Algorithm 1.
+ 3: predictors ← {}                                                  Here, Q(·) and Q−1 (·) denote quantization and de-
+ 4: for i = 1, . . . , model.num layers do                           quantization operators. Our algorithm is agnostic to the
+ 5:   block ← model.transformer layers[i]                            choice of Q(·): simple uniform min-max quantization or
+ 6:   (K, V) ← block.get attention kv(X)                             any advanced method can be used (Frantar et al., 2022; Mali-
+ 7:   X ← block(X)                                                   novskii et al., 2024b). The notation arg minf ||f (X) − Y ||22
+ 8:    if Kold = ∅ and Vold = ∅ then                                 fits a linear regressor to a given problem. By default, we
+ 9:       Kold , Vold ← K, V                                         use simple linear regression for all predictors, which allows
+10:       continue                                                   for a closed-form training and is easy to use during infer-
+11:    end if                                                        ence. However, our algorithm can accommodate any other
+12:    # Predict keys from past keys                                 regressor type. In 4.1 we consider alternative algorithms:
+13:    fkey ← arg minf ∥f (Kold ) − K∥22                             reduced-rank regression (Reinsel & Velu, 1998) and MLPs.
+14:    Kresidue ← Q−1 (Q(K − fkey (Kold )))                          Computational and memory overhead. In addition to the
+15:    Krec ← fkey (Kold ) + Kresidue                                cache entries, AQUA-KV also needs to store the trained pre-
+16:    # Predict values from past values and current keys            dictors during inference. This requires additional computa-
+17:    fvalue ← arg minf ∥f ([Vold ; Krec ]) − V∥22                  tion, and slightly increases the memory footprint. However,
+18:    Vresidue ← Q−1 (Q(V − fvalue ([Vold ; Krec ])))               this overhead is small in practice: this is largely because
+19:    Vrec ← fvalue ([Vold ; Krec ]) + Vresidue                     modern LLMs use GQA (Ainslie et al., 2023)—a popular at-
+                                                                     tention variant that uses fewer key-value heads than queries.
+20:   predictors[i] = (fkey , fvalue )
+                                                                     For AQUA-KV, this means that the predictors contain sig-
+21:   Kold , Vold ← Krec , Vrec
+                                                                     nificantly less parameters and require orders of magnitude
+22: end for
+                                                                     less computation. For instance, For Llama 3.x 70B and
+23: return predictors
+                                                                     Qwen 2.5 72B, inferencing AQUA-KV predictors for a to-
+3.2. The AQUA-KV Algorithm                                           ken requires at least 500× less floating point operations than
+                                                                     running the base model for the same token (see Section 4.2).
+Based on the findings from the previous section we design
+a cache compression algorithm that leverages the structure           Efficiency and limitations. Algorithm 1 is designed to
+of Key-Value cache to improve compression.                           work as a single-pass calibration procedure. It trains pre-
+                                                                     dictors separately, one at a time. This allows our algorithm
+We choose the following predictor configuration: (1) we              to run efficiently even on low-end hardware. For instance,
+use the previous layer keys to predict the subsequent keys;          calibrating the full set of AQUA-KV predictors for a Llama-
+and (2) we use both previous layer values and current layer          3.1-70B model takes up 4 hours on a single GPU and takes
+keys to predict values. Note that we do not use the depen-           up at most 16GB VRAM. AQUA-KV is designed as a sim-
+dency between same layer K and V vectors in the VL →KL               ple and lightweight algorithm that can be easily extended.
+direction: this is because we cannot predict in both direc-          As such, we deliberately forego more complex techniques
+tions simultaneously during inference, and we found that             such as global predictor fine-tuning or dynamic bitwidth.
+the values are overall harder to predict (see Figure 2), so          We discuss these possible extensions in Section 5.
+we opted to improve value predictor. We also purposefully
+leave out other possible input sources, such as more distant         3.3. Implementation Details
+past layers. While using these layers can slightly improve
+reduce error, it would also make the predictors themselves           Finally, we describe several practical details necessary for
+larger and more compute-intensive.                                   efficient implementation of our approach, whose experimen-
+                                                                     tal validation is given in Section 4.1.
+The way AQUA-KV trains those predictors is also different
+                                                                     Backbone quantization. To validate the generality, we
+from Section 3.1. This is because, in practical KV cache
+                                                                     couple AQUA-KV with two different quantization schemes:
+compression, the predictors do not have access to ground-
+                                                                     Quanto (HuggingFace, 2024) (simple round-to-nearest quan-
+truth past KVs during inference. Instead, they can only use
+                                                                     tization with absmax normalization) and the more advanced
+reconstructed (de-quantized) past key and value vectors. To
+                                                                     HIGGS (Malinovskii et al., 2024b).
+account for this discrepancy, AQUA-KV trains predictors se-
+quentially, one transformer layer at a time. Each subsequent         Relation between AQUA-KV and Attention Sinks. It
+set of predictors is trained using reconstructed cache entries       is well-known that modern LLMs tend to form attention
+as inputs, reflecting the way these predictors are used during       “sinks” — tokens that have extremely high attention scores
+
+                                                                 5
+                     Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+while being semantically unimportant (Xiao et al., 2023).               We define this procedure formally in Alg. 4. Due to the se-
+Several prior works in KV compression propose special                   quential nature of our approach, we only need to materialize
+treatment for such attention sinks, such as keeping them                (de-quantize) a single layer at a time, which can be further
+in higher precision (Hooper et al., 2024) or introducing                improved with chunking. Note that the proposed scheme is
+synthetic sinks (Xiao et al., 2023; Chen et al., 2025).                 seamlessly compatible with model parallelism, offloading,
+                                                                        speculative decoding, merging multiple sequences and other
+When evaluating AQUA-KV, we found that attention sinks
+                                                                        popular LLM inference techniques. Furthermore, as we
+are indeed important. Compressing attention sinks poorly
+                                                                        show in Section 4.3, our approach can be used in tandem
+can affect the behavior of attention heads on other to-
+                                                                        with pruning techniques, such as H2 O (Zhang et al., 2023).
+kens and, hence, change the input/output distribution for
+the learned predictors. The AQUA-KV calibration algo-                   4. Experiments
+rithm computes input keys and values without accounting
+for quantization error (Alg. 1 L5-7), as doing otherwise                To test the real-world effectiveness of AQUA-KV, we apply
+would significantly increase calibration time. Hence, we                it to modern LLMs in three setups: 1) in Section 4.1, we
+found that AQUA-KV benefits from keeping the first few                  analyze the impact of individual components of our method
+tokens uncompressed, similarly to how they are treated in               and verify the design choices 2) Section 4.2 evaluates on a
+KVQuant (Hooper et al., 2024). For fair comparison, we                  broader range of models and compression rates; 3) finally,
+keep the first 4 tokens uncompressed for both AQUA-KV                   Section 4.3 explores how our approach combines with other
+and baselines without predictors, and explore this in more              popular KV cache compression strategies.
+detail in Table 5 in suplementary materials.                            Across all three sections, we use the same calibration and
+Positional embeddings. Most LLMs apply Rotary Po-                       evaluation protocol. We use a sample from RedPajama (We-
+sitional Embeddings (RoPE, Su et al. 2021) to attention                 ber et al., 2024) dataset for calibration: namely, 256 se-
+keys (but not values). This raises a natural dilemma about              quences of 8192 tokens sampled at random. We use 32 of
+whether to apply predictors and quantizers before or after              those sequences as holdout for hyperparameter selection and
+quantization. In our analysis, we found that linear predictors          the remaining 224 are used to train the predictors themselves.
+are beneficial in either case, but they offer better accuracy in        We use two popular evaluation metrics: WikiText-2 (Merity
+pre-RoPE compression. We attribute this to the fact that the            et al., 2016) perplexity and LongBench (Bai et al., 2023).
+optimal predictor for post-RoPE compression needs to be                 When evaluating perplexity, we adopt the same approach as
+rotation-equivariant, and the simple linear models we use               in prior quantization works (Frantar et al., 2022; Lin et al.,
+are not. As for the backbone quantization, we found that the            2023; Egiazarian et al., 2024), with one exception: instead
+uniform quantizer (Quanto) works slightly better post-RoPE,             of processing sequences (of length 8192) in parallel, we en-
+while HIGGS works equally well in both cases due to its                 code them auto-regressively and maintain the (compressed)
+use of the Hadamard transform. We provide experimental                  Key-Value cache during inference. This results in the same
+validation for these claims in Appendix D.                              perplexity for non-compressed KV cache, but allows us to
+Per-token and per-channel compression. We use                           properly account for the effect of recent token buffers and
+per-token quantization for both schemes. While some                     attention sinks during KV quantization, as described in Sec-
+prior works suggest that keys are better quantized per-                 tion 3.3. Here, we use base (non-instruct) models since they
+channel (Liu et al., 2024c; Hooper et al., 2024) due to dif-            have better perplexity.
+ferent outlier structure, we found that this is not necessary           In turn, LongBench v1 (Bai et al., 2023) contains long-
+when quantizing predictor residuals. We use per-token com-              context length evaluation benchmarks including QA tasks,
+pression as it is easier to implement, and we ablate this               summarization, and few-shot learning. We evaluated all
+choice in Appendix D. For baselines, we always follow the               the 14 English-language tasks without restricting the input
+quantization axes suggested in their respective papers.                 length to 8192 tokens. This allows us to better explore the
+Inference Algorithm. Finally, we explain how these design               effectiveness of AQUA-KV on longer sequences. Since
+choices combine to the full AQUA-KV inference procedure.                14 individual tasks are often difficult to analyze, we report
+Both AQUA-KV and all our baselines maintain a small                     the average score across all tasks and provide detailed per-
+recent token buffer (up to r=128 tokens for all setups) that            task results in Appendices D, E & F. We use the official
+are originally stored without compression. This buffer has              benchmark code, and evaluate on Instruct models since
+two positive effects: it improves accuracy on recent tokens             many LongBench tasks were designed for such models (see
+and allows for efficient parallel processing. When the buffer           Appendix C).
+is filled, its contents are quantized incrementally from the
+first layer to the last, in the same order as during calibration.
+
+
+
+                                                                    6
+                    Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+4.1. Detailed Evaluation & Ablation Analysis                        First Layer Keys & Values. Since the first layer is not
+                                                                    compressed by AQUA-KV predictors, we consider several
+First, we evaluate the effectiveness of the individual com-
+                                                                    strategies for it: keeping it as is, or quantizing it to 2-4
+ponents of AQUA-KV in different combinations. To keep
+                                                                    bits. Table 1 shows that quantizing to 3 or 4 bits is nearly
+the number of experiments manageable, we have chosen the
+                                                                    lossless, while 2-bit quantization leads to drops. As such,
+Llama 3.2 3B model and focused on 2-bit quantization. We
+                                                                    we use 4-bit quantization of the first layer as our default
+explore additional models and compression targets in future
+                                                                    configuration for Llama models.
+sections. We report the evaluation results in Table 1 and
+describe each sub-section below. Additional experiments
+                                                                    Table 1. Evaluation of Llama 3.2 3B with various Key-Value cache
+and detailed LongBench scores are in Appendix D.                    compression strategies. The left panel contains WikiText-2 perplex-
+Alternative quantizers. As discussed, AQUA-KV is com-               ity for the base (non-Instruct) model and the average LongBench
+patible with any “backbone” quantization scheme. We                 results for the Instruct model. The right panel reports detailed
+focus on two schemes described in Section 3.3: HIGGS                per-task LongBench scores for the Instruct model. We report addi-
+                                                                    tional ablations and per-task scores in Appendix D.
+and Quanto. For HIGGS, we use the quantization group
+                                                                                                      Quant. Wiki2 PPL↓ LongBench Avg.↑
+size 1024 and use three grid configurations that have fast                       Config
+                                                                                                       Bits  (base model) (instruct model)
+GPU support, at 2-, 3- and 4-bit precision (we use d=2,                     Uncompressed                 16         6.98        44.47
+n ∈ {16, 64, 256} respectively) and one grid without fast                   Quanto-2b-gs64              2.50       21.56        33.59
+                                                                          KIVI-2b-gs128-r128            2.25        9.33        39.63
+GPU support (2-bit precision, d=4, n=256). For Quanto,                     KVQuant-2b-s1%               2.33        9.43        20.56
+we use the default group size 64 and per-token compression                HIGGS-2b-gs1024               2.02        7.47        43.25
+(0-th axis). Both methods use Round-To-Nearest (RTN)                       KVSharer (1 pair)           15.43       7.45         36.81
+quantization. We evaluate each scheme with and without                     KVSharer (4 pairs)          13.71       9.60         29.82
+
+learned AQUA-KV predictors, and compare against two                      AQUA-KV (Quanto)               2.64       10.33        43.64
+                                                                         AQUA-KV (HIGGS)                2.16        7.03        44.26
+popular algorithms for KV cache compression: KIVI (Liu
+                                                                                          AQUA-KV Predictor Architecture
+et al., 2024c) and KVQuant (Hooper et al., 2024). We also
+                                                                           Linear (162 MiB)             2.16       7.03         44.26
+discuss AQUA-KV compatibility with QuaRot and report                       MLP (540 MiB)                2.16       7.03         44.61
+additional Quanto configurations in Appendix D.                             RRR (68 MiB)                2.16       7.22         44.30
+                                                                           GPTQ (41 MiB)                2.16       7.03         44.19
+Table 1 shows that KVQuant, KIVI and Quanto have rela-                                    AQUA-KV 1st Layer Keys & Values
+tively poor results for 2-bit quantization. The addition of                 Keep in BF16                2.59       7.03         44.26
+AQUA-KV to Quanto provides a significant improvement                        HIGGS 4 bit                 2.16       7.03         44.26
+in both PPL and LongBench average scores. While be-                         HIGGS 3 bit                 2.13       7.03         44.28
+                                                                            HIGGS 2 bit                 2.09       7.05         44.41
+ing a calibration-free method, HIGGS outperforms all the                 HIGGS slow-grid 2 bit          2.09       7.01         44.43
+above-mentioned methods in terms of PPL; HIGGS with                                                  Ablation Analysis
+AQUA-KV achieves the best results on both metrics.                       AQUA-KV (default)              2.16       7.03         44.26
+                                                                         w/o 16-bit Attn. Sink          2.16       7.15         44.13
+Layer Sharing. As we discussed in Section 2, layer sharing                 w/o V predictor              2.09       7.06         43.91
+is conceptually similar to AQUA-KV. To compare these                       w/o K predictor              2.09       7.50         42.92
+                                                                            w/o pre-RoPE                2.16       7.05         44.13
+two strategies, we evaluate against KVSharer (Yang et al.,
+                                                                       Quantizer-agnostic training      2.16       7.13         44.26
+2024c). We follow the original algorithm to share 1 and 4
+layer pairs chosen by the KVSharer procedure. The results           Ablation Analysis. Finally, we validate some of the AQUA-
+can be seen in a separate section of Table 1: while the             KV design choices described in Section 3.3. Namely, we
+technique can reduce model size, sharing multiple layer             examine the strategy of keeping 16-bit attention “sinks” by
+pairs causes major accuracy drops.                                  measuring the effect of quantizing them. We also measure
+Predictor Architecture. Next, we compare several types              the effect of AQUA-KV with only key or only value predic-
+of learned predictors: linear regression (our main proposal),       tor, and validate the effectiveness of pre-RoPE predictors
+Reduced-Rank Regression (Reinsel & Velu, 1998) with rank            by comparing against post-RoPE. We evaluate a simplified
+256, a multilayer perceptron (MLP) with two layers, dou-            version of AQUA-KV calibration procedure that trains pre-
+bled hidden dimension and layer normalization. Further, we          dictors with non-quantized inputs: this way, the predictors
+evaluate the quality loss from quantizing predictor weights         could be trained once and can then used for arbitrary quanti-
+to 4 bits with GPTQ (Frantar et al., 2022). Overall, MLP            zation bitwidth. The results in Table 1 demonstrate that each
+predictors are only marginally better than linear, not justi-       of the tested components is important for the effectiveness
+fying their increase in size and inference time. In the other       of our method, particularly the key predictors.
+direction, using RRR for compression results in marginally          4.2. Large-Scale Evaluaton
+worse perplexity. GPTQ offers a favorable trade-off for use         Next, we evaluate how AQUA-KV scales across different
+cases that need to further minimize size.                           LLM sizes and compression bitwidths. We run our exper-
+
+                                                                7
+                      Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+Table 2. Evaluation of AQUA-KV (with HIGGS backbone) and baselines across five LLMs for 2, 3 & 4 bit compression. The WikiText-2
+Perplexity is evaluated on base (non-instruct) models with sequence length 8192. The LongBench results are an average over 14 tasks
+evaluated with Instruct model with sequence length 217 (131K) tokens. The cache size corresponds to the total memory footprint for
+Llama 3.1 70B model with sequence length 217 (131K) tokens and batch size 1, including predictors. Additional details in Appendix E.
+                                                 WikiText-2 PPL↓ (base model)                        LongBench Average↑ (instruct)
+                       Quant.    Cache size
+          Method                                 Llama 3.x              Qwen 2.5                     Llama 3.x                Qwen 2.5
+                        bits     GiB, 70B
+                                              3B    8B       70B      3B       7B           3B          8B      70B        3B        7B
+       Uncompressed      16         40        6.98   5.61    2.54       7.14      6.13     44.61          48.13      52.92           38.80   46.82
+         AQUA-KV        2.09        5.7       7.03   5.72    2.62       7.20      6.17     44.30          47.77      52.79           38.31   46.43
+           HIGGS        2.02        5.1       7.47   5.89    2.77       7.93      8.08     42.80          47.37      52.18           30.92   25.97
+            KIVI        2.25        5.6       9.34   7.37    3.06       9.05      7.02     39.64          46.28      52.45           28.66   32.78
+          KVQuant       2.33        5.6       9.43   6.64    3.28        —         —       20.56          37.17      46.14            —       —
+         AQUA-KV        3.06        8.1       6.98   5.64    2.55       7.15      6.14     44.37          48.10      52.81           38.77   46.81
+           HIGGS        3.02        7.6       7.05   5.66    2.57       7.26      7.20     44.41          47.86      52.56           31.85   14.61
+            KIVI        3.05        7.7       7.87   6.04    2.87       7.63      6.37     41.40          46.98      52.87           30.37   32.63
+          KVQuant       3.33        8.3       7.26   5.84    2.75        —         —       41.40          46.42      50.74            —       —
+         AQUA-KV        4.02        10.9      6.98   5.61    2.54       7.15      6.14     44.48          48.10      52.95           38.92   46.77
+           HIGGS        4.02        10.6      7.01   5.62    2.55       7.16      6.88     44.41          48.07      52.97           32.11   11.54
+            KIVI        4.25        10.6      7.03   5.64    2.61       7.17      6.14     43.11          47.57      52.88           31.50   33.40
+          KVQuant       4.33        10.8      7.04   5.65    2.58        —         —       43.62          47.77      52.89            —       —
+
+
+iments using the popular Llama 3.x (Touvron et al., 2023;               Table 3. Evaluation of AQUA-KV quantization in combination
+Dubey et al., 2024) and Qwen 2.5 (Yang et al., 2024a; Team,             with H2 O token pruning. This config follows the same setup as
+2024) LLM families. For Llama 3.x models, we take the lat-              Table 2, but every entry uses H2 O procedure to keep only 20%
+est versions that have both Instruct and non-Instruct model             tokens, using hyperparameters from Zhang et al. 2023.
+variants: v3.1 for 8B and 70B and v3.2 for 3B. We need                                           Quant.      Memory          LongBench Avg.↑ (instruct)
+                                                                               Method
+                                                                                                  Bits        Saved           3B           8B
+both variants for different evaluations (see Appendix C). We
+                                                                               H2 O only           16             5.0×       38.82           41.42
+evaluate for 2, 3 & 4 bit KV quantization in WikiText-2 PPL
+                                                                           H2 O + HIGGS            2.02       39.6×          37.02           40.53
+& LongBench scores, and report the resulting KV-Cache                     H2 O + AQUA-KV           2.09       38.3×          38.43           40.88
+footprint for a single full-length sequence.
+The results in Table 2 summarize our findings: as before,               Inference time. The practical inference speed of AQUA-
+AQUA-KV predictors can substantially improve over both                  KV depends heavily on the backbone quantizer (e.g.
+the HIGGS quantizer and prior works on KV-Cache quanti-                 HIGGS, Quanto, or others). Since AQUA-KV adds an extra
+zation. The advantage from using AQUA-KV is particularly                prediction step, it can not be faster than the baseline. To
+noticeable for extreme 2-bit compression, where AQUA-                   test the practical speeds, we ran inference for Llama 3.1 8B
+KV over 2-bit HIGGS quantizer is roughly equivalent to the              and 70B models in BFloat16 precision using the transform-
+3-bit baseline quantizer, and sometimes outperforms it. We              ers (Wolf et al., 2019) library for the LLM and FLUTE (Guo
+report additional results and details in Appendix E.                    et al., 2024) for HIGGS inference kernels.
+                                                                        We ran 8B model on a single A100 GPU and the 70B on
+4.3. Compatibility with Pruning                                         2xA100 in sequential mode, generating a single sequence
+AQUA-KV can be combined with token pruning: for                         of 8192 tokens with 2-bit HIGGS. For the 8B model, gen-
+this, we evaluate AQUA-KV in tandem with the popular                    erating with HIGGS quantizer runs at 24.02 tokens/second
+H2 O (Zhang et al., 2023) token pruning method.We train                 and AQUA-KV runs at 23.31. For 70B, HIGGS runs at 5.91
+our predictors normally as described in Section 3.2, without            tokens/s and AQUA-KV at 5.76 tokens/s, for the average
+pruning. During inference, we first use the H2 O heavy hitter           difference of about 3%. However, this slowdown can be out-
+oracle to select which tokens are to be preserved, and apply            weighed by the substantially better accuracy of AQUA-KV.
+AQUA-KV compression those tokens. For this experiment,                  Note that these results were obtained using unoptimized Py-
+we always keep 20% of all tokens with the same protocol as              Torch and can likely be improved with specialized libraries.
+in the original paper. We evaluate these mixed strategies in
+our main setup on a subset of Llama 3.x models.                         5. Discussion
+The results, shown in full in Table 3 suggest that AQUA does            We introduced a KV-Cache compression technique based
+not degrade pruning performance: our method combined                    on the idea of leveraging both inter- and intra-layer corre-
+with H2 O shows little to no accuracy drop compared to us-              lations in an efficient fashion. Empirical results suggest
+ing H2 O in isolation. Furthermore, in this setup AQUA-KV               that AQUA-KV sets new state-of-the-art compression-vs-
+with HIGGS quantization still outperforms HIGGS quanti-                 accuracy trade-offs, while being compatible with different
+zation without predictors, by a similar margin. We provide              quantization and pruning techniques. Our approach bears
+additional evaluations in Appendix F.                                   several extensions: 1) predictors could be optimized (e.g.
+
+                                                                    8
+                    Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+fine-tuned) to minimize a model-level objectives, similar               Du, Z., Liu, X., Zeng, A., Hou, L., et al. Longbench: A
+to weight quantization techniques (Tseng et al., 2024b); 2)             bilingual, multitask benchmark for long context under-
+the bit-widths of different cache components could be ad-               standing. arXiv preprint arXiv:2308.14508, 2023.
+justed based on what fraction of them can be predicted; 3) it
+would be interesting to integrate AQUA-KV with efficient              Bender, E. M., Gebru, T., McMillan-Major, A., and
+LLM inference engines such as vLLM. In general, it is in-               Shmitchell, S. On the dangers of stochastic parrots:
+teresting to consider the problem of efficient LLM inference            Can language models be too big?     In Proceedings
+with AQUA-KV, which may require merging predictors with                 of the 2021 ACM Conference on Fairness, Account-
+some of the base model computations to reduce overhead.                 ability, and Transparency, FAccT ’21, pp. 610–623,
+                                                                        New York, NY, USA, 2021. Association for Comput-
+Last but not least, it is curious why do LLMs learn pre-
+                                                                        ing Machinery. ISBN 9781450383097. doi: 10.1145/
+dictable key-value representations in the first place. If adja-
+                                                                        3442188.3445922. URL https://doi.org/10.
+cent keys and values can predict each other, it may hint at
+                                                                        1145/3442188.3445922.
+some redundancy within LLM attention heads. A promising
+direction for future work is to study the reasons why mod-            Chang, C.-C., Lin, W.-C., Lin, C.-Y., Chen, C.-Y., Hu, Y.-F.,
+ern LLMs learn inter-dependent representations, in hope of              Wang, P.-S., Huang, N.-C., Ceze, L., and Wu, K.-C. Palu:
+better understanding how LLMs use attention. If we can                  Compressing kv-cache with low-rank projection. arXiv
+learn the root cause of this apparent redundancy in attention           preprint arXiv:2407.21118, 2024.
+projections, it could lead us to a more efficient way of using
+LLMs in general, instead of relying on ad-hoc predictors.             Chen, M., Liu, Y., Wang, J., Bin, Y., Shao, W., and Luo, P.
+                                                                        Prefixquant: Eliminating outliers by prefixed tokens for
+Impact Statement                                                        large language models quantization, 2025. URL https:
+                                                                        //arxiv.org/abs/2410.05265.
+This paper presents work whose goal is to advance the field
+of Machine Learning. Since we study a general problem of              Cui, T., Wang, Y., Fu, C., Xiao, Y., Li, S., Deng, X.,
+memory-efficient LLM inference, our work can contribute                 Liu, Y., Zhang, Q., Qiu, Z., Li, P., Tan, Z., Xiong,
+to a broad range of consequences stemming from LLM                      J., Kong, X., Wen, Z., Xu, K., and Li, Q. Risk
+use and misuse. This also means that AQUA-KV does                       taxonomy, mitigation, and assessment benchmarks of
+not introduce any principally new kinds of societal benefit             large language model systems. ArXiv, abs/2401.05778,
+or harm, only making the existing LLM use cases more                    2024. URL https://api.semanticscholar.
+cost-efficient. The general societal impact of LLMs is an               org/CorpusID:266933337.
+important area of research that cannot be easily summarized
+in a broader impact statement. As such, we do not highlight           Dong, S., Cheng, W., Qin, J., and Wang, W. Qaq: Quality-
+any specific impacts here and defer the reader to dedicated             adaptive quantization for llm kv cache. arXiv preprint
+research on the broader impact of LLMs (Weidinger et al.                arXiv:2403.04643, 2024.
+2021; 2022; Bender et al. 2021; Zhuo et al. 2023; Cui et al.
+2024; Sheng et al. 2021; Durmus et al. 2023, among others).           Duanmu, H., Yuan, Z., Li, X., Duan, J., Zhang, X., and
+                                                                        Lin, D. Skvq: Sliding-window key and value cache
+References                                                              quantization for large language models. arXiv preprint
+                                                                        arXiv:2405.06219, 2024.
+Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y.,
+  Lebrón, F., and Sanghai, S. Gqa: Training generalized              Dubey, A., Jauhri, A., Pandey, A., Kadian, A., Al-Dahle,
+  multi-query transformer models from multi-head check-                A., Letman, A., Mathur, A., Schelten, A., Yang, A., Fan,
+  points. arXiv preprint arXiv:2305.13245, 2023. URL                   A., et al. The llama 3 herd of models. arXiv preprint
+  https://arxiv.org/abs/2305.13245.                                     arXiv:2407.21783, 2024.
+Alain, G. and Bengio, Y. Understanding intermediate                   Durmus, E., Nyugen, K., Liao, T., Schiefer, N.,
+  layers using linear classifier probes. arXiv preprint                Askell, A., Bakhtin, A., Chen, C., Hatfield-Dodds,
+  arXiv:1610.01644, 2016.                                               Z., Hernandez, D., Joseph, N., Lovitt, L., McCan-
+Ashkboos, S., Mohtashami, A., Croci, M. L., Li, B., Jaggi,              dlish, S., Sikder, O., Tamkin, A., Thamkul, J., Ka-
+  M., Alistarh, D., Hoefler, T., and Hensman, J. Quarot:                plan, J., Clark, J., and Ganguli, D. Towards mea-
+  Outlier-free 4-bit inference in rotated llms. arXiv preprint          suring the representation of subjective global opin-
+  arXiv:2404.00456, 2024.                                               ions in language models. ArXiv, abs/2306.16388,
+                                                                        2023. URL https://api.semanticscholar.
+Bai, Y., Lv, X., Zhang, J., Lyu, H., Tang, J., Huang, Z.,               org/CorpusID:259275051.
+
+                                                                  9
+                    Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+Egiazarian, V., Panferov, A., Kuznedelev, D., Frantar, E.,            Li, H., Li, Y., Tian, A., Tang, T., Xu, Z., Chen, X., Hu, N.,
+  Babenko, A., and Alistarh, D. Extreme compression of                  Dong, W., Li, Q., and Chen, L. A survey on large lan-
+  large language models via additive quantization. arXiv                guage model acceleration based on kv cache management.
+  preprint arXiv:2401.06118, 2024.                                      arXiv preprint arXiv:2412.19442, 2024a.
+
+Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D. Gptq:        Li, Y., Huang, Y., Yang, B., Venkitesh, B., Locatelli, A.,
+  Accurate post-training quantization for generative pre-               Ye, H., Cai, T., Lewis, P., and Chen, D. Snapkv: Llm
+  trained transformers. arXiv preprint arXiv:2210.17323,                knows what you are looking for before generation. arXiv
+  2022.                                                                 preprint arXiv:2404.14469, 2024b.
+
+Ge, S., Zhang, Y., Liu, L., Zhang, M., Han, J., and Gao,              Li, Y., Jiang, H., Wu, Q., Luo, X., Ahn, S., Zhang, C., Abdi,
+  J. Model tells you what to discard: Adaptive kv cache                 A. H., Li, D., Gao, J., Yang, Y., et al. Scbench: A kv
+  compression for llms. arXiv preprint arXiv:2310.01801,                 cache-centric analysis of long-context methods. arXiv
+  2023.                                                                  preprint arXiv:2412.10319, 2024c.
+
+Gray, R. M. and Neuhoff, D. L. Vector quantization. IEEE              Lin, J., Tang, J., Tang, H., Yang, S., Dang, X., and
+  Transactions on Information Theory, 44(6):2325–2383,                  Han, S. Awq: Activation-aware weight quantization
+  1998.                                                                 for llm compression and acceleration. arXiv preprint
+                                                                        arXiv:2306.00978, 2023.
+Guo, H., Brandon, W., Cholakov, R., Ragan-Kelley, J., Xing,
+  E., and Kim, Y. Fast matrix multiplications for lookup              Liu, A., Liu, J., Pan, Z., He, Y., Haffari, G., and Zhuang, B.
+  table-quantized llms. In Findings of the Association for              Minicache: Kv cache compression in depth dimension for
+  Computational Linguistics: EMNLP 2024, pp. 12419–                     large language models. arXiv preprint arXiv:2405.14366,
+ 12433, 2024.                                                           2024a.
+                                                                      Liu, R., Bai, H., Lin, H., Li, Y., Gao, H., Xu, Z., Hou, L.,
+He, Y., Zhang, L., Wu, W., Liu, J., Zhou, H., and Zhuang,
+                                                                        Yao, J., and Yuan, C. Intactkv: Improving large language
+  B. Zipcache: Accurate and efficient kv cache quanti-
+                                                                        model quantization by keeping pivot tokens intact. arXiv
+  zation with salient token identification. arXiv preprint
+                                                                        preprint arXiv:2403.01241, 2024b.
+  arXiv:2405.14256, 2024.
+                                                                      Liu, Z., Yuan, J., Jin, H., Zhong, S., Xu, Z., Braverman,
+Hooper, C., Kim, S., Mohammadzadeh, H., Mahoney,                        V., Chen, B., and Hu, X. Kivi: A tuning-free asym-
+  M. W., Shao, Y. S., Keutzer, K., and Gholami, A.                      metric 2bit quantization for kv cache. arXiv preprint
+  Kvquant: Towards 10 million context length llm in-                    arXiv:2402.02750, 2024c.
+  ference with kv cache quantization. arXiv preprint
+  arXiv:2401.18079, 2024.                                             Malinovskii, V., Mazur, D., Ilin, I., Kuznedelev, D.,
+                                                                       Burlachenko, K., Yi, K., Alistarh, D., and Richtarik, P.
+Horváth, S., Kovalev, D., Mishchenko, K., Richtárik, P.,             Pv-tuning: Beyond straight-through estimation for ex-
+  and Stich, S. Stochastic distributed learning with gradient          treme llm compression. arXiv preprint arXiv:2405.14852,
+  quantization and double-variance reduction. Optimization             2024a.
+ Methods and Software, 38(1):91–106, 2023.
+                                                                      Malinovskii, V., Panferov, A., Ilin, I., Guo, H., Richtárik,
+HuggingFace. Optimum-quanto: A pytorch quantiza-                       P., and Alistarh, D. Pushing the limits of large lan-
+  tion backend for optimum. https://github.com/                        guage model quantization via the linearity theorem. arXiv
+  huggingface/optimum-quanto, 2024. Accessed:                          preprint arXiv:2411.17525, 2024b.
+  2025-01-28.
+                                                                      Merity, S., Xiong, C., Bradbury, J., and Socher, R.
+Kang, H., Zhang, Q., Kundu, S., Jeong, G., Liu, Z., Krishna,           Pointer sentinel mixture models.     arXiv preprint
+  T., and Zhao, T. Gear: An efficient kv cache compression             arXiv:1609.07843, 2016.
+  recipe for near-lossless generative inference of llm. arXiv
+  preprint arXiv:2403.05527, 2024.                                    Paszke, A., Gross, S., Massa, F., Lerer, A., Bradbury, J.,
+                                                                        Chanan, G., Killeen, T., Lin, Z., Gimelshein, N., Antiga,
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,                 L., Desmaison, A., Kopf, A., Yang, E., DeVito, Z., Rai-
+ C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient               son, M., Tejani, A., Chilamkurthy, S., Steiner, B., Fang,
+ memory management for large language model serving                     L., Bai, J., and Chintala, S. PyTorch: An imperative style,
+ with pagedattention. In Proceedings of the 29th Sym-                   high-performance deep learning library. In Advances in
+ posium on Operating Systems Principles, pp. 611–626,                   Neural Information Processing Systems (NeurIPS). Neu-
+ 2023.                                                                  ral Information Processing Systems Foundation, 2019.
+
+                                                                 10
+                    Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+Razzhigaev, A., Mikhalchuk, M., Goncharova, E., Gerasi-              Weidinger, L., Mellor, J. F. J., Rauh, M., Griffin, C., Ue-
+  menko, N., Oseledets, I., Dimitrov, D., and Kuznetsov,              sato, J., Huang, P.-S., Cheng, M., Glaese, M., Balle, B.,
+  A. Your transformer is secretly linear. arXiv preprint              Kasirzadeh, A., Kenton, Z., Brown, S. M., Hawkins,
+  arXiv:2405.12250, 2024.                                             W. T., Stepleton, T., Biles, C., Birhane, A., Haas, J.,
+                                                                      Rimell, L., Hendricks, L. A., Isaac, W. S., Legassick, S.,
+Reinsel, G. C. and Velu, R. D. Multivariate Reduced-
+                                                                      Irving, G., and Gabriel, I. Ethical and social risks of
+  Rank Regression. Springer, New York, 1998. ISBN
+                                                                      harm from language models. ArXiv, abs/2112.04359,
+  978-1-4757-2853-8. doi: 10.1007/978-1-4757-2853-8.
+                                                                      2021. URL https://api.semanticscholar.
+  URL https://link.springer.com/book/10.
+                                                                      org/CorpusID:244954639.
+  1007/978-1-4757-2853-8.
+                                                                     Weidinger, L., Uesato, J., Rauh, M., Griffin, C., Huang,
+Sheng, E., Chang, K.-W., Natarajan, P., and Peng, N.
+                                                                      P.-S., Mellor, J. F. J., Glaese, A., Cheng, M., Balle, B.,
+  Societal biases in language generation: Progress and
+                                                                      Kasirzadeh, A., Biles, C., Brown, S. M., Kenton, Z.,
+  challenges. ArXiv, abs/2105.04054, 2021. URL https:
+                                                                      Hawkins, W. T., Stepleton, T., Birhane, A., Hendricks,
+  //api.semanticscholar.org/CorpusID:
+                                                                      L. A., Rimell, L., Isaac, W. S., Haas, J., Legassick, S.,
+  234337004.
+                                                                      Irving, G., and Gabriel, I. Taxonomy of risks posed by
+Su, J., Lu, Y., Pan, S., Murtadha, A., Wen, B., and Liu,              language models. Proceedings of the 2022 ACM Con-
+  Y. Roformer: Enhanced transformer with rotary position              ference on Fairness, Accountability, and Transparency,
+  embedding. arXiv preprint arXiv:2104.09864, 2021.                   2022. URL https://api.semanticscholar.
+                                                                      org/CorpusID:249872629.
+Team, Q. Qwen2.5: A party of foundation models, Septem-
+  ber 2024. URL https://qwenlm.github.io/                            Wolf, T., Debut, L., Sanh, V., Chaumond, J., Delangue, C.,
+  blog/qwen2.5/.                                                      Moi, A., Cistac, P., Rault, T., Louf, R., Funtowicz, M.,
+                                                                      et al. Huggingface’s transformers: State-of-the-art natural
+Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux,          language processing. arXiv preprint arXiv:1910.03771,
+  M.-A., Lacroix, T., Rozière, B., Goyal, N., Hambro, E.,            2019.
+  Azhar, F., et al. Llama: Open and efficient foundation lan-
+  guage models. arXiv preprint arXiv:2302.13971, 2023.               Xiao, G., Tian, Y., Chen, B., Han, S., and Lewis, M. Ef-
+                                                                       ficient streaming language models with attention sinks.
+Tseng, A., Chee, J., Sun, Q., Kuleshov, V., and De Sa,                 arXiv preprint arXiv:2309.17453, 2023.
+  C. Quip#: Even better llm quantization with hadamard
+  incoherence and lattice codebooks. arXiv preprint                  Yang, A., Yang, B., Hui, B., Zheng, B., Yu, B., Zhou, C.,
+  arXiv:2402.04396, 2024a.                                             Li, C., Li, C., Liu, D., Huang, F., Dong, G., Wei, H., Lin,
+                                                                       H., Tang, J., Wang, J., Yang, J., Tu, J., Zhang, J., Ma, J.,
+Tseng, A., Chee, J., Sun, Q., Kuleshov, V., and Sa, C. D.
+                                                                       Xu, J., Zhou, J., Bai, J., He, J., Lin, J., Dang, K., Lu, K.,
+  Quip#: Even better llm quantization with hadamard inco-
+                                                                       Chen, K., Yang, K., Li, M., Xue, M., Ni, N., Zhang, P.,
+  herence and lattice codebooks, 2024b.
+                                                                       Wang, P., Peng, R., Men, R., Gao, R., Lin, R., Wang, S.,
+Tseng, A., Sun, Q., Hou, D., and Sa, C. D. QTIP:                       Bai, S., Tan, S., Zhu, T., Li, T., Liu, T., Ge, W., Deng,
+  Quantization with trellises and incoherence processing.              X., Zhou, X., Ren, X., Zhang, X., Wei, X., Ren, X., Fan,
+  In The Thirty-eighth Annual Conference on Neural In-                 Y., Yao, Y., Zhang, Y., Wan, Y., Chu, Y., Liu, Y., Cui, Z.,
+  formation Processing Systems, 2024c. URL https:                      Zhang, Z., and Fan, Z. Qwen2 technical report. arXiv
+  //openreview.net/forum?id=7sdkLVuYCU.                                preprint arXiv:2407.10671, 2024a.
+
+van Baalen, M., Kuzmin, A., Nagel, M., Couperus, P., Bas-            Yang, J. Y., Kim, B., Bae, J., Kwon, B., Park, G., Yang, E.,
+  toul, C., Mahurin, E., Blankevoort, T., and Whatmough,               Kwon, S. J., and Lee, D. No token left behind: Reliable kv
+  P. Gptvq: The blessing of dimensionality for llm quanti-             cache compression via importance-aware mixed precision
+  zation. arXiv preprint arXiv:2402.15319, 2024.                       quantization. arXiv preprint arXiv:2402.18096, 2024b.
+
+Vaswani, A. Attention is all you need. Advances in Neural            Yang, Y., Cao, Z., Chen, Q., Qin, L., Yang, D., Zhao,
+  Information Processing Systems, 2017.                                H., and Chen, Z. Kvsharer: Efficient inference via
+                                                                       layer-wise dissimilar kv cache sharing. arXiv preprint
+Weber, M., Fu, D. Y., Anthony, Q., Oren, Y., Adams, S.,                arXiv:2410.18517, 2024c.
+ Alexandrov, A., Lyu, X., Nguyen, H., Yao, X., Adams,
+ V., Athiwaratkun, B., Chalamala, R., Chen, K., Ryabinin,            Yue, Y., Yuan, Z., Duanmu, H., Zhou, S., Wu, J., and Nie,
+ M., Dao, T., Liang, P., Ré, C., Rish, I., and Zhang, C.              L. Wkvquant: Quantizing weight and key/value cache
+ Redpajama: an open dataset for training large language                for large language models gains more. arXiv preprint
+ models. NeurIPS Datasets and Benchmarks Track, 2024.                  arXiv:2402.12065, 2024.
+
+                                                                11
+                   Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+Zandieh, A., Daliri, M., and Han, I. Qjl: 1-bit quantized jl
+  transform for kv cache quantization with zero overhead.
+  arXiv preprint arXiv:2406.03482, 2024.
+Zhang, Z. and Shen, H. Zero-delay qkv compression for mit-
+  igating kv cache and network bottlenecks in llm inference.
+  arXiv preprint arXiv:2408.04107, 2024.
+
+Zhang, Z., Sheng, Y., Zhou, T., Chen, T., Zheng, L., Cai,
+  R., Song, Z., Tian, Y., Ré, C., Barrett, C., et al. H2o:
+  Heavy-hitter oracle for efficient generative inference of
+  large language models. Advances in Neural Information
+  Processing Systems, 36:34661–34710, 2023.
+
+Zhuo, T. Y., Huang, Y., Chen, C., and Xing, Z. Red team-
+  ing chatgpt via jailbreaking: Bias, robustness, reliabil-
+  ity and toxicity, 2023. URL https://arxiv.org/
+  abs/2301.12867.
+
+
+
+
+                                                               12
+                    Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+A. Additional Details for Section 3
+Experiment configuration in Section 3.1. To measure the dependency between different layers, we first compute the
+Key-Value cache of a Llama-3.2-3B (non-instruct) model on a collection of 256 random sequenes of 8192 tokens sampled
+from RedPajama. We split these cache entries into 224 calibration sequences and 32 holdout sequences, and train linear
+probes (regressors) that learn to predict keys or values from one of the analyzed input sources: previous layers, past tokens,
+and different role vectors. The metric we report, explained variance ratio, is computed using per-channel variance, to account
+for biases in attention keys & values. We fit linear probes via close form solution with regularizer rate 10−3 .
+Full inference algorithm from Section 3.3. To better formalize our approach, we also provide a detailed description of
+infereece with AQUA-KV compressed cache in Algorithms 2, 3 & 4 below.
+Algorithm 2 encode
+Require: layer index, K, V, reconstructed keys and values of the previous layer K̂prev , V̂prev , predictors
+ 1: if layer index = 0 then
+ 2:    return K, V
+ 3: end if
+ 4: fkey , fvalue ← predictors[layer index]
+ 5: Kpred ← fkey (K̂prev )
+ 6: Kq ← Q(K − Kpred )
+ 7: K̂ ← Q−1 (Kq ) + Kpred
+ 8: Vpred ← fvalue ([V̂prev ; K̂]) {Concatenate V̂prev and K̂}
+ 9: Vq ← Q(V − Vpred )
+10: return Kq , Vq
+Algorithm 3 decode
+Require: layer index, Kq , Vq , reconstructed keys and values of the previous layer K̂prev , V̂prev , predictors
+ 1: if layer index = 0 then
+ 2:    return Kq , Vq
+ 3: end if
+ 4: fkey , fvalue ← predictors[layer index]
+ 5: K̂ ← Q−1 (Kq ) + fkey (K̂prev )
+ 6: # Value predictor expects both previous reconstructed V̂prev and current reconstructed K̂.
+ 7: V̂ ← Q−1 (Vq ) + fvalue ([V̂prev ; K̂])
+ 8: return K̂, V̂
+Algorithm 4 Inference with AQUA-KV Predictors
+Require: model, input, key cache, value cache, predictors
+ 1: K̂past , V̂past , K̂inp prev , V̂inp prev ← ∅
+ 2: X ← model.input embeddings(input)
+ 3: for i = 0, . . . , model.num layers − 1 do
+ 4:   # Recover previously saved key-values
+ 5:   (K̂past , V̂past ) ← decode(i, key cache[i], value cache[i], K̂past , V̂past , predictors)
+ 6:   # Run forward pass
+ 7:   block ← model.transformer layers[i]
+ 8:   (Kinp , Vinp ) ← block.get attention kv(X)
+ 9:   X ← block(X, K = [K̂past ; K̂inp ], V = [V̂past , V̂inp ]) {Concatenate past and input keys/values}
+10:   # Compress new key-value entries
+11:   (Kqinp , Vinp q
+                       ) ← encode(i, K̂inp , V̂inp , K̂inp prev , V̂inp prev , predictors)
+12:   key cache[i] ← [key cache[i]; Kqinp ] {Concatenate key cache with new keys}
+                                                          q
+13:   value cache[i] ← [value cache[i]; Vinp                  ] {Concatenate value cache with new values}
+                                                  q      q
+14:   (K̂inp prev , V̂inp prev ) ← decode(i, Kinp , Vinp , K̂inp prev , V̂inp prev , predictors)
+15: end for
+16: return model.compute logits(X)
+
+
+
+                                                             13
+                          Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+B. Extended Inter-Dependence Measurements
+In addition to the abbreviated charts in Section 3.1, we also report extended inter-dependence probing results. Figure 4
+explores additonal probe inputs and Figure 5 contains individual explained variance rations for each transformer block.
+
+                                                                 Predict Keys
+0.75
+0.50
+0.25
+0.00     KL 3 KL 2 KL 1 Kall   VL 3 VL 2 VL 1 Vall             K T 3 K T 2 K T 1 K all        V T 3 V T 2 V T 1 V all        KL 1 VL 1 KVL 1 VL   [KVL 1; VL]
+           Prev. block keys        Prev. block values            Prev. token keys             Prev. token values                 Mixed roles
+                                                                 Predict Values
+0.75
+0.50
+0.25
+0.00     KL 3 KL 2 KL 1 Kall   VL 3 VL 2 VL 1 Vall             K T 3 K T 2 K T 1 K all        V T 3 V T 2 V T 1 V all        KL 1 VL 1 KVL 1 KL   [KVL 1; KL]
+
+Figure 4. Additional Mean Explained Variance Ratios by linear probes from previous blocks (L), tokens (T) and role on Llama-3.2-3B.
+
+
+                   Explained Variance Ratio from Chosen Dependencies Across Transformer Blocks.
+
+0.75
+
+0.50
+                  KL 1 -> KL
+0.25              VL 1 -> VL
+                  KL -> VL
+0.00 0                         5                          10                             15                             20                 25
+                                                        Transformer block index (Llama-3.2-3B)
+              Figure 5. Explained Variance Ratios per Transformer Block for chosen sets of linear probes on Llama-3.2-3B.
+
+
+C. On LongBench Evaluation on non-Instruct models
+As we discuss in Section 4, we only evaluate Instruct model variants on LongBench tasks.
+Non-Instruct models treats the prompts with a question as a plain text that should be continued narratively. Namely, we
+observe that, when a non-Instruct model is evaluated on most LongBench tasks, it tends to behave as follows:
+
+  1. The model encodes the task and produces an answer to that problem, whether correct or not;
+  2. Having produced the answer, the model “continues” the prompt by imagining a new task;
+  3. The model produces the answer to the newly imagined problem;
+
+Depending on the model and the allowed sequence length, steps 2-3 can repeat multiple times. Although generated text by
+the model may contain the correct answer, this can reduce the score drastically as LongBench scorer, on the most tasks,
+calculate the score between the whole generated sequence and ground truth answer.
+Here is an example of such generation for the original Llama 3.2 3B model:
+
+   • Task name: NarrativeQA
+
+                                                                                14
+                     Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+
+Table 4. Evaluation of Llama 3.2 3B non-Instruct model on the same 14 LongBench tasks as in Section 4. The model was evaluated as is,
+without an additional “chat template”, using the official LongBench evaluation code (Bai et al., 2023).
+
+
+
+
+                                                                                  A
+                                                                              eQ
+
+
+                                                                                t
+                                                                               s
+                                                                  M QA
+
+
+
+
+                                                                             or
+                                                                             en
+                                                                             Q
+
+
+
+
+                                                                            ew
+
+
+
+
+                                                                            nt
+                                                                             A
+                                                                  2W m
+
+
+
+
+                                                                           ue
+
+
+
+
+                                                                          tiv
+                                                                  Ps m
+                                                                         iM
+
+
+
+
+                                                                          ep
+                                                                  N etr
+                                                                          Q
+
+
+
+
+                                                                         ou
+                                                                       tiN
+
+
+
+
+                                                                          r
+                                                                         A
+                                                                        Su
+
+
+
+
+                                                                          t
+
+
+
+
+                                                                       Su
+                                                                      EC
+                         Quant. Wiki2 PPL↓ LongBench Avg ↑
+
+
+
+
+                                                                        iq
+                                                                       po
+
+
+
+
+                                                                       pe
+
+
+
+                                                                       ra
+                                                                       ia
+
+
+
+
+                                                                       R
+                                                                    FQ
+                                                                      ik
+
+
+
+
+                                                                     gC
+
+
+
+
+                                                                    gR
+                                                                 m
+
+
+
+
+                                                                    us
+        Config
+
+
+
+
+                                                                     iv
+                                                                    ul
+
+
+
+
+                                                                   ov
+                                                                   M
+
+
+
+
+                                                                    as
+
+
+
+                                                                   ar
+                                                                    ot
+                                                                  TR
+                          Bits (base model)  (base model)
+
+
+
+
+                                                               Sa
+
+
+
+
+                                                                  Tr
+
+
+
+
+                                                                  Ps
+                                                                  M
+
+                                                                  M
+                                                                  H
+
+
+
+
+                                                                  Q
+
+
+
+
+                                                                  Q
+
+
+
+
+                                                                  G
+     Uncompressed         16       6.98         26.46        42.41 11.25 69.50 9.17 22.64 88.41 23.79 0.00 35.03 7.28 12.25 7.03 11.45 30.16
+     HIGGS 2-bit          2.02     7.47         24.93        40.49 11.75 68.00 9.89 15.22 88.45 22.22 0.00 29.83 6.80 12.42 6.77 13.90 23.22
+   AQUA-KV (HIGGS)        2.09     7.03         26.15        42.73 11.88 69.00 9.13 18.73 88.46 23.11 0.00 35.35 7.45 12.21 7.33 12.01 28.68
+   Quanto 2-bit gs64      2.50    21.56         21.14        27.03 12.83 64.00 13.05 10.57 81.21 15.54 0.12 22.30 6.01 11.63 5.51 10.84 15.30
+ AQUA-KV (Quanto gs64)    2.64    10.33         26.24        41.59 11.36 69.00 10.60 21.85 88.33 22.91 0.00 32.67 6.93 12.97 6.65 12.75 29.69
+
+
+
+
+   • PromptID: 58b8a46c20c05540367b90490846c4f9808db630026b28d4
+
+   • Generation:
+
+
+                    American
+                    \n\nQuestion: What is the name of the man who
+                    is the subject of the story?
+                    \n\nAnswer: Frank Saltram
+                    \n\nQuestion: What is the name of the man
+                    who is the subject of the story’s story?
+                    \n\nAnswer: George Gravener
+                    \n\nQuestion: What is the name of the man who
+                    is the subject of the story’s story’s story?
+                    \n\nAnswer: Kent Mulville
+                    \n\nQuestion: What is the name of the man
+                    who is the subject of the story’s story’s story’s story?
+                    \n\nAnswer: Sir Gregory Coxon
+                    \n\nQuestion: What is the name of the man who
+                    is the subject of the story’s story’s story
+
+
+
+   • Ground truth answer: She is an American.
+
+
+To the best of out knowledge, the original LongBench study (Bai et al., 2023) evaluated on chat assistants, not base language
+models. However, several prior works on Key-Value quantization chose to evaluate non-Instruct models on LongBench. For
+instance, KIVI (Liu et al., 2024c) evaluates both Llama-2 Chat and non-Chat models on LongBench tasks in Table 4. While
+non-chat models show inferior performance, we recognize that it may be interesting to see their LongBench evaluations for
+some niche cases. As such, we run several LongBench evaluations for AQUA-KV an baselines, using the same setup as in
+Section 4.1, but for the non-Instruct model. The results of this evaluation are reported in Table 4
+
+D. Detailed Evaluations for Section 4.1
+We provide scores on each of the LongBench tasks in Table 5, as well as some additional experiments. The table is
+supplemented with results on QuaRot quantization method (Ashkboos et al., 2024) that combines Randomized Hadamard
+Transform (RHT) with standard non-vector quantization. We also report Quanto with larger group size (1024); ablation
+with post-RoPE quantization and additonal KVSharer setup with 2 shared pairs. The table also contains an ablation on the
+predictor architecture, including MLP predictors without Layer Nomalization, reduced rank regression (RRR with rank
+256), quantized predictors and a corner case with bias-only predictor. We also perform ablation analysis of keeping a longer
+sequence of unquantized tokens at the beginning of the sentence (4 and 64 tokens). Finally, we evaluate AQUA-KV with
+different predictor input configurations: removing one of the predictor components or using more distant past layers.
+
+                                                                       15
+                    Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+E. Detailed Evaluation of AQUA-KV and Baselines 4.2
+This appendix presents the evaluation results for AQUA-KV with the HIGGS backbone and baseline models across multiple
+architectures, including Llama 3.2 (3B, 8B, 70B) and Qwen2.5 (3B, 7B). The models are assessed under 2-bit, 3-bit, and
+4-bit KV-cache compression settings.
+We evaluate two key aspects of model performance:
+
+  1. Language Modeling Quality – Measured using WikiText-2 Perplexity, tested on the base (non-instruct) versions of
+     the models with a sequence length of 8192.
+  2. Task-Specific Performance – Measured on LongBench, a benchmark covering 14 diverse NLP tasks, with evaluation
+     conducted on the Instruct-tuned versions of the models using a sequence length of 217 (131K tokens in total across
+     tasks).
+
+The Tables 6-10 summarize the average LongBench performance across all 14 tasks for each model, followed by the
+WikiText-2 perplexity scores. Additionally, detailed per-task results are provided for a deeper understanding of how different
+models and quantization settings affect specific NLP capabilities.
+To further analyze the impact of KV-cache compression on various NLP applications, we report the performance on each of
+the 14 individual LongBench tasks in the following table 10. Each task has its own original name, evaluation metric and
+average length, reflecting its unique requirements.
+
+F. Additional Evaluations of AQUA-KV with H2 O
+Here, we report more detailed evaluation results in a setup where AQUA-KV is combined with H2 O Heavy Hitter Oracle. In
+addition to per-task LongBench scores, we also report several additional configurations for AQUA-KV backbone quantizer.
+The results for 3B and 8B models can be found in Table 14 and 13 respectively.
+
+
+
+
+                                                             16
+                            Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+
+
+
+Table 5. Evaluation of Llama 3.2 3B with various Key-Value cache compression strategies. The left panel contains WikiText-2 perplexity
+for the base (non-Instruct) model and the average LongBench results for the Instruct model. The right panel reports detailed per-task
+LongBench scores for the Instruct model.
+
+
+
+
+                                                                                            A
+                                                                                        eQ
+
+
+                                                                                          t
+                                                                                         s
+                                                                            M QA
+
+
+
+
+                                                                                       or
+                                                                                       en
+                                                                                       Q
+
+
+
+
+                                                                                      ew
+
+
+
+
+                                                                                      nt
+                                                                                       A
+                                                                            2W m
+
+
+
+
+                                                                                     ue
+
+
+
+
+                                                                                    tiv
+                                                                            Ps m
+                                                                                   iM
+
+
+
+
+                                                                                    ep
+                                                                            N etr
+                                                                                    Q
+
+
+
+
+                                                                                   ou
+                                                                                 tiN
+
+
+
+
+                                                                                    r
+                                                                                   A
+                                                                                  Su
+
+
+
+
+                                                                                    t
+
+
+
+
+                                                                                 Su
+                                                                                EC
+
+
+
+
+                                                                                  iq
+                                Quant. Wiki2 PPL↓ LongBench Avg.↑
+
+
+
+
+                                                                                 po
+
+
+
+
+                                                                                 pe
+
+
+
+                                                                                 ra
+                                                                                 ia
+
+
+
+
+                                                                                 R
+                                                                              FQ
+                                                                                ik
+
+
+
+
+                                                                              gC
+
+
+
+
+                                                                              gR
+                                                                           m
+
+
+
+
+                                                                              us
+           Config
+
+
+
+
+                                                                               iv
+                                                                              ul
+
+
+
+
+                                                                              ov
+                                                                              M
+
+
+
+
+                                                                              as
+
+
+
+                                                                             ar
+                                                                              ot
+                                                                            TR
+                                 Bits (base model) (instruct model)
+
+
+
+
+                                                                         Sa
+
+
+
+
+                                                                            Tr
+
+
+
+
+                                                                            Ps
+                                                                            M
+
+                                                                            M
+                                                                            H
+
+
+
+
+                                                                            Q
+
+
+
+
+                                                                            Q
+
+
+
+
+                                                                            G
+        Uncompressed              16      6.98          44.47          42.57 40.65 71.5 53.07 26.17 88.78 24.50 3.53 50.36 26.27 40.17 96.0 25.16 33.89
+                                                                        Quantizers
+     KIVI-2b-gs128-r128          2.25      9.34         39.64          41.05 37.27 70.0 47.54 26.24 88.73 23.37 7.00 47.69 21.26 35.26 59.50 21.16 28.86
+      KVQuant-2b-s1%             2.33      9.43         20.56          26.75 17.38 50.50 23.58 21.64 56.96 18.28 2.11 22.93 8.25 12.92 4.50 4.41 17.66
+       Quanto-2b-gs64            2.50     21.56         33.59          32.80 32.03 67.50 47.31 25.80 81.93 22.58 3.06 44.17 20.46 25.81 21.0 19.47 26.40
+      Quanto-2b-gs1024           2.03    5559.23        8.37           8.81 3.76 33.0 4.91 12.32 14.41 10.40 2.57 6.85 1.97 4.05 1.0 2.54 10.52
+     QuaRot-2b-gs1024            2.03     44.68         32.80          29.4 34.72 63.00 47.43 24.64 75.57 20.59 4.50 37.90 19.14 29.77 32.50 16.86 23.22
+     HIGGS-2b-gs1024             2.02      7.47         43.25          39.58 40.81 71.50 53.41 24.87 88.42 23.93 4.12 50.92 26.87 37.76 88.0 25.76 29.56
+  AQUA-KV (Quanto gs64)          2.64     10.33         43.64          41.29 39.99 71.50 53.72 26.15 88.68 23.86 3.53 50.61 24.96 40.38 88.50 24.26 33.54
+ AQUA-KV (Quanto gs1024)         2.17     53.35         43.66          42.11 39.53 71.00 51.26 25.84 88.67 24.18 4.06 49.36 26.86 39.52 89.50 25.36 33.96
+ AQUA-KV (QuaRot gs1024)         2.17      8.44         44.54          42.31 39.28 72.00 53.21 25.77 88.48 24.03 4.50 52.26 27.23 40.89 94.00 25.72 33.94
+   AQUA-KV (HIGGS 2b)            2.16      7.03         44.26          42.42 39.98 71.5 52.36 25.65 88.67 24.31 4.50 52.22 26.42 39.82 95.0 24.73 32.02
+  AQUA-KV (per-channel)          2.16      7.06         43.96          42.47 40.14 71.5 52.92 25.54 88.92 24.13 4.50 50.74 25.35 39.96 94.50 24.73 30.07
+                                                                        KVSharer
+        1 shared pair            15.43    7.45          36.81          41.23 13.53 71.0 16.02 25.42 88.41 23.07 2.50 49.24 8.84 31.52 87.0 25.12 32.48
+        2 shared pairs           14.86    8.04          40.89          40.64 28.74 71.50 36.05 25.70 87.59 23.71 4.14 48.60 18.03 39.48 83.67 31.03 33.64
+        4 shared pairs           13.71    9.60          29.82          35.06 24.64 59.0 37.23 23.12 78.16 20.96 3.06 37.5 14.28 31.96 12.58 16.59 23.3
+                                                      Predictor Architecture (total predictor size)
+   MLP w/o LN (540 MiB)          2.16     7.03          44.33          42.42 40.02 71.50 53.47 25.50 88.67 24.02 5.00 51.57 26.01 39.34 95.0 25.46 32.65
+     MLP (540 MiB)               2.16     7.03          44.61          42.60 39.60 71.0 53.77 25.29 88.41 24.17 4.50 50.12 26.45 40.96 96.0 30.31 31.29
+   AQUA-KV (162 MiB)             2.16     7.03          44.26          42.42 39.98 71.5 52.36 25.65 88.67 24.31 4.50 52.22 26.42 39.82 95.0 24.73 32.02
+      RRR (68 MiB)               2.16     7.22          44.30          42.52 41.07 71.00 52.90 25.65 88.78 24.73 4.50 49.70 26.75 40.39 96.0 24.69 31.54
+     GPTQ (41 MiB)               2.16     7.03          44.19          41.97 41.06 72.00 53.62 25.57 88.87 24.43 4.50 50.46 26.0 38.50 95.0 24.59 32.11
+        Only bias                2.02     7.24          42.83          38.96 39.66 69.50 51.8 24.14 88.23 24.07 3.50 50.20 25.96 38.36 91.5 26.25 27.48
+                                                                 First Layer Quantization
+        First layer 16b          2.59     7.03          44.26          42.42 39.98 71.5 52.36 25.65 88.67 24.31 4.50 52.22 26.42 39.82 95.0 24.73 32.02
+        First layer 4b           2.16     7.03          44.26          41.63 40.30 71.50 53.17 25.71 88.32 24.07 4.50 50.67 26.24 40.75 95.50 25.10 32.21
+        First layer 3b           2.13     7.03          44.28          41.81 40.30 71.00 53.32 25.83 88.93 24.78 4.50 51.61 25.93 38.81 96.00 24.92 32.24
+        First layer 2b           2.09     7.05          44.41          42.74 41.03 72.00 53.45 25.57 88.70 24.47 4.50 49.70 26.67 39.47 96.00 25.11 32.38
+                                                                Attention Sink Quantization
+     All tokens quantized        2.16     7.15          44.13          42.30 40.14 71.50 52.15 25.46 89.23 24.08 4.53 51.13 26.58 39.49 95.0 24.66 31.54
+         Skip 4 tokens           2.16     7.03          44.26          42.42 39.98 71.5 52.36 25.65 88.67 24.31 4.50 52.22 26.42 39.82 95.0 24.73 32.02
+        Skip 64 tokens           2.17     7.01          44.26          42.01 40.30 72.00 52.39 25.83 88.67 24.73 4.50 50.76 26.67 39.64 95.00 24.78 32.30
+                                                                     Predictor Inputs
+Krec → K, {Krec , Vold } → V     2.16     7.03          44.26          42.42 39.98 71.5 52.36 25.65 88.67 24.31 4.50 52.22 26.42 39.82 95.0 24.73 32.02
+        w/o V predictor          2.09     7.06          43.91          41.73 39.80 71.50 53.12 25.53 88.80 23.56 4.00 50.65 26.44 38.38 94.00 26.30 30.93
+        w/o K predictor          2.09     7.50          42.92          39.51 40.33 71.50 53.36 25.24 87.51 23.87 4.06 49.02 26.15 37.85 88.0 24.35 30.14
+        w/o Krec → V             2.16     7.04          44.23          42.42 40.26 71.50 52.89 25.78 88.97 24.64 4.00 50.52 26.63 40.46 94.50 25.30 31.38
+        w/o Vold → V             2.16     7.04          44.28          42.79 39.71 71.50 52.75 25.86 88.68 24.42 4.00 50.94 26.92 39.73 95.0 26.07 31.54
+Inputs from layers L − 1 ⊕ L     2.16     7.02          44.42          42.43 39.80 71.50 53.42 25.98 88.61 24.46 5.50 50.41 26.80 39.69 95.50 24.99 32.76
+ Inputs only from layer L − 1    2.16     7.04          44.01          42.25 39.66 71.0 53.12 25.38 88.77 24.47 5.50 50.51 26.15 38.82 93.50 24.99 31.97
+                                                                     Predictor Order
+     Before RoPE HIGGS           2.16      7.03         44.26          42.42 39.98 71.5 52.36 25.65 88.67 24.31 4.50 52.22 26.42 39.82 95.00 24.73 32.02
+      After RoPE HIGGS           2.16      7.05         44.13          41.27 40.06 71.50 53.05 25.72 88.77 24.64 4.50 50.14 25.58 39.81 95.50 25.48 31.73
+   Before RoPE Quanto gs64       2.64     10.90         44.54          42.57 41.31 71.50 53.10 26.02 88.16 24.01 3.53 50.59 26.91 41.50 95.50 25.10 33.69
+   After RoPE Quanto gs64        2.64     10.33         43.64          41.29 39.99 71.50 53.72 26.15 88.68 23.86 3.53 50.61 24.96 40.38 88.50 24.26 33.54
+                                                                Quantizer Errors Handling
+      Quantizer-specific         2.16     7.03          44.26          42.42 39.98 71.5 52.36 25.65 88.67 24.31 4.50 52.22 26.42 39.82 95.00 24.73 32.02
+      Quantizer-agnostic         2.16     7.13          44.26          42.95 41.11 71.5 53.46 25.99 88.32 24.03 4.50 50.60 25.80 39.05 95.50 24.41 32.43
+
+
+
+
+                                                                               17
+                       Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+
+
+
+Table 6. Evaluation of AQUA-KV (with HIGGS backbone) and baselines on Llama 3.2 3B for 2, 3 & 4 bit compression. The WikiText-2
+Perplexity is evaluated on base (non-instruct) version of the model with sequence length 8192. The LongBench results are an average
+over 14 tasks evaluated with Instruct model with sequence length 217 (131K) tokens. In addition to the overall average score across all
+tasks, the table also includes individual scores for each of the 14 tasks. The specific tasks in the original LongBench benchmark and the
+corresponding evaluation metrics can be found in the text.
+
+
+
+
+                                                                                   A
+                                                                               eQ
+
+
+                                                                                 t
+                                                                                s
+                                                                  M QA
+
+
+
+
+                                                                              or
+                                                                              en
+                                                                              Q
+
+
+
+
+                                                                             ew
+
+
+
+
+                                                                             nt
+                                                                              A
+                                                                  2W m
+
+
+
+
+                                                                           ue
+
+
+
+
+                                                                          tiv
+                                                                  Ps m
+                                                                         iM
+
+
+
+
+                                                                          ep
+                                                                  N tr
+                                                                          Q
+
+
+
+
+                                                                         ou
+                                                                       tiN
+
+
+
+
+                                                                           r
+                                                                         A
+                                                                        Su
+
+
+
+
+                                                                           t
+
+
+
+
+                                                                       Su
+                                                                      EC
+                     Quant. Wiki2 PPL↓ LongBench Avg ↑
+
+
+
+
+                                                                        iq
+                                                                       po
+
+
+
+
+                                                                       pe
+
+                                                                         e
+                                                                       ra
+                                                                       ia
+
+
+
+
+                                                                       R
+                                                                    FQ
+                                                                      ik
+
+
+
+
+                                                                     gC
+
+
+
+
+                                                                    gR
+                                                                m
+
+
+
+
+                                                                    us
+         Config
+
+
+
+
+                                                                     iv
+                                                                    ul
+
+
+
+
+                                                                    ov
+                                                                    M
+
+
+
+
+                                                                    as
+
+
+
+                                                                   ar
+                                                                    ot
+                                                                  TR
+                      Bits (base model) (instruct model)
+
+
+
+
+                                                             Sa
+
+
+
+
+                                                                  Tr
+
+
+
+
+                                                                  Ps
+                                                                  M
+
+                                                                  M
+                                                                  H
+
+
+
+
+                                                                  Q
+
+
+
+
+                                                                  Q
+
+
+
+
+                                                                  G
+      Uncompressed     16      6.98          44.61         42.50 40.32 70.50 52.77 25.79 88.78 24.38 5.00 51.13 26.21 40.74 97.00 24.93 34.54
+      AQUA-KV         2.09     7.03          44.30         41.76 40.66 72.50 52.72 25.46 88.78 24.43 4.50 49.07 26.21 39.36 97.00 25.58 32.13
+       HIGGS          2.02     7.47          42.80         39.56 39.97 72.5 52.54 24.52 87.76 24.10 3.00 49.61 26.91 36.84 88.50 25.35 28.00
+        KIVI          2.25     9.34          39.64         41.05 37.27 70.00 47.54 26.24 88.73 23.37 7.00 47.69 21.26 35.26 59.50 21.16 28.86
+    KVQuant-2b-s1%    2.33     9.43          18.28         26.75 17.38 50.50 23.58 21.64 56.96 18.28 2.11 22.93 8.25 12.92 4.50 4.41 17.66
+      AQUA-KV         3.06     6.98          44.37         43.16 40.67 72.5 52.19 25.77 88.39 24.71 4.00 49.25 26.55 39.47 96.50 24.43 33.52
+       HIGGS          3.02     7.05          44.41         42.74 40.67 73.00 52.54 25.58 88.80 24.70 4.50 48.96 26.21 40.11 96.50 24.61 32.87
+        KIVI          3.05     7.87          41.40         41.86 38.47 71.00 48.63 26.59 89.13 23.60 3.50 48.10 20.48 36.78 73.00 24.84 33.57
+    KVQuant-3b-s1%    3.33     7.26          23.85         42.17 35.40 72.00 46.75 25.51 89.05 23.85 4.53 50.79 22.54 41.43 70.50 24.03 31.03
+      AQUA-KV         4.02     6.98          44.48         42.86 40.59 72.5 52.18 25.69 88.78 24.36 4.50 49.28 26.06 40.30 96.50 25.20 33.89
+       HIGGS          4.02     7.01          44.41         42.06 40.91 72.50 52.40 25.63 88.22 24.55 4.00 49.77 26.89 40.31 96.00 24.70 33.74
+        KIVI          4.25     7.03          43.11         42.82 38.41 71.00 48.91 26.64 89.28 23.61 6.50 50.53 21.51 40.62 86.00 24.08 33.65
+    KVQuant-4b-s1%    4.33     7.04          24.20         42.44 37.14 72.50 50.84 25.84 88.44 24.20 2.00 53.12 23.06 38.99 94.50 24.52 33.05
+
+
+
+
+Table 7. Evaluation of AQUA-KV (with HIGGS backbone) and baselines on Llama 3.1 8B for 2, 3 & 4 bit compression. The WikiText-2
+Perplexity is evaluated on base (non-instruct) version of the model with sequence length 8192. The LongBench results are an average
+over 14 tasks evaluated with Instruct model with sequence length 217 (131K) tokens. In addition to the overall average score across all
+tasks, the table also includes individual scores for each of the 14 tasks. The specific tasks in the original LongBench benchmark and the
+corresponding evaluation metrics can be found in the text.                     A
+                                                                           eQ
+
+
+                                                                             t
+                                                                            s
+                                                              M QA
+
+
+
+
+                                                                          or
+                                                                          en
+                                                                          Q
+
+
+
+
+                                                                         ew
+
+
+
+
+                                                                         nt
+                                                                          A
+                                                              2W m
+
+
+
+
+                                                                       ue
+
+
+
+
+                                                                       tiv
+                                                              Ps m
+                                                                     iM
+
+
+
+
+                                                                      ep
+                                                              N tr
+                                                                       Q
+
+
+
+
+                                                                     ou
+                                                                   tiN
+
+
+
+
+                                                                       r
+                                                                      A
+                                                                    Su
+
+
+
+
+                                                                       t
+
+
+
+
+                                                                   Su
+                                                                  EC
+
+
+
+
+                     Quant. Wiki2 PPL↓ LongBench Avg ↑
+                                                                    iq
+                                                                   po
+
+
+
+
+                                                                   pe
+
+                                                                     e
+                                                                   ra
+                                                                    ia
+
+
+
+
+                                                                   R
+                                                                FQ
+                                                                  ik
+
+
+
+
+                                                                 gC
+
+
+
+
+                                                                 gR
+                                                                 m
+
+
+
+
+                                                                us
+
+
+
+
+         Config
+                                                                 iv
+                                                                ul
+
+
+
+
+                                                                ov
+                                                                M
+
+
+
+
+                                                                as
+
+
+
+                                                               ar
+                                                                ot
+                                                              TR
+
+
+
+
+                      Bits (base model) (instruct model)
+                                                             Sa
+
+
+
+
+                                                              Tr
+
+
+
+
+                                                              Ps
+                                                              M
+
+                                                              M
+                                                              H
+
+
+
+
+                                                              Q
+
+
+
+
+                                                              Q
+
+
+
+
+                                                              G
+
+
+
+
+      Uncompressed     16      5.61          48.13         43.62 48.58 72.50 57.8 26.86 91.47 25.43 10.50 55.58 32.75 44.62 100.0 29.65 34.4
+      AQUA-KV         2.08     5.72          47.77         42.99 48.16 73.50 57.58 26.15 91.91 25.79 7.25 55.71 33.46 44.53 99.50 29.67 32.53
+       HIGGS          2.02     5.89          47.37         41.20 49.03 73.00 57.58 25.47 91.97 25.21 7.25 56.91 31.80 43.76 99.5 30.27 30.16
+        KIVI          2.25     7.37          46.28         43.41 43.33 71.50 55.12 26.79 91.14 24.57 5.67 52.56 30.9 41.02 99.50 29.10 33.3
+    KVQuant-2b-s1%    2.33     6.64          37.17         41.94 34.23 65.00 43.78 25.82 86.27 22.94 2.92 47.13 23.24 36.51 36.50 22.63 31.53
+      AQUA-KV         3.05     5.64          48.10         43.89 48.35 73.5 57.43 26.85 91.48 25.46 7.43 56.64 33.96 45.18 99.5 29.61 34.06
+       HIGGS          3.02     5.66          47.86         43.75 47.77 73.5 57.74 26.41 91.93 25.39 7.33 55.67 33.57 43.97 99.5 29.87 33.6
+        KIVI          3.05     6.04          46.98         43.46 43.86 72.50 54.46 26.93 91.76 25.21 6.78 54.40 30.92 43.73 99.00 29.54 35.15
+    KVQuant-3b-s1%    3.33     5.84          46.42         44.56 42.73 72.50 53.91 26.54 92.01 24.96 5.42 53.42 28.03 44.31 99.50 28.64 33.40
+      AQUA-KV         4.02     5.61          48.10         44.14 48.81 73.5 57.2 27.11 91.63 25.47 7.43 56.17 33.69 44.6 99.5 29.68 34.45
+       HIGGS          4.02     5.62          48.07         43.6 48.82 73.5 57.23 26.89 91.47 25.42 7.6 55.72 34.29 44.43 99.5 30.28 34.21
+        KIVI          4.25     5.64          47.57         44.07 45.54 72.50 55.72 26.86 92.42 25.58 8.34 54.89 31.41 44.42 99.50 29.46 35.22
+    KVQuant-4b-s1%    4.33     5.65          47.77         43.61 49.10 71.00 58.56 26.87 91.03 25.25 5.42 55.03 33.41 45.67 99.50 29.86 34.45
+
+
+
+
+                                                                         18
+                        Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+
+Table 8. Evaluation of AQUA-KV (with HIGGS backbone) and baselines on Llama 3.1 70B for 2, 3 & 4 bit compression. The WikiText-2
+Perplexity is evaluated on base (non-instruct) version of the model with sequence length 8192. The LongBench results are an average
+over 14 tasks evaluated with Instruct model with sequence length 217 (131K) tokens. In addition to the overall average score across all
+tasks, the table also includes individual scores for each of the 14 tasks. The specific tasks in the original LongBench benchmark and the
+corresponding evaluation metrics can be found in the text.
+
+
+
+
+                                                                                   A
+                                                                               eQ
+
+
+                                                                                 t
+                                                                                s
+                                                                  M QA
+
+
+
+
+                                                                              or
+                                                                              en
+                                                                              Q
+
+
+
+
+                                                                             ew
+
+
+
+
+                                                                             nt
+                                                                              A
+                                                                  2W m
+
+
+
+
+                                                                           ue
+
+
+
+
+                                                                          tiv
+                                                                  Ps m
+                                                                         iM
+
+
+
+
+                                                                          ep
+                                                                  N tr
+                                                                          Q
+
+
+
+
+                                                                         ou
+                                                                       tiN
+
+
+
+
+                                                                           r
+                                                                         A
+                                                                        Su
+
+
+
+
+                                                                           t
+
+
+
+
+                                                                       Su
+                                                                      EC
+                      Quant. Wiki2 PPL↓ LongBench Avg ↑
+
+
+
+
+                                                                        iq
+                                                                       po
+
+
+
+
+                                                                       pe
+
+                                                                         e
+                                                                       ra
+                                                                       ia
+
+
+
+
+                                                                       R
+                                                                    FQ
+                                                                      ik
+
+
+
+
+                                                                    gC
+
+
+
+
+                                                                    gR
+                                                                 m
+
+
+
+
+                                                                    us
+         Config
+
+
+
+
+                                                                     iv
+                                                                    ul
+
+
+
+
+                                                                    ov
+                                                                    M
+
+
+
+
+                                                                    as
+
+
+
+                                                                   ar
+                                                                    ot
+                                                                  TR
+                       Bits (base model) (instruct model)
+
+
+
+
+                                                              Sa
+
+
+
+
+                                                                  Tr
+
+
+
+
+                                                                  Ps
+                                                                  M
+
+                                                                  M
+                                                                  H
+
+
+
+
+                                                                  Q
+
+
+
+
+                                                                  Q
+
+
+
+
+                                                                  G
+      Uncompressed      16       2.54          52.92        47.04 68.63 76.50 65.71 26.72 94.21 23.93 18.00 54.79 45.96 49.73 98.50 36.31 34.85
+      AQUA-KV          2.04      2.62          52.79        46.65 69.71 76.00 64.94 26.64 94.04 24.40 18.00 55.31 46.17 49.72 97.50 35.92 34.06
+       HIGGS           2.02      2.77          52.18        46.43 68.04 76.00 63.41 26.49 93.94 24.25 20.00 54.08 44.56 48.68 97.50 35.04 32.11
+        KIVI           2.25      3.06          52.45        47.07 66.83 76.50 63.88 26.43 93.38 24.50 20.00 53.91 46.66 49.19 97.50 34.89 33.58
+    KVQuant-2b-s1%     2.33      3.28          31.39        44.87 39.64 65.50 51.52 26.09 89.42 23.44 11.50 51.64 38.50 43.59 97.50 30.92 31.85
+      AQUA-KV          3.03      2.55          52.81        46.74 68.63 76.50 65.11 26.50 94.21 24.16 18.00 54.60 45.89 49.73 98.50 36.17 34.59
+       HIGGS           3.02      2.57          52.56        46.26 68.33 75.50 64.76 26.38 94.04 24.80 18.50 54.74 45.17 49.24 97.50 36.42 34.24
+        KIVI           3.05      2.87          52.87        47.66 67.09 76.50 64.37 26.66 93.61 24.56 20.00 54.54 47.56 49.87 98.00 35.47 34.29
+    KVQuant-3b-s1%     3.33      2.75          35.02        45.83 59.45 76.00 58.21 26.32 89.42 23.90 17.50 53.86 43.93 48.46 97.50 35.86 34.18
+      AQUA-KV          4.02      2.54          52.95        47.05 68.63 76.50 65.79 26.75 94.04 24.01 18.50 54.66 46.18 49.49 98.50 36.58 34.63
+       HIGGS           4.02      2.55          52.97        47.77 69.01 76.50 66.33 26.83 94.04 24.50 16.50 54.37 46.56 49.27 99.00 36.31 34.65
+        KIVI           4.25      2.61          52.88        47.24 67.27 76.50 64.37 26.75 94.04 24.47 20.00 54.01 47.85 50.19 97.50 35.23 34.91
+    KVQuant-4b-s1%     4.33      2.58          35.42        47.68 68.79 75.50 66.70 26.87 93.73 24.20 18.00 54.27 46.03 48.83 99.00 36.13 34.70
+
+
+
+Table 9. Evaluation of AQUA-KV (with HIGGS backbone) and baselines on Qwen2.5 3B for 2, 3 & 4 bit compression. The WikiText-2
+Perplexity is evaluated on base (non-instruct) version of the model with sequence length 8192. The LongBench results are an average over
+14 tasks evaluated with Instruct model with sequence length 217 (131K) tokens. In addition to the overall average score across all tasks,
+the table also includes individual scores for each of the 14 tasks. The specific tasks in the LongBench benchmark and the corresponding
+evaluation metrics can be found in the text. The increased AQUA-KV bitwidth is due to not quantizing the 1st block for this model.
+
+
+
+
+                                                                                                                     A
+                                                                                                                 eQ
+
+
+                                                                                                                   t
+                                                                                                                  s
+                                                                                              A
+
+
+
+
+                                                                                                                or
+                                                                                                                en
+                                                                            Q
+
+
+
+
+                                                                                                               ew
+
+
+
+
+                                                                                                               nt
+                                                                                                                A
+                                                                  m
+
+
+
+
+                                                                                          tQ
+
+
+
+
+                                                                                                             ue
+
+
+
+
+                                                                                                             tiv
+                                                                                                    Ps m
+                                                                        iM
+
+
+
+
+                                                                                                            ep
+                                                                                                    N etr
+                                                                                                             Q
+
+
+
+
+                                                                                                           ou
+                                                                                                  tiN
+
+
+
+
+                                                                                                             r
+                                                                                                            A
+                                                               Su
+
+
+
+
+                                                                                                         Su
+                                                                                EC
+
+
+
+
+                     Quant. Wiki2 PPL↓ LongBench Avg ↑
+
+
+
+
+                                                                                                          iq
+                                                                                         po
+
+
+
+
+                                                                                                         pe
+
+
+
+                                                                                                         ra
+                                                                                                          ia
+
+
+
+
+                                                                                                         R
+                                                                                                      FQ
+                                                                       ik
+
+
+
+
+                                                                                                       gC
+
+
+
+
+                                                                                                       gR
+                                                              m
+
+
+
+
+                                                                                                      us
+         Config
+                                                                                                       iv
+                                                                                               ul
+
+
+
+
+                                                                                                      ov
+                                                                                                      M
+
+
+
+
+                                                                                                      as
+
+
+
+                                                                                                     ar
+                                                                                     ot
+                                                                     2W
+
+
+                                                                             TR
+
+
+
+
+                      Bits (base model) (instruct model)
+                                                             Sa
+
+
+
+
+                                                                                                    Tr
+
+
+
+
+                                                                                                    Ps
+                                                                                              M
+
+
+
+
+                                                                                                    M
+
+                                                                                                    M
+                                                                                     H
+
+
+
+
+                                                                                                    Q
+
+
+
+
+                                                                                                    Q
+
+
+
+
+                                                                                                    G
+      Uncompressed     16      7.14          38.80         44.45 38.64 68.00 46.60 22.60 87.60 22.94 3.00 49.29 20.53 37.07 49.00 21.88 31.64
+       AQUA-KV        2.44     7.20          38.31         43.43 37.43 68.50 46.35 22.69 88.17 23.23 3.00 48.93 18.11 36.98 47.50 21.71 30.34
+        HIGGS         2.06     7.92          30.92         38.73 34.81 48.00 44.54 18.11 84.40 20.26 2.50 38.24 16.17 32.51 15.00 19.34 20.26
+         KIVI         2.25     9.05          28.66         42.07 12.48 69.00 18.60 23.37 87.05 24.09 5.05 29.96 10.56 11.10 31.27 10.31 26.31
+       AQUA-KV        3.42     7.15          38.77         45.19 38.64 68.00 46.81 22.90 87.67 23.35 2.50 48.43 20.39 37.34 47.50 22.79 31.29
+        HIGGS         3.06     7.28          31.85         42.90 30.92 53.00 41.33 21.64 79.05 22.53 2.50 42.94 15.98 29.94 20.50 19.78 22.94
+         KIVI         3.05     7.63          30.37         44.08 13.71 69.00 18.31 23.97 86.66 23.44 4.75 36.62 9.84 14.10 38.75 12.05 29.92
+       AQUA-KV         4.4     7.14          38.92         44.77 37.98 68.00 46.80 22.57 87.93 23.09 3.00 49.07 21.20 37.34 50.00 21.75 31.42
+        HIGGS         4.06     7.15          32.11         41.37 29.80 55.00 37.84 23.01 70.86 22.79 2.00 42.52 15.46 34.17 33.42 20.29 20.95
+         KIVI         4.25     7.17          31.50         45.01 15.42 69.50 21.40 24.59 87.53 23.76 3.50 38.99 12.06 16.13 42.50 8.65 31.9
+
+
+
+Table 10. Evaluation of AQUA-KV (with HIGGS backbone) and baselines on Qwen2.5 7B for 2, 3 & 4 bit compression. The WikiText-2
+Perplexity is evaluated on base (non-instruct) version of the model with sequence length 8192. The LongBench results are an average over
+14 tasks evaluated with Instruct model with sequence length 217 (131K) tokens. In addition to the overall average score across all tasks,
+the table also includes individual scores for each of the 14 tasks. The specific tasks in the LongBench benchmark and the corresponding
+evaluation metrics can be found in the text. The increased AQUA-KV bitwidth is due to not quantizing the 1st block for this model.
+                                                                               A
+                                                                           eQ
+
+
+                                                                             t
+                                                                            s
+                                                              M QA
+
+
+
+
+                                                                          or
+                                                                          en
+                                                                          Q
+
+
+
+
+                                                                         ew
+
+
+
+
+                                                                         nt
+                                                                          A
+                                                              2W m
+
+
+
+
+                                                                       ue
+
+
+
+
+                                                                       tiv
+                                                              Ps m
+                                                                     iM
+
+
+
+
+                                                                      ep
+                                                              N etr
+                                                                       Q
+
+
+
+
+                                                                     ou
+                                                                   tiN
+
+
+
+
+                                                                       r
+                                                                      A
+                                                                    Su
+
+
+
+
+                                                                       t
+
+
+
+
+                                                                   Su
+                                                                  EC
+
+
+
+
+                     Quant. Wiki2 PPL↓ LongBench Avg ↑
+                                                                    iq
+                                                                   po
+
+
+
+
+                                                                   pe
+
+
+
+                                                                   ra
+                                                                    ia
+
+
+
+
+                                                                   R
+                                                                FQ
+                                                                  ik
+
+
+
+
+                                                                gC
+
+
+
+
+                                                                 gR
+                                                                 m
+
+
+
+
+                                                                us
+
+
+
+
+         Config
+                                                                 iv
+                                                                ul
+
+
+
+
+                                                                ov
+                                                                M
+
+
+
+
+                                                                as
+
+
+
+                                                               ar
+                                                                ot
+                                                              TR
+
+
+
+
+                      Bits (base model) (instruct model)
+                                                             Sa
+
+
+
+
+                                                              Tr
+
+
+
+
+                                                              Ps
+                                                              M
+
+                                                              M
+                                                              H
+
+
+
+
+                                                              Q
+
+
+
+
+                                                              Q
+
+
+
+
+                                                              G
+
+
+
+
+      Uncompressed     16      6.13          46.82         45.77 46.94 72.00 57.72 23.90 89.42 23.56 8.00 52.58 30.35 43.78 100.0029.49 31.93
+       AQUA-KV        2.48     6.17          46.43         45.99 45.71 72.00 56.88 23.84 89.18 23.44 8.50 52.15 29.63 42.77 99.50 29.21 31.15
+        HIGGS         2.03     8.08          25.97         26.98 17.98 52.50 31.67 12.04 55.46 13.14 7.25 27.19 14.55 22.22 55.79 14.72 12.05
+         KIVI         2.25     7.02          32.78         44.79 10.60 71.00 11.51 22.04 86.71 21.25 6.41 27.29 6.69 12.81 91.67 14.37 31.79
+       AQUA-KV        3.45     6.14          46.81         45.58 47.35 72.00 57.88 24.07 89.10 23.59 8.00 52.63 30.64 44.05 100.0028.40 32.03
+        HIGGS         3.03      7.2          14.61         14.02 13.38 45.00 15.27 6.07 29.29 10.00 5.54 18.29 4.65 14.81 15.90 6.10 6.19
+         KIVI         3.05     6.37          32.63         45.65 9.71 71.00 10.34 22.49 88.87 20.68 4.69 29.83 6.87 13.17 90.46 10.66 32.37
+       AQUA-KV        4.43     6.14          46.77         45.81 46.87 72.00 57.71 24.06 89.83 23.83 8.00 52.41 30.35 43.37 100.0028.65 31.86
+        HIGGS         4.03     6.88          11.54         11.80 7.62 37.75 10.13 4.39 22.54 10.52 7.20 10.50 4.83 5.85 16.26 7.11 5.02
+         KIVI         4.25     6.14          33.40         46.20 9.61 71.00 10.34 22.27 89.63 21.13 4.58 30.56 6.85 12.79 98.25 12.06 32.39
+
+
+
+                                                                                19
+                       Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+
+
+
+                                      Table 11. LongBench tasks mapping and evaluation metrics.
+                                               Our task name        Orig. task name      Eval metric Avg len
+                                                 SamSum                SAMSum             Rouge-L     6,258
+                                                 2WikiMQ           2WikiMultihopQA           F1       4,887
+                                                     TREC                 TREC            Accuracy    5,177
+                                                 HotpotQA              HotpotQA              F1       9,151
+                                                MultiNews              MultiNews          Rouge-L     2,113
+                                                 TriviaQA              TriviaQA              F1       8,209
+                                                 QMSum                    QMSum           Rouge-L    10,614
+                                                 PsgCount            PassageCount         Accuracy   11,141
+                                                 MFQA en            MutiFieldQA-en           F1       4,559
+                                                 Musique               MUSiQue               F1      11,214
+                                                     Qasper               Qasper             F1       3,619
+                                                     PsgRetr       PassageRetrieval-en    Accuracy    9,289
+                                                NarrativeQA           NarrativeQA            F1      18,409
+                                                GovReport              GovReport          Rouge-L     8,734
+
+
+
+
+Table 12. Evaluation of Llama 3.2 3B Instruct with H2 O pruning mixed with various Key-Value cache compression strategies. A 20%
+KV cache budget for H2 O was used for all evaluations. The left panel contains the average LongBench score for the model. The right
+panel reports detailed per-task LongBench accuracies and F1 scores for the model.
+
+
+
+
+                                                                          A
+                                                                      eQ
+
+
+                                                                        t
+                                                                       s
+                                                         M QA
+
+
+
+
+                                                                     or
+                                                                     en
+                                                                     Q
+
+
+
+
+                                                                    ew
+
+
+
+
+                                                                    nt
+                                                                     A
+                                                         2W m
+
+
+
+
+                                                                  ue
+
+
+
+
+                                                                  tiv
+                                                         Ps m
+                                                                iM
+
+
+
+
+                                                                 ep
+                                                         N etr
+                                                                  Q
+
+
+
+
+                                                                ou
+                                                              tiN
+
+
+
+
+                                                                  r
+                                                                 A
+                                                               Su
+
+
+
+
+                                                                  t
+
+
+
+
+                                                              Su
+                                                             EC
+
+
+
+
+                          Quant. LongBench Avg ↑               iq
+                                                              po
+
+
+
+
+                                                              pe
+
+
+
+                                                              ra
+                                                               ia
+
+
+
+
+                                                              R
+                                                           FQ
+                                                             ik
+
+
+
+
+                                                           gC
+
+
+
+
+                                                           gR
+                                                            m
+
+
+
+
+                                                           us
+              Config
+                                                            iv
+                                                           ul
+
+
+
+
+                                                           ov
+                                                           M
+
+
+
+
+                                                           as
+
+
+
+                                                          ar
+                                                           ot
+                                                         TR
+
+
+
+
+                           Bits   (instruct model)
+                                                        Sa
+
+
+
+
+                                                         Tr
+
+
+
+
+                                                         Ps
+                                                         M
+
+                                                         M
+                                                         H
+
+
+
+
+                                                         Q
+
+
+
+
+                                                         Q
+
+
+
+
+                                                         G
+           Uncompressed     16         44.61          42.5 40.32 70.5 52.77 25.79 88.78 24.38         5   51.13 26.21 40.74   97   24.93 34.54
+               H2 O         16         38.82         42.92 39.87     68    43.91 22.64 88.88 22.14 7.5 48.52 16.38 31.78      65   18.39 27.54
+         H2 O + AQUA-KV    2.09        38.43         42.99 39.67 68 44.02 22.19 88.6 21.74 7.5 46.51 16.54 30.03 65 18.65 26.52
+          H2 O + HIGGS     2.02        37.02         40.04 37.93 67.5 44.11 22.15 87.45 21.19 6.5 46.5 16.05 29.07 56.5 18.07 25.24
+         H2 O + AQUA-KV    3.06        38.76          43.2 39.73     68    43.99 22.34 89.04 21.93 7.5 48.02 16.51 31.5 64.5 18.88 27.45
+         H2 O + AQUA-KV    4.02        38.85         43.16 39.96     68    43.9 22.86 89.04 22.17 7.5 48.44 16.38 31.88 64.5 18.48 27.61
+
+
+
+
+Table 13. Evaluation of Llama 3.1 8B Instruct with H2 O pruning mixed with various Key-Value cache compression strategies. A 20%
+KV cache budget for H2 O was used for all evaluations. The left panel contains the average LongBench score for the model. The right
+panel reports detailed per-task LongBench accuracies and F1 scores for the model.
+                                                                                A
+                                                                            eQ
+
+
+                                                                              t
+                                                                             s
+                                                               M QA
+
+
+
+
+                                                                           or
+                                                                           en
+                                                                           Q
+
+
+
+
+                                                                          ew
+
+
+
+
+                                                                          nt
+                                                                           A
+                                                               m
+
+
+
+
+                                                                        ue
+
+
+
+
+                                                                        tiv
+                                                               Ps m
+                                                                      iM
+
+
+
+
+                                                                       ep
+                                                               N etr
+                                                                        Q
+
+
+
+
+                                                                      ou
+                                                                    tiN
+
+
+
+
+                                                                        r
+                                                                       A
+                                                             Su
+
+
+
+
+                                                                        t
+
+
+
+
+                                                                    Su
+                                                                   EC
+
+
+
+
+                          Quant. LongBench Avg ↑
+                                                                     iq
+                                                                    po
+
+
+
+
+                                                                    pe
+
+
+
+                                                                    ra
+                                                                     ia
+
+
+
+
+                                                                    R
+                                                                 FQ
+                                                                   ik
+
+
+
+
+                                                                 gC
+
+
+
+
+                                                                  gR
+                                                         m
+
+
+
+
+                                                                 us
+
+
+
+
+              Config
+                                                                  iv
+                                                                 ul
+
+
+
+
+                                                                 ov
+                                                                 M
+
+
+
+
+                                                                 as
+
+
+
+                                                                ar
+                                                                 ot
+                                                               2W
+
+
+                                                               TR
+
+
+
+
+                           Bits   (instruct model)
+                                                        Sa
+
+
+
+
+                                                               Tr
+
+
+
+
+                                                               Ps
+                                                               M
+
+                                                               M
+                                                               H
+
+
+
+
+                                                               Q
+
+
+
+
+                                                               Q
+
+
+
+
+                                                               G
+
+
+
+
+           Uncompressed     16         48.13         43.62 48.58 72.5 57.8 26.86 91.47 25.43 10.5 55.58 32.75 44.62 100 29.65 34.4
+               H2 O         16         41.42         44.57 44.84 69.5 44.09 23.04 91.75 22.1 6.61 51.49 24.28 38.45           68   22.29 28.91
+         H2 O + AQUA-KV    2.09        41.11         44.35 42.57 69 44.3 22.6 92.19 22.06 6.59 51.87 23.92 37.57 68.5 21.9 28.16
+          H2 O + HIGGS     2.02        40.72         42.04 44 68.5 43.39 23.01 91.26 22.38 7.24 50.08 24.24 34.53 69 22.68 27.69
+         H2 O + AQUA-KV    3.06        41.31         44.63 44.69 69.5 44.32 23.06 92.28 22.12 6.51 50.68 23.98 37.45          68   22.65 28.4
+         H2 O + AQUA-KV    4.02        41.47         44.51 44.94 69.5 44.07 22.95 91.75 22.45 6.83 51.53 24.29 38.5           68   22.22 28.98
+
+
+
+
+                                                                              20
+                       Cache Me If You Must: Adaptive Key-Value Quantization for Large Language Models
+
+
+
+
+Table 14. Evaluation of Llama 3.2 3B Instruct with H2 O pruning mixed with various Key-Value cache compression strategies. A 50%
+KV cache budget for H2 O was used for all evaluations. The left panel contains the average LongBench score for the model. The right
+panel reports detailed per-task LongBench accuracies and F1 scores for the model.
+
+
+
+
+                                                                       A
+                                                                   eQ
+
+
+                                                                     t
+                                                                    s
+                                                       M QA
+
+
+
+
+                                                                  or
+                                                                  en
+                                                                  Q
+
+
+
+
+                                                                 ew
+
+
+
+
+                                                                 nt
+                                                                  A
+                                                       2W m
+
+
+
+
+                                                                ue
+
+
+
+
+                                                               tiv
+                                                       Ps m
+                                                              iM
+
+
+
+
+                                                               ep
+                                                       N etr
+                                                               Q
+
+
+
+
+                                                              ou
+                                                            tiN
+
+
+
+
+                                                               r
+                                                              A
+                                                             Su
+
+
+
+
+                                                               t
+
+
+
+
+                                                            Su
+                                                           EC
+                          Quant. LongBench Avg ↑
+
+
+
+
+                                                             iq
+                                                            po
+
+
+
+
+                                                            pe
+
+
+
+                                                            ra
+                                                            ia
+
+
+
+
+                                                            R
+                                                         FQ
+                                                           ik
+
+
+
+
+                                                         gC
+
+
+
+
+                                                          gR
+                                                          m
+
+
+
+
+                                                         us
+              Config
+
+
+
+
+                                                          iv
+                                                         ul
+
+
+
+
+                                                         ov
+                                                         M
+
+
+
+
+                                                         as
+
+
+
+                                                        ar
+                                                         ot
+                                                       TR
+                           Bits   (instruct model)
+
+
+                                                       Sa
+
+
+
+
+                                                       Tr
+
+
+
+
+                                                       Ps
+                                                       M
+
+                                                       M
+                                                       H
+
+
+
+
+                                                       Q
+
+
+
+
+                                                       Q
+
+
+
+
+                                                       G
+           Uncompressed     16         44.61         42.5 40.32 70.5 52.77 25.79 88.78 24.38    5   51.13 26.21 40.74   97   24.93 34.54
+               H2 O         16         39.69         42.84 37.87 68.5 44.57 24.84 88.22 22.51 8.5 48.87 16.72 37.22     65   19.35 30.59
+         H2 O + AQUA-KV    2.09        39.11         42.89 38.04 68.5 45.12 24.38 88.64 21.82   6   49.15 16.59 34.65 63.5 19.68 28.62
+          H2 O + HIGGS     2.02        37.42         39.72 36.61 68.5 44.01 24.15 87.52 21.77   5   47.9 16.01 32.32 54.5 18.85 27.07
+         H2 O + AQUA-KV    3.06        39.61         42.59 38.68 68.5 44.58 25.06 88.39 22.17 7.5 49.22 17.22 36.46 64.5 19.42 30.29
+          H2 O + HIGGS     3.02        39.21         42.38 37.62 68 45.04 24.75 89.06 22.32 9 47.96 16.14 36.21 61 19.5 29.93
+         H2 O + AQUA-KV    4.02        39.72         42.65 37.8 68.5 44.58 25.07 89.08 22.35 8.5 49.06 17.06 36.83      64   20.07 30.52
+          H2 O + HIGGS     4.02        39.45         42.23 38.1 68.5 44.67 25 88.53 22.37 9 49.78 16.16 36.85           61   19.81 30.3
+
+
+
+
+Table 15. Evaluation of Llama 3.1 8B Instruct with H2 O pruning mixed with various Key-Value cache compression strategies. A 50%
+KV cache budget for H2 O was used for all evaluations. The left panel contains the average LongBench score for the model. The right
+panel reports detailed per-task LongBench accuracies and F1 scores for the model.
+                                                                                                A
+                                                                                            eQ
+
+
+                                                                                              t
+                                                                                             s
+                                                                               M QA
+
+
+
+
+                                                                                           or
+                                                                                           en
+                                                                  Q
+
+
+
+
+                                                                                          ew
+
+
+
+
+                                                                                          nt
+                                                                                           A
+                                                             m
+
+
+
+
+                                                                                        ue
+
+
+
+
+                                                                                        tiv
+                                                                               Ps m
+                                                                 M
+
+
+
+
+                                                                                       ep
+                                                                               N etr
+                                                                                        Q
+
+
+
+
+                                                                                      ou
+                                                                                    tiN
+
+
+
+
+                                                                                        r
+                                                                                       A
+                                                            Su
+
+
+
+
+                                                                                        t
+
+
+
+
+                                                                                    Su
+                                                                       EC
+
+
+
+
+                          Quant. LongBench Avg ↑
+                                                                                     iq
+                                                                                    po
+
+
+
+
+                                                                                    pe
+
+
+
+                                                                                    ra
+                                                                  i
+
+
+
+
+                                                                                     ia
+
+
+
+
+                                                                                    R
+                                                                                 FQ
+                                                               ik
+
+
+
+
+                                                                                 gC
+
+
+
+
+                                                                                  gR
+                                                        m
+
+
+
+
+                                                                                 us
+
+
+
+
+              Config
+                                                                                  iv
+                                                                                 ul
+
+
+
+
+                                                                                 ov
+                                                                                 M
+
+
+
+
+                                                                                 as
+
+
+
+                                                                                ar
+                                                                            ot
+                                                             2W
+
+
+                                                                      TR
+
+
+
+
+                           Bits   (instruct model)
+                                                       Sa
+
+
+
+
+                                                                               Tr
+
+
+
+
+                                                                               Ps
+                                                                               M
+
+                                                                               M
+                                                                           H
+
+
+
+
+                                                                               Q
+
+
+
+
+                                                                               Q
+
+
+
+
+                                                                               G
+
+
+
+
+           Uncompressed     16         48.13         43.62 48.58 72.5 57.8 26.86 91.47 25.43 10.5 55.58 32.75 44.62 100 29.65 34.4
+               H2 O         16         42.35         44.36 44.46 69.5 43.68 25.53 91.83 23.15 6.49 52.93 24.8 43.63     68   22.78 31.79
+         H2 O + AQUA-KV    2.09        42.08         43.87 43.32 69 44.27 25.31 92.38 23.45 6.14 53.2 24.86 41.8 68.5 22.7 30.31
+          H2 O + HIGGS     2.02        41.61         41.69 44.87 69.5 43.55 25.33 91.52 22.47 6.55 52.43 24.08 41.11 68 22.24 29.13
+         H2 O + AQUA-KV    3.05        42.37          44.1 44.65 69.5 44.12 25.38 92.62 23.47 6.5 53.57 24.73 43.3      68   22.13 31.14
+          H2 O + HIGGS     3.02        42.23         43.84 45.28 69.5 43.94 25.34 91.85 23.07 6.49 53.16 24.85 42.01    68   22.41 31.45
+         H2 O + AQUA-KV    4.02        42.37          44.3 44.34 69.5 43.73 25.78 91.72 23.33 6.71 53.08 24.7 43.56     68   22.82 31.64
+          H2 O + HIGGS     4.02        42.17         44.38 43.65 69.5 43.54 25.81 91.93 22.84 6.76 53.25 24.54 42.53    68   22.13 31.58
+
+
+
+
+                                                                            21
+

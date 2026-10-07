@@ -1,0 +1,813 @@
+            OrbitFlow: SLO-Aware Long-Context LLM Serving with
+                   Fine-Grained KV Cache Reconfiguration
+                     Xinyue Ma∗                                             Heelim Hong∗                                 Taegeon Um
+                   POSTECH                                                      UNIST                                 Samsung Research
+             xinyuema@postech.ac.kr                                       heelim@unist.ac.kr                      taegeon.um@samsung.com
+
+                   Jongseop Lee                                           Seoyeong Choy                                 Woo-Yeon Lee
+                    POSTECH                                                 POSTECH                                  Samsung Research
+            jslee202403@postech.ac.kr                                sychoy0704@postech.ac.kr                    wooyeon0.lee@samsung.com
+
+                                                                          Myeongjae Jeon
+                                                                             POSTECH
+                                                                       mj.jeon@postech.ac.kr
+
+ABSTRACT                                                                               1   INTRODUCTION
+Serving long-context LLMs is challenging because request lengths                       Large language models (LLMs) have gained significant prominence
+and batch composition vary during token generation, causing the                        across various natural language processing tasks, including text
+memory footprint to fluctuate significantly at runtime. Offloading                     generation [5, 7, 9, 11, 17, 28], language translation [31, 34, 53],
+KV caches to host memory limits effective GPU memory usage,                            summarization [26, 38], and question answering [16, 22, 41]. Their
+but existing static and predetermined offloading strategies cannot                     capabilities have greatly improved over the past few years, largely
+adapt to the rapidly shifting memory demands of long-context                           empowered by dramatic increases in context window size—i.e., the
+serving. This often leads to excessive CPU-to-GPU KV transfers                         maximum number of tokens in words a model can process at once.
+that translate into latency spikes and frequent SLO violations.                        For instance, GPT-2 [42] supported a context window of 1K tokens,
+    To address these challenges, we introduce OrbitFlow, a fine-                       while its successor GPT-3 [7] doubled the window size to 2K tokens.
+grained and adaptive KV cache management system that meets                             More recent models such as GPT-4 [27] and Claude [3] have pushed
+latency SLOs in long-context LLM serving. OrbitFlow employs a                          the limits further, handling up to 128K or even 1M tokens.
+lightweight ILP solver to decide which layers’ KV caches to retain                        To provide the best user experience, LLM serving systems must
+on the GPU for each request, within memory capacity constraints.                       respond to requests within stringent latency requirements defined
+It continuously refines KV placements based on runtime feedback                        by service-level objectives (SLOs) [1, 40, 56]. Upon receiving an
+when the active plan becomes suboptimal during token generation.                       input sequence of tokens, these systems generate output tokens
+Under heavy load, OrbitFlow invokes a fallback mechanism to                            autoregressively, one token at a time, through consecutive decode
+temporarily defer in-flight requests with large memory footprints,                     steps. Many LLM services, such as chat agents, creative writing
+preserving overall SLO attainment. Our experiments demonstrate                         tools, and real-time translators, stream tokens as they are gen-
+that OrbitFlow improves SLO attainment for TPOT and TBT by                             erated so that users can read responses incrementally. To keep
+62% and 66%, respectively, while reducing the 95th percentile (i.e.,                   decode latency perceptually invisible, these services typically set
+P95) latency by 38% and achieving up to 3.3× higher throughput                         per-token latency SLOs (e.g., 200–300 ms for chatbots) to match
+compared to existing offloading methods.                                               natural reading speeds [36, 56]. Frequent violations of these latency
+                                                                                       SLOs can impair user experience and reduce revenue [4], regardless
+PVLDB Reference Format:                                                                of response quality. As context windows expand and workloads
+Xinyue Ma, Heelim Hong, Taegeon Um, Jongseop Lee, Seoyeong Choy,                       become more decode-dominant, optimizing for per-token latency
+Woo-Yeon Lee, and Myeongjae Jeon. OrbitFlow: SLO-Aware Long-Context                    SLOs becomes ever more critical.
+LLM Serving with Fine-Grained KV Cache Reconfiguration. PVLDB, 19(5):
+                                                                                          However, serving long-context LLMs within strict time bounds
+1046 - 1059, 2026.
+                                                                                       is challenging because GPU memory demands vary widely during
+doi:10.14778/3796195.3796214
+PVLDB Artifact Availability:
+                                                                                       runtime. Modern serving systems accelerate token generation by
+The source code, data, and/or other artifacts have been made available at
+                                                                                       performing decode steps based on cached states of all preceding
+https://github.com/omnia-postech/OrbitFlow.
+                                                                                       input-output tokens, termed KV cache. Rapid decoding thus requires
+                                                                                       storing all KV caches in GPU memory, which was manageable with
+∗ These authors contributed equally to this work.                                      small context windows. Such caching has now become nontrivial
+This work is licensed under the Creative Commons BY-NC-ND 4.0 International            for two reasons: (1) although initially small, the KV cache grows
+License. Visit https://creativecommons.org/licenses/by-nc-nd/4.0/ to view a copy of
+this license. For any use beyond those covered by this license, obtain permission by   steadily during lengthy decoding, creating a high likelihood of
+emailing info@vldb.org. Copyright is held by the owner/author(s). Publication rights   exhausting GPU memory (i.e., token dimension); and (2) LLM serving
+licensed to the VLDB Endowment.                                                        systems often dynamically batch multiple requests to process them
+Proceedings of the VLDB Endowment, Vol. 19, No. 5 ISSN 2150-8097.
+doi:10.14778/3796195.3796214                                                           concurrently on the GPU [20, 29], further straining the available
+GPU memory (i.e., batch dimension). There are thriving efforts to
+reduce KV cache size itself during the decode step. For instance,
+state restoration [45] recomputes parts of the KV cache at runtime,
+and token pruning [13, 30, 47, 49, 54] discards presumably less
+critical KV entries. While effective, these approaches carry inherent
+limitations, as they either apply only to specific models with multi-
+head attention (MHA) [45] or risk degrading response quality.
+   This paper tackles GPU memory challenges in long-context serv-          Figure 1: (a) Prefill stage computes all input tokens in parallel.
+ing through KV offloading [50], which moves parts of the KV cache          (b) Decode stage loads KV from the cache and computes only one
+to host memory and overlaps their retrieval with ongoing GPU               token at a time. (c) MHA maps distinct KV per query head, while
+computation. KV offloading does not compromise accuracy and,               GQA shares KV across head groups to reduce the KV size.
+when scheduled concurrently, can achieve effective computation-
+                                                                           to a constant time-between-tokens (TBT) [1, 40], OrbitFlow first
+communication overlap. The key insight behind this is that each
+                                                                           deposits generated tokens into a buffer and then releases them at a
+layer uses only its own cached KV states and does not access
+                                                                           steady rate matching the predefined TBT to smooth the output rate.
+caches from other layers. However, current common practices are
+                                                                           This mechanism does not stand alone; our solver uses it to tem-
+largely SLO-unaware: they statically and monolithically offload
+                                                                           porarily pause suitable requests with high memory footprints and
+and prefetch states for all batched requests layer by layer to save
+                                                                           many buffered tokens, freeing GPU memory to better accommodate
+memory [30, 51]. Even with larger offload distances, i.e., evicting
+                                                                           other requests in the batch. Since OrbitFlow continues supplying
+caches at regular but wider layer intervals within the GPU memory
+                                                                           users with deposited tokens during pauses, it maintains the per-
+budget, static strategies fail to conceal escalating data-transfer over-
+                                                                           ception of continuous request processing. These mechanisms are
+heads as the cache expands along both token and batch dimensions.
+                                                                           particularly beneficial in batches where some requests complete
+This overhead markedly delays GPU computations and subsequent
+                                                                           quickly, as resources freed by such requests can then be reclaimed
+token decode steps for every request in a batch, making it difficult
+                                                                           to resume paused requests without disrupting the user experience.
+to consistently meet latency SLOs across requests.
+                                                                              We build OrbitFlow atop vLLM v0.6.6 [29] and evaluate it
+   Our system, OrbitFlow, realizes effective KV offloading through
+                                                                           against baseline offloading systems on ShareGPT-derived synthetic
+adaptive, fine-grained offload plans. At its core, OrbitFlow employs
+                                                                           traces across different arrival rates. Our evaluation shows that Or-
+a lightweight ILP-based solver that dynamically optimizes GPU
+                                                                           bitFlow improves time-per-output-token (TPOT) and TBT SLO
+memory usage across batched requests to minimize SLO violations.
+                                                                           attainment by 62% and 66%, respectively, while reducing P95 la-
+The solver iteratively refines optimal offload plans using real-time
+                                                                           tency by 38% and achieving up to 3.3× higher throughput, over
+feedback on varying state-transfer and GPU computation costs
+                                                                           existing methods. Additionally, OrbitFlow consistently provides
+per layer, allowing OrbitFlow to quickly adjust decisions under
+                                                                           performance improvements across different context lengths and
+current GPU memory and compute resource constraints.
+                                                                           batch sizes, and under distributed serving scenarios.
+   For fine-grained KV offloading, OrbitFlow treats each request
+in a dynamic batch individually based on its current stage in the          2     KV OFFLOADING: A UNIFIED VIEW
+decoding phase. A key challenge is balancing GPU memory alloca-
+tion among requests with distinct memory demands given limited             Service-level objectives (SLOs) typically target millisecond-level
+GPU capacity. For instance, when serving a single request, Orbit-          latency. Yet, the KV cache that grows linearly in batched long-
+Flow configures the largest possible offload distance to fully utilize     context workloads and exhausts GPU memory makes these SLOs
+available GPU memory and achieve maximum token generation                  hard to meet with existing static KV offloading methods [50, 51].
+speed. When another request arrives later, the two requests form a         In this section, we detail these problems and explain why dynamic
+batch at different stages in decoding, with non-identical KV cache         offloading is particularly necessary for long-context LLM inference.
+sizes. Within such batches, the memory demands of requests often
+conflict: a newly arrived request requires memory for rapid token          2.1    Background
+generation, whereas an older request with substantial decoding             Many contemporary LLM workloads involve decode-dominant,
+progress needs to retain a large portion of its KV cache on GPU to         highly interactive tasks like chat agents, code assistants, and cre-
+effectively overlap computation and memory prefetching. To rec-            ative writing tools. Such tasks often require context lengths exceed-
+oncile this, our solver holistically examines various offload-reload       ing 32K tokens, sometimes up to millions, as seen in recent flagship
+plans within the GPU memory budget at the request level and selects        models [3, 6, 8, 12, 17, 18, 24, 27, 48, 52]. The KV size grows with the
+the one that best prevents latency violations for each request.            input-output sequence length, so longer contexts translate directly
+   It is worth noting that OrbitFlow may fail to meet latency              into higher memory demand.
+SLOs when the server is severely oversubscribed. Nonetheless, it           Inference Stages. In modern LLMs built from stacked Transformer
+offers two simple yet effective fallback mechanisms—Token-Deposit          layers, inference comprises two distinct stages, as shown in Fig. 1:
+and Pause-Resume—to mitigate latency impacts during transient              prefill (compute-bound), where input tokens are processed in par-
+oversubscription. When a request produces output tokens while              allel to generate initial context information, and decode (memory-
+aggressively using GPU memory, OrbitFlow does not always emit              bound), where tokens are generated autoregressively.
+these tokens immediately. Instead, it emits tokens at a rate com-             At the core of both stages is the attention mechanism. In this
+pliant with latency SLOs. Specifically, if LLM serving must adhere         mechanism, inputs are projected to query (Q), key (K), and value (V)
+                                                                         offload pattern would look like [1 1 0 1 1 0], where 1 denotes a layer
+                                                                         kept on GPU and 0 denotes one offloaded to CPU.
+                                                                             In Transformer-based LLM inference, computation in a given
+                                                                         layer can start only after its entire KV cache is present on the GPU.
+                                                                         Therefore, each layer’s KV cache across batched requests share
+                                                                         a single operational timeline. The computation time per layer is
+                                                                         consistent, with the same amount of KV data to transfer if a layer
+Figure 2: (a) The KV cache size of various sequence lengths with         is offloaded. This makes offloading every N-th layer of a model
+the LLaMA3-70B model. (b) A layer’s computation time and com-            equivalent to repeating groups of N layers (e.g., two groups of [1
+munication time to transfer its KV from CPU to GPU over sequence         1 0] in the example above). Within each group, the computation,
+lengths with the LLaMA3-8B model. (c) With a fixed token-level           communication, and resulting stalls are identical, giving the runtime
+SLO, tokens generated in early steps become the latency margin.          a steady and predictable pattern to exploit.
+                                                                             The distance N is usually chosen based on the worst-expected
+                                                                         workload, so that KV caches at maximum sequence length still fit
+tensors, which are split into multiple heads for parallel processing.    in GPU memory and offloaded layers can overlap their transfers
+As shown in Fig. 1c, unlike multi-head attention (MHA) adopted           with computation as much as possible. Some prior systems [35, 51]
+by initial GPT models (e.g., GPT-2), recent models such as LLaMA3        profile offloading distances over a grid of batch sizes and sequence
+adopt grouped-query attention (GQA), where the KV tensors are            lengths to select the best value for each workload. Fixing this dis-
+split into fewer heads than the Q tensor to reduce the KV cache size.    tance ahead of time avoids runtime overhead but can be suboptimal
+Even with GQA, the KV size remains massive at sequence lengths           if actual workloads deviate from the worst-case assumptions. This
+from 128K to 1M tokens, as shown in Fig. 2a.                             reduces compute-communication overlap and increases stall risk.
+SLO Metrics. In LLM serving, time-to-first-token (TTFT) and time-        We examine this effect in two representative cases: token-dimension
+per-output-token (TPOT) are common SLO metrics because they              drift and batch-dimension mismatch.
+provide straightforward insights into user-perceived responsive-         Token-Dimension Drift. Fig. 2b plots computation and data
+ness and average throughput. On their own, however, these metrics        transfer times against sequence length for LLaMA3-8B on a single
+may not fully capture critical aspects of latency in extended context    NVIDIA A6000 GPU. As decoding proceeds and sequence length
+scenarios. While TPOT accurately measures average latency, it does       grows, both costs grow linearly. However, the transfer time rises
+not reveal whether token generation is consistently steady, since        faster, making the optimal offloading strategy dependent on their
+slow tokens can be offset by faster ones. As a result, recent research   relative ratio. For instance, at a sequence length of 2K, data transfer
+highlights token-level latency metrics, such as time-between-tokens      takes about 1.9× the time needed to compute one layer. In this
+(TBT), alongside TPOT. For the same latency target (e.g., 50 ms per      case, offloading every third layer hides the transfer time under
+token), under a TPOT SLO, a request violates the SLO when its            computation, yielding perfect overlap. As decoding continues and
+average per-token latency exceeds the target, whereas under a TBT        the sequence length reaches 16K, the ratio becomes 6.1×, and the
+SLO, each token exceeding that latency constitutes a violation. TBT      offloading strategy that worked at 2K tokens no longer fully hides
+thus explicitly pinpoints individual token delays that affect user       the transfer time and must be adjusted.
+experience in interactive workloads [1, 23, 40]. By adopting both           Notably, reducing decode latency always improves the TPOT
+TPOT and TBT, we gain a comprehensive view of system respon-             SLO attainment, but does not always improve TBT SLO attainment.
+siveness, ensuring that both overall throughput and fine-grained         For example, if we apply an offloading strategy optimal for perfect
+latency variations are captured and evaluated.                           overlap and the sequence is initially short, early tokens may be
+Continuous Batching. Production LLM servers process multiple             emitted faster than necessary. However, each subsequent token’s
+concurrent requests by grouping them into batches. Continuous            TBT SLO resets relative to the prior one, so early savings cannot
+batching [1, 20, 29, 44, 56] is a widely adopted strategy because it     be carried forward in improving TBT attainment. To illustrate, the
+sustains high throughput without provisioning additional serving         green area in Fig. 2c represents the latency margin created while the
+instances. Under continuous batching, when any request in a batch        TBT stays below the 52 ms SLO. As the sequence length increases,
+completes, a new request is admitted and its prefill begins, while the   the TBT grows more rapidly than the TPOT. Around 9K tokens, the
+ongoing decoding is temporarily paused. Unless otherwise specified,      margin is gone even though TPOT stays low, showing that early
+we assume continuous batching for all subsequent analyses.               speed gains improve TPOT but not TBT. In this work, we track
+                                                                         latency margin as a system-wide resource, harvesting it early and
+                                                                         spending it to mask later stalls.
+2.2    Drawbacks of Previous Offloading Methods
+                                                                         Batch-Dimension Mismatch. Real-world workloads vary sub-
+Previous offloading methods treat all requests within a batch uni-
+                                                                         stantially in request lengths, arrival times, and output sizes. As
+formly [2, 35, 51]. They operate at the layer granularity: if a layer
+                                                                         a result, requests in the same batch may be at different decoding
+is offloaded, the KV entries for that layer are moved to the CPU
+                                                                         stages with different KV cache sizes. Compute time grows with
+for all requests; otherwise, all these KV entries stay resident on
+                                                                         the total number of tokens in the batch, and data transfer time
+GPU. On top of this, the layers to offload are selected in a distance-
+                                                                         grows with the number of KV blocks that are offloaded. Under a
+driven manner, meaning they are evenly distributed across the
+                                                                         uniform distance-driven offload policy, the KV cache of one layer
+model depth. For instance, if two out of six layers are offloaded, the
+Figure 3: An illustrative example showing why a static, uniform offload policy is insufficient. The timelines track one decode step early
+(Step 1, left) and one much later (Step 16, right) for three placements. Each timeline is annotated with the resident KV blocks on GPU, the
+size of the per-layer prefetch buffer, and the resulting stalls.
+
+is either entirely on GPU or CPU, so both costs scale with the total      which both requests offload the evenly spaced layers L3, L6 and
+KV size rather than the individual KV cache sizes of each request.        L9. Placement B attempts to mitigate the batch-dimension mis-
+Short requests are therefore delayed, while the KV of a long request      match by keeping all KVs of the shorter Request 1 on the GPU and
+pushes up both compute and data transfer time for the batch.              offloading 3 layers for the longer Request 2. Placement C offloads
+   This impact also depends on the batching strategy. Consider            2 layers of Request 1 and 3 layers of Request 2, trading a little more
+a batch with one long request processed alongside several short           CPU-to-GPU traffic for extra headroom in GPU memory.
+requests, with additional short requests waiting in the queue. Con-
+tinuous batching allows the admission of one queued request when-         At Decoding Step 1. Placement A must move 9 blocks just in time
+ever a short request in the batch finishes. The long request, however,    for every offloaded layer. Since the bandwidth allows transferring 3
+continues to dominate compute and data transfer and slows down            blocks per layer time, those transfers spill past the preceding layer’s
+token generation. This is a poor trade-off: a single request with a       compute and create 9 units of stalls. Placement A is already the best
+large KV footprint can put all other short requests at risk of SLO        uniform choice: offloading one more layer leaves even less compu-
+violations, thereby degrading overall system performance.                 tation time to overlap with the data transfer, resulting in longer
+                                                                          stalls; offloading one less layer requires keeping too many blocks
+2.3    An Illustrative Example                                            on GPU, violating the 70-block memory limit. Both Placements B
+                                                                          and C apply request-wise placement and achieve perfect overlap
+To ground the two limitations pinpointed in the previous section,
+                                                                          without stalls, but Placement B transfers fewer blocks and keeps
+we walk through the minimal scenario shown in Fig. 3. We assume
+                                                                          higher GPU memory utilization.
+the PagedAttention KV layout [29], where each layer’s KV cache is
+allocated in fixed-size blocks of 16 tokens. Two concurrent requests       Observation 1) A uniform offload policy that ignores the batch-
+are served on a 9-layer LLM with Request 2 around twice as long,           dimension mismatch can miss the optimal placement and leave
+highlighting the batch-dimension mismatch. The left half of the            avoidable stalls. Allowing fine-grained per-request placements
+figure captures this initial state (Step 1), while the right half shows    can better overlap computation with data transfer.
+the status after 15 decode steps (Step 16). By this point, Request 1’s
+KV cache has grown from three to four blocks per layer because its        At Decoding Step 16. After 15 more decode steps, Request 2 still
+additional tokens demand a new 16-token block—each decode step            needs 6 blocks per layer, while Request 1 has grown to 4 blocks per
+adds one token, but allocation increases only when a 16-token block       layer. These additional blocks push Placement B’s memory usage to
+boundary is crossed. Request 2, however, still fits within its existing   78 blocks—beyond the 70-block GPU memory capacity—making it
+blocks, as shown in the figure’s upper panel. This growth illustrates     infeasible. Placement A remains feasible but must now prefetch 10
+token-dimension drift. In this example, we assume the GPU can store       blocks per layer, causing 12 stalls in total. Placement C, which had
+at most 70 KV blocks, and the PCIe bandwidth allows transferring at       sacrificed a bit of GPU residency earlier, still fits within capacity
+most 3 KV blocks within the computation time of one layer. When           and incurs only 2 stalls, becoming the new optimal strategy.
+the combined KV cache size of all requests exceeds this budget,
+some blocks must stay in CPU memory and be prefetched into a               Observation 2) A placement that was optimal early in decoding
+small staging buffer on the GPU to process the corresponding layer.        can later become suboptimal—or even infeasible—as KV caches
+   The scenario in Fig. 3 compares three KV placement plans. Place-        grow. A single, static placement therefore cannot serve all decode
+ment A serves as an example of the uniform offload method in               steps; dynamic reconfiguration is required.
+                                                                         Figure 5: (a) Deposited tokens mask all the SLO violations for a
+                                                                         single request. (b) Deposited tokens mask the transient latency
+                                                                         spikes caused by a short-lived request with a long prompt. S1, E1,
+                                                                         S2, and E2 mark the start and end of Request 1 and Request 2.
+        Figure 4: The overall architecture of OrbitFlow.
+
+
+3     SYSTEM DESIGN                                                         Placement Planner (§3.3) finds the best KV placement given
+We now introduce OrbitFlow, an implementation of fine-grained,           the current request lengths, available GPU block capacity, and the
+adaptive KV cache placement that optimizes KV offloading for             present PCIe bandwidth. It balances SLO awareness, solver over-
+long-context LLM serving under limited GPU memory.                       head, and adaptive call frequency. The Planner solves an ILP to
+                                                                         choose per-request offload distances that minimize decode latency
+                                                                         while respecting memory and SLO constraints. To keep the search
+3.1    Design Overview                                                   space tractable, it applies principled pruning and prevents the expo-
+The design of OrbitFlow is guided by the following principles:           nential explosion that a completely free layout would cause. Solver
+• Fine-grained Placements. To enable fine-grained offloading,            latency is hidden by running the optimization in parallel with the
+OrbitFlow treats each request-layer combination as a placement           computation, so the cost does not appear on the critical path. Along-
+choice on either GPU or host memory and accounts for how transfer        side the new layer-wise KV placement, the Planner also estimates
+schedules interact with per-layer compute costs. Because decode          an expiry time—i.e., the specific decoding step at which the growing
+steps last only tens of milliseconds, the solver must stay lightweight   KV size changes the communication-to-computation ratio (Fig. 2b)
+by exploring the search space efficiently without violating SLOs.        or exceeds available GPU memory. This plan is then forwarded to
+• Dynamic Reconfiguration. The system must decide when to                the Executor to install.
+reconfigure to balance stability and adaptivity. Reconfiguring after
+every step closely tracks workload drifts, but frequent data move-       3.2    Runtime Executor
+ment and plan switching can offset gains. In contrast, infrequent        Runtime Executor integrates an SLO-aware Token-Deposit that
+reconfiguration risks performance degradation and SLO violations.        decouples token generation from its delivery and a KV manager
+• System-level SLO Management. To meet system-level SLOs, it             that enforces the KV placements pulled from the Planner.
+must accumulate latency margins to mask later stalls and, in cases       SLO-aware Token-Deposit. Rather than delivering each token
+of memory pressure, pause a long-running, KV-dominant request            as soon as it is generated, OrbitFlow decouples token generation
+to guard overall SLOs. It must navigate this global trade-off without    from its delivery. Doing so allows us to convert any early latency
+inducing starvation, which would affect tail latency.                    margins into a reserve that can be spent to hide SLO violations.
+   Guided by these principles, OrbitFlow operates three key com-         Upon generation, the token is simply appended to Token-Deposit.
+ponents that form a closed-loop control system, shown in Fig. 4.         While the deposit is non-empty, the Executor delivers exactly one
+   Runtime Executor (§3.2) performs each decoding step. It exe-          token per SLO interval. An SLO violation is visible only when the
+cutes computations, installs a KV placement, initiates asynchronous      deposit is empty. In this case, the next token is delivered as soon
+KV transfers based on it, and records compute time, transfer time,       as it is generated. If a request is paused or preempted, the deposit
+and GPU memory usage. To maintain steady user-visible latency in         continues to drain, hiding the SLO violations until it empties. Once a
+the presence of latency margins, tokens generated within the SLO         request finishes, no further violations can occur, and any remaining
+are buffered in the Token-Deposit and released at the SLO rate. The      tokens are delivered in a single burst.
+Executor forwards recorded metrics to Adaptive Controller.                  Fig. 5a illustrates how Token-Deposit helps hide SLO violations
+   Adaptive Controller (§3.4) evaluates whether the placement re-        for a single request. During the early decode iterations, the KV
+mains valid. It monitors any batch-dimension mismatch that alters        cache is still small, so the generation latency margin remains well
+the KV cache size and the ratio between compute and communica-           below the SLO, and the deposit balance grows steadily. As soon
+tion, as well as the current placement’s expiry time provided by the     as the generation latency exceeds the SLO, the deposit is drawn
+Placement Planner, which indicates when token-dimension drift is         down. Although the backend incurs many more SLO violations,
+expected to invalidate the current placement. If any of these con-       the deposit masks a significant portion of them from the user, with
+ditions is triggered, it requests a new placement from the Planner.      no additional computation or memory traffic. The same buffering
+When the Planner’s best placement would still violate too many           logic smooths over transient latency spikes, as shown in Fig. 5b.
+SLOs, the Controller falls back to Pause-Resume.                         The arrival of a long-prompt, short-output request (i.e., Request 2)
+pushes the decode latency over the SLO temporarily, but this spike           Algorithm 1 Batch-level decode latency given a KV placement
+is mostly absorbed by deposited tokens until it empties.                      1: Input: KV placement 𝑥𝑟,ℓ , block sizes 𝑏𝑟 , peak memory band-
+   The Token-Deposit buffer is a CPU-resident FIFO that stores a                   width 𝐵, per layer compute times compℓ
+4-byte integer for each generated token. Its size is dynamic, but the         2: Output: batch latency 𝑇batch
+footprint is negligible, typically only hundreds of KBs. Enqueue              3: All ← {(𝑟, ℓ) | 𝑥𝑟,ℓ = 0}                 ⊲ every required transfer
+and dequeue operations are fast regardless of the buffer size.                4: Finished ← ∅, Pending ← All, Cur ← ∅
+KV Manager. The KV manager enforces the placement produced                    5: Stall tot ← 0, Comptot ← 0, compprev ← 0
+by the solver and keeps it consistent throughout decoding. It main-           6: for ℓ = 1 to 𝐿 do                       ⊲ boundary before layer ℓ
+tains up-to-date GPU-CPU block tables that record each request’s              7:     𝑄 ← CanStart(Pending, Cur)
+KV cache address and track the next write location for every decode           8:     Promote(𝑄, from = Pending, to = Cur)
+iteration. When a new placement arrives, the manager computes the             9:     DestL ← { 𝑒 ∈ Cur | 𝑒.layer = ℓ } ⊲ tasks blocking layer ℓ
+delta with respect to the current layout and performs the minimum            10:     sort Cur ascending by size
+data movement needed to realize it. For requests whose future lay-           11:     elapsed ← 0; 𝑛 ← |Cur|; stall ℓ ← 0; 𝑖 ← 1
+ers remain offloaded, the manager writes each freshly generated KV           12:     while DestL ≠ ∅ do
+entry directly to its designated slot in host memory, bypassing GPU          13:         𝛽 ← 𝐵/𝑛
+capacity altogether. Finally, because a new placement can change             14:         need ← Cur𝑖 .size/𝛽
+the split between KV blocks on GPU and the prefetch buffer, the              15:         elapsed ← elapsed + need
+manager reallocates GPU memory so that the buffer always spans a             16:         if elapsed > compprev then
+contiguous range of blocks big enough to hold the worst-case layer           17:               stall ℓ ← elapsed − compprev
+transfer dictated by Eq. 1.                                                  18:         end if
+                                                                             19:         if Cur𝑖 ∈ DestL then
+3.3    Solver-Based Placement Planner                                        20:               DestL ← DestL \ {Cur𝑖 }
+We first formulate KV offloading as a constrained optimization               21:         end if
+problem and optimize it with an off-the-shelf solver [19]. Our for-          22:         remove Cur𝑖 from Cur; 𝑛 ← 𝑛 − 1; 𝑖 ← 𝑖 + 1
+mulation is guided by three considerations:                                  23:     end while
+(1) SLO-awareness. We impose a tunable upper bound on the rate               24:     Stall tot ← Stall tot + stall ℓ
+of token-level SLO violations. The solver reports infeasible when            25:     Comptot ← Comptot + compℓ
+no placement satisfies this cap. OrbitFlow then triggers a fallback          26:     compprev ← compℓ
+mechanism that trims the batch and re-optimizes.                             27: end for
+                                                                             28: 𝑇batch ← Comptot + Stall tot
+(2) Solver overhead. We run the solver one decode step ahead
+and on a separate thread, so it adds no stalls as long as its over-
+head stays below the decode latency. To keep it small, we shrink
+the search space to distance-driven placements for each request,             GPU Capacity Bound. The sum of all blocks resident on GPU
+without exhaustive searching of all layer-placement combinations.            is bounded by the total GPU budget, i.e., the total number of KV
+                                                                             blocks that the GPU can hold at any time. We denote this budget by
+(3) Adaptive call frequency. We let the solver lengthen the in-              𝐵 GPU , which consists of all blocks we keep on GPU and a dedicated
+terval between invocations when the SLO margin is ample, and                 prefetch buffer reserved for blocks that are fetched just-in-time for
+shorten it when it is tight, so it is executed only when necessary.          the next layer. Formally,
+Under these three principles, the KV offloading problem reduces to
+                                                                                                   𝐿
+a compact ILP problem that, for each batch of requests, returns a KV                           ∑︂ ∑︂
+                                                                                                           𝑏𝑟 𝑥𝑟,ℓ + 𝐵 buf ≤ 𝐵 GPU,              (1)
+placement that satisfies GPU memory limits and SLO guarantees                                  𝑟 ∈ R ℓ=1
+with negligible runtime overhead.
+                                                                             where the prefetch buffer must be large enough to hold all offloaded
+3.3.1 Latency Modeling. We solve for one decode iteration for a              blocks required by any one layer:
+batch of R requests that traverse 𝐿 Transformer layers. The solver’s                                         ∑︂
+immutable inputs are (i) request-specific KV block sizes 𝑏𝑟 (𝑟 ∈ R),                            𝐵 buf = max      (1 − 𝑥𝑟,ℓ ) 𝑏𝑟 .
+                                                                                                             ℓ∈L
+                                                                                                                   𝑟 ∈R
+(ii) the peak interconnect bandwidth 𝐵, and (iii) per-layer compute
+times compℓ (ℓ =1, . . . , 𝐿). Its decision variable is the binary place-    Bounded SLO Violations. We formulate the SLO as a hard feasibil-
+ment matrix x = [𝑥𝑟,ℓ ] ∈ {0, 1} | R | ×𝐿 , where 𝑥𝑟,ℓ = 1 keeps the KV of   ity check. Concretely, we require that the number of SLO violations
+request 𝑟 at layer ℓ on GPU and 𝑥𝑟,ℓ = 0 offloads it to CPU.                 of a decode step across a batch of requests R be at most a tunable
+    Given a placement x, Algorithm 1 yields the batch latency𝑇batch (x).     cap 𝛼:                   ∑︂
+The solver tackles the following optimization problem:                                                        sloFail𝑟 ≤ 𝛼,
+                                                                                                       𝑟 ∈R
+                             min          𝑇batch (x),                        where sloFail𝑟 denotes whether a request 𝑟 violates the SLO in
+                         x∈ {0,1} |R|×𝐿                                      the current decode step and 𝛼 controls how many violations the
+subject to the GPU capacity, decode window, and token-level SLO              solver can tolerate across the batch R. Under this constraint, latency
+constraints introduced next.                                                 becomes a meaningful objective: many placements satisfy the same
+SLO bound but incur markedly different latencies, with the lower           𝑥𝑟,ℓ = 1. Otherwise, the execution of layer ℓ must reuse the request’s
+one being more preferable for exploiting Token-Deposit. If we set          prefetch buffer and launching another transfer could overwrite data
+𝛼 to 0, a plan that leads to any SLO violation across requests will        in use. (2) Some later layer’s KV is offloaded. There exists an
+be rejected. If no placement satisfies the constraint, the model           ℓ ′ > ℓ with 𝑥𝑟,ℓ ′ = 0; otherwise, all required transfers for this decode
+is declared infeasible; the runtime then pauses a request and re-          iteration are already complete. (3) The transfer is still in flight.
+optimizes (see §3.4). Because pausing a request causes at most one         The stream that fetches the KV cache for layer ℓ ′ has not finished
+violation in each decode step across the batch, we count each pause        when layer ℓ begins execution.
+as one potential violation and set 𝛼 to 1 in OrbitFlow. Proactive              We assume all active prefetch streams divide the available band-
+pausing is preferable in this scenario as it frees both GPU memory         width evenly. When the smallest transfer finishes, its share is redis-
+and bandwidth, allowing the remaining requests to run under a              tributed equally among the remaining streams. Algorithm 1 applies
+placement that achieves strictly lower latency than any placement          this greedy bandwidth-sharing rule to compute the batch-level de-
+that tries to keep all requests alive.                                     code latency for a given KV placement. The batch-level decode
+Self-Determined Decode Window. Invoking the solver at every                latency 𝑇batch is the optimization objective of the Planner.
+decode step would neutralize the exact latency we try to minimize.
+                                                                           3.3.2 Pruning the Search Space. A completely free layout would
+Instead, we let the solver itself decide how long it can safely run
+                                                                           force the solver to explore 2 | R | 𝐿 combinations, one binary choice
+unchecked by introducing an integer variable Δ ∈ [Δmin, Δmax ],
+                                                                           for every request-layer pair. An exhaustive search is prohibitively
+which we denote as the decode window. Formally, the window length
+                                                                           expensive, whether it is performed offline or online. Therefore, a
+interacts directly with the SLO feasibility constraint. Instead of
+                                                                           practical system requires a principled way to prune the search space
+enforcing the token-level SLO constraint for the current step, we
+                                                                           and focus only on candidates that matter. We achieve this in two
+enforce it on the average over the next Δ steps:
+                                                                           steps. First, we drop the uniform requirement. As discussed in §2.2,
+                       𝑡 +Δ−1                                              enforcing a uniform offload strategy for the entire batch lets long
+                     1 ∑︂ ∑︂
+                              sloFail𝑟 ≤ 𝛼 .                               requests monopolize GPU memory and push shorter or newer se-
+                     Δ 𝑡 𝑟 ∈R
+                                                                           quences into SLO violations. Second, we retain the distance-driven
+Mechanically, if the SLO is tight, the solver chooses a small Δ so that    policy itself. Grouping layers this way aligns identical compute
+the average is dominated by the imminent steps, the KV placement           times with identical KV transfers: offloading every 𝑁 -th layer turns
+will be re-optimized sooner. On the other hand, if the latency margin      execution into repeating 𝑁 -layer groups whose compute, communi-
+is ample, the solver chooses a larger Δ and amortizes minor viola-         cation, and stall patterns are identical, yielding a steady, predictable
+tions over a longer period, avoiding redundant re-optimizations.           runtime. The per-request alternative to the 2𝐿 search is:
+The lower bound Δmin is a tunable parameter which guarantees                                  |︁ {︁     |︁               }︁ |︁|︁ √
+that the solver is never invoked more frequently than every Δmin                     𝐷 (𝐿) = |︁ ⌊𝐿/𝑘⌋ |︁ 𝑘 = 2, . . . , 𝐿 |︁ ≤ 2⌊ 𝐿⌋ − 1,
+                                                                                              |︁
+iterations, as a way to keep the solver time bounded.
+Scheduling KV Prefetching. To assess whether a batch meets                 and the search space size drops from 2 | R | 𝐿 to 𝐷 (𝐿) | R | . As an ex-
+its token-level SLO, we first need an accurate estimate of compute         ample, with 𝐿 = 32 and |R| = 4, we have 𝐷 (32) = 9 possible KV
+time and the data-transfer stalls introduced by a given placement.         placements. Dropping the distance constraint altogether would
+A placement matrix x specifies, for every request 𝑟 ∈ R and layer          raise the space to 2128 ≈ 3.4 × 1038 placements, whereas keeping
+ℓ ∈ {1, . . . , 𝐿}, whether that layer’s KV blocks reside on GPU (𝑥𝑟,ℓ =   it but letting each of the |R| = 4 requests choose its own distance
+1) or must be fetched from CPU (𝑥𝑟,ℓ = 0). The aggregate blocks            yields only 94 = 6 561 possibilities (30 orders of magnitude smaller).
+that must cross the PCIe bus in one decode iteration are                   Solver Overhead. The ILP nature of the solver makes it NP-hard,
+                                       𝐿
+                                   ∑︂ ∑︂                                   which means the worst-case execution time grows exponentially.
+               blocks_to_fetch =               𝑏𝑟 (1 − 𝑥𝑟,ℓ ).             OrbitFlow hides this overhead in practice with three measures: 1)
+                                   𝑟 ∈ R ℓ=1                               The search space is kept small by considering only distance-driven
+Because LLM layers execute strictly sequentially, a layer can begin        placements for each request, without exhaustive searching of all
+only when both of its inputs are ready: 1) the outputs produced by         layer-placement combinations. 2) The solver is launched on the CPU
+its previous layer, and 2) the KV cache for that layer. A stall occurs     ahead of time to prevent GPU computation delays. We determine
+when the KV blocks are still in flight while the previous layer has        when to launch it by comparing the solver overhead to the time per
+finished its computation. The compute units must idle until the            decoding step. With the pruned search space, the solver overhead
+fetching of those blocks completes. Because layers are serialized, a       is usually less than one decoding step. Therefore, we trigger the
+stall at any layer pushes back the start time of all subsequent layers,    solver one step ahead and adjust each request’s token count by
+propagating delay throughout the rest of the decode iteration. To          adding one token to align with the target step. 3) The solver is
+best overlap data transfers with computation, we launch prefetches         invoked sparingly, based on the solver-determined window or by
+greedily as soon as their preconditions are satisfied. Because a           the Adaptive Controller when batch conditions change.
+request can have at most one layer’s KV in flight at any time, it
+needs only a single asynchronous data transfer stream. For any             3.4    Adaptive Controller
+layer, the total number of active prefetch streams is bounded by           The Adaptive Controller monitors the execution signals, re-invokes
+the number of requests |R|. A request’s stream is active only if           the Planner when necessary, and provides a fallback mechanism
+all of the following hold: (1) Current layer’s KV is on GPU, i.e.          when the Planner deems the current batch infeasible.
+    Figure 6: Illustration of flattened 1D KV cache layout in OrbitFlow modified from PagedAttention.           Figure 7: The length distri-
+                                                                                                                bution of traces.
+Solver Invocations. The solver-chosen decode window Δ already            or previously paused request as a victim. This gating mechanism
+guards against token-dimension drift: it guarantees that the current     ensures no single request monopolizes resources and starves others.
+KV placement remains optimal for at least the next Δ decode itera-
+tions provided (i) the requests in the current batch stay unchanged
+and (ii) the profiled performance model is accurate. We keep an on-      3.5    Extension to Distributed Inference
+line monitor that captures signals to re-invoke the solver whenever      Distributed inference becomes necessary when KV offloading on
+either assumption breaks earlier than expected:                          a single GPU cannot fully relieve memory pressure. We currently
+(1) Profile-mismatch trigger.; After each decode iteration, Orbit-       focus on single-node, multi-GPU serving where a single model is
+Flow compares the iteration latency predicted by Algorithm 1 with        configured to use all GPUs within a node. In this scenario, tensor
+the latency it actually observes. If the absolute difference exceeds a   parallelism (TP) [46], which symmetrically shards weights and
+configurable fraction of the predicted value, OrbitFlow interprets       computations across the GPUs, is the most suitable among common
+the gap as evidence of unexpected GPU or bandwidth contention.           parallelism strategies. Pipeline parallelism (PP) [21] can also be
+It then updates the profiled per-layer compute times and effective       adopted to reduce per-GPU memory demand, but it depends on
+bandwidth using an exponentially weighted moving average and             microbatches to hide pipeline bubbles. Unlike training, serving
+immediately re-runs the solver with the refreshed profile.               handles requests that arrive stochastically, so microbatches rarely
+(2) Batch-change trigger. The arrival of a new request or comple-        stay full and pipeline stages can sit idle.
+tion of an existing one alters the batch composition R, causing a           We extend OrbitFlow to support TP and validate its effective-
+batch-dimension mismatch between the current placement and the           ness experimentally in Fig. 11. With symmetric sharding and shared
+new batch composition. The solver is re-run with the updated batch       memory bandwidth, a KV placement computed for one worker is
+so that KV placement reflects the fresh load mix.                        expected to be optimal for all workers. OrbitFlow runs the solver
+                                                                         on one worker and broadcasts the resulting placement to the others.
+   Both triggers are infrequent. Profile deviation surfaces only un-
+                                                                         The Runtime Executor of each worker installs the placement syn-
+der contention, and batch changes can occur at most once per
+                                                                         chronously, thereby maintaining consistent KV placement across
+request completion or arrival.
+                                                                         workers. We note that PP and data parallelism (DP) [10] are typically
+                                                                         more desirable choices than TP when serving scales to multiple
+Pause-Resume Fallback. When the solver reports infeasible un-            nodes with slower interconnects. Since PP incurs lower commu-
+der the GPU capacity and SLO bounds, OrbitFlow abandons the              nication costs than TP, a single model instance can be organized
+“serve-all” stance and proactively pauses one request instead of         with PP across nodes and TP within each node. DP is used to scale
+forcing an extreme offload pattern that would cause a cascade of         out further by coordinating multiple model instances via a global
+SLO violations. The victim is the request with the largest sum of        scheduler. We leave extension to these scenarios as future work.
+KV blocks and deposited tokens. Selecting such a request prevents
+any single long request from monopolizing GPU memory while
+masking as many SLO violations as possible for the victim. Unlike        4     IMPLEMENTATION
+reactive preemption, which is triggered when the GPU memory              We build OrbitFlow on top of vLLM v0.6.6 [29] with three core
+constraint is violated and therefore drops a request’s entire KV         changes. First, we enable request-wise KV placement by modifying
+cache in one shot, OrbitFlow pauses a request before memory              vLLM’s cache engine to flatten the original per-layer KV layout
+becomes tight. Because the GPU still has headroom at the moment          into one contiguous 1D layout, indexed by a layer-aware 2D table.
+of pausing, OrbitFlow evicts the request’s KV blocks on demand           As illustrated in Fig. 6, this allows flexible allocation of a differ-
+and at the layer-level: its KV blocks on GPU are dropped layer by        ent set of layers for each request, unlike vLLM’s default KV cache
+layer when their space is actually needed. This on-demand eviction       management, which uniformly moves every 𝑁 th layer for all re-
+makes a later resume much cheaper than repatriating an all-or-           quests. We also embed the KV manager in vLLM’s cache engine,
+nothing dump, requiring at most those evicted blocks. A request          which pulls the placement decision from the Planner and issues
+can be paused and resumed multiple times. OrbitFlow resumes a            necessary data movements to realize the placement. Second, we
+paused request only after some in-flight requests have completed         enable Pause-Resume by tweaking the scheduler to temporarily
+and a feasible plan exists (i.e., the transient overload has cleared).   drop a running request. To optimize Pause-Resume, we implement
+If the server becomes overloaded again, OrbitFlow chooses a new          the removable cache to manage paused requests efficiently. Rather
+than immediately offloading all GPU-resident layers of paused re-                (2) FlexGen [51] maximizes throughput by profiling a fixed, op-
+quests, we incrementally move layers to CPU only when additional                 timal KV placement offline, assuming peak GPU performance. It
+GPU space is needed, reducing data transfer overhead and resume                  does not consider SLO constraints or reconfigure at runtime.
+latency. Third, the Placement Planner runs in a separate thread                  (3) FlexGen+ is an enhanced version of FlexGen that dynami-
+and always solves one decode iteration ahead. The cache engine                   cally reconfigures its KV placement when requests join and leave,
+pulls the finished plan in the next iteration and applies the changes,           allowing it to adapt to batch-dimension mismatches.
+without device-wide synchronization.
+                                                                                 (4) SLO-aware Offloading [35] adjusts KV cache placement based
+5     EVALUATION                                                                 on offline profiling while maximizing throughput within SLO con-
+                                                                                 straints. It still employs uniform offload distances across requests,
+We evaluate OrbitFlow against baseline offloading systems, includ-
+                                                                                 and reconfiguration is confined to batch boundaries, similar to
+ing DeepSpeed [11], FlexGen [51] and SLO-aware Offloading [35],
+                                                                                 FlexGen+.
+on ShareGPT-derived synthetic traces across different arrival rates.
+Our evaluation shows that OrbitFlow outperforms the baselines,                   (5) Dynamic Heuristic is a variant of OrbitFlow that replaces
+achieving 62% and 66% higher TPOT and TBT SLO attainment, and                    the solver-based planner with a heuristic that minimizes offloaded
+up to 3.3× higher throughput. Additionally, OrbitFlow consis-                    layers to reduce communication costs. It reconfigures at the itera-
+tently provides performance improvements under various context                   tion level but lacks the solver’s fine-grained optimization.
+lengths, batch sizes, and distributed serving scenarios.                         DeepSpeed-Inference and FlexGen use static placements deter-
+                                                                                 mined offline, while the remaining three baselines adaptively re-
+5.1     Experimental Setup                                                       configure at runtime.
+Models and Hardware Settings. We evaluate OrbitFlow using
+LLaMA3 models [17]. Our default configuration uses the 8B model
+on a single NVIDIA RTX A5000 (24GB) GPU with 384GB of host                       5.2    Performance Analysis
+memory over PCIe 3.0×16. For longer contexts up to 128K tokens,
+                                                                                 SLO Attainment. We evaluate the effectiveness of OrbitFlow
+we also report results on LLaMA3-70B using a 4-GPU node with
+                                                                                 by examining its performance in terms of TBT and TPOT SLO
+RTX A6000 (48GB) and 256GB of host memory over PCIe 4.0×16.
+                                                                                 attainment compared to the baselines under varying request arrival
+Workloads. Because publicly available production traces for long-                rates and SLO scales, as illustrated in Fig. 8a.
+context serving are limited, we synthesize workloads by sampling                    We observe that OrbitFlow consistently outperforms the base-
+requests from ShareGPT [43]. We use Poisson arrivals with varying                lines in both TBT and TPOT SLO attainment, maintaining over
+arrival rates to emulate real-world LLM serving scenarios. The                   75% TBT attainment under high request rates and a tight SLO scale.
+generated traces span a wide spectrum of short to long inputs and                Among the static methods, DeepSpeed-Inference shows the weakest
+outputs, as illustrated in Fig. 7. Unless otherwise specified, we use            performance, as its layer-wise offloading stalls computation with
+a batch size of 4 and limit the total sequence length per batch to               frequent KV transfers that cannot be hidden within a single layer’s
+32K tokens.1 For design validations and sensitivity studies, we fix              compute time. FlexGen does not reconfigure at runtime or account
+the arrival rate at 0.97 req/min and vary individual parameters                  for SLO constraints, so its static placement becomes increasingly
+including burstiness of arrivals, batch size, and context length.                suboptimal as the KV cache grows during decoding. The adaptive
+Key Metrics. We focus on two complementary latency SLOs. TBT                     baselines perform better but remain limited. FlexGen+ improves
+measures the latency between consecutive output tokens and thus                  over FlexGen by reconfiguring whenever the batch composition
+captures user-perceived interactivity at the token level. TPOT mea-              changes, accounting for batch-dimension mismatch. SLO-aware
+sures the average per-token latency. We set the base SLO by profil-              Offloading adjusts offload distances in response to the SLO target—
+ing the decoding latency of the longest request that can be served               offloading more aggressively under loose constraints and reducing
+without offloading, and scale it to create progressively looser bud-             offload distances as the SLO tightens—but still applies uniform dis-
+gets for fair comparison across latency constraints. Unless other-               tances across requests, limiting its adaptability when requests in
+wise specified, experiments use an SLO scale of 1.5, representing                the same batch have different KV cache sizes. Dynamic Heuristic
+a mid-level constraint. We also report throughput, requests com-                 performs best among the baselines, yet its greedy approach lacks
+pleted per minute, and end-to-end (E2E) latency, and the average                 the precision of solver-based planning to sustain high attainment.
+per-request completion time, to capture overall serving efficiency.                 Under relaxed latency constraints (SLO scale=2.5), most base-
+Baselines. We consider five baseline KV cache offloading strate-                 lines except DeepSpeed-Inference maintain stable attainment at
+gies, all implemented on the same codebase for a fair comparison.                lower arrival rates. However, attainment drops to around 50% as the
+(1) DeepSpeed-Inference [2] offloads all KV caches to the CPU                    arrival rate increases. This degradation accelerates when the SLO
+and retains only the current layer’s KV cache in GPU. It overlaps                scale is tightened further. OrbitFlow experiences the same trend,
+data transfers with computation by prefetching the next layer’s KV               but demonstrates considerably better robustness. Its solver-driven,
+cache during the current layer’s execution.                                      adaptive fine-grained approach adapts to both token-dimension
+                                                                                 drifts and batch-dimension mismatch, the sources of performance
+1 On a single RTX A5000 (24GB), an 8B model uses about 16GB of GPU memory, and
+                                                                                 degradation that static policies cannot accommodate. TPOT attain-
+PyTorch runtime consumes ∼6GB. The remaining ∼2GB can hold roughly 16K tokens.
+With offloading, the system can accommodate up to 32K tokens per batch without   ment penalizes any per-token latency spike more heavily, as TPOT
+memory oversubscription.                                                         evaluates average latency at the request level.
+Figure 8: (a) TBT and TPOT SLO attainment across arrival rates and SLO scales. Y-axis indicates the SLO attainment, and X-axis indicates
+the arrival rate. (b) Comparison of P95 TBT latency across varying SLO scales. (c) Comparison of end-to-end latency.
+
+                                                                        Memory Usage. OrbitFlow’s throughput gains rely on effective
+                                                                        use of limited GPU memory. Fig. 9c shows the average GPU mem-
+                                                                        ory utilization across methods. The static methods under-utilize
+                                                                        GPU memory: DeepSpeed-Inference keeps at most one layer on
+                                                                        the GPU at a time, whereas FlexGen employs a static offloading
+                                                                        decision based on the maximum expected batch size. Among the
+                                                                        adaptive methods: SLO-aware Offloading prioritizes CPU place-
+                                                                        ment conservatively, resulting in utilization similar to FlexGen.
+Figure 9: Comparison of (a) P99 TBT latency. (b) P99 TPOT latency.      FlexGen+ shows improvement over FlexGen by recomputing the
+(c) Throughput. (d) Average GPU memory utilization.                     offload distances upon batch composition changes. Dynamic Heuris-
+                                                                        tic closely matches the high utilization achieved by OrbitFlow, as
+                                                                        it aggressively maximizes GPU memory usage.
+Tail Latency (P95 and P99). Beyond average SLO attainment,
+we examine how OrbitFlow performs under worst-case condi-
+tions. Fig. 8b reports the P95 latency across SLO scales. OrbitFlow     5.3   Sensitivity Studies
+consistently demonstrates the lowest latency. At an SLO scale of        We study OrbitFlow’s sensitivity to different workloads and serv-
+1, OrbitFlow achieves 21.7% and 68.6% lower P95 latency than            ing scenarios. We first evaluate longer contexts and multi-GPU
+FlexGen and DeepSpeed-Inference, respectively. This gap narrows         setups under tensor parallelism, then vary arrival burstiness and
+as the SLO loosens, but OrbitFlow maintains the lowest P95 la-          batch size on the default single-GPU setup. Finally, we evaluate
+tency across all scales. At the extreme-tail latencies (P99) under      OrbitFlow under an alternative request scheduling policy.
+SLO scale of 1.5, OrbitFlow achieves a 65% lower P99 TBT and a
+64% lower P99 TPOT compared to DeepSpeed-Inference, as shown            Context Length Variation. Increasing context length magnifies
+in Fig. 9a-b. Against other baselines, the improvement is a con-        KV cache demands due to significant token-dimension drift and
+sistent 3–9% in both metrics. The margin narrows at P99 because         exacerbates batch-level imbalance, as requests with widely varying
+rare, burst-induced stalls affect all methods similarly. Nonetheless,   lengths are in the same batch. Fig. 10 compares OrbitFlow with
+OrbitFlow still delivers the lowest tail latency overall.               FlexGen+ and Dynamic Heuristic—the two strongest baselines from
+                                                                        Fig. 8—at 8K, 32K, and 128K sequence lengths on LLaMA3-70B with
+E2E Latency and Throughput. As shown in Fig. 8c, OrbitFlow’s
+                                                                        2-way TP. While FlexGen+ and Dynamic Heuristic achieve near
+E2E latency is 12–21% higher than the adaptive baselines, a direct
+                                                                        100% SLO attainment with 8K tokens at an SLO scale of 2.5, their
+consequence of the Pause-Resume mechanism, which defers long
+                                                                        performance degrades as context length grows, dropping to 69.2%
+requests to keep the batch feasible under memory and SLO con-
+                                                                        and 32.9% at 128K tokens. In contrast, OrbitFlow consistently
+straints. Dynamic Heuristic—which does not use Pause-Resume—
+                                                                        achieves above 85% SLO attainment across all context lengths.
+achieves the lowest E2E latency among all methods, confirming
+that the additional E2E cost is from the deferred requests. How-        Tensor Parallelism. Tensor parallelism (TP) distributes model
+ever, this is a trade-off for system-level efficiency. Fig. 9d shows    weights and KV caches across GPUs, requiring frequent all-reduce
+that OrbitFlow achieves the highest throughput, outperforming           operations. Without NVLink, these operations rely on PCIe, directly
+DeepSpeed-Inference by 3.3× and other baselines by 4–52%. By de-        competing with KV cache offloading and causing PCIe contention.
+ferring stragglers that would otherwise slow down the entire batch,     Fig. 11 evaluates OrbitFlow against FlexGen+, SLO-aware Offload-
+Pause-Resume allows the remaining requests to decode faster, im-        ing, and Dynamic Heuristic under 2-way and 4-way TP. Baseline
+proving both SLO attainment and throughput at the cost of longer        methods degrade sharply under this contention due to their static
+completion time for individual deferred requests.                       placement strategies, whereas OrbitFlow sustains higher TBT SLO
+Figure 10: Comparison of TBT SLO attainment                         Figure 11: Comparison under 2-way         Figure 12: Sensitivity studies with varying
+under various context lengths.                                      and 4-way TP.                             (a) CV scales and (b) batch sizes.
+
+
+
+
+        Figure 13: Effect of SRTF scheduling on OrbitFlow.
+                                                                                        Figure 14: (a) Impact of OrbitFlow’s components. (b) Effective-
+                                                                                        ness of Token-Deposit mechanism (c) Comparison of fallback victim
+attainment even under stringent SLOs by dynamically adapting its
+                                                                                        selection.
+placement to the reduced available bandwidth.
+Burstiness Variation. As shown in Fig. 12a, we vary the coef-
+                                                                                        confirming that its runtime adaptation remains effective across
+ficient of variation (CV) of request arrivals to control burstiness.
+                                                                                        different scheduling policies.
+Higher CV produces more bursty traffic, increasing queuing delay
+and the risk of SLO violations. OrbitFlow maintains TBT SLO
+attainment above 90% as CV increases, while FlexGen+ and Dy-                            5.4    Design Validation and Overheads
+namic Heuristic degrade steadily. When CV exceeds 6, all methods                        Impact of Individual Techniques. To assess the contributions
+flatten as bursts become intense enough to saturate the GPU. Extra                      of OrbitFlow’s core components, we evaluate OrbitFlow by
+burstiness only lengthens the time requests wait in the queue.                          adding each component incrementally, as shown in Fig. 14a. Batch-
+Batch Size Variation. We evaluate OrbitFlow under different                             Uniform applies a uniform offload distance to all requests within
+batch sizes, as shown in Fig. 12b. Dynamic Heuristic and FlexGen+                       a batch, achieving 45.1% SLO attainment at the tightest SLO scale
+fail to scale since larger batches amplify drifts in both dimensions.                   of 1. Building on this, +Request-Wise introduces fine-grained, per-
+The token dimension grows more rapidly as the total KV cache                            request offloading decisions optimized by the solver, improving SLO
+size increases with batch size, and the batch dimension becomes                         attainment to 54.5% by better balancing KV cache placement across
+more volatile due to frequent request completions and arrivals. In                      heterogeneous requests. Adding Pause-Resume further boosts SLO
+contrast, OrbitFlow effectively manages such fluctuations, main-                        attainment to 71.0% by temporarily deferring requests with large
+taining consistently high performance regardless of the batch size.                     KV caches to free GPU memory for others. Finally, OrbitFlow adds
+                                                                                        Token-Deposit, further raising SLO attainment to 85.6%. The same
+                                                                                        trend persists at a looser SLO scale of 2.5, with each component
+Effect of Request Scheduling. OrbitFlow uses the first-come,
+                                                                                        contributing consistent improvements.
+first-served (FCFS) scheduling policy in vLLM by default. We fur-
+ther examine the performance of OrbitFlow under an alternative                          Token-Deposit on Baselines. Fig. 14b adds Token-Deposit to
+shortest-remaining-time-first (SRTF) policy, which sorts the re-                        FlexGen+ and Dynamic Heuristic to evaluate its generality. At a
+quests in the waiting queue by their predicted output length at                         loose SLO scale of 2.5, Token-Deposit improves TBT attainment by
+each admission, following [14]2 . SRTF prioritizes requests with                        18%, 11%, and 5% for FlexGen+, Dynamic Heuristic, and OrbitFlow,
+shorter outputs and tends to batch requests with similar output                         respectively. As the SLO tightens, the benefit grows for Dynamic
+lengths, thereby helping alleviate the batch-dimension mismatch.                        Heuristic and OrbitFlow, which gain a further 35% and 20%, as
+This reduces the average and P95 TTFT of OrbitFlow by 40%                               their adaptive placement generates early tokens fast enough to
+and 24%, respectively, compared to FCFS, as shown in Fig. 13a.                          accumulate a buffer, whereas FlexGen+ gains little benefit.
+However, SRTF inevitably clusters long requests together, forcing                       Fallback Strategy. When Pause-Resume is triggered, OrbitFlow
+more KV caches to be offloaded and increasing data transfer costs,                      must select which request to pause. We evaluate three approaches:
+which eventually translate into long decode stalls. As a result, Or-                    pausing the longest, shortest, or a randomly chosen request from
+bitFlow+SRTF achieves TPOT SLO attainment of 92.4%, which                               the batch. We study these policies using a stress-test trace with an
+is 4.8% lower than OrbitFlow. SRTF also leads to a 29% increase                         increased fraction of long requests to increase overload frequency
+in P95 TPOT and an 8% drop in overall throughput. Despite these                         and trigger more fallback events. Because KV sizes grow linearly
+trade-offs, OrbitFlow maintains over 90% TPOT SLO attainment,                           with sequence length, pausing the longest request releases the most
+                                                                                        GPU memory, allowing the remaining requests to continue without
+2We use the same trace as [14], scaled by 6 × to align with our long-context setting.   stalls, as confirmed in Fig. 14c.
+      Trace                Calls/Req.      E2E (%)     TBT (%)
+      Both Static                  1.25        0.27        23.47
+      Token Dynamic               11.92        0.37        31.65
+      Both Dynamic                48.33        0.64        28.49
+       Table 1: Solver overhead across different workloads.                    Figure 15: Effect of search space pruning of OrbitFlow.
+
+Component-wise Runtime Overhead. We break down the total                   H2O [54] prune less critical KV entries, KIVI [33] employs asym-
+execution time into scheduler (5.28%), prefill (7.04%), decode (87.23%),   metric quantization, and MiniCache [32] merges similar KV states
+KV Manager (0.45%), and Placement Planner (0.02%), with the last           across layers. Although effective in reducing memory usage, these
+two representing overheads introduced by OrbitFlow. Table 1                methods risk degrading model accuracy.
+further details the Planner’s overhead across three workloads with         Recomputation. Recomputation rematerializes KV states rather
+increasing dynamism: Both Static uses static batching with short           than transferring them, but prior work has focused on the prefill
+outputs, limiting changes in both dimensions; Token Dynamic uses           stage for reusing historical prompt contexts. HCache [45] recon-
+static batching but with long outputs, so KV caches grow along             structs KV states with activations that are lightweight in MHA mod-
+the token dimension while the batch stays fixed; Both Dynamic              els. CachedAttention [15] reuses or recomputes KV states across
+combines long outputs with continuous batching, varying both               conversation turns to avoid redundant transfers. Although such re-
+dimensions simultaneously. We report the solver’s accumulated              computation could be applied to the decode stage, its effectiveness
+share of total execution time (E2E%) and its per-invocation wall-          is still limited to MHA models. OrbitFlow is primarily evaluated
+time relative to one decode step (TBT%). For Both Dynamic, the             on modern GQA models, where activations are no longer light-
+solver is triggered approximately 4× and 39× more often than the           weight. However, in MHA models, combining KV offloading with
+static workloads, reflecting frequent changes in batch composition         recomputation may yield synergistic effects.
+and KV cache size. Even in this volatile trace, E2E% is only 0.64%.        Request Scheduling. Request scheduling techniques improve
+Per invocation, TBT% stays well below 100%. As we launch the               GPU utilization and batching efficiency during inference. Orca [20]
+solver one iteration ahead on a separate thread, this cost can be          introduces continuous batching to insert new requests dynami-
+fully hidden under computation. In rare cases, however, the solver         cally as others finish, and Sarathi-Serve [1] integrates prefill and
+exceeds one decode step, visible as the long tail in Fig. 15c.             decode using stall-free chunked batching. Disaggregated systems
+Search Space Pruning. The low overhead is enabled by pruning               such as DistServe [56] decouple prefill and decode across GPU
+the search space. Our solver restricts placements to evenly spaced         clusters, while Helix [37] and Hetegen [55] explore heterogeneous
+offloaded layers, parameterized by a single offload distance. For a 32-    GPU graphs for model- and tensor-parallel pipelines. OrbitFlow
+layer model, distance 4 offloads every 4th layer (8 total) and distance    complements these methods by optimizing latency within active
+5 offloads every 5th layer (6 total). Counts between these, such as        batches through fine-grained, layer-wise KV cache placement with
+7 offloaded layers, require uneven spacing and are never explored.         a solver that adapts to token- and batch-level drifts.
+To evaluate the impact of this restriction, we compare our solver,
+Pruned, against Full which allows arbitrary KV placements. We              7   CONCLUSION
+sample 2000 solver inputs from the evaluation traces and compare           OrbitFlow provides an effective framework for long-context LLM
+the placements. Fig. 15a shows that 80.9% of Full’s placements match       serving, dynamically reconfiguring KV cache placement per re-
+Pruned in decode latency, with 56% identical and 24.9% differing           quest using a solver to meet stringent latency SLOs. Evaluations on
+only in which layers are offloaded. Only 16.7% are strictly better.        LLaMA3-8B show that OrbitFlow improves TPOT and TBT SLO
+Moreover, 98% of the strictly better cases arise from intermediate         attainment by 62% and 66% under the most demanding conditions,
+layer counts that even spacing skips, as we expected. The median           reduces P95 TBT latency by 38% over the best competing systems,
+speedup in these cases is just 2.29% (Fig. 15b), while closing this        and achieves up to 3.3× higher throughput compared to state-of-
+gap would require 7.74× more solver time (Fig. 15c) on average,            the-art offloading methods. These gains come with less than 1%
+which would itself violate the SLO.                                        runtime overhead and persist under multi-GPU settings.
+
+6    RELATED WORK                                                          ACKNOWLEDGMENTS
+KV Offloading. InfiniGen [30] speculatively prefetches critical KV         This work was supported by SAMSUNG Research, Samsung Elec-
+entries to minimize CPU-to-GPU transfer overhead. Neo [25] and             tronics Co., Ltd., and by the Institute of Information & Communica-
+FlexInfer [39] extend memory capacity by offloading KV caches to           tions Technology Planning & Evaluation (IITP) grants (No. RS-2025-
+host memory or SSD. These methods primarily optimize the spatial           02304554, Efficient and Scalable Framework for AI Heterogeneous
+placement and movement of KV data to reduce transfer latency.              Cluster Systems; No. RS-2019-II191906, Artificial Intelligence Gradu-
+OrbitFlow follows a similar motivation but performs placement              ate School Program (POSTECH)), the National Research Foundation
+decisions online, adapting KV allocations at runtime according to          of Korea (NRF) grant (No. RS-2024-00354947), and the ETRI grant
+batch composition and token-level latency feedback.                        (No. 26ZS1100, Development of Large-Scale Parallel Computing
+Pruning and Compression. Structural pruning and quantiza-                  Technology for Generative AI), funded by the Korean government
+tion reduce KV cache footprints on GPUs. StreamingLLM [49] and             (MSIT).
+REFERENCES                                                                                [17] Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Ab-
+ [1] Agrawal Amey, Kedia Nitin, Panwar Ashish, Mohan Jayashree, Kwatra Nipun,                  hishek Kadian, Ahmad Al-Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten,
+     Gulavani Bhargav S, Tumanov Alexey, and Ramjee Ramachandran. Taming                       et al. The Llama 3 Herd of Models. arXiv preprint arXiv:2407.21783, 2024.
+     Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve. In OSDI,            [18] Mandy Guo, Joshua Ainslie, David Uthus, Santiago Ontanon, Jianmo Ni, Yun-
+     pages 117–134, 2024.                                                                      Hsuan Sung, and Yinfei Yang. LongT5: Efficient text-to-text transformer for long
+ [2] Reza Yazdani Aminabadi, Samyam Rajbhandari, Minjia Zhang, Ammar Ahmad                     sequences. In Marine Carpuat and Ivan Vladimir Meza Ruiz, editors, Findings of
+     Awan, Cheng Li, Du Li, Elton Zheng, Jeff Rasley, Shaden Smith, Olatunji Ruwase,           the Association for Computational Linguistics: NAACL 2022, 2022.
+     and Yuxiong He. DeepSpeed Inference: Enabling Efficient Inference of Trans-          [19] Gurobi Optimization, LLC. Gurobi Optimizer Reference Manual, 2024.
+     former Models at Unprecedented Scale. arXiv preprint arXiv:2207.00032, 2022.         [20] Yu Gyeong-In, Jeong Joo Seong, Kim Geon-Woo, Kim Soojeong, and Chun Byung-
+ [3] AI Anthropic. The Claude 3 Model Family: Opus, Sonnet, Haiku. Claude-3 Model              Gon. Orca: A Distributed Serving System for Transformer-Based Generative
+     Card, 2024.                                                                               Models. In OSDI, pages 521–538, 2022.
+ [4] Patke Archit, Reddy Dhemath, Jha Saurabh, Qiu Haoran, Pinto Christian,               [21] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Mia Xu Chen, Dehao
+     Narayanaswami Chandra, Kalbarczyk Zbigniew, and Iyer Ravishankar. Queue                   Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V. Le, Yonghui Wu, and Zhifeng
+     Management for SLO-Oriented Large Language Model Serving. In Proceedings                  Chen. GPipe: Efficient Training of Giant Neural Networks Using Pipeline Parallelism.
+     of the 2024 ACM Symposium on Cloud Computing, SoCC ’24, page 18–35, 2024.                 Curran Associates Inc., Red Hook, NY, USA, 2019.
+ [5] Acharya Arkadeep, Singh Brijraj, and Onoe Naoyuki. LLM Based Generation of           [22] Wei Jason, Wang Xuezhi, Schuurmans Dale, Bosma Maarten, ichter brian, Xia
+     Item-Description for Recommendation System. In Proceedings of the 17th ACM                Fei, Chi Ed, Le Quoc V, and Zhou Denny. Chain-of-Thought Prompting Elic-
+     Conference on Recommender Systems, RecSys ’23, page 1204–1207, 2023.                      its Reasoning in Large Language Models. In Advances in Neural Information
+ [6] Jinze Bai, Shuai Bai, Yunfei Chu, Zeyu Cui, Kai Dang, Xiaodong Deng, Yang Fan,            Processing Systems, volume 35, pages 24824–24837, 2022.
+     Wenbin Ge, Yu Han, Fei Huang, Binyuan Hui, Luo Ji, Mei Li, Junyang Lin, Runji        [23] Siddharth Jha, Coleman Richard Charles Hooper, Xiaoxuan Liu, Sehoon Kim,
+     Lin, Dayiheng Liu, Gao Liu, Chengqiang Lu, Keming Lu, Jianxin Ma, Rui Men,                and Kurt Keutzer. Learned Best-Effort LLM Serving. In Workshop on Efficient
+     Xingzhang Ren, Xuancheng Ren, Chuanqi Tan, Sinan Tan, Jianhong Tu, Peng                   Systems for Foundation Models II @ ICML2024, 2024.
+     Wang, Shijie Wang, Wei Wang, Shengguang Wu, Benfeng Xu, Jin Xu, An Yang,             [24] Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, De-
+     Hao Yang, Jian Yang, Shusheng Yang, Yang Yao, Bowen Yu, Hongyi Yuan, Zheng                vendra Singh Chaplot, Diego de las Casas, Florian Bressand, Gianna Lengyel,
+     Yuan, Jianwei Zhang, Xingxuan Zhang, Yichang Zhang, Zhenru Zhang, Chang                   Guillaume Lample, Lucile Saulnier, Lélio Renard Lavaud, Marie-Anne Lachaux,
+     Zhou, Jingren Zhou, Xiaohuan Zhou, and Tianhang Zhu. Qwen Technical Report,               Pierre Stock, Teven Le Scao, Thibaut Lavril, Thomas Wang, Timothée Lacroix,
+     2023.                                                                                     and William El Sayed. Mistral 7B, 2023.
+ [7] Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan,              [25] Xuanlin Jiang, Yang Zhou, Shiyi Cao, Ion Stoica, and Minlan Yu. NEO: Saving
+     Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda                GPU Memory Crisis with CPU Offloading for Online LLM Inference. In Proceed-
+     Askell, et al. Language Models are Few-Shot Learners. NeurIPS, 33:1877–1901,              ings of the 8th Conference on Machine Learning and Systems (MLSys 2025), 2025.
+     2020.                                                                                     Available at OpenReview.
+ [8] Zheng Cai, Maosong Cao, Haojiong Chen, Kai Chen, Keyu Chen, Xin Chen, Xun            [26] Zhang Jingqing, Zhao Yao, Saleh Mohammad, and Liu Peter. PEGASUS: Pre-
+     Chen, Zehui Chen, Zhi Chen, Pei Chu, Xiaoyi Dong, Haodong Duan, Qi Fan,                   training with Extracted Gap-sentences for Abstractive Summarization. In Pro-
+     Zhaoye Fei, Yang Gao, Jiaye Ge, Chenya Gu, Yuzhe Gu, Tao Gui, Aijia Guo,                  ceedings of the 37th International Conference on Machine Learning, Proceedings
+     Qipeng Guo, Conghui He, Yingfan Hu, Ting Huang, Tao Jiang, Penglong Jiao,                 of Machine Learning Research, pages 11328–11339, 2020.
+     Zhenjiang Jin, Zhikai Lei, Jiaxing Li, Jingwen Li, Linyang Li, Shuaibin Li, Wei      [27] Achiam Josh, Adler Steven, Agarwal Sandhini, Ahmad Lama, Akkaya Ilge, Ale-
+     Li, Yining Li, Hongwei Liu, Jiangning Liu, Jiawei Hong, Kaiwen Liu, Kuikun                man Florencia Leoni, Almeida Diogo, Altenschmidt Janko, Altman Sam, Anadkat
+     Liu, Xiaoran Liu, Chengqi Lv, Haijun Lv, Kai Lv, Li Ma, Runyuan Ma, Zerun Ma,             Shyamal, et al. GPT-4 Technical Report. arXiv preprint arXiv:2303.08774, 2023.
+     Wenchang Ning, Linke Ouyang, Jiantao Qiu, Yuan Qu, Fukai Shang, Yunfan Shao,         [28] Li Kunze and Zhang Yu. Planning First, Question Second: An LLM-Guided
+     Demin Song, Zifan Song, Zhihao Sui, Peng Sun, Yu Sun, Huanze Tang, Bin Wang,              Method for Controllable Question Generation. In Findings of the Association for
+     Guoteng Wang, Jiaqi Wang, Jiayu Wang, Rui Wang, Yudong Wang, Ziyi Wang,                   Computational Linguistics: ACL 2024, pages 4715–4729, 2024.
+     Xingjian Wei, Qizhen Weng, Fan Wu, Yingtong Xiong, Chao Xu, Ruiliang Xu,             [29] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng,
+     Hang Yan, Yirong Yan, Xiaogui Yang, Haochen Ye, Huaiyuan Ying, Jia Yu, Jing Yu,           Cody Hao Yu, Joseph E. Gonzalez, Haotong Zhang, and Ion Stoica. Efficient
+     Yuhang Zang, Chuyu Zhang, Li Zhang, Pan Zhang, Peng Zhang, Ruijie Zhang,                  Memory Management for Large Language Model Serving with PagedAttention.
+     Shuo Zhang, Songyang Zhang, Wenjian Zhang, Wenwei Zhang, Xingcheng                        In SOSP, pages 611–626, 2023.
+     Zhang, Xinyue Zhang, Hui Zhao, Qian Zhao, Xiaomeng Zhao, Fengzhe Zhou,               [30] Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. InfiniGen: Effi-
+     Zaida Zhou, Jingming Zhuo, Yicheng Zou, Xipeng Qiu, Yu Qiao, and Dahua Lin.               cient Generative Inference of Large Language Models with Dynamic KV Cache
+     InternLM2 Technical Report, 2024.                                                         Management. In 18th USENIX Symposium on Operating Systems Design and
+ [9] Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav                   Implementation (OSDI 24), pages 155–172, 2024.
+     Mishra, Adam Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebas-           [31] Xue Linting, Constant Noah, Roberts Adam, Kale Mihir, Al-Rfou Rami, Siddhant
+     tian Gehrmann, et al. PaLM: Scaling Language Modeling with Pathways. Journal              Aditya, Barua Aditya, and Raffel Colin. mT5: A Massively Multilingual Pre-
+     of Machine Learning Research, 24(240):1–113, 2023.                                        trained Text-to-Text Transformer. In Proceedings of the 2021 Conference of the
+[10] Jeffrey Dean, Greg S. Corrado, Rajat Monga, Kai Chen, Matthieu Devin, Quoc V.             North American Chapter of the Association for Computational Linguistics: Human
+     Le, Mark Z. Mao, Marc’Aurelio Ranzato, Andrew Senior, Paul Tucker, Ke Yang,               Language Technologies, pages 483–498, 2021.
+     and Andrew Y. Ng. Large Scale Distributed Deep Networks. In Proceedings of the       [32] Akide Liu, Jing Liu, Zizheng Pan, Yefei He, Gholamreza Haffari, and Bohan
+     26th International Conference on Neural Information Processing Systems - Volume           Zhuang. MiniCache: KV Cache Compression in Depth Dimension for Large
+     1, NIPS’12, 2012.                                                                         Language Models. In Proceedings of the 38th International Conference on Neural
+[11] DeepSpeed Model Implementations for Inference. https://github.com/microsoft/              Information Processing Systems, NIPS ’24, 2024.
+     DeepSpeed-MII.                                                                       [33] Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu, Vladimir
+[12] Jiayu Ding, Shuming Ma, Li Dong, Xingxing Zhang, Shaohan Huang, Wen-                      Braverman, Beidi Chen, and Xia Hu. KIVI: A tuning-free asymmetric 2bit
+     hui Wang, Nanning Zheng, and Furu Wei. LongNet: Scaling Transformers to                   quantization for KV cache. In Proceedings of the 41st International Conference on
+     1,000,000,000 Tokens. arXiv preprint arXiv:2307.02486, 2023.                              Machine Learning. PMLR, 2024.
+[13] Qichen Fu, Minsik Cho, Thomas Merth, Sachin Mehta, Mohammad Rastegari,               [34] Yinquan Lu, Wenhao Zhu, Lei Li, Yu Qiao, and Fei Yuan. LLaMAX: Scaling
+     and Mahyar Najibi. LazyLLM: Dynamic token pruning for efficient long context              linguistic horizons of LLM by enhancing translation capabilities beyond 100
+     LLM inference. In Workshop on Efficient Systems for Foundation Models II @                languages. In Findings of the Association for Computational Linguistics: EMNLP
+     ICML2024, 2024.                                                                           2024, 2024.
+[14] Yichao Fu, Siqi Zhu, Runlong Su, Aurick Qiao, Ion Stoica, and Hao Zhang. Effi-       [35] Chenxiang Ma, Zhisheng Ye, Hanyu Zhao, Zehua Yang, Tianhao Fu, Jiaxun Han,
+     cient llm scheduling by learning to rank. In Proceedings of the 38th International        Jie Zhang, Yingwei Luo, Xiaolin Wang, Zhenlin Wang, Yong Li, and Diyu Zhou.
+     Conference on Neural Information Processing Systems, NIPS ’24, 2024.                      Memory Offloading for Large Language Model Inference with Latency SLO
+[15] Bin Gao, Zhuomin He, Puru Sharma, Qingxuan Kang, Djordje Jevdjic, Junbo                   Guarantees . arXiv preprint arXiv:2502.08182, 2025.
+     Deng, Xingkun Yang, Zhou Yu, and Pengfei Zuo. Cost-Efficient Large Language          [36] Brysbaert Marc. How many words do we read per minute? A review and meta-
+     Model Serving for Multi-turn Conversations with CachedAttention. In 2024                  analysis of reading rate. Journal of Memory and Language, 109:104047, 2019.
+     USENIX Annual Technical Conference (USENIX ATC 24), pages 111–126, 2024.             [37] Yixuan Mei, Yonghao Zhuang, Xupeng Miao, Juncheng Yang, Zhihao Jia, and
+[16] Izacard Gautier and Grave Edouard. Leveraging Passage Retrieval with Gen-                 Rashmi Vinayak. Helix: Serving Large Language Models over Heterogeneous
+     erative Models for Open Domain Question Answering. In EACL 2021 - 16th                    GPUs and Network via Max-Flow. In Proceedings of the 30th ACM International
+     Conference of the European Chapter of the Association for Computational Linguis-          Conference on Architectural Support for Programming Languages and Operating
+     tics, pages 874–880, 2021.                                                                Systems, Volume 1, ASPLOS ’25, 2025.
+                                                                                          [38] Lewis Mike, Liu Yinhan, Goyal Naman, Ghazvininejad Marjan, Mohamed Abdel-
+                                                                                               rahman, Levy Omer, Stoyanov Veselin, and Zettlemoyer Luke. BART: Denoising
+     Sequence-to-Sequence Pre-training for Natural Language Generation, Trans-            [48] Gemini Team, Petko Georgiev, Ving Ian Lei, Ryan Burnell, Libin Bai, Anmol
+     lation, and Comprehension. In Proceedings of the 58th Annual Meeting of the               Gulati, Garrett Tanzer, Damien Vincent, Zhufeng Pan, Shibo Wang, et al. Gemini
+     Association for Computational Linguistics, pages 7871–7880, 2020.                         1.5: Unlocking multimodal understanding across millions of tokens of context.
+[39] Seonjin Na, Geonhwa Jeong, Byung Hoon Ahn, Aaron Jezghani, Jeffrey Young,                 arXiv preprint arXiv:2403.05530, 2024.
+     Christopher J. Hughes, Tushar Krishna, and Hyesoon Kim. FlexInfer: Flexible          [49] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Effi-
+     LLM Inference with CPU Computations. In Proceedings of the 8th Conference on              cient Streaming Language Models with Attention Sinks. In The Twelfth Interna-
+     Machine Learning and Systems (MLSys 2025), 2025. Available at OpenReview.                 tional Conference on Learning Representations, 2024.
+[40] Patel, Pratyush and Choukse, Esha and Zhang, Chaojie and Shah, Aashaka               [50] Yi Xiong, Hao Wu, Changxu Shao, Ziqing Wang, Rui Zhang, Yuhong Guo, Junping
+     and Goiri, Íñigo and Maleki, Saeed and Bianchini, Ricardo. Splitwise: Efficient           Zhao, Ke Zhang, and Zhenxuan Pan. LayerKV: Optimizing Large Language Model
+     Generative LLM Inference Using Phase Splitting. In 2024 ACM/IEEE 51st Annual              Serving with Layer-wise KV Cache Management. arXiv preprint arXiv:2410.00428,
+     International Symposium on Computer Architecture (ISCA), 2024.                            2025.
+[41] Lewis Patrick, Perez Ethan, Piktus Aleksandra, Petroni Fabio, Karpukhin Vladimir,    [51] Sheng Ying, Zheng Lianmin, Yuan Binhang, Li Zhuohan, Ryabinin Max, Chen
+     Goyal Naman, Küttler Heinrich, Lewis Mike, Yih Wen-tau, Rocktäschel Tim,                  Beidi, Liang Percy, Christopher Ré, Stoica Ion, and Zhang Ce. FlexGen: High-
+     Riedel Sebastian, and Kiela Douwe. Retrieval-Augmented Generation for                     throughput Generative Inference of Large Language Models with a Single GPU.
+     Knowledge-Intensive NLP Tasks. In Advances in Neural Information Processing               In Proceedings of the 40th International Conference on Machine Learning, ICML’23,
+     Systems, volume 33, pages 9459–9474, 2020.                                                2023.
+[42] Alec Radford, Jeff Wu, Rewon Child, David Luan, Dario Amodei, and Ilya               [52] 01.AI Alex Young, Bei Chen, Chao Li, Chengen Huang, Ge Zhang, Guanwei
+     Sutskever. Language Models are Unsupervised Multitask Learners. In Ope-                   Zhang, Heng Li, Jiangcheng Zhu, Jianqun Chen, Jing Chang, Kaidong Yu, Peng
+     nAI Blog. OpenAI, 2019.                                                                   Liu, Qiang Liu, Shawn Yue, Senbin Yang, Shiming Yang, Tao Yu, Wen Xie, Wenhao
+[43] ShareGPT Contributors. ShareGPT_V3_unfiltered_cleaned_split conversations                 Huang, Xiaohui Hu, Xiaoyi Ren, Xinyao Niu, Pengcheng Nie, Yuchi Xu, Yudong
+     dataset. https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_                  Liu, Yue Wang, Yuxuan Cai, Zhenyu Gu, Zhiyuan Liu, and Zonghong Dai. Yi:
+     unfiltered, 2023. Version V3 (unfiltered, cleaned, split). Apache-2.0 license. Ac-        Open Foundation Models by 01.AI. arXiv preprint arXiv:2403.04652, 2025.
+     cessed 2025-06-02.                                                                   [53] Tang Yuqing, Tran Chau, Li Xian, Chen Peng-Jen, Goyal Naman, Chaudhary
+[44] Sheng, Ying and Cao, Shiyi and Li, Dacheng and Zhu, Banghua and Li, Zhuohan               Vishrav, Gu Jiatao, and Fan Angela. Multilingual Translation from Denoising Pre-
+     and Zhuo, Danyang and Gonzalez, Joseph E. and Stoica, Ion. Fairness in Serv-              Training. In Findings of the Association for Computational Linguistics: ACL-IJCNLP
+     ing Large Language Models. In Proceedings of the 18th USENIX Conference on                2021, pages 3450–3466, 2021.
+     Operating Systems Design and Implementation, OSDI’24, 2024.                          [54] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi
+[45] Gao Shiwei, Chen Youmin, and Shu Jiwu. Fast State Restoration in LLM Serving              Cai, Zhao Song, Yuandong Tian, Christopher Re, Clark Barrett, Zhangyang Wang,
+     with HCache. In Proceedings of the Twentieth European Conference on Computer              and Beidi Chen. H2O: Heavy-Hitter Oracle for Efficient Generative Inference
+     Systems, EuroSys ’25, pages 128–143, 2025.                                                of Large Language Models. In Thirty-seventh Conference on Neural Information
+[46] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper,            Processing Systems, 2023.
+     and Bryan Catanzaro. Megatron-LM: Training Multi-Billion Parameter Language          [55] Xuanlei Zhao, Bin Jia, Haotian Zhou, Ziming Liu, Shenggan Cheng, and Yang
+     Models Using Model Parallelism. arXiv preprint arXiv:1909.08053, 2019.                    You. HeteGen: Efficient Heterogeneous Parallel Inference for Large Language
+[47] Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao, Baris Kasikci, and Song               Models on Resource-Constrained Devices. In MLSys, 2024.
+     Han. QUEST: Query-Aware Sparsity for Efficient Long-Context LLM Inference.           [56] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu,
+     In International Conference on Machine Learning, pages 47901–47911. PMLR,                 Xin Jin, and Hao Zhang. DistServe: Disaggregating Prefill and Decoding for
+     2024.                                                                                     Goodput-optimized Large Language Model Serving. In OSDI, pages 193–210,
+                                                                                               2024.
+

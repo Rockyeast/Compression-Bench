@@ -1,0 +1,904 @@
+                                                         ARCHead: Activation-Metric Residual Correction
+                                                            for Large Language Model Output Heads
+                                                          Şuayp Talha Kocabay                              Talha Rüzgar Akkuş
+                                                         Independent Researcher                            Independent Researcher
+                                                    kocabaysuayptalha08@gmail.com                       talharuzgarakkus@gmail.com
+
+                                                                                     Kamer Ali Yüksel
+                                                                                       aiXplain, Inc.
+                                                                                    kamer@aixplain.com
+
+
+                                                             Abstract                              8B-Base (Yang et al., 2025) and Gemma-4-E4B
+                                                                                                   (Team, 2026) occupy approximately 1.18 and
+                                            Weight-only quantization substantially reduces
+                                            the storage of large language model (LLM)
+                                                                                                   1.28 GB, respectively. Once transformer blocks
+                                            transformer blocks, but practical backends of-         have been reduced to four bits, such a projection
+                                            ten retain the final language-modeling head            can become one of the largest remaining dense
+                                            (LM-head) in BF16 or FP16. Quantizing this             tensors. In our inspection of quantized Qwen3-
+                                            projection naively can strongly perturb the            8B-Base checkpoints, both AWQ and bitsandbytes
+arXiv:2608.02703v1 [cs.CL] 3 Aug 2026
+
+
+
+
+                                            vocabulary-logit distribution. We present ARC-         NF4 retained lm_head as a BF16 Linear layer
+                                            Head, a packed LM-head compressor that com-            of shape 151,936 × 4,096.
+                                            bines a quantized low-rank core, group-wise
+                                                                                                      Naive low-bit head quantization is not an ade-
+                                            INT4 residuals, and a low-rank correction fit-
+                                            ted in an activation-derived metric. ARCHead           quate remedy. It minimizes a weight-space recon-
+                                            stores no dense BF16 head and reduces per-             struction error that treats every hidden direction
+                                            sistent LM-head storage by 3.7–3.9×. On                equally, even though the final hidden states occupy
+                                            Qwen3-8B-Base, it uses 25.6% of BF16 head              an anisotropic distribution. A small error along a
+                                            storage while attaining 1.007 relative perplex-        frequently activated direction can alter many vocab-
+                                            ity; storage-matched naive INT4 yields 1.14–           ulary logits, whereas a larger error along a nearly
+                                            1.16. Replacing the BF16 head left by AWQ              inactive direction may have little effect. The rele-
+                                            or bitsandbytes adds only 0.006–0.007 cross-
+                                            entropy, with less than 2% throughput change
+                                                                                                   vant objective is therefore the expected output error
+                                            in our measurements. ARCHead therefore                 induced by the hidden-state distribution.
+                                            complements block quantizers by compress-                 We introduce ARCHead, a specialized, packed
+                                            ing the large output projection they can leave         LM-head compressor. ARCHead first represents
+                                            untouched. Code is available at https://               the head with quantized low-rank factors and a
+                                            github.com/suayptalha/archead.                         group-wise INT4 residual. It then approximates
+                                                                                                   the remaining error with a low-rank branch fitted
+                                        1   Introduction
+                                                                                                   after an activation-derived metric transform. The
+                                        Post-training quantization (PTQ) methods such as           resulting module is a drop-in output head and stores
+                                        GPTQ (Frantar et al., 2023), AWQ (Lin et al.,              no dense BF16 copy of the original matrix.
+                                        2025), and bitsandbytes NF4 (Dettmers et al.,                 Our contributions are:
+                                        2023a) make large language models (LLMs) sub-
+                                        stantially easier to deploy. Their practical imple-           • We formulate output-head compression in an
+                                        mentations, however, often focus on transformer-                activation-derived metric and show that, for a
+                                        block weights and retain the final language-                    fixed quantized core, the ARCHead correction
+                                        modeling head (LM-head) in BF16 or FP16. This                   is the best rank-r approximation in that metric
+                                        head maps the final hidden state directly to a logit            before factor quantization.
+                                        for every vocabulary item. Unlike errors inside               • We develop a packed representation whose
+                                        a transformer block, an LM-head error is not fol-               measured state-dictionary footprint is 25–27%
+                                        lowed by normalization, a residual path, or another             of the corresponding BF16 head across five
+                                        learned transformation; it reaches the softmax di-              model families.
+                                        rectly.
+                                           This matters increasingly for large-vocabulary             • We show that ARCHead avoids the large qual-
+                                        models. The BF16 output projections of Qwen3-                   ity loss of storage-matched naive INT4, gen-
+
+                                                                                               1
+     eralizes across three output heads, and can                                                             Packed: no dense BF16 W
+
+     compress the BF16 head left by AWQ and
+                                                                              Packed core Wd
+     bitsandbytes at a small additional loss.                                   low-rank factors +             ⊤
+                                                                                                             HWd
+                                                                              group-wise INT4 residual
+
+
+                                                                    H                                                             b
+                                                                                                                                  Y
+    • We evaluate logit fidelity, downstream ac-                                                                         +       logits
+                                                                  N ×D
+      curacy, calibration sensitivity, construction                           Metric correction
+                                                                                                                                N ×V
+
+                                                                                  Aw B w
+      time, and generation throughput, and separate                                                         (HB⊤   ⊤
+                                                                                                               w )Aw
+                                                                              rank-rr SVD of ETp
+      persistent parameter storage from backend-
+      dependent runtime peak memory.                                            Cλ ← H⊤ H/N
+
+
+
+
+2    Related Work                                             Figure 1: ARCHead decomposes the dense output head
+                                                              into a packed quantized core Wd and an activation-
+LLM quantization. GPTQ applies second-order                   metric low-rank correction. The original BF16 matrix
+information during sequential weight quanti-                  is discarded after construction.
+zation (Frantar et al., 2023); AWQ protects
+activation-salient channels (Lin et al., 2025); and
+SmoothQuant moves quantization difficulty be-                 3     Method
+tween activations and weights (Xiao et al., 2023).            3.1       Activation-Metric Objective
+Other approaches optimize quantization parame-
+                                                              Let the dense output-head weight be W ∈ RV ×D
+ters (Shao et al., 2024), use layer-wise distillation
+                                                              and let H ∈ RN ×D contain final hidden states
+(Yao et al., 2022), isolate outliers (Dettmers et al.,
+                                                              from N calibration tokens. For an approximation
+2023b; Kim et al., 2024), or introduce incoherence            c write ∆ = W − W.    c The empirical squared
+                                                              W,
+transforms and rotations (Chee et al., 2023; Tseng
+                                                              logit error is
+et al., 2024; Ashkboos et al., 2024; Liu et al., 2025).
+AQLM uses additive codes for extreme compres-                                 1                  
+sion (Egiazarian et al., 2024), while LLM.int8()                         E=     ∥H∆⊤ ∥2F = Tr ∆C∆⊤ ,                                 (1)
+                                                                              N
+and NF4 provide widely used mixed-precision rep-
+resentations (Dettmers et al., 2022, 2023a). These            where C = H⊤ H/N . A Frobenius weight ob-
+methods primarily target transformer-block linear             jective is the special case C = I and ignores the
+layers; ARCHead instead addresses the large out-              activation geometry.
+put projection that practical pipelines may leave                ARCHead uses a damped metric transform.
+dense.                                                        With Cλ = C + λc̄I = QΛQ⊤ , where c̄ is the
+                                                              mean diagonal of C, define
+Low-rank and residual correction. Low-rank
+language-model compression (Hsu et al., 2022)                       Tp = QΛp Q⊤ ,                        T−1    −p ⊤
+                                                                                                          p = QΛ Q .                 (2)
+and parameter-efficient low-rank updates (Hu et al.,
+2022) demonstrate that structured matrix compo-               At p = 12 , the induced objective is the damped
+nents can be represented compactly. ARCHead                   form of Eq. 1; other values adjust how strongly
+differs in both target and objective: it computes a           dominant activation directions are emphasized. We
+low-rank approximation of the quantization resid-             select p on calibration data and use p = 0.75 for
+ual after transforming that residual by a metric              Qwen3-8B-Base.
+estimated from LM-head inputs. This directly al-
+locates correction capacity to directions that affect         3.2       Core and Residual Correction
+the observed logits.                                          The quantized core is
+
+Realized storage. An intended bit width does                   Wd = Q5 (Ac )Q8 (Bc ) + QSC4 (W − Ac Bc ) ,
+not itself establish deployable compression: an im-                                                       (3)
+plementation can retain a dequantized tensor or               where Ac Bc is a rank-rc approximation, Qb de-
+materialize one in its serialized state. We therefore         notes b-bit group quantization, and SC4 denotes
+measure bytes from the actual tensors registered              the packed signed-INT4 residual with quantized
+by the packed head and report persistent storage              group scales. The residual left by this core is
+separately from temporary forward-pass memory.                E = W − Wd .
+
+                                                          2
+  ARCHead computes a rank-rr randomized trun-                  over all parameters and buffers θi in the serialized
+cated SVD                                                      module. The original V × D BF16 matrix is not
+                                                               registered. During model conversion, the dense
+                ETp ≈ Urr Σrr Vr⊤r                  (4)        head is used to construct ARCHead and is then
+                                                               discarded. The module can replace the output em-
+and maps the right factor back:
+                                                               bedding after block quantization, so ARCHead is
+      Aw = Urr Σrr ,          Bw = Vr⊤r T−1                    complementary to AWQ, bitsandbytes, or another
+                                         p .        (5)
+                                                               block backend. Algorithm 1 gives the complete
+The final approximation and logits are                         construction procedure.
+
+           c = W d + A w Bw ,
+           W                                        (6)        State-dictionary accounting. The packed imple-
+           b = HW⊤ + (HB⊤ )A⊤ .
+           Y                                        (7)        mentation is not merely a theoretical bit-counting
+                        d          w       w
+                                                               scheme: unlike prototypes that retain dequantized
+For the packed ARCHead variant, both correction                dense tensors at load time, it stores no dense BF16
+factors are stored with row/group-wise INT8 quan-              V × D head. Dense storage is V D × 2 bytes,
+tization.                                                      whereas packed storage is the measured sum above
+Conditional optimality. For fixed Wd and in-                   over the registered state_dict. The stored
+vertible Tp , the unquantized factors above mini-              components are the packed INT4 residual and its
+mize                                                           FP16/BF16 scales; the 5-bit left and 8-bit right
+                 ∥(E − AB)Tp ∥2F              (8)              core factors and their scales; row/group-wise INT8
+                                                               correction factors Aw and Bw ; quantization scales
+over all rank-rr products AB. This follows di-                 and zero-point metadata; and group-size and shape
+rectly from the Eckart–Young–Mirsky theorem af-                metadata. Table 1 reports values measured from
+                          e = ETp . The guarantee
+ter changing variables to E                                    instantiated PyTorch buffers rather than theoretical
+is conditional on the fixed core and applies before            bit widths.
+correction-factor quantization.
+           e = BTp . Because Tp is invertible,
+Proof. Set B                                                   Load-time versus peak memory. Persistent LM-
+         e
+rank(AB) = rank(AB), so the problem is equiv-                  head memory measures the parameter allocation
+alent to                                                       when loading the model onto the GPU and is the ap-
+                                       2
+                                                               propriate quantity for evaluating the stored output-
+                 min        e − AB
+                            E    e         .        (9)        head footprint. Table 2 reports the correspond-
+            rank(AB)≤r                 F
+                      r                                        ing savings. Forward-pass peak memory is sepa-
+                  e
+
+
+By the Eckart–Young–Mirsky theorem, the mini-                  rate: it includes activations, output logits, tempo-
+mizer is the rank-rr truncated SVD Urr Σrr Vr⊤r                rary buffers, CUDA allocator behavior, backend
+   e Choosing A = Urr Σrr and B = V⊤ T−1                       workspaces, and the KV cache. ARCHead reduces
+of E.                                           rr p
+                                                               persistent output-head parameters; we do not con-
+yields the stated factors. For p = 21 , the objective is
+                                                               flate this with backend- and workload-dependent
+the damped empirical logit MSE. Our randomized
+                                                               runtime peak memory.
+truncated SVD and subsequent factor quantization
+approximate this ideal correction, so the result does
+not assert global optimality of the quantized end-             Peak-memory          measurement          proto-
+to-end module.                                                 col. Before measurement,           we execute
+                                                               torch.cuda.empty_cache(), reset Py-
+3.3   Packed Representation and Integration                    Torch peak-memory statistics, and synchronize
+The packed ARCHead registers only the SC4 resid-               the CUDA device before and after execution. We
+ual and scales, quantized core factors, quantized              measure and report load-time persistent param-
+correction factors, and shape metadata. Its persis-            eter memory separately from the forward-pass
+tent size is measured directly as                              peak, which inherently includes dynamic logits,
+                         X                                     temporary buffers, allocator state, and backend
+  bytes(ARCHead) =           numel(θi )                        workspaces; consequently, we avoid unsupported
+                          i                   (10)             claims about backend-dependent peak-memory
+                        × element_size(θi ),                   reductions.
+
+                                                           3
+    Model                      Vocab    Hidden         Dense BF16 MB         Packed ARCHead MB         Compression
+    Qwen3-8B-Base             151,936       4,096                   1187.0                   303.96          3.905×
+    Gemma-4-E4B               262,144       2,560                   1280.0                   345.41          3.706×
+    VibeThinker-3B            151,936       2,048                    593.5                   153.23          3.873×
+    Mistral-7B-v0.3            32,768       4,096                    256.0                    65.61          3.902×
+    LFM2.5-8B-A1B             128,000       2,048                    500.0                   129.10          3.873×
+
+Table 1: Detailed packed ARCHead storage validation, calculated from the instantiated PyTorch state_dict
+buffers.
+
+
+ Model             Dense MB   ARCHead MB    Saved MB    Ratio       Algorithm 1 ARCHead compression
+ Qwen3-8B            1188.0         304.0      884.0    3.91×
+ Gemma-4-E4B         1280.0         345.4      934.6    3.71×
+                                                                    Input: Dense head W, activations H, ranks rc , rr ,
+ VibeThinker-3B       594.0         153.4      440.6    3.87×           group size g, metric power p, damping λ
+ Mistral-7B-v0.3      256.0          65.6      190.4    3.90×       Output: Packed ARCHead module
+ LFM2.5-8B            500.0         130.1      369.9    3.84×
+                                                                     1: C ← H⊤ H/N + λI
+Table 2: Load-time persistent LM-head memory sav-                    2: Wd ← QuantizeCore(W, rc , g)
+ings.                                                                3: E ← W − Wd
+                                                                     4: Q, Λ ← Eigendecompose(C)
+                                                                     5: Tp ← QΛp Q⊤
+3.4    Construction Algorithm                                           e ← ETp
+                                                                     6: E
+                                                                     7: U, Σ, V ← TruncatedSVD(E,   e rr )
+The inputs are the dense LM-head weight W ∈
+                                                                     8: Aw ← UΣ; Bw ← V Tp     ⊤  −1
+RV ×D , hidden calibration activations H ∈ RN ×D ,
+core and correction ranks rc and rr , group size g,                  9: (Aw , Bw ) ← QuantizeINT8(Aw , Bw )
+metric power p, and damping λ. The procedure                        10: return PackBuffers(Wd , Aw , Bw )
+first estimates the damped activation covariance
+C = H⊤ H/N + λI. It then constructs the quan-
+tized core Wd by quantizing a low-rank approx-                      Data and metrics. We collect calibration activa-
+imation of W and applying group-wise low-bit                        tions from the training split of WikiText-103 (Mer-
+quantization to the remaining residual.                             ity et al., 2016) and evaluate cross-entropy (CE)
+                                                                    on 16,384 held-out test tokens. We report perplex-
+   Next, ARCHead computes the core error E =
+                                                                    ity (PPL), relative PPL (compressed PPL divided
+W − Wd , eigendecomposes C = QΛQ⊤ , and
+                                                                    by dense PPL), ∆CE, logit MSE, KL divergence,
+forms Tp = QΛp Q⊤ and its inverse. The trans-
+                  e = ETp is truncated to rank                      dense-prediction agreement, and persistent head
+formed residual E
+                                                                    bytes. For the GPTQ-head comparison, evaluation
+rr ; mapping its right factor through T−1 p    pro-
+                                                                    activations are fixed and disjoint from calibration;
+duces Aw and Bw . We store Aw with row-wise
+                                                                    each 2K–16K budget uses three matched calibra-
+INT8 quantization and Bw with group-wise INT8
+                                                                    tion seeds.
+quantization, pack every component, and discard
+the dense BF16 tensor. Inference then evaluates                     Baselines and implementation. Head-only base-
+Y = HWd⊤ + (HB⊤           ⊤
+                      w )Aw .                                       lines are BF16, row-wise INT8, group INT4,
+                                                                    SVD8+INT4, and a GPTQ-style INT4 output head.
+4     Experimental Setup                                            Transformer blocks remain BF16 unless a row ex-
+                                                                    plicitly names AWQ or bitsandbytes NF4. On
+Models. We evaluate head quality on Qwen3-8B-                       Qwen, ARCHead uses rc = 10, rr = 6, groups of
+Base (Yang et al., 2025), Gemma-4-E4B (Team,                        64, p = 0.75, and ridge 10−3 . Primary deployment
+2026), and VibeThinker-3B (Xu et al., 2026).                        measurements use one NVIDIA RTX Pro 6000.
+Their (V, D) dimensions are (151,936, 4096),
+(262,144, 2560), and (151,936, 2048). Packed-                       Reproducibility protocol. We use the
+storage validation additionally includes Mistral-7B-                checkpoints      Qwen/Qwen3-8B-Base,
+v0.3 (Jiang et al., 2023) and LFM2.5-8B-A1B (AI,                    google/gemma-4-E4B,
+2026).                                                              WeiboAI/VibeThinker-3B,
+
+                                                                4
+    Method        Ratio     CE     ∆CE     Rel. PPL           Model             INT4 R-PPL ARCHead R-PPL Ratio
+    Dense BF16    1.000   2.443    0.000      1.000           Qwen3-8B                 1.151                1.007 0.256
+    Row INT8      0.500   2.460   +0.017      1.017           Gemma-4-E4B              1.013                1.010 0.269
+    Group INT4    0.266   2.583   +0.140      1.151           VibeThinker-3B           1.050                1.027 0.257
+    SVD8+INT4     0.270   2.634   +0.191      1.211
+    ARCHead       0.256   2.450   +0.007      1.007           Table 4: Head-only results across model families. The
+                                                              bold entry marks the lower relative PPL when the dis-
+Table 3: Qwen3-8B-Base head-only results on WikiText-         played rounded values differ materially.
+103. Ratio is persistent head storage relative to BF16.
+                                                                    Blocks      Head           Head ratio   Extra CE
+mistralai/Mistral-7B-v0.3,                       and                AWQ 4-bit   BF16               1.000       0.000
+LiquidAI/LFM2.5-8B-A1B.                  Calibration                AWQ 4-bit   ARCHead            0.256      +0.006
+                                                                    BNB NF4     BF16               1.000       0.000
+activations come from the training split of                         BNB NF4     ARCHead            0.256      +0.007
+Salesforce/wikitext-103-raw-v1;
+quality is evaluated on a fixed 16,384-token test set.        Table 5: ARCHead replaces the dense head left by two
+The matched GPTQ-head comparison uses 2,048,                  block-quantization backends on Qwen3-8B-Base.
+4,096, 8,192, and 16,384 calibration tokens with
+seeds 0, 1, and 2; the broader ARCHead sensitivity            stored size to 25.6% of BF16. The extra CE over
+sweep uses 4,096–65,536 tokens. AutoAWQ                       each already-quantized model was 0.006 for AWQ
+and bitsandbytes are used for the full-model                  and 0.007 for NF4 (Table 5). ARCHead is not
+hybrid experiments. GPTQ is evaluated as a                    claimed to improve the block quantizer; it recov-
+standalone head-only INT4 baseline with the same              ers most of the persistent storage occupied by the
+activation cache and evaluation protocol as ARC-              dense output projection at a small additional loss.
+Head; it is omitted from the hybrid experiments
+because of backend compatibility constraints.                 Backend inspection. We verified the re-
+Construction times are measured on the same                   tained head directly. Under bitsandbytes NF4,
+NVIDIA RTX Pro 6000 and reported as paired                    lm_head remains a torch.nn.Linear with
+relative speedups. Code is available at https:                BF16 weights of shape [151936, 4096] on
+//github.com/suayptalha/archead.                              cuda:0. Under AWQ it likewise remains a BF16
+                                                              torch.nn.Linear of the same shape; it is on
+5     Results                                                 CPU immediately after loading and can be moved
+                                                              to CUDA for evaluation. Thus, deployments
+5.1    Head-Only Quality
+                                                              described as fully quantized can still contain a
+At nearly the same storage, Group INT4 raises                 dense BF16 output projection, and ARCHead
+relative PPL to 1.151, and adding an ordinary low-            operates orthogonally to their transformer-block
+rank component does not repair the loss (Table 3).            quantization.
+ARCHead instead remains near the dense head at
+1.007 relative PPL. The ablation in Section 5.6               5.3     Packed Storage Is Realized
+shows that the improvement does not come from                 Summing the tensors actually registered in
+the quantized core alone.                                     ARCHead yields 3.71–3.91× compression across
+   Across architectures, ARCHead obtains relative             five heads (Table 6). This is a persistent state-
+PPL values of 1.007, 1.010, and 1.027 on Qwen,                dictionary and load-time parameter reduction, not
+Gemma, and VibeThinker, respectively (Table 4).               a claim about total forward-pass peak VRAM. The
+The gain over naive INT4 is largest on Qwen and               latter also includes logits, activations, allocator
+narrower on Gemma, whose group-INT4 head is                   state, backend workspaces, and the KV cache.
+already strong. This variation argues against assum-
+ing that every output head has the same sensitivity.          5.4     Comparison with GPTQ-Style Head
+                                                                      Quantization
+5.2    Compressing Heads Left by Block                        We compare ARCHead with a GPTQ-style INT4
+       Quantizers                                             quantizer applied only to the Qwen LM-head. Both
+AWQ and bitsandbytes NF4 both retained a                      methods use the same calibration activations and
+1.18 GB BF16 head in our Qwen checkpoint. Re-                 fixed test activations, and their effective sizes are
+placing only this head with ARCHead reduced its               comparable (25.61% for ARCHead and 25.78%
+
+                                                          5
+Model               BF16 MB ARCHead MB Compression                             Method       Ratio    Top-1     KL ↓      MSE ↓
+Qwen3-8B                 1188.0           304.0            3.91×               Row INT8     0.500    97.56    0.0013        740
+Gemma-4-E4B              1280.0           345.4            3.71×               Group INT4   0.266    76.95    0.1671    107,599
+VibeThinker-3B            594.0           153.4            3.87×               SVD8+INT4    0.267    76.11    0.1611    103,015
+Mistral-7B-v0.3           256.0            65.6            3.90×               ARCHead      0.256    93.05    0.0113      7,167
+LFM2.5-8B                 500.0           130.1            3.84×
+                                                                         Table 8: Fidelity to dense Qwen logits. Top-1 is agree-
+Table 6: Measured persistent LM-head storage. Values                     ment in percent. ARCHead is compared with storage-
+are sums over actual packed buffers.                                     matched low-bit baselines; INT8 uses roughly twice its
+                                                                         storage.
+                 Relative PPL ↓           Logit MSE ↓        Build
+ Tokens         GPTQ         ARCHead    GPTQ    ARCHead    speedup
+                                                                               Variant              Ratio     ∆CE      Rel. PPL
+    2K    1.0104±.0028   1.0058±.0012   8,811      7,025    2.58×
+    4K    1.0128±.0018   1.0065±.0007   8,245      6,985    2.41×              Group INT4           0.266    +0.140       1.151
+    8K    1.0093±.0032   1.0062±.0004   7,715      6,964    2.40×              SVD8+INT4            0.270    +0.191       1.211
+   16K    1.0105±.0007   1.0062±.0004   7,349      6,956    2.36×              ARCHead core only    0.230    +0.126       1.134
+                                                                               ARCHead full         0.256    +0.007       1.007
+Table 7: Three-seed, head-only comparison on Qwen3-
+8B-Base. Build speedup is GPTQ time divided by ARC-                      Table 9: Qwen head-only ablation. Removing the
+Head time.                                                               activation-metric correction accounts for most of the
+                                                                         quality loss.
+
+for GPTQ). Table 7 reports means and standard
+deviations over three matched calibration seeds.                         It also reduces their KL divergence by more than
+    ARCHead has lower mean relative PPL and logit                        an order of magnitude. Top-5 agreement reaches
+MSE at every tested budget. Measured as the ex-                          99.95% and top-10 agreement 100.00%. Row
+cess above dense relative PPL, it reduces GPTQ’s                         INT8 remains more accurate, but uses approxi-
+degradation by 44.0%, 49.3%, 33.6%, and 40.6%                            mately twice the head storage.
+from 2K through 16K tokens. It also constructs the
+head 2.36–2.58× faster in this implementation. At                        5.6     Ablation: The Correction Is Decisive
+8K, GPTQ is better on one of three individual seeds,                     The quantized core alone yields 1.134 relative PPL
+but ARCHead retains the lower mean and markedly                          (Table 9). Adding the rank-6 activation-metric cor-
+lower variance; at the other budgets ARCHead is                          rection lowers this to 1.007 for a 2.6-point increase
+better on all three seeds.                                               in storage ratio. Thus, the low-rank core is not
+    The methods use activation information differ-                       sufficient: the decisive component is the correction
+ently. GPTQ commits sequential discrete weight                           fitted to the core’s remaining, activation-weighted
+updates and propagates their error through an                            error.
+inverse-Hessian factor. ARCHead first fixes a quan-
+tized core, then globally allocates rank-rr correc-                      5.7     Downstream Sanity Check
+tion capacity to the dominant modes of the entire                        We evaluate the Qwen3-8B-Base head variants with
+vocabulary-wide residual. The conditional opti-                          lm-evaluation-harness (Gao et al., 2024)
+mum in Section 3.2 explains the specific theoretical                     on HellaSwag (Zellers et al., 2019), TruthfulQA
+advantage of this stage: among rank-rr corrections                       MC2 (Lin et al., 2022), and WinoGrande (Sak-
+to that core, no other unquantized correction has                        aguchi et al., 2021). Transformer blocks and evalua-
+lower error in ARCHead’s chosen activation metric.                       tion settings are fixed across heads. The differences
+The empirical result shows that this global residual                     are small, and the suite is too limited to support a
+repair is more effective than our storage-matched                        claim of downstream improvement; we use it only
+GPTQ-head implementation in the tested regime;                           to check for an obvious regression after replacing
+it is not a claim that ARCHead dominates GPTQ                            the output head.
+for arbitrary layers or settings.                                           ARCHead matches the dense head on HellaSwag
+                                                                         and remains within the small spread among head
+5.5   Logit Fidelity
+                                                                         variants on TruthfulQA MC2 and WinoGrande (Ta-
+ARCHead preserves the dense top-1 token on                               ble 10). These results reveal no obvious regression,
+93.05% of positions, compared with approximately                         but they do not establish task-level gains or preser-
+76% for the storage-matched baselines (Table 8).                         vation of every model capability.
+
+                                                                     6
+    Method           HellaSwag   TruthfulQA MC2   WinoGrande       is intentionally complementary to full-model quan-
+    Dense BF16         0.504         0.5353         0.632          tizers rather than a replacement for them.
+    Group INT4         0.500         0.5310         0.648
+    GPTQ-head INT4     0.500         0.5364         0.640
+    ARCHead            0.504         0.5408         0.644          Limitations
+
+Table 10: Downstream accuracy sanity check. Small                  ARCHead is specialized for output heads and
+differences should not be interpreted as statistically es-         does not compress transformer MLP or attention
+tablished task-level gains.                                        weights. Its benefit is largest when the vocabu-
+                                                                   lary projection is both dense and sensitive to ordi-
+             Calibration tokens     Relative PPL                   nary low-bit quantization; on Gemma-4-E4B, naive
+                                                                   INT4 is already slightly better in the displayed
+                         4,096          ∼1.00725                   rounded relative-PPL result. The cross-model study
+                         8,192          ∼1.00703                   covers three quality evaluations, while packed size
+                        16,384          ∼1.00714                   is checked on five heads; broader architectures, lan-
+                        32,768          ∼1.00761                   guages, context lengths, and calibration domains
+                        65,536          ∼1.00749                   remain to be tested.
+                                                                      Our principal memory claim concerns serialized
+Table 11: Calibration sensitivity sweep on Qwen3-8B-
+                                                                   and load-time parameter tensors. Total peak GPU
+Base.
+                                                                   memory is workload- and backend-dependent be-
+                                                                   cause logits, activations, workspaces, allocator be-
+5.8     Efficiency and Calibration                                 havior, and KV caches can dominate. The three
+Generation throughput changes by less than 2%                      downstream tasks are only a sanity check and do
+in all measured configurations. Qwen throughput                    not establish preservation of every model capabil-
+is 4468 versus 4467 tokens/s for BF16 and ARC-                     ity or safety property. Finally, the conditional op-
+Heads, 3452 versus 3451 with AWQ blocks, and                       timality result applies to the unquantized rank-r
+1789 versus 1813 with NF4 blocks; VibeThinker                      correction for a fixed core; quantizing its factors
+measures 7091 versus 6947. Small positive dif-                     introduces additional approximation error, and the
+ferences are treated as measurement noise, not                     end-to-end ARCHead construction is not claimed
+speedups. A preliminary fused-kernel evaluation                    to be globally optimal.
+gives the same conclusion (Appendix L).
+                                                                   Ethical Considerations
+   ARCHead’s Qwen relative PPL remains between
+1.0070 and 1.0076 as calibration size varies from                  This work uses publicly released model check-
+4K to 64K tokens (Table 11). This suggests that the                points and WikiText-103; it does not introduce
+dominant hidden-space directions can be estimated                  human-subject data collection or annotation. Com-
+with a modest sample for this model, but we do not                 pression can lower deployment costs and thereby
+claim calibration-size invariance in general. A few                broaden access, but it can also make models with
+thousand tokens suffice to estimate the covariance                 existing biases or unsafe behaviors easier to de-
+accurately in this experiment; this is not a claim of              ploy. ARCHead does not remove such behavior: a
+universal calibration independence.                                compressed model inherits the risks, licenses, and
+                                                                   intended-use constraints of its source checkpoint.
+6     Conclusion                                                   Practitioners should therefore repeat application-
+ARCHead addresses a concrete gap in quantized                      specific quality and safety evaluations after com-
+LLM deployment: the large BF16 output projec-                      pression rather than relying only on perplexity or
+tion that can remain after transformer-block quan-                 logit fidelity.
+tization. Its activation-metric residual branch re-                Acknowledgments. We thank TextCortex AI for
+pairs the structured error left by a compact quan-                 providing GPU support for this study.
+tized core, while its packed module realizes a mea-
+sured 3.7–3.9× persistent head-storage reduction.
+Across the tested heads, ARCHead provides a prac-                  References
+tical quality–storage trade-off and can be com-                    Liquid AI. 2026.     Lfm2.5-8b-a1b: Personal as-
+posed with AWQ or bitsandbytes without mate-                         sistant on your laptop.        Liquid AI Blog.
+rially changing generation throughput. The method                    Www.liquid.ai/blog/lfm2-5-8b-a1b.
+
+
+                                                               7
+Saleh Ashkboos, Amirkeivan Mohtashami, Maximil-                  de las Casas, Florian Bressand, Gianna Lengyel, Guil-
+  ian L Croci, Bo Li, Pashmina Cameron, Martin Jaggi,            laume Lample, Lucile Saulnier, Lélio Renard Lavaud,
+  Dan Alistarh, Torsten Hoefler, and James Hensman.              Marie-Anne Lachaux, Pierre Stock, Teven Le Scao,
+  2024. Quarot: Outlier-free 4-bit inference in rotated          Thibaut Lavril, Thomas Wang, Timothée Lacroix,
+  llms. Advances in Neural Information Processing                and William El Sayed. 2023. Mistral 7b. Preprint,
+  Systems, 37:100213–100240.                                     arXiv:2310.06825.
+
+Jerry Chee, Yaohui Cai, Volodymyr Kuleshov, and                Sehoon Kim, Coleman Hooper, Amir Gholami, Zhen
+   Christopher M De Sa. 2023. Quip: 2-bit quantization           Dong, Xiuyu Li, Sheng Shen, Michael W. Mahoney,
+   of large language models with guarantees. Advances            and Kurt Keutzer. 2024. Squeezellm: dense-and-
+   in neural information processing systems, 36:4396–            sparse quantization. In Proceedings of the 41st Inter-
+   4429.                                                         national Conference on Machine Learning, ICML’24.
+                                                                 JMLR.org.
+Tim Dettmers, Mike Lewis, Younes Belkada, and Luke
+  Zettlemoyer. 2022. Llm.int8(): 8-bit matrix multi-           Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang,
+  plication for transformers at scale. In Proceedings             Guangxuan Xiao, and Song Han. 2025. Awq:
+  of the 36th International Conference on Neural In-              Activation-aware weight quantization for on-device
+  formation Processing Systems, NIPS ’22, Red Hook,               llm compression and acceleration. GetMobile: Mo-
+  NY, USA. Curran Associates Inc.                                 bile Computing and Communications, 28(4):12–17.
+
+Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and              Stephanie Lin, Jacob Hilton, and Owain Evans. 2022.
+  Luke Zettlemoyer. 2023a. Qlora: Efficient finetuning           Truthfulqa: Measuring how models mimic human
+  of quantized llms. Advances in neural information               falsehoods. In Proceedings of the 60th annual meet-
+  processing systems, 36:10088–10115.                             ing of the association for computational linguistics
+                                                                 (volume 1: long papers), pages 3214–3252.
+Tim Dettmers, Ruslan Svirschevski, Vage Egiazarian,
+  Denis Kuznedelev, Elias Frantar, Saleh Ashkboos,             Zechun Liu, Changsheng Zhao, Igor Fedorov, Bilge
+  Alexander Borzunov, Torsten Hoefler, and Dan Alis-             Soran, Dhruv Choudhary, Raghuraman Krishnamoor-
+  tarh. 2023b. Spqr: A sparse-quantized representation           thi, Vikas Chandra, Yuandong Tian, and Tijmen
+  for near-lossless llm weight compression. Preprint,            Blankevoort. 2025. Spinquant: Llm quantization
+  arXiv:2306.03078.                                              with learned rotations. In International Conference
+                                                                 on Learning Representations, volume 2025, pages
+Vage Egiazarian, Andrei Panferov, Denis Kuznedelev,              92009–92032.
+  Elias Frantar, Artem Babenko, and Dan Alistarh.
+  2024. Extreme compression of large language mod-             Stephen Merity, Caiming Xiong, James Bradbury, and
+  els via additive quantization. In Proceedings of the            Richard Socher. 2016. Pointer sentinel mixture mod-
+  41st International Conference on Machine Learning,              els. Preprint, arXiv:1609.07843.
+  ICML’24. JMLR.org.
+                                                               Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavat-
+Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and              ula, and Yejin Choi. 2021. Winogrande: An adver-
+   Dan Alistarh. 2023. Gptq: Accurate post-training              sarial winograd schema challenge at scale. Commu-
+   quantization for generative pre-trained transformers.         nications of the ACM, 64(9):99–106.
+   Preprint, arXiv:2210.17323.
+                                                               Wenqi Shao, Mengzhao Chen, Zhaoyang Zhang, Peng
+Leo Gao, Jonathan Tow, Baber Abbasi, Stella Bider-              Xu, Lirui Zhao, Zhiqian Li, Kaipeng Zhang, Gao
+  man, Sid Black, Anthony DiPofi, Charles Foster,               Peng, Yu Qiao, and Ping Luo. 2024. Omniquant: Om-
+  Laurence Golding, Jeffrey Hsu, Alain Le Noac’h,               nidirectionally calibrated quantization for large lan-
+  Haonan Li, Kyle McDonell, Niklas Muennighoff,                 guage models. In International Conference on Learn-
+  Chris Ociepa, Jason Phang, Laria Reynolds, Hailey             ing Representations, volume 2024, pages 45472–
+  Schoelkopf, Aviya Skowron, Lintang Sutawika, and              45496.
+  5 others. 2024. The language model evaluation har-
+  ness.                                                        Gemma Team. 2026. Gemma 4 technical report.
+                                                                 Preprint, arXiv:2607.02770.
+Yen-Chang Hsu, Ting Hua, Sungen Chang, Qian Lou,
+  Yilin Shen, and Hongxia Jin. 2022. Language model            Albert Tseng, Jerry Chee, Qingyao Sun, Volodymyr
+  compression with weighted low-rank factorization.              Kuleshov, and Christopher De Sa. 2024. Quip#:
+  Preprint, arXiv:2207.00112.                                    Even better llm quantization with hadamard incoher-
+                                                                 ence and lattice codebooks. Proceedings of machine
+Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan                 learning research, 235:48630.
+  Allen-Zhu, Yuanzhi Li, Shean Wang, Liang Wang,
+  Weizhu Chen, et al. 2022. Lora: Low-rank adaptation          Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu,
+  of large language models. Iclr, 1(2):3.                        Julien Demouth, and Song Han. 2023. Smoothquant:
+                                                                 Accurate and efficient post-training quantization for
+Albert Q. Jiang, Alexandre Sablayrolles, Arthur Men-             large language models. In International conference
+  sch, Chris Bamford, Devendra Singh Chaplot, Diego              on machine learning, pages 38087–38099. PMLR.
+
+
+                                                           8
+Sen Xu, Shixi Liu, Wei Wang, Jixin Min, Yingwei                Thus, directions with greater activation energy re-
+  Dai, Zhibin Yin, Yirong Chen, Xin Zhou, and Junlin           ceive greater weight. Ordinary Frobenius recon-
+  Zhang. 2026. Vibethinker-3b: Exploring the fron-
+                                                               struction treats the covariance as the identity and
+  tier of verifiable reasoning in small language models.
+  Preprint, arXiv:2606.16140.                                  cannot distinguish frequently activated directions
+                                                               from nearly inactive ones.
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang,                  ARCHead uses the damped covariance
+  Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao,
+  Chengen Huang, Chenxu Lv, Chujie Zheng, Day-                                   H⊤ H
+  iheng Liu, Fan Zhou, Fei Huang, Feng Hu, Hao                            Cλ =        + λc̄I = QΛQ⊤ ,           (13)
+  Ge, Haoran Wei, Huan Lin, Jialong Tang, and 41                                  N
+  others. 2025. Qwen3 technical report. Preprint,
+  arXiv:2505.09388.                                            where c̄ is the mean diagonal covariance. The trans-
+                                                               form Tp = QΛp Q⊤ interpolates between an un-
+Zhewei Yao, Reza Yazdani Aminabadi, Minjia Zhang,              weighted residual approximation at p = 0 and the
+  Xiaoxia Wu, Conglong Li, and Yuxiong He. 2022.               damped empirical logit-MSE geometry at p = 12 .
+  Zeroquant: Efficient and affordable post-training
+  quantization for large-scale transformers. Advances
+                                                               Values above one half emphasize dominant activa-
+  in neural information processing systems, 35:27168–          tion directions more strongly; the Qwen configura-
+  27183.                                                       tion selects p = 0.75 on calibration data. Damping
+                                                               keeps the transform numerically stable in weakly
+Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali
+  Farhadi, and Yejin Choi. 2019. Hellaswag: Can
+                                                               observed directions and makes its inverse well de-
+  a machine really finish your sentence? In Proceed-           fined.
+  ings of the 57th annual meeting of the association for
+  computational linguistics, pages 4791–4800.                  Scope of the optimality statement. For a fixed
+                                                               core Wd , invertible Tp , and unquantized rank-rr
+A    Extended Notation and Objective                           correction, the truncated SVD of ETp is optimal
+                                                               in the induced metric. This statement does not opti-
+This section collects the notation used throughout             mize the core, metric power, or damping jointly. It
+the construction and makes explicit the relationship           also precedes INT8 factor quantization and there-
+between head-weight error and logit error. Let V               fore characterizes the ideal correction stage rather
+denote vocabulary size, D hidden width, and N                  than the complete packed module. These qualifica-
+the number of calibration tokens. The dense LM-                tions are important when interpreting the theorem
+head is W ∈ RV ×D , the calibration activations                as an explanation of the correction design rather
+are H ∈ RN ×D , and the compressed head is W.    c
+                                                               than as a claim of global end-to-end optimality.
+Table 12 summarizes the remaining symbols.
+                                                               B     Expanded Construction Procedure
+     Symbol      Meaning
+                                                               The construction consumes a dense head only while
+     Wd          fixed packed quantized core                   fitting the packed replacement. It proceeds as fol-
+     E           core residual W − Wd                          lows.
+     Cλ          damped activation covariance
+     Tp          activation-metric transform                       1. Collect head inputs. Run calibration text
+     rc , rr     core and correction ranks                            through the model and retain final hidden
+     g           quantization group size                              states immediately before the LM-head. The
+     Aw Bw       low-rank residual correction                         evaluation activations used for reported qual-
+                                                                      ity metrics remain disjoint from calibration.
+Table 12: Notation used in the ARCHead construction.
+                                                                   2. Estimate activation geometry. Accumulate
+                                                 c                    H⊤ H/N , apply damping, and eigendecom-
+   For an arbitrary weight error ∆ = W − W,
+                                                                      pose the resulting D × D matrix.
+the average squared logit error over the calibration
+activations is                                                     3. Construct the low-rank core. Compute the
+     1               1                                              rank-rc core factors and quantize the left and
+        ∥H∆⊤ ∥2F =      Tr H∆⊤ ∆H⊤              (11)                  right factors with their designated precisions.
+     N               N
+                                      
+                             H⊤ H ⊤                                4. Quantize the core residual. Subtract the un-
+                  = Tr ∆           ∆      .     (12)
+                              N                                       quantized low-rank core from W and encode
+
+                                                           9
+     the remaining matrix with signed group-wise            C     Packed Buffers and Model-Conversion
+     INT4 values and quantized scales.                            Lifecycle
+
+  5. Measure the realized core error. Dequantize            Table 13 lists the logical components of the serial-
+     the packed core representation for construc-           ized module. Exact tensor layouts can vary with the
+     tion only and form E = W − Wd . Using the              packing implementation, but every reported byte
+     realized core error ensures that the correction        count is obtained from the actual registered param-
+     targets errors introduced by both approxima-           eters and buffers rather than inferred solely from
+     tion and factor quantization.                          nominal bit widths.
+
+                                                             Component           Stored form                Role
+  6. Fit in the activation metric. Form ETp ,                Core left factor    packed 5-bit + scales      vocabulary-side core
+     compute its randomized rank-rr truncated                Core right factor   packed INT8 + scales       hidden-side core
+                                                             Core residual       signed packed INT4         full-shape residual
+     SVD, and map the right factor back through              Residual scales     quantized group scales     INT4 reconstruction
+     T−1
+       p .
+                                                             Correction left     row-wise INT8 + scales     vocabulary-side repair
+                                                             Correction right    group-wise INT8 + scales   hidden-side repair
+                                                             Metadata            integer shapes/groups      unpacking and dispatch
+  7. Quantize and pack the correction. Store
+     Aw row-wise and Bw group-wise in INT8                  Table 13: Logical contents of the packed ARCHead
+     together with their scales and shape metadata.         state dictionary.
+
+
+  8. Discard the dense source. Register only
+                                                            Conversion lifecycle. The source checkpoint is
+     the packed tensors in ARCHead; the original
+                                                            first loaded with its dense LM-head available to the
+     BF16 V × D tensor and construction tempo-
+                                                            constructor. Calibration activations and the metric
+     raries are not part of the serialized module.
+                                                            are computed, the quantized core and correction are
+                                                            fitted, and a packed ARCHead instance is created.
+                                                            The model’s output embedding is then replaced by
+Algorithm 2 Expanded packed-head construction
+                                                            this module. Before serialization, the dense source
+Require: W, H, rc , rr , group size g, p, λ                 tensor and temporary decompositions are released.
+Ensure: Packed module with no dense BF16 head               Reloading the converted checkpoint instantiates
+                                                            only the packed buffers listed above.
+ 1: Cλ ← H⊤ H/N + λc̄I
+ 2: (Q, Λ) ← Eigh(Cλ )                                      Persistent storage versus working mem-
+ 3: Tp ← QΛp Q⊤                                             ory. Persistent storage is the sum of
+           −p ⊤
+ 4: T−1
+     p ← QΛ Q                                               numel×element_size              over     registered
+ 5: Wd ← QuantizeCore(W, rc , g)                            tensors. Construction working memory can be
+ 6: E ← W − Wd                                              larger because it includes W, covariance factors,
+ 7: (U, Σ, V) ← RandomizedSVD(ETp , rr )                    randomized-SVD workspaces, and temporary
+ 8: Aw ← UΣ                                                 dequantized values. Forward working memory is
+ 9: Bw ← V⊤ T−1
+             p                                              different again and can include logits, activations,
+       q    q
+10: (Aw , Bw ) ← QuantizeINT8(Aw , Bw )                     the KV cache, allocator state, and backend
+                          q    q
+11: return Pack(Wd , Aw , Bw , g)                           workspaces. The 3.7–3.9× claim concerns the first
+                                                            quantity only; separating these categories prevents
+                                                            a packed-parameter result from being misread as
+  At inference, ARCHead evaluates the core path
+                                                            an identical reduction in end-to-end peak GPU
+and correction path separately,
+                                                            memory.
+     b = mathbf HW⊤ + (HB⊤ )A⊤ .
+     Y                                         (14)         Integration order. ARCHead is applied after
+                  d      w   w
+                                                            the chosen transformer-block quantizer. This or-
+This factorized evaluation avoids registering a re-         der preserves the block backend and targets only
+constructed dense head. A backend may dequantize            the remaining dense output projection. In the
+tiles or factors internally, but such temporary exe-        inspected Qwen AWQ and bitsandbytes check-
+cution state is distinct from the persistent module         points, the head remained a BF16 Linear of
+representation measured in the storage tables.              shape 151,936 × 4,096, so replacement does not
+
+                                                       10
+require changing the transformer-block representa-           Downstream sanity check. HellaSwag, Truth-
+tion.                                                        fulQA MC2, and WinoGrande are evaluated with
+                                                             fixed transformer blocks and evaluation settings
+D    Evaluation and Reproducibility                          across head variants. The suite is intentionally
+     Checklist                                               described as a sanity check because its small dif-
+The following checklist clarifies how the reported           ferences do not establish task-level improvement
+comparisons isolate the output head.                         or comprehensive capability preservation. Its role
+                                                             is to identify an obvious regression that might be
+    • Head-only experiments: transformer blocks              hidden by aggregate perplexity alone.
+      remain BF16 and only the LM-head represen-
+      tation changes.                                        E        Full Head-Only Results
+    • Hybrid experiments: AWQ or bitsandbytes
+                                                             Table 14 provides the comprehensive head-only
+      quantizes the blocks first; BF16-head and
+                                                             quantization results for Qwen3-8B-Base. In these
+      ARCHead rows share the same block back-
+                                                             experiments, the transformer blocks are deliber-
+      end.
+                                                             ately kept in BF16 to isolate the performance im-
+    • Calibration split: final hidden states are sam-        pact of the LM-head. As the results indicate, ARC-
+      pled from the WikiText-103 training split.             Head achieves a storage footprint similar to naive
+                                                             Group INT4, but with significantly lower cross-
+    • Evaluation split: quality is measured on               entropy and perplexity degradation.
+      16,384 held-out test tokens that are not reused
+      for fitting.                                            Method               Head Ratio             CE   Delta CE        PPL     Relative PPL
+                                                              Dense BF16                1.0000       2.443         0.000     11.504              1.000
+    • Matched seeds: the GPTQ-style head and                  Row INT8                  0.5000       2.460        +0.017     11.704              1.017
+                                                              Group INT4                0.2656       2.583        +0.140     13.237              1.151
+      ARCHead use the same activation cache at                SVD8 + INT4              ∼0.2700       2.634        +0.191     13.929              1.211
+      each 2K, 4K, 8K, and 16K calibration budget             ARCHead                   0.2557       2.450        +0.007     11.588              1.007
+
+      with seeds 0, 1, and 2.
+                                                             Table 14: Full head-only quantization results on Qwen3-
+    • Storage measurement: bytes are summed                  8B-Base. Transformer blocks remain in BF16.
+      from instantiated packed tensors, including
+      scales and metadata-bearing buffers.
+                                                             F        Cross-Model Head-Only Results
+    • Timing comparison: paired construction
+      times use the same NVIDIA RTX Pro 6000;                Table 15 shows the performance of ARCHead
+      speedup is GPTQ time divided by ARCHead                across models with differing vocabularies and hid-
+      time.                                                  den dimensions.
+    • Throughput interpretation: changes within                 Qwen3-8B exhibits the strongest relative im-
+      2% are treated as negligible measurement               provement because its naive INT4 baseline fails
+      variation, and small positive values are not           drastically. For Gemma-4-E4B, the naive INT4
+      claimed as speedups.                                   baseline is already strong, meaning ARCHead’s
+                                                             advantage is narrower, though it remains highly
+Metric interpretation. Cross-entropy and rela-               competitive. VibeThinker-3B shows a larger over-
+tive perplexity measure language-model quality un-           all loss due to its smaller hidden dimension, but
+der the fixed evaluation activations. Logit MSE              ARCHead still provides a substantial improvement
+and KL divergence measure fidelity to the dense              over the naive INT4 baseline. This highlights the
+head, while top-k agreement records whether dense            model-dependent behavior of LM-head quantiza-
+predictions remain among the compressed head’s               tion sensitivity.
+leading candidates. Persistent head ratio measures
+serialized module size relative to BF16. These met-           Model            Dense PPL   INT4 Rel PPL   ARCHead Rel PPL   ARCHead Delta CE   Head Ratio
+                                                              Qwen3-8B            11.504          1.151             1.007             +0.007        0.256
+rics answer different questions and should not be             Gemma-4-E4B
+                                                              VibeThinker-3B
+                                                                                  11.970
+                                                                                  12.450
+                                                                                                  1.013
+                                                                                                  1.050
+                                                                                                                    1.010
+                                                                                                                    1.027
+                                                                                                                                      +0.010
+                                                                                                                                      +0.026
+                                                                                                                                                    0.269
+                                                                                                                                                    0.257
+collapsed into a single claim: storage does not de-
+termine quality, logit fidelity does not guarantee           Table 15: Cross-model head-only results demonstrating
+every downstream capability, and persistent bytes            model-dependent sensitivity.
+do not equal runtime peak memory.
+
+                                                        11
+G Hybrid Quantizer + ARCHead Results                                                             J                      Additional Result Visualizations
+ARCHead is intended as a drop-in replacement for
+backends like AWQ and bitsandbytes. Table 16                                                                           1.25
+                                                                                                                                                                                    Dense BF16
+presents the hybrid setup. ARCHead does not im-                                                                                        SVD8+INT4                                    Row INT8
+                                                                                                                       1.20                                                         Group INT4
+prove the base perplexity of AWQ or BNB; rather,                                                                                                                                    SVD8+INT4
+
+
+
+
+                                                                                               Relative Perplexity
+                                                                                                                                       Group INT4                                   ARCHead (Ours)
+it compresses the dense BF16 head they leave                                                                           1.15
+behind. The additional cross-entropy cost intro-
+duced by ARCHead is extremely small (+0.006 to                                                                         1.10
++0.007), validating the drop-in replacement claim.
+                                                                                                                       1.05
+                                                                                                                                                 ARCHead: 0.256x, 1.007 Rel PPL
+                                                                                                                                                      Row INT8
+    Block Quantizer   LM-Head      Head Ratio     Rel PPL    Delta CE      Extra CE
+    AWQ 4-bit         Dense BF16          1.000    1.0465      +0.0454          0.000                                  1.00                                                         Dense BF16
+    AWQ 4-bit         ARCHead             0.256    1.0530      +0.0516         +0.006
+    BNB NF4           Dense BF16          1.000    1.1084      +0.1030          0.000                                          0.2           0.4               0.6            0.8             1.0
+    BNB NF4           ARCHead             0.256    1.1170      +0.1100         +0.007
+                                                                                                                                     Head Storage Ratio (fraction of BF16)
+Table 16: Hybrid model results on Qwen3-8B-Base.
+                                                                                                 Figure 2: Qwen3-8B-Base head-storage and perplexity
+ARCHead compresses the remaining dense head with
+                                                                                                 trade-off. ARCHead occupies a similar storage range to
+minimal extra CE.
+                                                                                                 group INT4 while remaining close to the dense head.
+
+
+H        Ablation Details
+                                                                                                                       8000          BF16 Head
+The extended ablation study in Table 17 under-                                                                                       ARCHead                                             7091 6947
+                                                                                                                       7000
+                                                                                               Throughput (tokens/s)
+
+
+
+scores the necessity of the activation-metric resid-                                                                   6000
+ual correction branch. The “ARCHead core only”                                                                         5000     4468 4467
+variant exhibits a relative PPL of 1.134. Adding the                                                                   4000                        3452 3451
+residual correction branch reduces this sharply to                                                                     3000
+1.007. This confirms that the core alone is insuffi-                                                                   2000                                            1789 1813
+
+cient and supports the central novelty of optimizing                                                                   1000
+in the covariance-weighted logit space.                                                                                   0
+                                                                                                                                Qwen3-8B           Qwen3-8B            Qwen3-8B          VibeThinker
+                                                                                                                                 Dense               AWQ               BNB NF4              Dense
+    Variant               Head Ratio       CE     Delta CE         PPL     Rel PPL
+    Dense BF16                 1.000      2.443      0.000      11.504         1.000             Figure 3: Measured generation throughput with a BF16
+    Group INT4                 0.266      2.583     +0.140      13.237         1.151             or packed ARCHead head. Differences below 2% are
+    SVD8 + INT4               ∼0.270      2.634     +0.191      13.929         1.211
+    ARCHead core only         ∼0.230      2.569     +0.126      13.048         1.134             treated as negligible measurement variation.
+    ARCHead full               0.256      2.450     +0.007      11.588         1.007
+
+
+Table 17: Expanded ablation details highlighting the                                                                   1.010
+importance of the correction branch.
+                                                                                                                       1.009
+                                                                                               Relative Perplexity
+
+
+
+
+I       Throughput Measurement Details                                                                                 1.008                                         Stable range: 1.0070 1.0076
+
+Table 18 outlines generation throughput measure-                                                                       1.007
+ments. ARCHead does not bottleneck generation.
+                                                                                                                       1.006
+The small positive difference observed in the BNB
+NF4 configuration represents measurement noise                                                                         1.005
+                                                                                                                               4K             8K                16K                32K              64K
+rather than a real speedup. Throughput is measured                                                                                          Number of Calibration Tokens
+independently from persistent memory to provide
+an accurate picture of inference viability.                                                      Figure 4: Qwen3-8B-Base calibration sensitivity. Rel-
+                                                                                                 ative PPL remains in a narrow band from 4K through
+ Model / Backend        BF16 Head tok/s   ARCHead tok/s                       Change             64K calibration tokens.
+ Qwen3-8B Dense                    4468             4467                     negligible
+ Qwen3-8B AWQ                      3452             3451                     negligible
+ Qwen3-8B BNB NF4                  1789             1813    meas. noise / no slowdown
+ VibeThinker-3B Dense              7091             6947                       ∼ −2%
+
+                                                                                                 K                       Failure Modes and Limitations
+Table 18: ARCHead maintains generation throughput.
+                                                                                                 The scope and limitations of ARCHead include:
+
+                                                                                          12
+                                                              Model / Backend            BF16 Head (tok/s)   ARCHead Fused Kernel (tok/s)     Change
+    • Density Requirement: ARCHead is most                    Qwen3-8B Dense                       4404.8                          4398.0   ∼ −0.15%
+      beneficial when the LM-head constitutes a               Qwen3-8B BNB NF4
+                                                              Qwen3-8B AWQ 4-bit
+                                                                                                   1803.7
+                                                                                                   3468.4
+                                                                                                                                   1814.6
+                                                                                                                                   3490.5
+                                                                                                                                            ∼ +0.60%
+                                                                                                                                            ∼ +0.60%
+      large dense parameter block.                            VibeThinker-3B Dense
+                                                              VibeThinker-3B BNB NF4
+                                                                                                   7011.9
+                                                                                                   3192.6
+                                                                                                                                   6883.1
+                                                                                                                                   3198.0
+                                                                                                                                            ∼ −1.80%
+                                                                                                                                            ∼ +0.10%
+                                                              VibeThinker-3B AWQ 4-bit             4510.8                          4508.4   ∼ −0.05%
+
+    • Model Sensitivity: If a model’s naive INT4
+      head quantization already performs exception-          Table 19: Preliminary throughput validation of the ARC-
+                                                             Head fused Triton kernel on one NVIDIA RTX Pro
+      ally well (as observed to some degree with
+                                                             6000. The measured differences are within 2%; small
+      Gemma), ARCHead’s relative advantage di-               positive values are treated as noise rather than speedups.
+      minishes.
+
+    • Prior Compression: If a backend natively
+      and successfully quantizes the LM-head, ap-
+      plying ARCHead may not yield additional
+      quality improvements.
+
+    • Scope: ARCHead is explicitly developed
+      for LM-head compression. It is not in-
+      tended for compressing Feed-Forward Net-
+      works (FFN/MLP) in this paper.
+
+    • Evaluation: WikiText perplexity and logit fi-
+      delity are the primary quality measures. The
+      three downstream tasks are a limited sanity
+      check; exhaustive capability and safety evalu-
+      ation remains future work.
+
+    • Kernel Optimization: The included fused-
+      kernel result is preliminary and limited to one
+      accelerator. Broader hardware and production-
+      backend optimization remains future work.
+
+L    Preliminary Future Work: Fused
+     Triton Kernel Integration
+We present preliminary results from a custom Tri-
+ton kernel designed for the ARCHead compressed
+head. The kernel performs INT8 dequantization
+and evaluates the low-rank residual branch within
+a fused pass, loading the quantized core and row-
+wise scales directly while computing the low-rank
+residual.
+   This prevents the prohibitive memory bandwidth
+overhead of sequentially instantiating the full FP16
+matrix before multiplication. Table 19 presents the
+throughput results of integrating this fused kernel
+on a single NVIDIA RTX Pro 6000.
+   These preliminary findings confirm that ARC-
+Head does not bottleneck inference generation in
+practical deployment scenarios, even when paired
+with aggressively quantized transformer backends
+like AWQ or bitsandbytes NF4.
+
+
+
+
+                                                        13
+

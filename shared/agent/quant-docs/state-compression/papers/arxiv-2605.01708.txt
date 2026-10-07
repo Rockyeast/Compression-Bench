@@ -1,0 +1,971 @@
+                                             SplitZip: Ultra Fast Lossless KV Compression for
+                                                        Disaggregated LLM Serving
+
+
+                                                                             Yipin Guo, Siddharth Joshi
+                                                                               University of Notre Dame
+                                                                                       IN, USA
+                                                                           yguo23@nd.edu, sjoshi2@nd.edu
+arXiv:2605.01708v3 [cs.DC] 23 Jun 2026
+
+
+
+
+                                                                                        Abstract
+                                                     Contemporary systems serving large language models (LLMs) have adopted prefill-
+                                                     decode disaggregation to better load-balance between the compute-bound prefill
+                                                     phase and the memory-bound decode phase. Under this design, prefill workers
+                                                     generate a KV cache that must be transferred to decode workers before token
+                                                     generation can begin. With these workers residing on different physical systems,
+                                                     this transfer becomes a significant bottleneck to serving LLMs at scale. This
+                                                     bottleneck gets exacerbated for long-input and agentic workloads. Existing loss-
+                                                     less codecs are not suited to this setting as they primarily target offline weight
+                                                     compression, run on the CPU, or use variable-length coding whose decompression
+                                                     is fast but compression is too slow to keep up with KV production during prefill.
+                                                     We introduce SplitZip, a GPU-friendly lossless compressor for KV cache transfer
+                                                     that preserves KV tensors bitwise and integrates into existing serving frameworks
+                                                     without changes to model execution. SplitZip exploits redundancy in floating-point
+                                                     exponents of KV activations, encoding the most frequent exponent values with
+                                                     fixed-length codes and routing rare exponents through a sparse escape stream
+                                                     of (position, value). An offline calibrated top-16 exponent codebook eliminates
+                                                     online-histogramming, while the regular dense path and sparse escape correction
+                                                     make both encoding and decoding efficient on GPUs. On real BF16 activation
+                                                     tensors, SplitZip achieves 613.3 GB/s compression throughput and 2181.8 GB/s
+                                                     decompression throughput, substantially outperforming prior lossless compres-
+                                                     sors on the latency-critical codec path. End-to-end transfer experiments show
+                                                     up to 1.32× speedup for BF16 KV cache transfer, 1.30× speedup for TTFT, and
+                                                     1.23× increase on Request Throughput. The same approach extends to FP8 KV
+                                                     caches, providing up to 1.14× compression over native E5M2. Code is available at
+                                                     https://github.com/Intelligent-Microsystems-Lab/SplitZip.
+
+
+                                         1    Introduction
+                                         Prefill-decode (PD) disaggregation has become a widely adopted systems design pattern [32, 11] for
+                                         large-scale LLM serving because it enables specialization during two fundamentally different phases
+                                         of inference: prefill is primarily compute-intensive, whereas decode is primarily memory-bandwidth-
+                                         intensive. This system direction has influenced the larger serving ecosystem, having been widely
+                                         adopted by open frameworks such as vLLM [24], SGLang [6], and Dynamo [18]. However, although
+                                         PD disaggregation improves resource utilization and scheduling flexibility, its efficiency depends
+                                         on KV Cache transfer between the prefill and decode stages. When prefill and decode are deployed
+                                         on different nodes or different clusters, the KV Cache generated during prefill must be transmitted
+                                         quickly enough to keep decode continuously fed. In tightly coupled deployments, this transfer can
+                                         often be sustained by a high-bandwidth RDMA fabric. In more realistic production settings, however,
+                                         prefill and decode are frequently separated across deployment boundaries for reasons such as resource
+
+                                         Preprint.
+  1      Key Observation                2   Lossless Compression                                                                      3       GPU-Friendly Parallel Decode
+
+                                                                                                                                        4-bit packed          Escape buffer
+ BF16 =                                                                    Top-16 Exponent Codebook                                   exponent stream         (pos, raw exp)
+                                                                                                                     Pack 2 codes
+   Sign     Exponent      Mantissa                                           e0        e1   e2       …     e15                                       …                     …
+                                                          Extract                                                      per byte
+   1 bit      8 bits          7 bits                     exponent                                                              …
+                                                                     …      0000 0001 0010           …     1111                           1    Parallel 4-bit decode
+                                                                                                                      4-bit packed
+ Exponent: highly redundant                                                Fixed 4-bit codes (most frequent)        exponent stream            Decode exponents in parallel
+                                                                                                                                                                       …
+                         Entropy                                                                                  Coverage ＞ 99%,
+                         ~ 3–4 bits                                                                               escape overhead
+                                                    Chunk-wise            Escapes (rare exponents)
+ ...                    ...                                                                                       is tiny.                2    Merge with sign+mantissa
+                                                     Escape                 position raw exponent
+                                        KV Cache     Sensing                                                                                   Exp, sign and mantissa combine
+                                                                                  p1        ex1
+       Exponent value                    (BF16)                                                                    Store
+                                                                                  p2        ex2                                                                            …
+                                                                                                                   (position,
+                                                                                  ⋮              ⋯
+                                                                                                                   raw exponent)
+   Mantissa: little redundancy                                                                                                            3    Escape fix-up
+                              High                                  …                                                      …                   Overwrite escaped exponents
+ ...                    ...
+                              entropy                     Extract                  Keep exact                 Sign+mantissa
+                                                                                                         stream (no compression)                                           …
+                                                      sign + mantissa
+
+ Compressibility:                                                                                                                         2182 GB/s
+                                                High Throughput Encode                       Fixed-length 4-bit codes                 Decode Throughput
+       BF16: 1.32× achieved                  613 GB/s; 68.9× faster than Falcon                          GPU friendly
+       FP8 E5M2: 1.14× achieved                                                                                                                   ✓ Truly lossless
+
+
+
+Figure 1: Overview of SplitZip for lossless KV cache compression. SplitZip exploits the redundancy
+of the BF16 exponent field while keeping sign and mantissa exact. It encodes the most frequent
+exponent values with fixed 4-bit codes and stores rare values in a small escape buffer with their
+positions and raw exponents. This design enables GPU-friendly parallel decoding and reconstructs
+the original KV cache bit-exactly.
+
+
+isolation, cluster management, elasticity, distinct accelerator architectures, or independent scaling. In
+such settings, KV Cache transfer must traverse slower and more constrained inter-node or inter-cluster
+links, making communication overhead a growing bottleneck [21].
+This transfer bottleneck is especially pronounced for long-input workloads, such as document-level
+question answering, codebase understanding, and multi-document summarization, where prefill pro-
+duces a large KV cache that must be transferred to the decode workers. Recent serving deployments
+increasingly separate prefill and decode across different hardware tiers or even different datacenters,
+where inter-cluster bandwidth (typically 50-100 GB/s) is an order of magnitude lower than the
+intra-rack RDMA fabrics (400+ GB/s within NVLink) that earlier disaggregation work assumed [22].
+Therefore, accelerating KV Cache transfer is a key requirement for making PD disaggregation
+efficient in standard large-scale serving deployments.
+To mitigate this, approaches have explored lossy KV cache compression, such as pruning[31, 13],
+quantizing[10, 29], or selectively retaining KV states[3, 26], as well as system-level solutions that
+depend on specialized hardware assumptions[7] or changes to the serving paradigm[22]. Although
+lossy methods can achieve higher compression ratios, they alter model outputs in ways that require
+per-deployment validation and accumulate errors across stored KV tokens, an effect that worsens
+at the long contexts and multi-step reasoning we target[23, 15]. We propose a lossless compression
+approach for KV Cache transfer in conventional PD-disaggregated deployments called SplitZip. Our
+goal is to reduce communication volume while preserving exact model semantics, thereby improving
+transfer efficiency without sacrificing model ability or changing any tensor values.
+Prior work has shown that, in BF16 model weights, redundancy is concentrated in the exponent
+field, while the mantissa has limited compressibility [30]. We find that this also holds for activations,
+including KV tensors in PD-disaggregated serving. Across common LLMs, we find the exponent
+entropy to be typically 3–4 bits, indicating roughly 4 bits of headroom for lossless compression (see
+Fig. 1 left).
+Several prior works use Huffman coding[28, 30, 2] to losslessly compress weight tensors. Huffman
+codes are entropy-optimal in the limit, but their variable-length bitstreams produce irregular memory
+access patterns that map poorly to GPU execution. Blockwise bitstream processing[28] and variable-
+length coding[1] reduce this overhead, but variable codes still impose sequential dependencies during
+decoding that limit parallel throughput. Our approach, shown in Fig. 1, uses fixed 4-bit codes for the
+most frequent exponent values, and stores the rare uncovered cases as escapes with their positions
+and original values. In practice, 4-bit coding covers about 99% of cases, as shown in Table 1, so
+
+
+                                                                                   2
+Table 1: BF16 KV value exponent statistics across different model families and architectures. Top-16
+coverage exceeds 99% for high-frequency exponents. This motivates 4-bit exponent coding with
+escapes.
+      Model                    Family         Top-8    Top-16    Entropy    Realized SplitZip CR
+      Qwen3-30B-A3B            Qwen-MoE       83.5%     99.3%     3.59 b          1.31×
+      Qwen3-32B                Qwen           90.1%     99.8%     3.29 b          1.32×
+      Qwen3-Next-80B-A3B       Qwen-Hyper     96.0%     99.9%     2.89 b          1.33×
+      Llama-3.1-70B            Llama          89.7%     99.5%     3.41 b          1.32×
+      Llama-3-8B               Llama          90.9%     99.6%     3.30 b          1.32×
+      Phi-2                    Phi            92.3%     99.6%     3.11 b          1.32×
+
+
+escape overhead is very small. At the same time, the fixed-length design maps naturally to GPU
+parallelism, enabling much higher encoding and decoding throughput while remaining fully lossless.
+Our contributions can be summarized as:
+
+       • Characterizing redundancy in KV activations. We show that the BF16 exponent redun-
+         dancy previously documented in model weights also appears in KV activations, and that it is
+         consistent across six model spanning dense, MoE, and hybrid architectures, across multiple
+         calibration datasets, and across nearly all transformer layers we tested. Existing approaches
+         achieve high compression ratios, but operate at sub-GBps rates, too slow to keep up with
+         prefill generation [30, 9].
+
+       • SplitZip for online encode-decode. We present a fixed-length codec that achieves 613.3
+         GB/s encoding and 2181.8 GB/s decoding throughput on real BF16 KV activations, the
+         highest measured rates among lossless floating-point compressors we evaluated. Our
+         ablations show that explicit escape positions, despite a small metadata overhead, deliver
+         3.5× higher decode throughput owing to divergence-free GPU execution.
+
+       • End-to-end validation in a production serving stack. We integrate SplitZip into
+         SGLang [6] on top of Mooncake [22] transport. This delivers up to 1.32× faster BF16
+         KV cache transfer, 1.30× faster TTFT, and 1.23× higher request throughput. The same
+         approach delivers 1.14× additional compression over native E5M2 FP8 KV Caches.
+
+
+2   Related Work
+
+Disaggregated PD serving. DistServe [32] was one of the first to separate prefill and decode to
+improve goodput under latency constraints, while Splitwise [20] pipelines phase-split inference across
+heterogeneous GPUs. Mooncake [22] introduces a KV cache-centric disaggregated architecture with
+a Transfer Engine for RDMA and TCP transport. FlowKV [12] focuses on fragmented KV memory
+transfer and segmented kernel launches. These systems reduce scheduling or transfer overhead, but
+they do not employ compression for KV transfer itself.
+Lossless LLM compression. General GPU compression libraries such as nvCOMP[19] provide LZ4,
+Cascaded, and entropy-coding primitives. They are valuable for generic data, but floating-point KV
+tensors can benefit from format-aware codes: although the BF16 mantissa stream is hard to compress,
+the exponent stream has structure. DFloat11 [30] compresses BF16 model weights by coding only
+the exponent bits, improving decode throughput. ZipNN [9] studies lossless compression for weights,
+checkpoints, and low-precision tensors. ZipLLM [25] combines tensor-level deduplication with
+lossless compression for efficient LLM storage. They all employ compression methods based on
+Huffman coding. More recently, Falcon[14] and ZipServ[7] utilize multi-level fixed-length encoding
+and execution to the GPU, thereby further enhancing throughput.
+SplitZip adopts fixed-length coding from this line of work but targets a different regime. The latency-
+critical KV transfer path in disaggregated serving requires both compression and decompression
+throughput to be optimized, leading to different performance tradeoffs.
+
+
+                                                  3
+3     SplitZip
+3.1   KV Exponent Entropy
+
+Table 1 characterizes the exponent distribution of KV cache across multiple model families. Despite
+differences in architecture and numerical range, we consistently observe low exponent entropy,
+ranging from 2.89 to 3.59 bits vs. the 8-bit BF16 exponent. The distribution is also highly concen-
+trated, with the most frequent 16 exponent values covering ≥99.3% of all exponent entries across
+all evaluated models, including dense, MoE, and hybrid architectures. Top-8 coverage varies from
+83.5% on Qwen3-30B-A3B to 96.0% on Qwen3-Next-80B-A3B, indicating that a 3-bit codebook is
+less robust across activation distributions. SplitZip therefore uses a Top-16 design (see Sec. 3.4 and
+Sec. 4.3.1 for details).
+
+3.2   Method
+
+SplitZip combines fixed-length exponent coding with explicit escape capture, as illustrated in Figure 1.
+For a BF16 value represented as a 16-bit integer xi , SplitZip extracts
+
+              ei = (xi ≫ 7) & 0xf f,         ai = ((xi ≫ 8) & 0x80) | (xi & 0x7f ),
+where ei is the 8-bit exponent and ai is the exact sign–mantissa byte. Given a decoded exponent êi ,
+the original BF16 bit pattern is reconstructed as
+                          x̂i = ((ai & 0x80) ≪ 8) | (êi ≪ 7) | (ai & 0x7f ).
+
+The sign and mantissa bits are stored losslessly as an 8-bit stream. For the exponent stream, SplitZip
+uses a calibrated codebook containing the 16 most frequent exponent values. Each common exponent
+is encoded using a 4-bit code, and two 4-bit codes are packed into one byte. Exponent values outside
+the top-16 set are treated as escape values. For each escape value, SplitZip records its chunk-relative
+element position as a 16-bit unsigned integer and its raw exponent value as an 8-bit integer.
+Let C = {c0 , . . . , c15 } be the calibrated top-16 exponent set and E = {i | ei ∈     / C} be the escape set.
+For a tensor with N BF16 elements and M = |E| escaped exponents, SplitZip stores
+                                                                                         
+                                       N                                           3
+       BSZ = |{z}     N      +                  +           3M                =N     + 3ϵ       Bytes.
+                                       2                    |{z}                   2
+               sign–mantissa         |{z}         escape positions and values
+                             4-bit exponent codes
+
+Here the ϵ = M/N is the escape rate. Since the uncompressed BF16 tensor uses Braw = 2N bytes,
+the compression ratio is
+                                          Braw       2
+                                     ρ=         = 3       .
+                                          BSZ      2 + 3ϵ
+As escape rates decrease, ρ approaches 4/3 asymptotically.
+The first two terms form the compression path, while the final term is the correction stream. When the
+top-16 exponent coverage is high (covers greater than 99%), M is very small, so the escape overhead
+is negligible compared with the reduction from replacing each 8-bit exponent with a 4-bit code.
+The encoding path contains two stages. The first stage performs the dense transformation: it extracts
+the exponent, maps it through the encoding lookup table, packs two 4-bit codes into one byte,
+and stores the sign–mantissa stream exactly. The second stage scans the original exponent stream
+and compacts all exponents not covered by the top-16 codebook into chunked escape-position and
+escape-value arrays. We use a separate escape-collection stage.
+In practice, we observe that the encoding bottleneck lies in exponent extraction and the packing
+of 4-bit compressed values. To address this, we fuse the four KV encoding process into a single
+kernel through an optimized implementation called Quad64 vectorized encoding. This optimization is
+conceptually similar to loop unrolling in code execution optimization. This improved our throughput
+by 1.5× over the unfused baseline. See Appendix A for more details.
+Decoding follows the reverse order. SplitZip first unpacks each byte into two 4-bit codes, maps each
+code through a 16-entry decoding lookup table, and reconstructs a BF16 bit pattern by combining the
+
+
+                                                      4
+decoded exponent with the stored sign–mantissa bits. Escaped elements may initially decode to an
+incorrect common exponent; SplitZip then overwrites them through the sparse correction stream: for
+each recorded escape position, it overwrites the reconstructed exponent with the exact raw exponent
+value for lossless reconstruction.
+
+3.3   Calibration
+
+Computing an exact exponent histogram during every compression call is expensive, instead, SplitZip
+performs a one-time calibration step on a small representative dataset. During calibration, SplitZip
+extracts all exponent values from the calibration tensors, counts their frequencies, selects the top-16
+exponents, and constructs three lookup tables: an encoding table from exponent values to 4-bit codes,
+a decoding table from 4-bit codes back to exponent values, and a membership table for detecting
+escapes. This removes histogram construction from the online compression path.
+Although the codebook is selected using a calibration dataset, our experiments show that the selected
+high-frequency exponent set generalizes well across inputs.
+
+3.4   Top-16 Instead of Top-15
+
+A natural alternative for identifying escape values is to reserve one codeword as an explicit escape
+token. This top-15-plus-escape-token design allows the decoder to infer escape positions directly
+from the packed exponent-code stream, thereby reducing the escape positions overhead. However,
+this design also reduces the number of directly represented common exponents from 16 to 15 and
+introduces special-case handling into the dense decode path.
+SplitZip instead uses all 16 possible 4-bit codes for common exponent values. Escaped exponents are
+assigned a dummy code in the packed stream to be overwritten using the explicit escape-position
+array. It increases codebook coverage by retaining the 16th most frequent exponent and preserves a
+uniform dense decoding path: every element is decoded by the same 4-bit lookup operation.
+
+4     Experiments
+4.1   Setup
+
+Platform and timing protocol. Experiments are conducted on server with NVIDIA H200 GPU and
+dual-socket Intel Xeon Platinum 8468 CPU. The server includes Mellanox ConnectX-7 MT2910
+InfiniBand/RDMA adapters for high-speed KV transfer, as well as Mellanox ConnectX-4 Lx and Intel
+X550 Ethernet adapters. We report compression and decompression throughput in GB/s, where the
+byte count is the uncompressed BF16 tensor size. Each codec benchmark first verifies bitwise round-
+trip correctness and then times repeated executions after warm-up. Codec throughput is measured
+over 10 runs, and tables report the average with measured fluctuation when available. Mooncake[22]
+transfer experiments report measured KV-transfer time; the Qwen3-32B[27] breakdown uses additive
+accounting for encode, compressed transfer, and decode under the RoCE 4×200G configuration with
+700 Gb/s effective payload bandwidth.
+Datasets and workloads. All main experiments use authentic BF16 KV cache activations. For codec
+and ablation measurements, we use Qwen3-32B KV tensors assembled into a 256M BF16 workload
+on wikitext2-test and use chunked escape-value capture with chunk size 1024 (refer to Appendix D
+for ablation). For Mooncake transfer, we evaluate Llama-3-8B[17] and Qwen3-30B-A3B under four
+sweeps: fixed batchSize 1 with sequence length from 512 to 131K, fixed batchSize 16 with sequence
+length from 128 to 64K, fixed sequence length 1024 with batchSize from 1 to 256, and fixed sequence
+length 32768 with batchSize from 1 to 128. For the Qwen3-32B transmission breakdown, we report
+sequence lengths 2048, 16384, and 65536. We also instrument SGLang on Qwen3-32B with the
+same sweep structure to record TTFT and serving throughput. Unless stated otherwise, the BF16
+Top-16 codebook is calibrated on the WikiText-2[16] training subset.
+Baselines and ablations. For BF16 codec comparison, we evaluate nvCOMP LZ4, nvCOMP
+Cascaded, nvCOMP Bitcomp[19], DFloat11[30], ZipNN[9], ZipServ[7], Falcon[14], and SplitZip.
+For transfer-time studies, the native baseline moves raw BF16 KV cache bytes, while SplitZip
+sends the compressed payload and accounts for encode and decode where applicable. The abla-
+tion suite covers BF16 Top-8 3-bit coding versus Top-16 4-bit coding, explicit escape-position
+
+
+                                                  5
+   Table 2: Comparison of encoding/decoding throughput and compression ratio of various compression
+   methods. SplitZip delivers high codec throughput while maintaining a respectable compression ratio.
+
+                                   Method                      Ratio             Encode(GB/s)          Decode(GB/s)
+                                   nvCOMP LZ4[19]              1.019       13.4 ± 0.4   137.1 ± 8.8
+                                   nvCOMP Cascaded[19]         1.000      111.8 ± 0.8   155.2 ± 5.6
+                                   nvCOMP Bitcomp[19]          1.056      341.5 ± 7.1   147.7 ± 4.8
+                                   ZipNN[9]                    1.515           1.2           1.7
+                                   DFloat11[30]                1.423 4.0e−03 ± 5.0e−05 468.2 ± 2.5
+                                   Falcon[14]                  1.428        8.9 ± 1.8    14.4 ± 3.3
+                                   ZipServ - CPP [7]           1.236    0.1 ± 2.1e−04   499.5 ± 0.0
+                                   ZipServ - Kernel [7]        1.236           N/A     1260.9 ± 1.4
+                                   SplitZip                    1.324      613.3 ± 2.6  2181.8 ± 38.5
+
+                                                                TTFT         Requests/s          Native
+                      (a) BS=1 TTFT                 (b) BS=1 Requests/s                   (c) BS=16 TTFT              (d) BS=16 Requests/s
+Speedup (x)
+
+
+
+
+          1.0                                1.0                                  1.0                          1.0
+          0.5                                0.5                                  0.5                          0.5
+                                                                                  0.0 8 6 2 K K K K            0.0 8 6 2 K K K K
+              512 1K 2K 4K 8K16K32K641K28K    512 1K 2K 4K 8K16K32K641K28K         12 25 51 1 2 4 8             12 25 51 1 2 4 8
+                         Seq Len                         Seq Len                            Seq Len                        Seq Len
+   Figure 2: End-to-end speedup on Qwen3-32B across sequence-lengths with SplitZip in SGLang [6].
+   metadata versus sentinel-only escape discovery, pre-calibrated versus dynamic Top-16 codebooks,
+   per-tensor/per-token/per-channel calibration granularity, chunk-size sensitivity, codec-stage break-
+   down, and codebook stability across layers and between K and V caches. Unless otherwise specified,
+   ablations use Qwen3-32B BF16 KV values.
+
+   4.2            Results
+   Codec-level performance. Table 2 compares SplitZip with existing lossless compressors. The table
+   includes GPU-oriented baselines evaluated during the revision, including nvCOMP LZ4, Cascaded,
+   and Bitcomp, as well as Falcon and ZipServ. For ZipNN, we report the throughput numbers from its
+   original paper. For ZipServ, the CPP row corresponds to its CPU computation kernel, while Kernel
+   corresponds to its GPU computation kernel.
+   SplitZip reaches 613.3 ± 2.6 GB/s encoding and 2181.8 ± 38.5 GB/s decoding, higher than all
+   measured baselines on both encode and decode. Specifically, SplitZip improves encode throughput
+   by 1.8× over nvCOMP Bitcomp and improves decode throughput by 14.1× over nvCOMP Cascaded,
+   the fastest nvCOMP encoder and decoder respectively. Compared with ZipServ, SplitZip removes
+   the CPU-side compression bottleneck and achieves 1.7× higher decode throughput than the GPU
+   kernel path. Falcon is also GPU-optimized, yet SplitZip achieves 68.9× higher encoding throughput.
+   Meanwhile, SplitZip still maintains a strong compression ratio: it is 7.1% higher than ZipServ when
+   including metadata overhead, and only 7.0% lower than DFloat11, a Huffman-based method.
+   We also study performance across multiple GPU generations (details in Appendix E), with SplitZip
+   consistently maintaining the highest encoding throughput, improving over the strongest available
+   encoder by 1.8× to 3.0× depending on the platform. Decoding behavior is more hardware-dependent:
+   SplitZip leads on every platform, but the margin grows on newer GPUs with higher memory band-
+   width. This trend highlights the hardware-friendly nature of SplitZip: its decoding throughput is
+   largely governed by the available GPU memory bandwidth, while the compute portion is sufficiently
+   optimized and does not become the bottleneck.
+   SplitZip can also be extended to FP8 KV caches by adapting the exponent coding scheme to the
+   FP8 format. For E5M2, the 5-bit exponent field can be compressed using 4-bit Top-16 code under
+   the same fixed-code-plus-escape framework as BF16. Although FP8 already halves the KV cache
+   size compared with BF16, leaving less room for additional lossless compression, E5M2 still exposes
+   meaningful exponent redundancy. In our Qwen3-32B workload, E5M2 achieves 1.14× with a 0.16%
+   escape rate. This is approximately 88% of the theoretical maximum compression for E5M2 (from the
+   6.19-bit raw byte entropy). The lower escape rate substantially improves codec throughput: Top-16
+   reaches 249.7 GB/s encoding and 564.9 GB/s decoding throughput. See Appendix C for details.
+
+
+                                                                             6
+                                                                                         Native             SplitZip           Theoretical Opt.
+
+
+
+
+                Mooncake Transfer (ms)
+                                    300         BS=1, Seq Sweep                       BS=16, Seq Sweep                    Seq=1024, BS Sweep               Seq=32768, BS Sweep
+                                                               1.27x                                    1.29x                               1.32x   7500                    1.32x
+                                    200                                     2000                                  400
+Llama-3-8B                                                                                                                                          5000
+                                    100                                     1000                                  200
+                                                                                                                                                    2500
+                                          0                                      0                                     01 2 4 8 6 2 4 8 6              01 2 4 8 6 2 4 8
+                                         512 1K 2K 4K 8K16K32K641K28K           128256512 1K 2K 4K 8K16K32K64K                 1 3 6 12 25                      1 3 6 12
+                                                    Seq Len                                 Seq Len                            Batch Size                      Batch Size
+                Mooncake Transfer (ms)
+
+
+
+                                                BS=1, Seq Sweep                       BS=16, Seq Sweep                    Seq=1024, BS Sweep               Seq=32768, BS Sweep
+Qwen3-30B-A3B
+
+
+
+
+                                                               1.24x                                    1.32x     300                       1.32x                           1.22x
+                                                                            1000                                                                    4000
+                                    100                                                                           200
+                                         50                                  500                                  100                               2000
+
+                                          0                                      0                                     01 2 4 8 6 2 4 8 6              01 2 4 8 6 2 4 8
+                                         512 1K 2K 4K 8K16K32K641K28K           128256512 1K 2K 4K 8K16K32K64K                 1 3 6 12 25                      1 3 6 12
+                                                    Seq Len                                 Seq Len                            Batch Size                      Batch Size
+
+    Figure 3: KV cache transfer time across sequence-length and batch-size sweeps using Mooncake[22].
+                                                                        Native transfer             Encode             Transfer         Decode
+                                                   Seq Len = 2K                                         Seq Len = 16K                                Seq Len = 64K
+     Native                                                               56.5 Native                                         441.4 Native                               1749.3
+      Ours                                                               53.1        Ours                              353.8          Ours                         1397.0
+                                     0           20          40           60                0             200           400                  0      500 1000 1500 2000
+                                                    Time (ms)                                            Time (ms)                                    Time (ms)
+    Figure 4: Transmission-time breakdown on Qwen3-32B. Native transfer sends the raw BF16 KV
+    cache, while SplitZip consists of encoding, compressed transfer, and decoding under RoCE 4 × 200G.
+
+    KV Transfer time. Figure 3 reports the measured Mooncake transfer time for Llama-3-8B and
+    Qwen3-30B-A3B across different batchSize and sequence lengths. Theoretical Opt here represents
+    the theoretically optimal time under the assumption of zero encoding/decoding overhead and the
+    complete absence of any escape values. Across all eight panels, SplitZip consistently reduces
+    Mooncake transfer time once the KV payload becomes large enough for bandwidth to dominate the
+    end-to-end transfer cost. For short sequences, the benefit is smaller because fixed overheads and kernel
+    launch costs account for a larger fraction of the total time. As sequence length increases, however, the
+    transfer time becomes increasingly bandwidth-bound, and the reduction in transferred bytes directly
+    translates into lower latency. At the largest point in each sweep, SplitZip achieves 1.27×–1.32×
+    speedup on Llama-3-8B and 1.22×–1.32× speedup on Qwen3-30B-A3B. These results show that
+    SplitZip provides consistent transfer-time reduction across model architectures and workload scales.
+    Mooncake is the default KV-transfer backend for PD disaggregated serving in SGLang[6], a widely
+    used LLM serving framework, and is therefore representative of practical deployments. We also
+    integrate SplitZip into SGLang and evaluate end-to-end performance across sequence-length sweeps.
+    As shown in Figure 2, SplitZip provides consistent improvements once the workload becomes
+    transfer-dominated at longer sequence lengths, while slight slowdowns can occur in small-payload
+    regimes due to fixed overheads. For batchSize=1 with sequence length ranging from 512 to 128K,
+    SplitZip achieves TTFT speedups up to 1.303× and throughput improvements up to 1.233×. For
+    batchSize=16 with sequence length ranging from 128 to 64K, the TTFT ranges up to 1.274×, while
+    requests throughput improvements up to 1.206×.
+
+
+    Transmission-time breakdown. Figure 4 further breaks down the Qwen3-32B transfer time with
+    batchSize equal to 16. This breakdown uses additive accounting for encode, compressed transfer, and
+    decode time. At sequence length 2K, SplitZip slightly reduces transfer time from 56.5 ms to 53.1 ms.
+    However, the advantage increases with sequence length. At 16K, SplitZip reduces transfer time
+    from 441.4 ms to 353.8 ms. At 64K, it reduces transfer time from 1749.3 ms to 1397.0 ms. In this
+    long-context regime, compressed transfer accounts for 92.9% of the SplitZip time, while encoding
+    and decoding account for only 5.7% and 1.4%, respectively. This confirms that SplitZip keeps codec
+    overhead small enough for long-context KV cache transfer to remain primarily communication-bound.
+
+
+                                                                                                            7
+4.3     Ablation Study
+
+4.3.1    Ablation on Top-k Exponent Coding
+Table 3 compares Top-8 3-bit coding with Top-16 4-bit coding. Top-8 reduces the dense code width,
+but the much larger escape stream overwhelms this saving and lowers the measured compression
+ratio from 1.324× to 1.241×. Encoding throughput is similar for the two variants, while Top-16 is
+3.07× faster in decoding.
+The slowdown of Top-8 comes from both higher escape overhead Table 3: Top-k exponent coding.
+and less GPU-friendly packing. Reducing the codebook from 16
+to 8 entries lowers coverage from 99.84% to 92.11%, increasing    Metric        Top-8  Top-16
+the escape rate from 0.16% to 7.89%. This nearly 50× higher
+                                                                  Code width     3-bit  4-bit
+escape rate increases memory-intensive escape collection and      Coverage     92.11% 99.84%
+sparse overwrite costs. In addition, unlike 4-bit codes which     Ratio        1.241× 1.324×
+can be byte-packed, 3-bit codes do not align naturally with byte- Encode(GB/s)  440.1   613.3
+oriented GPU operations.                                          Decode(GB/s) 710.5   2181.8
+                                                                     Escape rate        7.89%     0.16%
+4.3.2    Ablation on Calibration Dataset
+SplitZip uses a calibrated top-16 exponent Table 4: Cross-dataset calibration coverage. Dataset
+codebook to avoid online histogram construc- A is WikiText-2 train.
+tion. To test whether this codebook is dataset-
+specific, we calibrate on WikiText-2 train and Eval set   Qwen3-32B   Qwen3-Coder-30B  Llama-3-8B
+evaluate coverage on datasets from different             A→B B→B A→B          B→B     A→B B→B
+domains. Table 4 compares cross-dataset cal- WikiText-2 99.83% 99.83% 99.48% 99.48% 99.85% 99.85%
+ibration, denoted A→B, with oracle calibra- HumanEval 99.81% 99.83% 99.44% 99.49% 99.84% 99.85%
+tion on each target dataset, denoted B→B.       GSM8K   99.79% 99.80% 99.41% 99.45% 99.78% 99.79%
+                                               MMLU      99.78% 99.79% 99.38%      99.33%   99.77% 99.80%
+The calibrated exponent set generalizes well. PTB        99.76% 99.76% 99.34% 99.34% 99.73% 99.74%
+Coverage remains higher than 99% across
+all evaluated datasets, and almost matches the oracle result on WikiText-2 test, HumanEval [4],
+GSM8K [5], MMLU [8], and PTB [33] in this run. This shows that high-frequency KV cache
+exponents are stable across domains, enabling SplitZip to use a fixed offline codebook.
+
+4.3.3    Ablation on Calibration Granularity
+Some prior compression designs use finer-grained code- Table 5: Calibration granularity ablation.
+books to improve locality, compression ratio, or paral-
+                                                           Metric     Tensor   Token    Channel
+lelism. We evaluate this idea on per-tensor, per-token and
+per-channel codebooks.                                     Coverage   99.84%   99.90%    99.90%
+                                                             Compression   1.324×       1.324×    1.327×
+Table 5 shows that finer-grained calibration increases top- Encode(GB/s) 613.3     0.082     0.020
+                                                             Decode(GB/s) 2181.8   0.173     0.060
+16 coverage, reaching 99.90% with per-token and per-
+channel codebooks. However, throughput drops by several orders of magnitude: per-token and
+per-channel calibration both fall from hundreds of GB/s to sub-GB/s performance. This is because
+fine-grained calibration requires many small codebooks, introducing extra storage, irregular lookup
+patterns, and more complex GPU execution.
+
+4.3.4    Ablation on Escape-Position Metadata
+We also study whether SplitZip should explicitly store        Table 6: Escape-position ablation.
+escape positions or reserve one code as an escape sen-
+tinel. The sentinel design uses only 15 frequent exponent   Metric         Top-16 + Pos.     Top-15 + Sent.
+values and reserves the remaining 4-bit code to mark es-    Coverage          99.84%             99.73%
+caped elements. This avoids storing explicit chunk-local    Escape rate        0.16%              0.27%
+                                                            Ratio             1.324×             1.331×
+positions and therefore slightly improves the compression   Encode(GB/s)        613.3             396.0
+ratio, from 1.324× to 1.331×. However, this metadata        Decode(GB/s)       2181.8             620.8
+saving comes at a large decoding cost.
+As shown in Table 6, the Top-15 sentinel design reduces decode throughput from 2181.8 GB/s to
+620.8 GB/s, a 3.5× slowdown. The reason is that the decoder can no longer treat all 4-bit codes
+
+
+                                                8
+uniformly. It must inspect the dense code stream to identify sentinel values and then merge escaped
+exponents back into the output, introducing irregular control flow and memory access. In contrast,
+the Top-16 design decodes every element through the same dense lookup path and applies rare escape
+corrections through a separate sparse overwrite. This requires explicit position, making the metadata
+overhead a little higher. SplitZip prioritizes throughput, where the minimal cost of additional metadata
+is amortized by the higher throughput, making Top-16 coding the natural choice.
+
+4.3.5   Ablation on Pre-Calibration
+
+SplitZip’s offline pre-calibrated codebook is compared                        Table 7: Pre-calibration ablation.
+with a dynamic Top-16 variant that rebuilds the exponent
+codebook for each input in Table 7. Dynamic calibration                           Metric           Pre-calib.   Dynamic
+achieves the same compression ratio and escape rate as                            Ratio            1.324×       1.324×
+the pre-calibrated design, and decode throughput is almost                        Escape rate       0.16%        0.16%
+unchanged. However, it substantially slows down online                            Encode(GB/s)       613.3        80.7
+                                                                                  Decode(GB/s)      2181.8       2197.3
+compression: encode throughput drops from 613.3 GB/s
+to 80.7 GB/s, 7.6× slower, because the dynamic variant
+adds an online histogram and top-k selection pass.
+
+4.3.6   Ablation on Layer-Wise Coverage
+
+We further test whether a small number of layers ex- Figure 5: Layer-wise coverage under a fixed
+hibit heavier-tailed exponent distributions that would shared Top-16 codebook on Qwen3-32B.
+increase the escape rate. For Qwen3-32B, we profile
+                                                         64                            61
+                                                          Number of Layers
+BF16 KV caches from all 64 layers, select one shared
+                                                                   K cache   V cache
+Top-16 codebook from the aggregate K-cache distri-       48                                44
+bution and one shared Top-16 codebook from the ag-
+                                                         32
+gregate V-cache distribution, and then apply each fixed
+                                                         16                      13
+codebook back to every layer. Figure 5 reports the re-
+                                                              0  2      1  5   2
+sulting layer-wise coverage histogram. It directly mea-   0
+
+
+
+
+                                                                                                                 .8%
+                                                                              %
+
+
+                                                                                            .5%
+
+
+                                                                                                       .8%
+sures whether the deployed fixed codebook produces
+                                                                             9.0
+
+
+
+
+                                                                                                                99
+                                                                                           -99
+
+
+                                                                                                    -99
+                                                                             <9
+
+
+
+
+low-coverage outlier layers.
+                                                                                       .0-
+
+
+                                                                                                    .5-
+                                                                                     99
+
+
+                                                                                                  99
+
+
+The fixed K-cache codebook is stable across layers: all 64 layers remain above 99.0% coverage, and
+61 layers remain above 99.8%. The V-cache codebook shows a modest lower-coverage tail, with
+two early layers below 99.0% and a worst-layer coverage of 98.77%. However, even this worst case
+corresponds to a 1.23% escape rate, and the median V layer still reaches 99.88% coverage. While
+per-layer codebooks would eliminate this tail, the cost in codebook management and per-layer storage
+might offset the throughput advantage of the global codebook design.
+
+
+5   Conclusion
+
+This paper presents SplitZip, a GPU-friendly lossless compression scheme for KV cache transfer
+in PD disaggregated LLM serving. SplitZip encodes frequent exponent values with fixed-length
+codes, and corrects rare values through an explicit escape stream. Our experiments show that SplitZip
+achieves higher compression and decompression throughput than prior lossless codecs, and translates
+this throughput into end-to-end KV-transfer speedups for long-context workloads.
+SplitZip is most effective when KV cache communication is a major bottleneck; for short contexts or
+compute-bound regimes, codec overhead may outweigh the reduced transfer volume. Its compression
+ratio is also bounded by the redundancy in floating-point exponent values, making it complementary
+to more aggressive lossy or model-aware compression methods. In particular, SplitZip can be applied
+on top of an already-quantized KV cache (e.g., FP8) to recover additional bandwidth savings without
+further accuracy risk, as demonstrated by our E5M2 results.
+SplitZip reduces the cost, latency, and energy footprint of long-context LLM serving without changing
+model outputs. As with any efficiency improvement, this may also increase total deployment volume,
+so it should be used together with appropriate governance.
+
+
+                                                   9
+References
+ [1] Aditya Agrawal, Albert Magyar, Hiteshwar Eswaraiah, Patrick Sheridan, Pradeep Janedula, Ravi Krishnan
+     Venkatesan, Krishna Nair, and Ravi Iyer. Quad length codes for lossless compression of e4m3, 2026. URL
+     https://arxiv.org/abs/2602.17849.
+
+ [2] Aditya Agrawal, Albert Magyar, Hiteshwar Eswaraiah, Patrick Sheridan, Pradeep Janedula, Ravi Krishnan
+     Venkatesan, Krishna Nair, and Ravi Iyer. Single-stage huffman encoder for ml compression, 2026. URL
+     https://arxiv.org/abs/2601.10673.
+
+ [3] Iz Beltagy, Matthew E. Peters, and Arman Cohan. Longformer: The long-document transformer, 2020.
+     URL https://arxiv.org/abs/2004.05150.
+
+ [4] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared Kaplan,
+     Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, Alex Ray, Raul Puri, Gretchen Krueger,
+     Michael Petrov, Heidy Khlaaf, Girish Sastry, Pamela Mishkin, Brooke Chan, Scott Gray, Nick Ryder,
+     Mikhail Pavlov, Alethea Power, Lukasz Kaiser, Mohammad Bavarian, Clemens Winter, Philippe Tillet,
+     Felipe Petroski Such, Dave Cummings, Matthias Plappert, Fotios Chantzis, Elizabeth Barnes, Ariel Herbert-
+     Voss, William Hebgen Guss, Alex Nichol, Alex Paino, Nikolas Tezak, Jie Tang, Igor Babuschkin, Suchir
+     Balaji, Shantanu Jain, William Saunders, Christopher Hesse, Andrew N. Carr, Jan Leike, Josh Achiam,
+     Vedant Misra, Evan Morikawa, Alec Radford, Matthew Knight, Miles Brundage, Mira Murati, Katie Mayer,
+     Peter Welinder, Bob McGrew, Dario Amodei, Sam McCandlish, Ilya Sutskever, and Wojciech Zaremba.
+     Evaluating large language models trained on code, 2021. URL https://arxiv.org/abs/2107.03374.
+
+ [5] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias
+     Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, Christopher Hesse, and John Schulman. Training
+     verifiers to solve math word problems, 2021. URL https://arxiv.org/abs/2110.14168.
+
+ [6] LMSYS Corp. Sglang. https://github.com/sgl-project/sglang, 2026.
+
+ [7] Ruibo Fan, Xiangrui Yu, Xinglin Pan, Zeyu Li, Weile Luo, Qiang Wang, Wei Wang, and Xiaowen
+     Chu. Zipserv: Fast and memory-efficient llm inference with hardware-aware lossless compression.
+     In Proceedings of the 31st ACM International Conference on Architectural Support for Programming
+     Languages and Operating Systems, Volume 2, ASPLOS ’26, page 2264–2280, New York, NY, USA, 2026.
+     Association for Computing Machinery. ISBN 9798400723599. doi: 10.1145/3779212.3790250. URL
+     https://doi.org/10.1145/3779212.3790250.
+
+ [8] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob
+     Steinhardt. Measuring massive multitask language understanding, 2021. URL https://arxiv.org/
+     abs/2009.03300.
+
+ [9] Moshik Hershcovitch, Andrew Wood, Leshem Choshen, Guy Girmonsky, Roy Leibovitz, Ilias Ennmouri,
+     Michal Malka, Peter Chin, Swaminathan Sundararaman, and Danny Harnik. Zipnn: Lossless compression
+     for ai models, 2024. URL https://arxiv.org/abs/2411.05239.
+
+[10] Coleman Richard Charles Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W. Mahoney, Sophia
+     Shao, Kurt Keutzer, and Amir Gholami. KVQuant: Towards 10 million context length LLM inference
+     with KV cache quantization. In The Thirty-eighth Annual Conference on Neural Information Processing
+     Systems, 2024. URL https://openreview.net/forum?id=0LXotew9Du.
+
+[11] Hongyi Jia, Jinghui Zhang, Lu Fang, Stephen Chen, Yan Cui, Ye (Charlotte) Qi, and Zijing
+     Liu. Disaggregated inference at scale with pytorch & vllm. https://pytorch.org/blog/
+     disaggregated-inference-at-scale-with-pytorch-vllm/, September 2025. PyTorch Blog. Ac-
+     cessed: April 26, 2026.
+
+[12] Weiqing Li, Guochao Jiang, Xiangyong Ding, Zhangcheng Tao, Chuzhan Hao, Chenfeng Xu, Yuewei
+     Zhang, and Hao Wang. Flowkv: A disaggregated inference framework with low-latency kv cache transfer
+     and load-aware scheduling, 2025. URL https://arxiv.org/abs/2504.03775.
+
+[13] Yuhong Li, Yingbing Huang, Bowen Yang, Bharat Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle Cai,
+     Patrick Lewis, and Deming Chen. SnapKV: LLM knows what you are looking for before generation. In
+     The Thirty-eighth Annual Conference on Neural Information Processing Systems, 2024. URL https:
+     //openreview.net/forum?id=poE54GOq2l.
+
+[14] Zheng Li, Weiyan Wang, Ruiyuan Li, Chao Chen, Xianlei Long, Linjiang Zheng, Quanqing Xu, and
+     Chuanhui Yang. A high-throughput gpu framework for adaptive lossless compression of floating-point
+     data, 2025. URL https://arxiv.org/abs/2511.04140.
+
+
+                                                     10
+[15] Tengxuan Liu, Shiyao Li, Jiayi Yang, Tianchen Zhao, Feng Zhou, Xiaohui Song, Guohao Dai, Shengen
+     Yan, Huazhong Yang, and Yu Wang. PM-KVQ: Progressive mixed-precision KV cache quantization for
+     long-cot LLMs. In The Fourteenth International Conference on Learning Representations, 2026. URL
+     https://openreview.net/forum?id=Vem6FQvRvq.
+
+[16] Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture models,
+     2016. URL https://arxiv.org/abs/1609.07843.
+
+[17] Meta. The llama 3 herd of models, 2024. URL https://arxiv.org/abs/2407.21783.
+
+[18] NVIDIA. Dynamo. https://github.com/ai-dynamo/dynamo, 2026.
+
+[19] NVIDIA. Nvcomp. https://github.com/NVIDIA/nvcomp, 2026.
+
+[20] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ricardo
+     Bianchini. Splitwise: Efficient generative llm inference using phase splitting, 2024. URL https:
+     //arxiv.org/abs/2311.18677.
+
+[21] Ruoyu Qin, Weiran He, Yaoyu Wang, Zheming Li, Xinran Xu, Yongwei Wu, Weimin Zheng, and Mingxing
+     Zhang. Prefill-as-a-service: Kvcache of next-generation models could go cross-datacenter, 2026. URL
+     https://arxiv.org/abs/2604.15039.
+
+[22] Qin Ruoyu, Li Zheming, He Weiran, Cui Jialei, Tang Heyi, Ren Feng, Ma Teng, Cai Shangming, Zhang
+     Yineng, Zhang Mingxing, Wu Yongwei, Zheng Weimin, and Xu Xinran. Mooncake: A kvcache-centric
+     disaggregated architecture for llm serving. ACM Trans. Storage, nov 2025. ISSN 1553-3077. doi:
+     10.1145/3773772. URL https://doi.org/10.1145/3773772.
+
+[23] Utkarsh Saxena and Kaushik Roy. Kvlinc: Kv cache quantization with hadamard rotation and linear
+     correction. arXiv preprint arXiv:2510.05373, 2025.
+
+[24] vLLM Team. vllm. https://github.com/vllm-project/vllm, 2026.
+
+[25] Zirui Wang, Tingfeng Lan, Zhaoyuan Su, Juncheng Yang, and Yue Cheng. Zipllm: Efficient llm storage
+     via model-aware synergistic data deduplication and compression, 2025. URL https://arxiv.org/abs/
+     2505.06252.
+
+[26] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming language
+     models with attention sinks. In The Twelfth International Conference on Learning Representations, 2024.
+     URL https://openreview.net/forum?id=NG7sS51zVF.
+
+[27] An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao,
+     Chengen Huang, Chenxu Lv, Chujie Zheng, Dayiheng Liu, Fan Zhou, Fei Huang, Feng Hu, Hao Ge,
+     Haoran Wei, Huan Lin, Jialong Tang, Jian Yang, Jianhong Tu, Jianwei Zhang, Jianxin Yang, Jiaxi Yang,
+     Jing Zhou, Jingren Zhou, Junyang Lin, Kai Dang, Keqin Bao, Kexin Yang, Le Yu, Lianghao Deng,
+     Mei Li, Mingfeng Xue, Mingze Li, Pei Zhang, Peng Wang, Qin Zhu, Rui Men, Ruize Gao, Shixuan
+     Liu, Shuang Luo, Tianhao Li, Tianyi Tang, Wenbiao Yin, Xingzhang Ren, Xinyu Wang, Xinyu Zhang,
+     Xuancheng Ren, Yang Fan, Yang Su, Yichang Zhang, Yinger Zhang, Yu Wan, Yuqiong Liu, Zekun
+     Wang, Zeyu Cui, Zhenru Zhang, Zhipeng Zhou, and Zihan Qiu. Qwen3 technical report, 2025. URL
+     https://arxiv.org/abs/2505.09388.
+
+[28] Patrick Yubeaton, Tareq Mahmoud, Shehab Naga, Pooria Taheri, Tianhua Xia, Arun George, Yasmein
+     Khalil, Sai Qian Zhang, Siddharth Joshi, Chinmay Hegde, and Siddharth Garg. Huff-llm: End-to-end
+     lossless compression for efficient llm inference, 2025. URL https://arxiv.org/abs/2502.00922.
+
+[29] Tianyi Zhang, Jonah Wonkyu Yi, Zhaozhuo Xu, and Anshumali Shrivastava. KV cache is 1 bit per
+     channel: Efficient large language model inference with coupled quantization. In The Thirty-eighth Annual
+     Conference on Neural Information Processing Systems, 2024. URL https://openreview.net/forum?
+     id=pNnvzQsS4P.
+
+[30] Tianyi Zhang, Mohsen Hariri, Shaochen Zhong, Vipin Chaudhary, Yang Sui, Xia Hu, and Anshumali
+     Shrivastava. 70% size, 100% accuracy: Lossless LLM compression for efficient GPU inference via
+     dynamic-length float (DFloat11). In The Thirty-ninth Annual Conference on Neural Information Processing
+     Systems, 2025. URL https://openreview.net/forum?id=xdNAVP7TGy.
+
+[31] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong
+     Tian, Christopher Re, Clark Barrett, Zhangyang Wang, and Beidi Chen. H2o: Heavy-hitter oracle for
+     efficient generative inference of large language models. In Thirty-seventh Conference on Neural Information
+     Processing Systems, 2023. URL https://openreview.net/forum?id=RkRrPp7GKO.
+
+
+                                                      11
+[32] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, and Hao Zhang.
+     Distserve: disaggregating prefill and decoding for goodput-optimized large language model serving. In
+     Proceedings of the 18th USENIX Conference on Operating Systems Design and Implementation, OSDI’24,
+     USA, 2024. USENIX Association. ISBN 978-1-939133-40-3.
+[33] Junru Zhou and Hai Zhao. Head-driven phrase structure grammar parsing on penn treebank, 2020. URL
+     https://arxiv.org/abs/1907.02684.
+
+
+
+
+                                                   12
+A    Quad64 Vectorized Encoding
+We further ablate the low-level GPU encoding layout. Table 8: Quad64 vectorization ablation.
+The baseline lossless implementation uses a two-kernel
+encode path: the first kernel performs dense 4-bit ex-           Variant            Encode Speedup
+ponent packing and sign–mantissa extraction, while the                               GB/s
+second kernel scans the original exponent stream and             Scalar pair encode  416.2  1.00×
+collects rare escapes. This design is already fully loss-        Quad64 encode       613.3  1.47×
+less, but its dense path still processes BF16 values at a
+relatively fine granularity, which increases instruction count and memory-store overhead.
+To improve dense-path efficiency, SplitZip uses a Quad64 vectorized encoding kernel. Instead of
+processing BF16 values as individual elements or pairs, Quad64 reinterprets every four BF16 values
+as one 64-bit word. Each program loads one packed 64-bit value, extracts four 16-bit BF16 words,
+maps their four exponents through the 4-bit codebook, packs the four 4-bit codes into two bytes, and
+simultaneously packs the four sign–mantissa bytes into one 32-bit word. This reduces the number of
+memory instructions and makes the dense output streams more naturally aligned for GPU execution.
+For the default chunk size of 1024, Quad64 is further fused with escape counting. The optimized
+kernel not only writes the packed exponent stream and sign–mantissa stream, but also uses a marked
+lookup table to detect uncommon exponents and accumulate per-chunk escape counts. This avoids an
+additional full pass over the input for escape counting on the common path, while still keeping the
+later escape write stage compact and deterministic.
+As shown in Table 8, Quad64 improves encode throughput from 416.2 GB/s to 613.3 GB/s, corre-
+sponding to a 1.47× speedup. This optimization does not change the compression format or the
+lossless reconstruction semantics; it only changes how the dense encode path is mapped to GPU
+memory operations. Therefore, Quad64 is a key implementation optimization that allows SplitZip to
+reach its final high-throughput online compression performance.
+
+B    The Potential of Hiding Codec Overhead with Pipeline Overlap
+In prefill–decode disaggregated serving, KV cache compression, network transfer, and decompression
+can be executed as a streaming pipeline. This is important because the latency of a standalone codec
+kernel does not necessarily translate into additional end-to-end latency: if communication is the
+bottleneck, the encode and decode stages can be overlapped with data transfer.
+Let S denote the raw KV cache size, ρ the compression ratio, Genc the compression throughput,
+Gdec the decompression throughput, and B the physical communication bandwidth for transferring
+compressed bytes. For one pipeline chunk, the three stage times are
+                                  S                   S                 S
+                       Tenc =        ,      Txfer =      ,     Tdec =      .
+                                Genc                 ρB               Gdec
+For a long stream of chunks, the steady-state pipeline time is dominated by the slowest stage:
+                                                                 
+                                                  S      S    S
+                                Tpipe = max           ,    ,        .
+                                                Genc ρB Gdec
+
+The codec overhead is fully hidden when the transfer stage remains the bottleneck, i.e. Txfer ≥
+Tenc and Txfer ≥ Tdec . Equivalently, the maximum physical communication bandwidth for fully
+hiding both encoding and decoding overhead is
+                                              min(Genc , Gdec )
+                                     Bhide =                    .
+                                                     ρ
+Thus, a faster codec increases the range of communication bandwidths under which SplitZip behaves
+as a purely bandwidth-saving transformation with no exposed codec latency.
+In our implementation, SplitZip achieves a compression throughput of Genc = 613.3 GB/s and a
+decompression throughput of Gdec = 2181.8 GB/s. Since compression is the slower codec stage,
+the hiding threshold is determined by Genc :
+                                min(613.3, 2181.8)   613.3
+                       Bhide =                     =       ≈ 463.2 GB/s.
+                                      1.324          1.324
+
+                                                13
+                          Table 9: FP8 codec throughput and compression ratio.
+                          Metric                E4M3           E5M2              E5M2
+                                                Top-8          Top-8             Top-16
+                          Coverage            92.17%           92.28%            99.84%
+                          Ratio vs. FP8       0.933×           1.049×            1.136×
+                          Ratio vs. BF16      1.866×           2.097×            2.273×
+                          Encode(GB/s)       219.6±1.5       221.6±14.6         249.7±0.8
+                          Decode(GB/s)       366.9±2.5        340.8±0.9         564.9±6.5
+                          Escape rate          7.83%            7.72%             0.16%
+
+
+
+Therefore, SplitZip can fully hide its codec overhead as long as the physical communication bandwidth
+is no higher than approximately 463.2 GB/s.
+This threshold is well above the bandwidth of common inter-node communication technologies. For
+example, 400 Gb/s and 800 Gb/s Ethernet correspond to approximately 50 GB/s and 100 GB/s,
+respectively, and PCIe 5.0 x16 provides roughly 64 GB/s per direction. Thus, under typical datacenter
+interconnects, SplitZip’s encoding and decoding overheads can in principle be fully covered by
+communication time. In this regime, SplitZip behaves as a bandwidth-saving transformation rather
+than adding exposed codec latency to the end-to-end prefill–decode transfer path.
+Only very high-bandwidth intra-node GPU fabrics, such as modern NVLink-class interconnects,
+approach or exceed this threshold. In those settings, communication may no longer be the sole
+bottleneck, and codec throughput can again become visible in the end-to-end critical path.
+
+C     SplitZip on FP8
+SplitZip can also be applied to FP8 KV caches by adapting the exponent code width to the FP8 format.
+We consider both E5M2 and E4M3. For E5M2, the 5-bit exponent can be compressed with either
+a 4-bit top-16 code or a 3-bit top-8 code. For E4M3, a 4-bit code would not reduce the exponent
+size, so SplitZip uses a 3-bit top-8 code. FP8 offers less redundancy than BF16 because the original
+representation is already smaller, but the same fixed-code-plus-escape principle still applies.
+Table 9 reports the FP8 results of SplitZip. Since FP8 already halves the KV cache size compared
+with BF16, the remaining lossless compression opportunity is smaller. Nevertheless, SplitZip still
+provides additional compression over native E5M2 FP8. E4M3 Top-8 expands the payload because
+its exponent field is already compact and the escape metadata is too large for this distribution. E5M2
+offers more redundancy, and the Top-16 variant achieves both the highest compression ratio and the
+lowest escape rate.
+The lower escape rate of E5M2 Top-16 also improves throughput: it reaches 249.7 GB/s encoding
+and 564.9 GB/s decoding, compared with 221.6 GB/s and 340.8 GB/s for E5M2 Top-8. This mirrors
+the BF16 trend that reducing escapes is more important than shrinking the dense code width when
+sparse correction dominates the tail cost. We therefore recommend Top-16 as the default FP8 setting
+for the measured Qwen3-32B workload.
+
+D     Ablation on Chunk Size
+We evaluate the sensitivity of SplitZip to the escape-                      Encode         Decode
+                                                         600                                                  2220
+collection chunk size. The chunk size determines the
+                                                                                                              Decode (GB/s)
+                                                                Encode (GB/s)
+
+
+
+
+                                                                                                              2200
+local range used to record escape positions. When the    400                                                  2180
+chunk size is no larger than 256, each escape position                                                        2160
+                                                         200
+can be represented with an 8-bit integer instead of a                                                         2140
+16-bit integer, reducing the metadata cost of the sparse   0
+                                                             1 28 2 56 5 12 1 K   2 K 4 K  8 K 1 6K 3 2K 6 4K
+escape stream. However, this metadata saving comes                              Chunk Size
+at a substantial throughput cost. As shown in Figure 6, Figure 6: Escape value capture chunk-size
+using chunk size 256 reduces encode throughput from ablation.
+613.3 GB/s to 351.3 GB/s. The reason is that smaller chunks increase the number of chunks that
+must be processed, which introduces more per-chunk bookkeeping, more metadata operations, and
+
+
+                                                        14
+Table 10: Codec throughput across different NVIDIA GPUs. The compression ratio is reported using
+the H200 measurement as the reference. Each throughput entry is reported as encoding/decoding
+throughput in GB/s.
+
+      Method                     Ratio       H200               A100              H100                B200
+      nvCOMP LZ4 [19]      1.019 13.4/137.1         6.2/31.7        N/A         25.9/77.6
+      nvCOMP Cascaded [19] 1.000 111.8/155.2       52.1/32.4    101.6/176.3    108.7/109.9
+      nvCOMP Bitcomp [19] 1.056 341.5/147.7       116.4/33.9    290.8/180.4    258.3/111.3
+      ZipNN [9]            1.515      1.2/1.7        1.2/1.7       1.2/1.7        1.2/1.7
+      DFloat11 [30]        1.423 4.0e−03/468.2 4.28e−03/224.3 6.6e−03/496.3 4.108e−03/515.7
+      Falcon [14]          1.428     8.9/14.4        4.3/6.0      8.5/13.3       8.9/15.2
+      ZipServ - CPP [7]    1.236    0.1/499.5      0.073/1.9     0.0796/1.5    0.0449/10.8
+      ZipServ - Kernel [7] 1.236 N/A/1260.9       N/A/791.1     N/A/1156.5     N/A/1493.0
+      SplitZip             1.324 613.3/2181.8    352.5/842.6   579.8/1486.3   637.9/2607.4
+
+Each entry is reported as encode/decode throughput in GB/s. N/A indicates that the corresponding encode or decode path is
+unavailable.
+
+
+
+less efficient escape collection. Although the uint8 escape-position representation slightly reduces
+compressed size, the escape rate is already very low under Top-16 coding, so the absolute metadata
+saving is small.
+Larger chunks do not always improve performance. While chunk size 2048 achieves similar through-
+put to 1024, further increasing the chunk size gradually reduces encode throughput, and very large
+chunks such as 16K or above cause a sharp slowdown. Overall, chunk size 1024 provides the best
+balance between compact metadata, high encode throughput, and high decode throughput.
+In addition, the chunked representation itself is important for decoding efficiency. Recording
+escape positions as chunk-local offsets substantially improves decode throughput; if escape positions
+are instead stored as 32-bit absolute indices, decode throughput drops to 1421.7 GB/s, while the
+representation also risks integer overflow for very large KV tensors. Therefore, considering both
+metadata size and codec throughput, SplitZip uses chunk size 1024 as the default setting.
+
+E     Codec Throughput on More GPUs
+Table 10 shows that SplitZip consistently maintains the highest encoding throughput across all
+evaluated GPUs. Compared with the fastest available encoder, nvCOMP Bitcomp, SplitZip improves
+encoding throughput by 1.8× on H200, 3.0× on A100, 2.0× on H100, and 2.5× on B200. This
+confirms that the fixed-length exponent coding design scales robustly across GPU generations and
+avoids the CPU-side or variable-length encoding bottlenecks observed in prior lossless compressors.
+For decoding, SplitZip also achieves the best throughput in all settings, but the relative gain depends
+more strongly on the underlying hardware. This is because the decode path is largely memory-
+movement bound: once the implementation approaches the hardware communication/memory-
+bandwidth limit, further algorithmic improvements provide diminishing returns. As a result, on
+A100 and H100, where ZipServ’s kernel decoder already reaches a high fraction of the attainable
+bandwidth, SplitZip provides a relatively modest decode advantage. In contrast, on newer GPUs
+with higher bandwidth and stronger memory subsystems, SplitZip continues to scale: on B200, it
+reaches 2607.4 GB/s decoding throughput, achieving a much larger advantage over ZipServ Kernel’s
+1493.0 GB/s. These results suggest that SplitZip’s lightweight and highly parallel decoding design
+is especially beneficial on modern high-bandwidth GPUs, where the codec can better exploit the
+available hardware throughput.
+
+F    Lossless check
+We verify that SplitZip is strictly lossless by reconstructing the KV cache and comparing the resulting
+model outputs against the uncompressed baseline. As shown in Table 11, across context lengths
+from 128 to 2840 tokens, SplitZip achieves exact text match, zero reconstruction errors, and zero
+measured logit difference. This confirms that SplitZip preserves the BF16 KV cache bitwise and does
+not introduce any numerical deviation in model execution.
+
+
+                                                           15
+Table 11: Lossless BF16 correctness across context lengths. All rows reconstruct the KV cache
+bitwise and produce zero measured logit difference.
+                          Tokens   Text match    Max logit diff   Errors
+                            128       Yes            0.000000       0
+                            256       Yes            0.000000       0
+                            494       Yes            0.000000       0
+                            970       Yes            0.000000       0
+                           1939       Yes            0.000000       0
+                           2840       Yes            0.000000       0
+
+
+
+
+                                                16
+

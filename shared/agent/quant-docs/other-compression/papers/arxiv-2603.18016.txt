@@ -1,0 +1,1435 @@
+                                                  M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+
+                                                         Zhenwei Tang 1 2 * Arun Verma 2 * Zijian Zhou 2 3 Zhaoxuan Wu 2 Alok Prakash 2
+                                                                             Daniela Rus 4 2 Bryan Kian Hsiang Low 3 2
+
+
+                                                                 Abstract                                     which the target model then verifies in parallel. This parallel
+                                                                                                              verification allows SD to achieve higher generation through-
+                                             Speculative decoding (SD) accelerates large lan-
+                                                                                                              put than conventional autoregressive decoding when most
+                                             guage model inference by using a smaller draft
+arXiv:2603.18016v3 [cs.CL] 1 Sep 2026
+
+
+
+
+                                                                                                              drafted tokens are accepted. However, the effectiveness
+                                             model to propose draft tokens that are subse-
+                                                                                                              of SD is highly sensitive to the acceptance rate of drafted
+                                             quently verified by a larger target model. How-
+                                                                                                              tokens, as drafting introduces additional computational over-
+                                             ever, the performance of standard SD is often lim-
+                                                                                                              head, frequent rejections can negate its benefits, and even
+                                             ited by the strictly sequential execution of these
+                                                                                                              make SD slower than standard autoregressive decoding.
+                                             drafting and verification stages. To address this,
+                                             this paper proposes M INE D RAFT, a batch parallel               Prior work has improved the verification success rate (VSR)
+                                             speculative decoding (PSD) framework designed                    of draft tokens through methods such as specialized draft-
+                                             to effectively hide drafting latency by overlapping              ing models (Cai et al., 2024; Li et al., 2024a), tree-based
+                                             it with verification. Our theoretical analysis shows             drafting (Wang et al., 2025), and active draft token selec-
+                                             that PSD is substantially more efficient than stan-              tion (Wu et al., 2025). While these methods increase the
+                                             dard SD. M INE D RAFT realizes the PSD through                   overall VSR, they often lengthen the drafting stage due
+                                             a novel batch-parallel design that maintains two                 to increased model complexity (Cai et al., 2024; Li et al.,
+                                             batches of requests, overlapping drafting for one                2024a) or sampling overhead (Wang et al., 2025; Wu et al.,
+                                             batch with verification for the other. Our experi-               2025). In standard speculative decoding, drafting and verifi-
+                                             mental results show significant improvements of                  cation are executed sequentially, placing drafting directly
+                                             M INE D RAFT in both throughput (up to 75%) and                  on the critical path and fundamentally limiting achievable
+                                             end-to-end latency (up to 39%) over standard SD.                 speedups. This observation motivates parallelizing the two
+                                             Furthermore, we have implemented M INE D RAFT                    phases: since the draft model is typically much smaller than
+                                             as a plugin for vLLM, demonstrating its prac-                    the target model, its computation can be effectively over-
+                                             ticality for production-ready inference systems.                 lapped with the target model’s verification. By parallelizing
+                                             The code is publicly available in the MineDraft                  the drafting and verification stages, a smaller draft model
+                                             GitHub repository.                                               can generate draft tokens without blocking the verification
+                                                                                                              process. When combined with an effective drafting mecha-
+                                                                                                              nism, parallel speculative decoding hides drafting latency
+                                        1. Introduction                                                       and yields improved overall inference performance.
+                                        Speculative decoding (SD) (Leviathan et al., 2023; Ryu &              Since the verification stage inherently depends on the out-
+                                        Kim, 2024; Xia et al., 2024) is a popular method used for             puts of the drafting stage, implementing parallelism in spec-
+                                        accelerating large language model (LLM) inference. In-                ulative decoding is nontrivial (Leviathan et al., 2023). Ex-
+                                        stead of generating tokens sequentially with the target large         isting methods (Wang et al., 2024; Xiao et al., 2024; Timor
+                                        model, SD uses a typically smaller and faster draft model to          et al., 2025) typically break this dependency at the cost of
+                                        autoregressively draft (propose) a short sequence of tokens,          substantial additional resources, such as increased GPU or
+                                           *
+                                                                                                              memory usage (Wang et al., 2024; Timor et al., 2025), or
+                                             Equal contribution 1 College of Computing and Data Sci-          require a dedicated training stage for the draft model (Xiao
+                                        ence, Nanyang Technological University, Republic of Singapore
+                                        2
+                                          Singapore-MIT Alliance for Research and Technology Centre           et al., 2024). While Liu et al. (2025a) propose a method that
+                                        3
+                                          Department of Computer Science, National University of Singa-       parallelizes drafting and verification for a single request us-
+                                        pore, Republic of Singapore 4 CSAIL, MIT, Cambridge, MA, USA.         ing pre-verify and post-verify strategies, scaling this method
+                                        Correspondence to: Arun Verma <arun.verma@smart.mit.edu>.             to batched requests (multi-request) remains challenging.
+                                                                                                              Moreover, its performance degrades when prerequisites for
+                                        Proceedings of the 43 rd International Conference on Machine
+                                        Learning, Seoul, South Korea. PMLR 306, 2026. Copyright 2026          post-verification are not satisfied, a limitation that becomes
+                                        by the author(s).                                                     especially severe in batched request settings.
+
+                                                                                                          1
+                                         M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+            Legend                  Standard SD Pipeline                       • Experimental results. In Sec. 6, we evaluate the per-
+           Drafting     Process 1                                 ……             formance of M INE D RAFT through comprehensive exper-
+                                                                                 iments across existing SD methods. Our results show
+        Communication               MineDraft Pipeline
+                                                                                 that M INE D RAFT achieves average throughput gains of
+         Veri ication   Process 2
+                                                                  ……             up to 75% and reduces end-to-end latency by up to 39%
+                        Process 1        Idle     Idle     Idle
+                                                                                 compared to standard SD, at the cost of one extra GPU.
+                                                                  Time
+
+    Figure 1. MineDraft parallelizes drafting and verification: a              • M INE D RAFT as a vLLM plugin. We develop a plug-
+    draft model generates tokens while the target model simultane-               and-play vLLM plugin that implements M INE D RAFT, en-
+    ously verifies the previously generated draft tokens, thereby hiding         couraging further academic research and experimentation.
+    drafting latency and improving overall inference throughput.
+                                                                                 The plugin also supports continuous batching (iteration-
+f
+
+
+    This paper presents M INE D RAFT, a framework for batch                      level scheduling) (Yu et al., 2022) and is fully compatible
+    parallel speculative decoding (PSD) that systematically par-                 with PagedAttention (Kwon et al., 2023), highlighting its
+    allelizes the drafting and verification stages to hide drafting              significant practical impact and ease of use.
+    latency and thereby accelerate LLM inference. We provide a
+    theoretical justification showing that PSD outperforms stan-               2. Related Work
+    dard SD by efficiently utilizing additional computational
+    resources through parallel drafting and verification. To effi-             Speculative decoding. SD has been receiving increasing at-
+    ciently parallelize drafting and verification, our framework               tention as an effective method to accelerate LLM inference
+    uses a novel batch-parallel design that maintains two batches              by decomposing autoregressive decoding into a drafting
+    of requests, overlapping drafting for one batch with verifica-             phase and a verification phase (Leviathan et al., 2023; Ryu &
+    tion for the other. The name of our framework is inspired                  Kim, 2024; Xia et al., 2024). Prior work has focused on im-
+    by the Minecraft game engine, which loads the next ‘chunk’                 proving SD performance in both single-request settings (Cai
+    of blocks (the next set of draft tokens) into the game world               et al., 2024; Cheng et al., 2024; Zhang et al., 2024; Li et al.,
+    while the player is still interacting with the current blocks              2025; Oliaro et al., 2025) and batch-request settings (Li
+    (verifying the current drafted tokens). This ‘background                   et al., 2026; Liu et al., 2025b; Wu et al., 2025), primarily
+    loading’ is exactly how M INE D RAFT hides drafting latency.               by improving drafting efficiency. In contrast, M INE D RAFT
+                                                                               explores an orthogonal direction by parallelizing the draft-
+    Since M INE D RAFT is agnostic to the strategies for generat-
+                                                                               ing and verification phases, allowing easy integration with
+    ing and selecting draft tokens, it can be combined with exist-
+                                                                               existing methods to further improve SD performance.
+    ing SD methods such as EAGLE (Li et al., 2024a;b; 2025),
+    PEARL (Liu et al., 2025a), and TETRIS (Wu et al., 2025),                   Parallel speculative decoding. Recent work has explored
+    and is orthogonal to most LLM inference optimization tech-                 reducing drafting overhead through parallelism. Parallel
+    niques, including forward-pass modifications, model par-                   SD methods achieve faster decoding at the cost of substan-
+    allelism, and draft models. Our experimental results show                  tial GPU resources, such as increased VRAM consump-
+    that M INE D RAFT outperforms standard SD by achieving                     tion (Wang et al., 2024; Timor et al., 2025). Another promis-
+    average throughput gains and reducing end-to-end latency                   ing direction is parallel decoding with tree attention, which
+    at the cost of only 1 additional GPU, highlighting its sig-                accelerates SD by drafting multiple tokens in parallel (Cai
+    nificant practical impact. Furthermore, M INE D RAFT is                    et al., 2024; Li et al., 2024a). In addition, prior work focuses
+    implemented as a plugin for the production-ready inference                 on the single-request setting and modifies the SD process to
+    library vLLM (Kwon et al., 2023). The specific contribu-                   generate variable-length drafts, thereby reducing synchro-
+    tions of this paper are summarized as follows:                             nization overhead between the drafter and verifier (Liu et al.,
+     • Theoretical efficiency of PSD. In Sec. 4, we first present              2025a). Whereas M INE D RAFT adopts a new parallelism
+       a theoretical analysis of batch PSD, demonstrating that it              paradigm, Batch Parallelism, requiring only one additional
+       achieves a 37.9% reduction in inference time compared                   GPU over standard SD, balancing resource usage with re-
+       to standard SD under mild assumptions about the quality                 duced overhead, and eliminating a dedicated training stage.
+       and acceptance rate of the draft model.                                 Adaptive drafting. Under many concurrent requests, stan-
+     • A framework for batch PSD. In Sec. 5, we propose a                      dard SD can have suboptimal performance when using long
+       novel framework, M INE D RAFT, for batch PSD that main-                 speculative lengths, as the increased number of draft to-
+       tains two batches of requests, overlapping drafting for one             kens places significant pressure on the verification stage.
+       batch with verification for the other. To enable parallel ex-           To mitigate this issue, adaptive drafting strategies generate
+       ecution, M INE D RAFT runs the draft model on a separate                variable-length drafts and selectively verify only the most
+       GPU and employs direct GPU-to-GPU communication to                      promising tokens. EAGLE-2 (Li et al., 2024b) adopts this
+       transfer draft tokens to the target model, which runs on                approach by expanding and reranking a context-aware draft
+       GPUs separate from the draft model.                                     tree. Other heuristics include selecting drafts with the high-
+
+                                                                           2
+                               M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+est likelihood of acceptance within a batch (Wu et al., 2025)             4. Theoretical Efficiency of PSD
+and choosing among drafts generated by different specula-
+tive methods based on their historical acceptance rates (Hou              To highlight the fundamental differences between SD and
+et al., 2025). Additionally, AdaSpec (Huang et al., 2025)                 PSD, we present an analysis under the constraint that the
+dynamically controls the execution of the draft model based               number of tokens sent for verification at each step is fixed.
+on estimated draft quality and generation speed. Despite                  Drafting Pareto frontier. Let f : R+ → [0, 1] denote the
+these advances, existing adaptive drafting methods yield                  Pareto frontier of the draft model, characterizing the maxi-
+limited performance gains: the number of draft tokens that                mum achievable verification success rate given a drafting
+can be generated remains constrained, as excessive drafting               time budget. The function f can be modified by changing
+quickly makes verification overhead prohibitive.                          the draft model or by applying speculating techniques such
+                                                                          as Medusa (Cai et al., 2024), EAGLE (Li et al., 2024a), and
+3. Preliminaries                                                          TETRIS (Wu et al., 2025). Our goal is to compare the infer-
+Speculative decoding (SD). We consider the standard SD                    ence time of SD, denoted by TSD , and that of PSD, denoted
+setting, which involves a small draft model (the drafter)                 by TPSD . For simplicity, we ignore the time required to draft
+and a large target model (the verifier). At each SD step, the             the first batch of requests in the PSD analysis.
+drafter first generates a sequence of draft tokens, after which           Analysis. We assume that the drafting time per step is
+the verifier evaluates them in parallel to decide whether to              a constant t. Let R denote the total number of tokens to
+accept or reject them (i.e., verification), and then produces             be generated across all requests. Under standard SD, the
+the final output. Standard SD does not allow parallelization              expected inference time incurred is
+between drafting and verification, since the verification in-                                        hP              i
+                                                                                                         T
+herently depends on the prior availability of the draft tokens.                        TSD := min E      s=1 (t + V ) ,
+                                                                                                  t
+Parallel speculative decoding (PSD). We consider a vari-
+ant of PSD that systematically parallelizes the drafting and              where T is a random variable representing the number of
+verification stages. By overlapping these stages, the draft               steps required to generate responses for all requests such
+model generates tokens for one batch of requests while the                that E[T ] = R/f (t). The term V denotes the verification
+target model simultaneously verifies the draft tokens from                time per step, which we assume to be a constant since the
+another batch, thereby effectively hiding drafting latency                number of tokens submitted for verification is fixed. In
+and providing a significant speedup over standard SD.                     practice, f is typically an increasing function of t. On the
+                                                                          other hand, under PSD, the drafting and verification times
+Notations. We consider an LLM inference service provider                  overlap, resulting in the expected inference time
+with a fixed capacity C, representing the maximum number                                   " T             #
+of tokens its computing resources can process in parallel                                    X                       R max(V, t)
+at each decoding step. In practice, this capacity depends                  TPSD := min E         max(V, t) = min                  .
+                                                                                      t
+                                                                                             s=1
+                                                                                                                  t      f (t)
+on the service provider’s server configuration. At each de-
+coding step, the server processes a batch of m requests
+r1 , r2 , · · · , rm . Each request ri is associated with a par-          Under a mild assumption on f , we have the following result.
+tially generated sequence Si,ℓi = (di,1 , . . . , di,ℓi ), where ℓi
+represents the number of tokens generated so far for request              Theorem 1. Let f (t) = 1−e−αt for some constant α ∈ R+ .
+ri . We allow a variable draft window size for each request,              For αV ≈ 2.23, we have TSD ≳ 1.61 TPSD .
+i.e., ki for request ri . At decoding step s, the draft model
+S drafts and selects a set Ds := {(i, j)|i ∈ {1, . . . , m}, j ∈          This result shows that the guaranteed reduction in inference
+{ℓi + 1, . . . , ℓi + ki }}, such                                         time is maximized at αV ≈ 2.23, where PSD achieves a
+                              Pmthat the total number of selected
+tokens satisfies |Ds | = i=1 ki = C.                                      (1.61 − 1)/1.61 ≈ 37.9% reduction compared to standard
+                                                                          SD. Since larger values of α yield stronger diminishing
+Average throughput. Let 1i,j be an indicator variable that                returns in the verification success rate, the quantity αV
+equals 1 if the token (i, j) ∈ Ds is verified, 0 otherwise.               can be interpreted as a proxy for the expected number of
+The average throughput is defined as the total number of                  accepted tokens per verification step. From this perspective,
+verified tokens generated over T steps, divided by the total              any method with an improved Pareto frontier for f results in
+time τ required to complete these steps:                                  more accepted tokens per step, thereby making PSD more
+                    PT
+           G := τ −1 s=1 ( (i,j)∈Ds 1i,j + m).
+                            P
+                                                                          effective than standard SD. Finally, note that the theoretical
+                                                                          upper bound on the improvement is 50%, corresponding
+End-to-end latency (E2EL). The end-to-end latency is de-                  to the idealized case in which drafting is perfectly hidden
+fined as the average time from request arrival to completion              within the verification time and therefore contributes no
+across a set of requests under the SD inference system.                   additional delay to the critical path.
+
+                                                                      3
+                                 M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+ Requests                                                                                                   Drafter               vLLM Executor
+
+           Preempt by recompute: Assign Batch ID
+                                                          vLLM step            Batch   Batch        Batch        Batch        Batch        Batch
+                                                                                 0       1            0            1            0            1          ⋯
+                                                                                                                                                        Time
+     Waiting                                                                                   s₁           s₂           s₃           s₄           s₅
+                         Assign Batch ID                                                  Draft                     Target Sampler Output
+                                     Recycle
+ Scheduler                Finished
+                                     Batch ID
+                                              Running
+                                                             Output                    Batch        Batch        Batch        Batch        Batch
+                         Assign Batch ID                                                 0            1            0            1            0           ⋯
+    Swapped
+                                                                                                                                                        Time
+                                                                                               s₁           s₂           s₃           s₄           s₅
+
+               Preempt by swap: Assign Batch ID
+   Invoke Batch Manager to
+                                                                                                            Verifier
+                                                              Alternate
+       Assign Batch ID /        Assigned Batch ID
+                                                             batch state
+       Recycle Batch ID
+
+                                                           Batch Manager
+Figure 2. Architecture overview of M INE D RAFT. (Left) The Scheduler manages request life-cycles and batch IDs by coordinating
+with the Batch Manager, which maintains two batches to enable parallelism in M INE D RAFT. (Right) Parallel execution timeline of
+the Drafter and Verifier across speculative decoding (SD) steps. Magenta blocks/arrows denote broadcast of drafts from the Drafter
+to the Verifier, while dark green blocks/arrows denote point-to-point dispatch of target sampler outputs from the Verifier to the Drafter.
+Ticks indicate synchronization points between SD steps. During the initial SD step (before s1 ), the Drafter sequentially drafts Batch 0,
+broadcasts drafts to the Verifier, then drafts Batch 1. At the same time, the Verifier immediately processes Batch 0 upon receipt and returns
+outputs to the Drafter. In subsequent SD steps, the two batches alternate roles between drafting and verification, enabling overlapped
+execution. Batch alternation is triggered when the Drafter returns outputs to the Scheduler at the end of each SD step.
+
+5. M INE D RAFT: A Framework for Batch                                     whose batch ID differs from skip_batch, is the target
+   Parallel Speculative Decoding                                           batch, whose draft tokens are verified concurrently in the
+                                                                           same SD step. At initialization, balance is set to 0, in-
+We illustrate the overall architecture of M INE D RAFT in                  dicating equal batch sizes, and skip_batch is set to 1,
+Fig. 2, which consists of a Batch Manager, a Scheduler, a                  designating Batch 1 as the initial draft batch.
+Drafter, and a Verifier. Our parallelism follows a simple
+principle: at the beginning of each SD step, we regroup                    Batch ID assignment. In the first SD step, the assign
+requests by filtering out those verified in the previous step,             operation assigns a batch ID to each new running request
+allowing the Verifier to continue operating in parallel with               and serves as a load-balancing mechanism between the two
+the Drafter. To fully utilize the Verifier, if it processes                batches. If balance ≥ 0, indicating that Batch 1 has at
+m requests per step, we maintain 2m requests partitioned                   least as many requests as Batch 0, the request is assigned
+into two batches and alternate between them, sending m                     to Batch 0 and balance is decremented. Otherwise, if
+requests to the Verifier at each SD step. We describe the role             balance < 0, the request is assigned to Batch 1 and
+of each component below and provide a concrete example                     balance is incremented. This assignment rule maintains
+of a M INE D RAFT execution in Sec. C.2.                                   a balanced workload between the two batches.
+                                                                           After the first SD step, assuming both batches have reached
+5.1. Batch Manager                                                         their capacity of m requests, new running requests are as-
+                                                                           signed to the current skip_batch to ensure verification
+State variables and initialization. Given a maximum
+                                                                           occurs only when draft tokens are available. This policy typ-
+of m requests processed per step, the system supports
+                                                                           ically preserves balance between the two batches, since after
+up to 2m concurrent requests, which the Batch Manager
+                                                                           the first SD step, a waiting request can be scheduled only
+organizes into two batches. Each running request is as-
+                                                                           when a request in the target batch finishes. However, excep-
+signed a batch ID, either 0 or 1, indicating membership in
+                                                                           tional terminations due to preemption or abort can disrupt
+Batch 0 or Batch 1, respectively. The imbalance between
+                                                                           this balance. Moreover, when chunked prefill is enabled, the
+the two batches is tracked by a state variable balance,
+                                                                           Batch Manager may receive fewer than 2m requests from
+defined as the difference in their sizes: balance =
+                                                                           the Scheduler in the first SD step, resulting in batch sizes
+|Batch 1| − |Batch 0|. A positive balance indicates that
+                                                                           that fall below the capacity m. As subsequent requests are
+Batch 1 contains more requests, in which case new requests
+                                                                           consistently assigned to the draft batch, this initial shortfall
+are assigned to Batch 0 for re-balancing; a negative value
+                                                                           can lead to an irrecoverable workload imbalance between
+indicates the opposite. At each SD step, the state variable
+                                                                           the two batches, degrading the expected performance gains
+skip_batch identifies the batch undergoing parallelized
+                                                                           of M INE D RAFT. We further discuss the implications of this
+drafting, referred to as the draft batch. The remaining batch,
+
+                                                                      4
+                             M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+limitation and possible mitigation in Sec. A.                          KV blocks for all of them. Under Batch Parallelism, this
+                                                                       causes redundant allocations for requests in the draft batch,
+Batch ID recycling. The recycle operation is invoked
+                                                                       which are drafted but not verified, leaving allocated blocks
+when a request is finished, preempted, or aborted. It takes
+                                                                       accessed but unwritten. We patch the vLLM scheduler’s
+the batch ID b of the terminated request as input, and up-
+                                                                       KV block allocation logic to maintain compatibility with
+dates balance to reflect the new distribution of requests.
+                                                                       PagedAttention and avoid unnecessary memory allocation.
+If the request belonged to Batch 0 (b = 0), balance is
+incremented; if it belonged to Batch 1 (b = 1), balance                Scheduler patch. To implement this patch, we introduce a
+is decremented. This update is the inverse of the assign               set, has_deferred, that tracks request IDs for which KV
+operation, preserving consistency of balance.                          block allocation skipping has been deferred. The modified
+                                                                       allocation logic proceeds as follows. If Batch 0 or Batch 1
+5.2. Drafter and Verifier                                              is empty, the Scheduler allocates KV blocks for all running
+                                                                       requests, except for the first occurrence of this condition.
+Start-up of parallelism. Batch Parallelism uses a Drafter              When both batches are non-empty, KV blocks are allocated
+and a Verifier. In the first SD step, the Drafter generates            for prefill requests to support the next prefill iteration. For
+drafts for the target batch and sends them to the Verifier.            requests in the decoding stage, KV blocks are allocated if
+While the Verifier processes the target batch, the Drafter             the request ID is not in has_deferred or if the request
+concurrently proposes draft tokens for the draft batch. After          belongs to the current draft batch; otherwise, allocation is
+verification, the Verifier returns the sampled tokens and prob-        skipped. After this decision, the request ID of each decoding
+ability distributions (target sampler output) to the Drafter.          request is added to has_deferred. This ensures that KV
+Batch state alternation. At the end of each SD step, the               block allocation is not inadvertently skipped for requests in
+Verifier sends the target sampler’s output to the Drafter,             the target batch during the first SD step.
+which processes it and returns the output to the Sched-
+uler. We refer to the moment when the Drafter returns                  6. Experiments
+output to the Scheduler as a sync point. At each sync point,
+skip_batch is alternated with the other batch. After                   We evaluate the effectiveness of M INE D RAFT using the
+the first SD step, the Verifier verifies the target batch corre-       performance metrics introduced in Sec. 3, namely average
+sponding to the previous step’s draft batch, while the Drafter         throughput (tokens/second or tokens/s) and end-to-end la-
+concurrently proposes draft tokens for the new draft batch,            tency (milliseconds or ms). In addition to demonstrating the
+which corresponds to the previous step’s target batch.                 performance gains of M INE D RAFT, our empirical results
+                                                                       show that M INE D RAFT can further improve speculative
+Fallback mechanism. A corner case arises when one batch                decoding by integrating existing drafting techniques.
+becomes empty as requests are finished and no new requests
+arrive. In this case, Batch Parallelism falls back to standard         Model settings. We consider seven target–draft model
+SD if draft tokens of the target batch are unavailable. This           configurations, listed below. In all settings, the target model
+exposes a native limitation of M INE D RAFT: when the two              is served with tensor parallelism set to four, while a single
+batches cannot be replenished to maintain balance, it eventu-          GPU is dedicated to serving the draft model. Additional
+ally leads to an empty batch and degrades performance. We              setup details are provided in Sec. C.1.
+discuss this limitation and a potential mitigation in Sec. A.          • Settings 1–4 use Qwen3-32B (Yang et al., 2025) as the
+                                                                         target model with different draft models: Qwen3-0.6B
+5.3. Scheduler                                                           (Setting 1), Qwen3-1.7B (Setting 2), Qwen3-4B (Set-
+KV block management. In PagedAttention, a KV block                       ting 3), Qwen3-8B (Setting 4). All are served on 5 L40S
+stores the key–value vectors for a fixed number of tokens,               GPUs with m = 16.
+defined by the KV block size (B). KV blocks associated                 • Setting 5 pairs Llama-3.3-70B-Instruct-AWQ-
+with a request need not be contiguous in physical mem-                   INT4 (Ibanez, 2024) as the target model with
+ory, allowing flexible memory management (Kwon et al.,                   Llama-3.1-8B-Instruct (Grattafiori et al., 2024) as
+2023). Before token generation, the Scheduler allocates the              the draft model, served on five H100 GPUs with m = 64.
+required KV blocks for each running request.                           • Settings 6 and 7 use vicuna-33b-v1.3 and vicuna-13b-
+                                                                         v1.3 (Zheng et al., 2023) as the target models, re-
+Over-allocation issue in default scheduler. We observe                   spectively, paired with EAGLE-Vicuna-33B-v1.3 and
+that during drafting, the Drafter accesses newly allocated               EAGLE-Vicuna-13B-v1.3 (Li et al., 2024a) as the draft
+KV blocks without populating them, whereas during verifi-                model, respectively. These settings are served on five
+cation, the Verifier computes and writes KV caches to the                L40S GPUs with m = 16.
+allocated blocks. The default vLLM scheduler assumes that
+all running requests are generated in each step and allocates          Datasets.    Following the experimental settings of prior
+
+                                                                   5
+                                      M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+                              Arena                    ShareGPT                     Spec-Bench                        Tough
+ Qwen3 32B-0.6B
+
+
+
+
+                  (a)   ↑ 42.36%, ∆ 70.32% (b)    ↑ 47.28%, ∆ 64.05% (c)        ↑ 45.02%, ∆ 62.87% (d)         ↑ 40.59%, ∆ 57.95%
+ Qwen3 32B-1.7B
+
+
+
+
+                  (e)   ↑ 38.62%, ∆ 69.19% (f)   ↑ 47.35%, ∆ 62.36% (g)         ↑ 40.90%, ∆ 62.80% (h)        ↑ 48.47%, ∆ 75.68%
+ Qwen3 32B-4B
+
+
+
+
+                  (i)   ↑ 53.55%, ∆ 75.12% (j)    ↑ 65.02%, ∆ 65.64% (k)        ↑ 49.88%, ∆ 64.65% (l)        ↑ 51.06%, ∆ 70.98%
+Figure 3. Throughput comparison against baseline methods across Settings 1–3. ↑ indicates the average improvement over the best
+baseline method. ∆ indicates the maximum average gap between M INE D RAFT and standard SD. More details about ↑ and ∆ are provided
+in Sec. C.3. M INE D RAFT consistently outperforms baselines, improving average throughput by up to 65.02% over the best-performing
+baseline and by up to 75.68% over standard SD.
+
+
+work (Hou et al., 2025; Oliaro et al., 2025; Wu et al.,                   65.02%, with maximum gains over standard SD ranging
+2025), we evaluate M INE D RAFT on ShareGPT (Anon,                        from 57.95% to 75.68%. These results show M INE D RAFT
+2023) (Apache License 2.0), Arena (Zheng et al., 2023)                    consistently outperforms all baselines across all model set-
+(CC), LLM-Tough-Questions (Tough) (YAV-AI, 2024) (MIT                     tings and datasets. For all experimental results, we report
+License), and Spec-Bench (Xia et al., 2024) (Apache Li-                   the mean and standard deviation over three independent
+cense 2.0), to robustly assess the applicability of M INE -               trials unless otherwise specified. We omit PEARL from sub-
+D RAFT across a diverse range of scenarios.                               sequent throughput comparisons, as it exhibits substantially
+                                                                          lower efficiency than M INE D RAFT in preceding evaluations.
+6.1. Comparison against Baselines.                                        Issue with extreme k value. Notably, increasing the num-
+We measure the average throughput of M INE D RAFT and                     ber of draft tokens per step is not always beneficial: exces-
+establish baselines, including PEARL (Liu et al., 2025a)                  sive drafting can cause the draft stage to dominate verifi-
+and standard SD. As shown in Fig. 3, M INE D RAFT im-                     cation time, thereby negating the benefit of hiding drafting
+proves throughput over the best baseline by 38.62% to                     latency via PSD. This effect is particularly significant for
+                                                                          large draft models and is further analyzed in Sec. C.6.
+
+                                                                      6
+                                               M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+                                       Arena                     ShareGPT                    Spec-Bench                        Tough
+    Llama-3 70B-8B
+
+
+
+
+                          (a)    ↑ 25.57%, ∆ 28.68% (b)      ↑ 30.81%, ∆ 37.06% (c)       ↑ 21.73%, ∆ 27.73% (d)         ↑ 25.81%, ∆ 30.89%
+       Vicuna 33B-EAGLE
+
+
+
+
+                           (e)    ↑ 7.51%, ∆ 19.91%    (f)   ↑ 3.95%, ∆ 22.09%      (g)    ↑ 1.06%, ∆ 17.92%       (h)    ↑ 6.06%, ∆ 18.87%
+Figure 4. Throughput comparison across Settings 5 and 6. ↑ indicates the average improvement over the best baseline method. ∆ indicates
+the maximum average gap between M INE D RAFT and standard SD or EAGLE. M INE D RAFT consistently outperforms standalone EAGLE
+and standard SD, achieving maximum average throughput gains of 37.06% and 22.09%, respectively.
+                                      Arena                     ShareGPT                     Spec-Bench                        Tough
+ Qwen3 32B-8B
+
+
+
+
+Figure 5. Throughput results on Setting 4. Standalone M INE D RAFT outperforms M INE D RAFT’s integration with TETRIS when draft
+model is large. Standard SD experiments failed on this setting due to OOM.
+
+6.2. Results with Different Drafting Strategies                                    ploying larger draft models, such as Qwen3-8B, due to the
+                                                                                   coexistence of draft and target models within the same GPU
+We further evaluate M INE D RAFT integrated with other
+                                                                                   memory, leading to VRAM contention. In contrast, the
+drafting strategies, including EAGLE and TETRIS, on the
+                                                                                   M INE D RAFT architecture places the draft model on a dedi-
+other model settings. As shown in Fig. 4, integrating
+                                                                                   cated GPU, enabling parallel drafting without competing for
+M INE D RAFT with TETRIS and/or EAGLE consistently
+                                                                                   memory with the target model. This design alleviates mem-
+outperforms standalone EAGLE and standard SD across
+                                                                                   ory bottlenecks and promotes a more balanced utilization
+all datasets. In particular, M INE D RAFT improves average
+                                                                                   of available GPU resources. Similar memory constraints
+throughput by up to 30.81% and 7.51% over the best results
+                                                                                   arise for standard SD when deploying large target models,
+of standard SD and EAGLE, respectively. The maximum
+                                                                                   such as Qwen3-235B-A22B-Instruct-2507-FP8 (Yang et al.,
+average improvements over standard SD and EAGLE reach
+                                                                                   2025), as detailed in Sec. C.10.
+37.06% and 22.09%, respectively.
+                                                                                   EAGLE’s subpar performance. We observe that EA-
+Memory contention in standard SD. As shown in Fig. 5,
+                                                                                   GLE’s performance degrades as the number of draft tokens
+standard SD can encounter memory limitations when de-
+
+                                                                               7
+                                      M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+                              Arena                    ShareGPT                     Spec-Bench                       Tough
+ Qwen3 32B-1.7B
+
+
+
+
+                  (a)   ↑ 24.59%, ∆ 36.99% (b)     ↑ 25.50%, ∆ 31.09% (c)       ↑ 18.34%, ∆ 28.63% (d)       ↑ 28.97%, ∆ 39.51%
+Figure 6. End-to-End Latency (ms) comparison against baseline methods in Setting 2. ↑ indicates the average improvement over the best
+baseline method. ∆ indicates the maximum average gap between M INE D RAFT and standard SD. M INE D RAFT reduces latency by up to
+28.97% compared to best-performing baseline and by up to 39.51% compared to standard SD.
+                              Arena                    ShareGPT                     Spec-Bench                       Tough
+ Qwen3 32B-1.7B
+
+
+
+
+                  (a)   ↑ 12.72%, ∆ 30.24% (b)     ↑ 17.88%, ∆ 29.88% (c)       ↑ 10.89%, ∆ 35.35% (d)       ↑ 18.78%, ∆ 40.55%
+ Qwen3 32B-1.7B
+
+
+
+
+                  (e)   ↑ 5.74%, ∆ 21.24%    (f)   ↑ 6.87%, ∆ 13.87%      (g)   ↑ -2.08%, ∆ 10.78% (h)       ↑ 11.21%, ∆ 24.38%
+Figure 7. Normalized throughput and latency comparisons against baseline methods in Setting 2. ↑ indicates the average improvement
+over the best baseline method. ∆ indicates the maximum average gap between M INE D RAFT and standard SD. M INE D RAFT improves
+normalized average throughput and latency by up to 40.55% and 24.38% over standard SD, respectively. Additional normalized results
+across other model settings are included in Sec. C.5.
+
+per step increases, potentially due to the current vLLM im-               dalone M INE D RAFT implementation is left for future work.
+plementation of EAGLE-based speculators, which is under
+investigation by the vLLM team (vLLM, 2024).                              6.3. End-to-End Latency
+M INE D RAFT as a batch PSD framework. When inte-                         We measure end-to-end latency of M INE D RAFT and base-
+grated with TETRIS (denoted by “extra=” in the legends),                  line methods across drafting strategies, selected model set-
+M INE D RAFT outperforms its standalone variant under cer-                tings, and datasets. Fig. 6 shows representative results for
+tain settings, highlighting its potential for further inference           Setting 2 across all datasets, where M INE D RAFT demon-
+optimization when paired with effective drafting strategies.              strates a 28.97% latency reduction relative to the best-
+A more detailed breakdown of performance differences                      performing baseline and a maximum reduction of 39.51%
+between integrations with drafting strategies and the stan-               compared to standard SD. Complete results are in Sec. C.4.
+
+
+                                                                      8
+                               M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+ Arena
+
+
+
+
+         (a) Different Draft Models (b) Different Extra Tokens           (c) Different #Sequences         (d) Different Batch Sizes
+Figure 8. Different ablation studies using the Arena dataset. The comprehensive details and analysis of our ablation studies are included
+in Sections C.6 to C.8. Plot (a) indicates that the choice of draft model can affect M INE D RAFT’s parallelism benefit. Plot (b) shows
+M INE D RAFT consistently improves average throughput relative to standard SD across different numbers of extra draft tokens generated
+for TETRIS. Plots (c) and (d) present how M INE D RAFT scales with larger n (number of sequences per request) and m (batch size) values.
+
+6.4. Normalized Results w.r.t. GPU Count                               extra draft tokens (e) for TETRIS. Fig. 8 presents results
+                                                                       for Setting 1 on the Arena dataset, where M INE D RAFT at-
+To ensure a fair comparison between parallel methods
+                                                                       tains its maximum throughput at k = 3 and e = 1. As
+(M INE D RAFT and PEARL, evaluated on 5 GPUs) and stan-
+                                                                       e increases, M INE D RAFT integrated with TETRIS outper-
+dard SD (evaluated on 4 GPUs), we normalize the metrics
+                                                                       forms standalone M INE D RAFT for e ≤ 2, but experiences a
+to a per-GPU basis, as specified in Sec. C.5. Fig. 7 il-
+                                                                       degradation in throughput for e ≥ 3. Complete results and
+lustrates that M INE D RAFT outperforms both standard SD
+                                                                       a detailed analysis of this trend are provided in Sec. C.7.
+and PEARL in normalized average throughput, achieving
+a 18.78% improvement over the best throughput achieved                 Scaling behavior with n and m. We evaluate through-
+by baselines. Compared to standard SD, M INE D RAFT im-                put scaling with respect to the number of sequences per
+proves normalized average throughput by up to 40.55%.                  request (n) and batch size (m). The final two plots in Fig. 8
+However, M INE D RAFT marginally underperforms standard                show that, with m held constant, increasing n yields only
+SD in normalized latency when k is small. Particularly,                marginal throughput gains, whereas increasing m consis-
+M INE D RAFT exhibits a 2.08% increase in normalized la-               tently improves average throughput. Moreover, when the
+tency compared to the best-performing baseline at k = 2 on             number of draft tokens per step exceeds 4, the average
+Spec-Bench. Additional comparisons of normalized metrics               throughput of M INE D RAFT approaches that of standard SD
+across Settings 1, 3, and 4, along with an analysis of this            with doubled batch size, suggesting that M INE D RAFT can
+degradation in normalized latency, are provided in Sec. C.5.           complement adaptive drafting strategies, which are often
+                                                                       limited by draft length, to enable additional performance
+6.5. Ablation Studies                                                  gains. More experiments are provided in Sec. C.8.
+
+This section presents representative ablation studies on the
+Arena dataset. Comprehensive results across all selected               7. Conclusion
+datasets are provided in Sections C.6 to C.8. Due to space             This paper introduces M INE D RAFT, a novel framework that
+constraints, analysis of verification success rate of integra-         realizes the potential of PSD. M INE D RAFT exploits the la-
+tion with TETRIS and Nsight Systems profiling results is               tency savings allowed by Batch Parallelism, which overlaps
+also provided in Sections C.9 and C.11.                                drafting and verification in SD by maintaining a target batch
+Draft model sizes. We study the impact of draft model                  and a draft batch. Our theoretical analysis characterizes the
+scale on system performance. Although M INE D RAFT con-                expected minimum end-to-end latency gains achievable with
+sistently outperforms standard SD across draft model sizes,            PSD. Extensive experiments across diverse model families,
+Fig. 8 shows that increasing the number of draft tokens per            model sizes, hyperparameter settings, and datasets further
+step does not monotonically improve average throughput.                validate the performance advantages of M INE D RAFT in
+This degradation is most pronounced for Qwen3-4B: when                 practice. As future work, we will explore extending sup-
+more than three draft tokens are generated per step, through-          port to the vLLM v1 engine and the chunked prefill fea-
+put drops below that achieved with only two draft tokens. A            ture (Agrawal et al., 2023). We also plan to study whether
+detailed analysis of this behavior is provided in Sec. C.6.            the current requirement for an additional GPU in Batch Par-
+                                                                       allelism can be eliminated by leveraging the weight-padding
+Extra tokens. We evaluate the average throughput of                    method described in Appendix F of (Liu et al., 2025a).
+M INE D RAFT and standard SD across varying numbers of
+
+
+                                                                   9
+                            M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+Acknowledgements                                                     Cheng, Y., Zhang, A., Zhang, X., Wang, C., and Wang, Y.
+                                                                       Recurrent drafter for fast speculative decoding in large
+This research is supported by the National Research Foun-              language models. arXiv:2403.09919, 2024.
+dation (NRF), Prime Minister’s Office, Singapore under its
+Campus for Research Excellence and Technological En-                 Dai, D., Deng, C., Zhao, C., Xu, R., Gao, H., Chen, D., Li,
+terprise (CREATE) programme. The Mens, Manus, and                      J., Zeng, W., Yu, X., Wu, Y., et al. DeepSeekMoE: To-
+Machina (M3S) is an interdisciplinary research group (IRG)             wards ultimate expert specialization in mixture-of-experts
+of the Singapore MIT Alliance for Research and Technology              language models. In Proc. ACL, pp. 1280–1297, 2024.
+(SMART) centre.
+                                                                     Fernandez, J., Wehrstedt, L., Shamis, L., Elhoushi, M., Sal-
+                                                                       adi, K., Bisk, Y., Strubell, E., and Kahn, J. Hardware
+Impact Statement                                                       scaling trends and diminishing returns in large-scale dis-
+This paper proposes M INE D RAFT, a framework for batch                tributed training. arXiv:2411.13055, 2024.
+parallel speculative decoding that improves throughput and
+                                                                     Grattafiori, A., Dubey, A., Jauhri, A., Pandey, A., Kadian,
+reduces latency for LLM inference. By accelerating end-to-
+                                                                       A., Al-Dahle, A., Letman, A., Mathur, A., Schelten,
+end generation, M INE D RAFT can broaden access to capable
+                                                                       A., Vaughan, A., et al. The llama 3 herd of models.
+AI systems and improve the efficiency of shared inference in-
+                                                                       arXiv:2407.21783, 2024.
+frastructure. Speculative decoding incurs additional compu-
+tation relative to standard autoregressive decoding because          Gunther, N. J. A general theory of computational scalability
+it executes both a draft and a target model. Consequently,             based on rational functions. arXiv:0808.1431, 2008.
+the overall impact on energy consumption depends on the
+deployment setting: improvements in serving throughput               Hou, Y., Zhang, F., Du, C., Zhang, X., Pan, J., Pang, T., Du,
+and hardware utilization may offset the increased FLOPs.               C., Tan, V. Y. F., and Yang, Z. Banditspec: Adaptive spec-
+However, such gains are not universal across workloads or              ulative decoding via bandit algorithms. In Proc. ICML,
+system configurations. As with other advances in efficient             2025.
+text generation, reduced inference latency may lower the
+                                                                     Huang, K., Wu, H., Shi, Z., Zou, H., Yu, M., and Shi, Q.
+cost of producing content at scale, including in adversarial
+                                                                      AdaSpec: Adaptive speculative decoding for fast, slo-
+contexts such as spam or misinformation campaigns. We
+                                                                       aware large language model serving. In Proc. SoCC, pp.
+believe, however, that the benefits of faster and more acces-
+                                                                       361–374, 2025.
+sible inference outweigh these risks. Mitigating harmful
+downstream use is better addressed through application-              Hugging Face. Transformers v4.53.3. https://
+level safeguards, monitoring, and policy interventions than            github.com/huggingface/transformers/
+by limiting research on inference efficiency.                          releases/tag/v4.53.3, 2025.        Accessed:
+                                                                       2026-01-09.
+References
+                                                                     Ibanez, T. ibnzterrell/meta-llama-3.3-70b-instruct-awq-int4.
+Agrawal, A., Panwar, A., Mohan, J., Kwatra, N., Gula-                  https://huggingface.co/ibnzterrell/
+ vani, B. S., and Ramjee, R. Sarathi: Efficient llm in-                Meta-Llama-3.3-70B-Instruct-AWQ-INT4,
+  ference by piggybacking decodes with chunked prefills.               2024. Accessed: 2026-01-06.
+  arXiv:2308.16369, 2023.
+                                                                     Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu,
+Agrawal, S., Jeon, W., and Lee, M. AdaEDL: Early draft                C. H., Gonzalez, J., Zhang, H., and Stoica, I. Efficient
+  stopping for speculative decoding of large language mod-            memory management for large language model serving
+  els via an entropy-based lower bound on token acceptance            with pagedattention. In Proc. SOSP, 2023.
+  probability. In NeurIPS Workshop on Efficient Natural
+                                                                     Leviathan, Y., Kalman, M., and Matias, Y. Fast inference
+ Language and Signal Processing, 2024.
+                                                                       from transformers via speculative decoding. In Proc.
+                                                                       ICML, pp. 19274–19286, 2023.
+Anon, a. Sharegpt dataset. https://huggingface.
+  co/datasets/anon8231489123/ShareGPT_                               Li, Y., Wei, F., Zhang, C., and Zhang, H. EAGLE: Specula-
+ Vicuna_unfiltered, 2023.                                              tive sampling requires rethinking feature uncertainty. In
+                                                                       Proc. ICML, pp. 28935–28948, 2024a.
+Cai, T., Li, Y., Geng, Z., Peng, H., Lee, J. D., Chen, D.,
+  and Dao, T. Medusa: Simple llm inference acceleration              Li, Y., Wei, F., Zhang, C., and Zhang, H. EAGLE-2: Faster
+  framework with multiple decoding heads. In Proc. ICML,               inference of language models with dynamic draft trees.
+  pp. 5209–5235, 2024.                                                 In Proc. EMNLP, pp. 7421–7432, 2024b.
+
+                                                                10
+                            M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+Li, Y., Wei, F., Zhang, C., and Zhang, H. EAGLE-3: Scaling            vLLM.     vllm v0.9.2.     https://github.com/
+   up inference acceleration of large language models via               vllm-project/vllm/releases/tag/v0.9.2,
+   training-time test. In Proc. NeurIPS, volume 38, pp.                 2025. Accessed: 2026-01-09.
+  136737–136756, 2025.
+                                                                      Wang, J., Su, Y., Li, J., Xia, Q., Ye, Z., Duan, X., Wang,
+Li, Z., Chen, Z., Delacourt, R., Oliaro, G., Wang, Z., Chen,           Z., and Zhang, M. OPT-tree: Speculative decoding with
+  Q., Lin, S., Yang, A., Zhang, Z., Chen, Z., et al. Adaserve:         adaptive draft tree structure. Transactions of the Associa-
+  Accelerating multi-slo llm serving with slo-customized               tion for Computational Linguistics, 13:188–199, 2025.
+  speculative decoding. In Proc. EuroSys, pp. 36–54, 2026.
+                                                                      Wang, S., Yang, H., Wang, X., Liu, T., Wang, P., Liang,
+Liu, T., Li, Y., Lv, Q., Liu, K., Zhu, J., Hu, W., and Sun,            X., Ma, K., Feng, T., You, X., Bao, Y., Liu, Y., Luan,
+  X. PEARL: Parallel speculative decoding with adaptive                Z., and Qian, D. Minions: Accelerating large language
+  draft length. In Proc. ICLR, 2025a.                                  model inference with aggregated speculative execution.
+                                                                       arXiv:2402.15678, 2024.
+Liu, X., Park, J., Hu, L., Kwon, W., Li, Z., Zhang, C.,
+  Du, K., Mo, X., You, K., Cheung, A., Deng, Z., Sto-                 Wu, Z., Zhou, Z., Verma, A., Prakash, A., Rus, D., and Low,
+  ica, I., and Zhang, H. Turbospec: Closed-loop specula-               B. K. H. TETRIS: Optimal draft token selection for batch
+  tion control system for optimizing llm serving goodput.              speculative decoding. In Proc. ACL, pp. 33329–33345,
+  arXiv:2406.14066, 2025b.                                             2025.
+
+NVIDIA. NVIDIA Nsight Systems 2024.2. https:                          Xia, H., Yang, Z., Dong, Q., Wang, P., Li, Y., Ge, T., Liu, T.,
+ //developer.nvidia.com/nsight-systems,                                 Li, W., and Sui, Z. Unlocking efficiency in large language
+ 2024. Accessed: 2026-01-20.                                            model inference: A comprehensive survey of speculative
+                                                                        decoding. In Proc. ACL Findings, pp. 7655–7671, 2024.
+Oliaro, G., Jia, Z., Campos, D., and Qiao, A. Suffixde-
+                                                                      Xiao, Z., Zhang, H., Ge, T., Ouyang, S., Ordonez, V., and
+  coding: Extreme speculative decoding for emerging ai
+                                                                        Yu, D. Parallelspec: Parallel drafter for efficient specula-
+  applications. In Proc. NeurIPS, 2025.
+                                                                        tive decoding. arXiv:2410.05589, 2024.
+PyTorch. Pytorch 2.7.0. https://github.com/
+                                                                      Yang, A., Li, A., Yang, B., Zhang, B., Hui, B., Zheng, B.,
+  pytorch/pytorch/releases/tag/v2.7.0,
+                                                                        Yu, B., Gao, C., Huang, C., Lv, C., et al. Qwen3 technical
+  2025. Accessed: 2026-01-09.
+                                                                        report. arXiv:2505.09388, 2025.
+Ryu, H. and Kim, E.       Closer look at efficient in-                YAV-AI. Llm-tough-questions dataset: A collection
+  ference methods: A survey of speculative decoding.                    of complex questions across 100 domains. https:
+  arXiv:2411.13157, 2024.                                               //huggingface.co/datasets/YAV-AI/
+                                                                        llm-domain-specific-tough-questions,
+Sadhukhan, R., Chen, J., Chen, Z., Tiwari, V., Lai, R., Shi,
+                                                                        2024.
+  J., Yen, I., May, A., Chen, T., and Chen, B. Magicdec:
+  Breaking the latency-throughput tradeoff for long context           Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-
+  generation with speculative decoding. In Proc. ICLR,                  G. Orca: A distributed serving system for {Transformer-
+  volume 2025, pp. 6835–6850, 2025.                                     Based} generative models. In Proc. OSDI, pp. 521–538,
+                                                                        2022.
+Shazeer, N., Mirhoseini, A., Maziarz, K., Davis, A., Le,
+  Q., Hinton, G., and Dean, J. Outrageously large neural              Zhang, J., Wang, J., Li, H., Shou, L., Chen, K., Chen, G.,
+  networks: The sparsely-gated mixture-of-experts layer.                and Mehrotra, S. Draft& verify: Lossless large language
+  In Proc. ICLR, 2017.                                                  model acceleration via self-speculative decoding. In Proc.
+                                                                        ACL, pp. 11263–11282, 2024.
+Timor, N., Mamou, J., Korat, D., Berchansky, M., Pereg, O.,
+  Wasserblat, M., Galanti, T., Gordon-Kiwkowitz, M., and              Zheng, L., Chiang, W.-L., Sheng, Y., Zhuang, S., Wu, Z.,
+  Harel, D. Distributed speculative inference (DSI): Spec-              Zhuang, Y., Lin, Z., Li, Z., Li, D., Xing, E., Zhang, H.,
+  ulation parallelism for provably faster lossless language             Gonzalez, J. E., and Stoica, I. Judging llm-as-a-judge
+  model inference. In Proc. ICLR, 2025.                                 with mt-bench and chatbot arena. In Proc. NeurIPS
+                                                                        (Datasets and Benchmarks Track), pp. 46595–46623,
+vLLM.      [performance]: vllm eagle performance is                     2023.
+  worse than expected.     https://github.com/
+  vllm-project/vllm/issues/9565, 2024. Ac-
+  cessed: 2026-01-09.
+
+                                                                 11
+                             M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+A. Limitations
+Irrecoverable from biased batch workload. The workload balance between batches can become irrecoverably disrupted
+under certain conditions. When a request is terminated due to user abort or preemption, M INE D RAFT may fail to recover
+from the resulting imbalance because new replacement running requests are consistently assigned to the draft batch. While
+this policy ensures that draft tokens are available for verification, it prevents the load-balancing mechanism (the assign
+operation) from correcting the induced batch imbalance. Furthermore, when chunked prefill is enabled, the Scheduler
+may initialize fewer than 2m running requests in the first SD step. In this case, M INE D RAFT must continue to apply
+the load-balancing assign operation for all subsequent batch ID assignments, rather than switching to the simplified
+post–first-step policy. Otherwise, an irrecoverable workload imbalance between the two batches can arise. However,
+continuously applying the assign operation introduces a minor overhead. If a new running request is assigned to the
+target batch, the Verifier can sample only a single token because there are no draft tokens, resulting in one less efficient
+“idle” SD step for that request. Since this cost is incurred at most once per request, it is deemed an acceptable trade-off
+for the long-term performance benefits of maintaining batch balance. Accordingly, we plan to adopt this revised batch ID
+assignment strategy in a future version of M INE D RAFT that supports the vLLM v1 engine and chunked prefill.
+Batch exhaustion and tail effect. The Batch Parallelism scheme, as specified in Sec. 5, includes a fallback mechanism:
+when one batch becomes empty and the other batch contains no verifiable drafts, the system reverts to standard SD, which
+inevitably curtails the duration of parallel execution. Although Batch Parallelism successfully parallelizes the substantial
+majority of SD steps and yields significant performance gains per our empirical results, the tail effect circumscribes its
+maximum potential improvement. A possible approach to offset this limitation involves adopting a modified PEARL
+parallelism. When one batch becomes empty, the system instructs the Drafter to generate draft tokens for the remaining
+batch, including those undergoing verification, without confirming their success. In the next step, instead of verifying only
+previously successful requests as in standard PEARL, the system re-drafts requests that failed verification before submitting
+the batch to the Verifier. This re-drafting mechanism for failed verification attempts is intended for partially overlapping
+drafting time, optimizing performance to the greatest extent possible.
+Adaptive to varying workload. Although M INE D RAFT supports continuous batching that automatically handles varying
+workloads, it is assumed that the number of requests in the system seldom drops below the nominal capacity of 2m. If the
+actual total batch size of draft and target batches is frequently less than 2m, M INE D RAFT may suffer from batch imbalance
+or even fall back to sequential SD, thereby diluting the parallelism effect. On the other hand, if the user-configured batch
+size m is too large, it is desirable to automatically turn off speculative decoding or adaptively adjust m to prevent the
+compute-bound scenarios (Liu et al., 2025b; Sadhukhan et al., 2025). It is left as a future direction to design and integrate an
+adaptive scheduling mechanism that accounts for resource constraints, selected drafter-verifier pair, and active workload.
+Request-dependent draft token selection. In practice, draft acceptance rates are varied and correlated with the “difficulty”
+of different requests, and selecting draft tokens irrespective of request difficulty can be insufficient to attain the full potential
+of speculative decoding and M INE D RAFT. Existing literature has proposed a proxy measure to estimate the request difficulty
+(Agrawal et al., 2024), which can be employed by future work to develop a request-dependent draft selection algorithm that
+dynamically adjusts the number of draft tokens based on the predicted difficulty of each incoming request.
+
+B. Leftover Proof
+We first derive an upper bound on TSD that does not involve the expectation operator. Under a mild assumption on the form
+of f , we have the following result.
+Lemma 1. Let f (t) = 1 − e−αt for some constant α ∈ R+ . We have that
+                                                        1
+                                                            ln(αV + 1) + V
+                                                TSD > α                    ×R.
+                                                             1 − 2(αV1 +1)
+
+
+Proof. First, the form of f (x) is monotone increasing in the domain of α. Hence, the function g(t) = t+V     f (t) has a global
+minimum, taken at its turning point (critical point theorem). In the following, we derive this turning point g ′ (t) = 0. Taking
+the derivative with respect to t and substituting the formula of f (t), we have
+
+                                              g ′ (t) = 0
+
+                                                                12
+                           M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+                                             ⇐⇒ (t + V )f ′ (t) = f (t)
+                                             ⇐⇒ α(t + V )e−αt = 1 − e−αt .
+
+Rearrange the last equation:
+                                                (α(t + V ) + 1)e−αt = 1 .
+We use the Lambert W function to solve this equation. Specifically, the Lambert W function is defined as the inverse
+function of f (w) = wew , i.e.,
+                                           z = wew ⇐⇒ w = W (z) .
+With this, let u := α(t + V ) + 1. Then, the equation above can be rewritten as −ue−u = −e−(αV +1) . So,
+
+                                                 u = −W (−e−(αV +1) ) ,
+
+and since t = αu − (V + α1 ), we have
+
+                                               1                      1
+                                         t∗ = − W (−e−(αV +1) ) − (V + ) .
+                                               α                      α
+
+For z ∈ (−e−1 , 0), there are two real branches: W0 (z) ∈ (−1, 0) and W−1 (z) ∈ (−∞, −1]. Here z = −e−(αV +1) ∈
+(−e−1 , 0) and u = α(t + V ) + 1 ≥ 1. If we took W0 , we would have u = −W0 (z) ∈ (0, 1), a contradiction. Therefore,
+we take W−1 . Let µ := αV + 1. The expansion for the −1 branch as µ → ∞ is
+
+                                                                      ln(− ln(−z))
+                                W−1 (z) = ln(−z) − ln(− ln(−z)) +                  + ··· .
+                                                                         ln(−z)
+
+Substitute z = −e−µ , we have
+
+                                                                                (ln µ)2
+                                                                                         
+                                                                 ln µ
+                                   W−1 (−e−µ ) = −µ − ln µ −          +O                      .
+                                                                  µ               µ2
+
+Plugging this equation into the equation of t∗ , we have
+
+                                                             (ln µ)2
+                                                                   
+                                ∗    1            ln µ
+                               t =       ln µ +        +O
+                                     α             µ           µ2
+                                                                           (ln(αV ))2
+                                                                                     
+                                     1                  1 ln(αV + 1)
+                                  = ln(αV + 1) +                      +O                .
+                                     α                  α αV + 1            α(αV )2
+
+With this, we now bound the range of t∗ . First, recall that (α(t + V ) + 1)e−αt = 1. We rearrange the equation of t into
+
+                                                 αt = ln(α(t + V ) + 1) .
+
+Let y := αt and define g(y) := ln(αV + 1 + y) − y. Then, g ′ (y) = αV +1+y
+                                                                      1
+                                                                           − 1 < 0, so g is strictly decreasing and has a
+unique zero y ∗ . Define y0 := ln(αV + 1) and y1 := ln(2(αV + 1)). We now show that y0 < y ∗ < y1 .
+At y0 , we have g(y0 ) = ln(1 + ln(αV +1)                    ∗
+                                  αV +1 ) > 0. This implies y > y0 .
+
+At y1 , g(y1 ) = ln(1/2 + ln(2(αV +1))
+                            2(αV +1) ). For x ≥ 1, ln(2x) ≤ x. Hence, 1/2 + ln(2x)/(2x) < 1. Therefore, g(y1 ) < 0 for
+αV > 0. This implies y ∗ < y1 . Therefore, substitute t = y/α, we have
+
+                                        1                  1
+                                          ln(αV + 1) < t∗ < ln(2(αV + 1)) .
+                                        α                  α
+As such, we have a bound for TSD as
+                                            1                       1
+                               t∗ + V          ln(αV + 1) + V         ln(αV + 1) + V
+                     TSD =             ×R > α1                  ×R= α                ×R.
+                                    ∗
+                                f (t )     f ( α ln(2(αV + 1)))        1 − 2(αV1 +1)
+
+                                                            13
+                            M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+On the other hand, under PSD, the expected time for verification is
+                                                            " T             #
+                                                             X
+                                           TPSD := min E          max(V, t)
+                                                         t
+                                                                s=1
+                                                    = min E [T ] max (V, t)
+                                                         t
+                                                             R max(V, t)
+                                                    = min                .
+                                                         t      f (t)
+While it is obvious from the two definitions that TPSD < TSD , we prove a stronger result:
+Lemma 2. Similarly, let f (t) = 1 − e−αt for some constant α ∈ R+ . We have that
+                                                                 RV
+                                                     TPSD =            .
+                                                              1 − e−αV
+
+Proof. We minimize h(t) := max(V,t)
+                                  f (t)    over t > 0. For t < V , we have max(V, t) = V , so h(t) = V /f (t), which is strictly
+decreasing since f is strictly increasing. For t ≥ V , we have max(V, t) = t, so h(t) = t/f (t). Computing the derivative,
+h′ (t) > 0 if and only if f (t) > tf ′ (t), i.e., (1 − e−αt ) > αte−αt , which after multiplying through by eαt is equivalent to
+eαt − 1 > αt. This holds for all t > 0 by the standard inequality ex > 1 + x applied with x = αt > 0, so h is strictly
+increasing on [V, ∞). Since h is strictly decreasing on (0, V ) and strictly increasing on [V, ∞), the unique global minimum
+is attained at t∗ = V .
+
+                                                        R max(V, t)      RV
+                                          TPSD = min                =          .
+                                                    t      f (t)      1 − e−αV
+Theorem 1. Let f (t) = 1 − e−αt for some constant α ∈ R+ . For αV ≈ 2.23, we have TSD ≳ 1.61 TPSD .
+
+Proof. Combining Lemma 1 and Lemma 2,
+                                                1
+                                        TSD       ln(αV + 1) + V    1 − e−αV
+                                             > α                 ·               ,
+                                        TPSD           V           1 − 2(αV1 +1)
+                                               |              {z               }
+                                                               =: L(αV )
+
+where the strict inequality follows from the lower bound on TSD in Lemma 1 and TPSD is exact by Lemma 2. Note that L
+depends on α and V only through the product αV . Maximizing L(·) over αV > 0 (solving dL/d(αV ) = 0 numerically)
+gives the maximizer αV ≈ 2.23, at which L(αV ) ≈ 1.6111. Hence, at αV ≈ 2.23,
+                                     TSD
+                                          > L(αV ) ≈ 1.6111 =⇒ TSD ≳ 1.61 TPSD .
+                                     TPSD
+
+C. Additional Experiment Results
+C.1. Experiment Setups
+Unless otherwise specified, we use PyTorch 2.7.0 (PyTorch, 2025), HuggingFace Transformers 4.53.3 (Hugging Face, 2025),
+and vLLM 0.9.2 (vLLM, 2025), with temperature set to 1.0, one sequence per request (n = 1), and 256 output tokens per
+sequence (ignoring the end-of-sequence token). Target models are served with a tensor parallelism (TP) size of 4, and draft
+models with TP set to 1.
+
+C.2. Example Lifespan Illustration
+Timeline illustration. Fig. 9 illustrates a Batch Parallelism lifespan with m = 4 and 12 total requests. In the first SD step,
+Batch 0 serves as the target batch and Batch 1 as the draft batch. The target batch is drafted and then verified in SD step 1.
+While the target batch is being verified in SD step 1, the draft batch is drafted in parallel. In subsequent SD steps, the two
+batches alternate states as target and draft batches, enabling concurrent drafting and verification. This alternating pattern
+
+                                                              14
+                                         M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+continues until the target batch of an SD step lacks draft tokens (e.g., SD step 10 in Fig. 9), at which point the fallback to
+standard SD is triggered.
+KV block allocation illustration. Fig. 10 depicts the same lifespan from the Scheduler’s perspective, illustrating the
+patched KV block allocation logic. In the first SD step, KV blocks are allocated for all requests in both the target and
+draft batches. From SD step 2 through SD step 8, the Scheduler allocates KV blocks only for the draft batch, skipping
+allocation for the target batch. At SD step 9, one batch becomes empty; since this is the first such occurrence, the patched
+logic continues to skip allocation. From SD step 10, the Scheduler resumes allocating KV blocks to all running requests at
+each step until all requests are completed.
+
+
+
+
+Figure 9. Timeline of an example Batch Parallelism lifespan.                 Figure 10. Scheduler perspective of the example Batch Par-
+Requests with an orange background belong to Batch 0, those                  allelism lifespan. At each time point, Alloc indicates that the
+with a blue background belong to Batch 1, and those with a red               Scheduler allocates KV blocks for a request, Fill indicates that
+background have completed execution.                                         the allocated blocks are populated with updated KV vectors, and
+                                                                             FIN indicates that the request has completed.
+
+
+                                 Arena                    ShareGPT                      Spec-Bench                         Tough
+   Vicuna 13B-EAGLE
+
+
+
+
+                      (a)   ↑ 5.89%, ∆ 20.71%    (b)   ↑ 6.82%, ∆ 20.31%       (c)   ↑ 2.78%, ∆ 15.60%        (d)   ↑ 6.99%, ∆ 21.08%
+Figure 11. Throughput comparison on Setting 7. ↑ indicates the average improvement over the best baseline method. ∆ indicates
+the maximum average gap between M INE D RAFT and EAGLE. M INE D RAFT consistently outperforms EAGLE, improving average
+throughput by up to 6.99% over the best case of EAGLE and by up to 21.08% across all tested k.
+
+
+C.3. Performance Improvement Metrics.
+To quantify the performance improvements of M INE D RAFT, we compute two percentage metrics relative to baseline
+methods. Let p denote a performance metric, and let Bp (k) denote the best value of p achieved by baseline methods at k,
+where k is the number of draft tokens per step. Similarly, let Mp (k) denote the best value of p achieved by M INE D RAFT
+variants (including the standalone variant and its integration with TETRIS) at k.
+Average improvement over the best baseline. First, for each performance metric p, the optimal baseline draft token count
+kp∗ is selected as follows:
+
+   • If p is maximized (higher is better): kp∗ = arg max Bp (k).
+                                                                  k
+
+                                                                        15
+                                     M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+                             Arena                       ShareGPT                 Spec-Bench                         Tough
+ Qwen3 32B-0.6B
+
+
+
+
+                  (a)   ↑ 26.58%, ∆ 37.89% (b)   ↑ 22.49%, ∆ 32.87% (c)       ↑ 24.37%, ∆ 32.49% (d)         ↑ 25.63%, ∆ 33.44%
+ Qwen3 32B-4B
+
+
+
+
+                  (e)   ↑ 31.13%, ∆ 38.94% (f)   ↑ 29.22%, ∆ 31.57% (g)       ↑ 25.36%, ∆ 30.18% (h)         ↑ 30.73%, ∆ 37.92%
+ Qwen3 32B-8B
+
+
+
+
+Figure 12. End-to-end latency comparison against baseline methods across Settings 1, 3, and 4. ↑ indicates the average improvement over
+the best baseline method. ∆ indicates the maximum average gap between M INE D RAFT and standard SD. M INE D RAFT consistently
+outperforms baselines, achieving a reduction in latency of up to 31.13% compared to the best-performing baseline and up to 38.94%
+compared to standard SD. Standard SD fails in Setting 4 due to OOM.
+
+
+         • If p is minimized (lower is better): kp∗ = arg min Bp (k).
+                                                             k
+
+
+Let Bp∗ = Bp (kp∗ ) be the corresponding baseline performance metric value. Next, among all M INE D RAFT variants, select
+the best M INE D RAFT performance metric value at kp∗ as Mp∗ = Mp (kp∗ ). The average improvement of p of M INE D RAFT
+over the best baseline method ↑p (in percent) is calculated as follows:
+
+                                       Mp∗ −Bp∗
+         • If p is maximized: ↑p =       Bp∗    × 100.
+                                       Bp∗ −Mp∗
+         • If p is minimized: ↑p =        Bp∗   × 100.
+
+Maximum average improvement. Define Sp (k) as the value of p of standard SD or EAGLE* (Li et al., 2024a;b; 2025),
+where applicable, at k. For a given target metric p, the average percentage improvement of M INE D RAFT over standard SD
+at k (∆p (k)) is calculated as:
+
+                                            Mp (k)−Sp (k)
+         • If p is maximized: ∆p (k) =          Sp (k)    × 100.
+
+                                                                    16
+                                             M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+  Llama-3 70B-8B                     Arena                          ShareGPT                 Spec-Bench                      Tough
+
+
+
+
+                        (a)    ↑ 15.28%, ∆ 18.52% (b)           ↑ 11.22%, ∆ 13.61% (c)    ↑ 7.79%, ∆ 10.93% (d)        ↑ 15.67%, ∆ 20.63%
+     Vicuna 33B-EAGLE
+
+
+
+
+                         (e)    ↑ 6.47%, ∆ 15.52%         (f)   ↑ 2.88%, ∆ 15.01%   (g)   ↑ 0.72%, ∆ 12.27%      (h)    ↑ 5.22%, ∆ 14.93%
+     Vicuna 13B-EAGLE
+
+
+
+
+                         (i)   ↑ 4.95%, ∆ 15.95%          (j)   ↑ 4.98%, ∆ 14.37%   (k)    ↑ 2.12%, ∆ 8.60%      (l)   ↑ 5.99%, ∆ 16.30%
+Figure 13. End-to-end latency comparison across Settings 5–7. ↑ indicates the average improvement over the best baseline method. ∆
+indicates the maximum average gap between M INE D RAFT and standard SD or EAGLE. M INE D RAFT consistently outperforms standard
+SD or EAGLE, reducing latency by up to 20.63% over standard SD and 16.30% over EAGLE.
+
+
+                                                        Sp (k)−Mp (k)
+      • If p is minimized: ∆p (k) =                         Sp (k)    × 100.
+
+The maximum average percentage improvement of p of M INE D RAFT over standard SD or EAGLE (∆p ) is the maximum of
+∆p (k) over all k values: ∆p = max ∆p (k).
+                                                    k
+
+
+C.4. End-to-End Latency Results
+Comparison with baselines. Fig. 12 shows that M INE D RAFT reduces end-to-end latency by up to 31.13% relative to
+the best-performing baseline, and the maximum reduction compared to standard SD reaches 38.94%, consistent with the
+theoretical analysis in Sec. 4 which predicts an improvement of 37.9% under mild assumptions.
+Results with larger draft model. As shown in Fig. 12, under Setting 4 with Qwen3-8B as the draft model, M INE D RAFT
+achieves its lowest end-to-end latency when generating 1–2 draft tokens per step. Drafting more than 2 tokens per step
+results in degraded performance. In this setting, integrating TETRIS does not yield additional reductions in end-to-end
+latency, as the computational cost of drafting already dominates that of verification. Standard SD fails to execute on this
+setting due to VRAM constraints. The effect of draft model size on performance is further examined in Sec. C.6.
+
+                                                                               17
+                                     M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+                             Arena                    ShareGPT                    Spec-Bench                       Tough
+ Qwen3 32B-0.6B
+
+
+
+
+                  (a)   ↑ 16.02%, ∆ 30.30% (b)   ↑ 17.82%, ∆ 31.24% (c)       ↑ 13.89%, ∆ 36.25% (d)        ↑ 12.47%, ∆ 26.36%
+ Qwen3 32B-4B
+
+
+
+
+                  (e)   ↑ 19.90%, ∆ 31.72% (f)   ↑ 32.02%, ∆ 32.51% (g)       ↑ 22.84%, ∆ 40.09% (h)        ↑ 20.85%, ∆ 36.79%
+ Qwen3 32B-8B
+
+
+
+
+Figure 14. Normalized throughput comparison against baseline methods across Settings 1, 3, and 4. ↑ indicates the average improvement
+over the best baseline method. ∆ indicates the maximum average gap between M INE D RAFT and standard SD. Overall, M INE D RAFT
+improves normalized average throughput by up to 32.02% over the best-performing baseline and by up to 40.09% over standard SD.
+Standard SD fails in Setting 4 due to OOM.
+
+
+
+Integration with different drafting strategies. Fig. 13 shows that M INE D RAFT achieves a 15.67% reduction in end-to-end
+latency relative to the best standard SD result in Setting 5, with a maximum improvement of 20.63%. On the selected
+EAGLE model settings, M INE D RAFT outperforms the best standalone EAGLE result by up to 6.47% and attains a maximum
+latency reduction of 16.30%.
+
+C.5. Additional Normalized Results
+We present normalized performance comparisons for Settings 1, 3, and 4 on selected datasets. Specifically, we calculate
+the normalized average throughput by dividing the throughputs of parallel methods by 5, and that of standard SD by 4.
+End-to-end latency is normalized by multiplying the latencies of parallel methods by 1.25 to account for their proportionally
+higher compute resource usage relative to standard SD.
+Figs. 14 and 15 show that M INE D RAFT outperforms standard SD and PEARL except in regimes where k is small (between
+1 and 2), where M INE D RAFT may underperform compared to standard SD. We attribute this degradation in normalized
+latency to the communication bottleneck inherent in distributed systems (Fernandez et al., 2024), which is well-characterized
+
+                                                                    18
+                                     M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+                             Arena                    ShareGPT                    Spec-Bench                        Tough
+ Qwen3 32B-0.6B
+
+
+
+
+                  (a)   ↑ 8.22%, ∆ 22.36%   (b)   ↑ 3.12%, ∆ 16.09%      (c)   ↑ 5.46%, ∆ 15.62%         (d)   ↑ 7.04%, ∆ 16.80%
+ Qwen3 32B-4B
+
+
+
+
+                  (e)   ↑ 13.91%, ∆ 23.68% (f)    ↑ 11.52%, ∆ 14.46%     (g)   ↑ 6.70%, ∆ 12.72% (h)           ↑ 13.41%, ∆ 22.40%
+ Qwen3 32B-8B
+
+
+
+
+Figure 15. Normalized end-to-end latency comparison against baseline methods across Settings 1, 3, and 4. ↑ indicates the average
+improvement over the best baseline method. ∆ indicates the maximum average gap between M INE D RAFT and standard SD. M INE D RAFT
+outperforms baselines with an exception when k is small (k = 1), where M INE D RAFT may be underperformed compared with standard
+SD. Besides that, M INE D RAFT improves normalized latency by up to 13.91% over the best-performing baseline and by up to 23.68%
+over standard SD. Standard SD fails in Setting 4 due to OOM.
+
+
+
+by the Universal Scalability Law (Gunther, 2008). We empirically validate this hypothesis by profiling experiments across
+Settings 1–3 on the Spec-Bench dataset using Nsight Systems and computing the ratio of average total communication
+latency per step to the average end-to-end latency. As reported in Tab. 1, communication overhead dominates the end-to-end
+latency for small k: it accounts for 50.49%–57.93% of the latency when k = 1 and 20.96%–34.18% when k = 2. For
+k > 2, communication overhead diminishes significantly to between 9.14% and 13.44%. Overall, Fig. 14 demonstrates
+that M INE D RAFT improves normalized average throughput by up to 32.02% over the best-performing baseline and by up
+to 40.55% over standard SD. Similarly, Fig. 15 shows that M INE D RAFT reduces normalized end-to-end latency by up to
+13.91% compared to the best baseline results and by up to 24.38% compared to standard SD.
+
+C.6. Ablation on Draft Model Size
+We fix the target model to Qwen3-32B and evaluate M INE D RAFT using three draft models: Qwen3-0.6B, Qwen3-1.7B, and
+Qwen3-4B. As shown in Fig. 16, performance degrades noticeably when the number of draft tokens per step exceeds 3 for
+the Qwen3-4B and Qwen3-0.6B draft models, whereas the medium-sized Qwen3-1.7B model is less affected.
+
+                                                                    19
+                              M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+                    Arena                         ShareGPT                        Spec-Bench                          Tough
+ Throughput
+  E2EL
+  VSR
+
+
+
+
+Figure 16. Comparisons for various draft models paired with Qwen3-32B using M INE D RAFT. M INE D RAFT always improves average
+throughput and end-to-end latency compared to standard SD counterparts and matches the VSR of standard SD counterparts across
+different draft models. More importantly, the performance of Settings 1 (Qwen3-0.6B) and 3 (Qwen3-4B) is degraded when k > 3, while
+that of Setting 2 (Qwen3-1.7B) is not. This phenomenon of degraded performance is discussed in Sec. C.6.
+Table 1. Percentage of average total communication latency per step over the average end-to-end latency on Spec-Bench across Settings 1–
+3. Reported numbers are extracted from Nsight Systems profiling results of one run. The percentage of communication latency generally
+decreases as k increases.
+
+                    Setting                             k     Percentage of Communication Latency (%)
+                    Qwen3 32B-0.6B (Setting 1)          1                            57.93
+                                                        2                            34.18
+                                                        3                            13.44
+                                                        4                            11.49
+                    Qwen3 32B-1.7B (Setting 2)          1                            57.30
+                                                        2                            26.63
+                                                        3                            12.74
+                                                        4                            11.47
+                    Qwen3 32B-4B (Setting 3)            1                            50.49
+                                                        2                            20.96
+                                                        3                            10.23
+                                                        4                             9.14
+
+
+
+                                                                  20
+                             M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+                   Arena                        ShareGPT                        Spec-Bench                        Tough
+ Throughput
+  E2EL
+  VSR
+
+
+
+
+Figure 17. Comparisons against standard SD across various e on Setting 1. M INE D RAFT consistently improves average throughput and
+end-to-end latency over its standard SD counterparts. However, the VSR of M INE D RAFT sometimes degrades relative to standard SD on
+the Spec-Bench dataset, as analyzed in Sec. C.9.
+
+
+These results highlight the need to balance draft quality and speed in M INE D RAFT. Fig. 16 shows that an overly small draft
+model (e.g., Qwen3-0.6B) may fail to generate sufficiently accurate drafts, leading to a low verification success rate and
+degraded performance. Conversely, an overly large draft model (e.g., Qwen3-4B), while capable of producing high-quality
+drafts, may generate them too slowly to benefit from PSD, which requires drafting to be faster than verification. As shown
+in Fig. 16, Qwen3-1.7B strikes this balance by producing accurate drafts at sufficient speed to exploit parallelized drafting in
+M INE D RAFT. This observation is supported by Nsight Systems (NVIDIA, 2024) profiling with Spec-Bench in Sec. C.11.
+
+C.7. Ablation on Number of Extra Tokens
+To evaluate the performance scaling behavior of M INE D RAFT when integrated with TETRIS, we measure the average
+throughput and end-to-end latency in Setting 1 across varying numbers of extra tokens for TETRIS (e). As illustrated in
+Fig. 17, M INE D RAFT consistently outperforms standard SD across different e. However, M INE D RAFT ’s integration with
+TETRIS frequently underperforms relative to standalone M INE D RAFT for e ≥ 3, as previously noted in Sec. 6.5.
+This performance trend mirrors the observations from varying the draft model size in Sec. C.6, where drafting speed
+and quality both affect overall system performance. Fig. 17 indicates that, while a larger e enables TETRIS to select
+higher-quality draft tokens for verification and yields a higher verification success rate (VSR), it also prolongs the latency to
+generate these draft tokens. This trade-off reiterates the need to balance drafting speed and draft quality in M INE D RAFT.
+Fig. 17 also reveals that the VSR of M INE D RAFT exhibits little overlap with that of standard SD on the Spec-Bench dataset,
+
+                                                                21
+                              M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+                    Arena                        ShareGPT                       Spec-Bench                         Tough
+ Throughput
+  E2EL
+
+
+
+
+Figure 18. Throughput and end-to-end latency comparisons against standard SD across various n on Setting 1. M INE D RAFT consistently
+outperforms standard SD across all selected n values. Throughput of M INE D RAFT reaches the maximum when n = 2 except in the
+Spec-Bench dataset, where n = 3 may also take the maximum throughput at specific k values (3 and 4).
+
+
+                    Arena                        ShareGPT                       Spec-Bench                         Tough
+ Throughput
+  E2EL
+
+
+
+
+Figure 19. Throughput and end-to-end latency comparisons against standard SD across various m (batch size) on Setting 1. The plots
+show that the performance of M INE D RAFT is sometimes comparable to that of standard SD with a doubled batch size (2m) at a large k
+value (4 to 5).
+
+
+
+whereas on the other datasets, the VSR of M INE D RAFT aligns closely with its standard SD counterparts. This anomaly is
+analyzed in detail in Sec. C.9.
+
+                                                                 22
+                            M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+                   Arena                       ShareGPT                            Spec-Bench                  Tough
+ Qwen3 32B-0.6B
+
+
+
+
+Figure 20. VSR comparison for M INE D RAFT with TETRIS across extra tokens on Setting 1. VSR of M INE D RAFT ’s integration with
+TETRIS generally increases as the number of extra tokens (e) increases except on Spec-Bench.
+
+
+C.8. Empirical Results with Varied Sequences per Request and Batch Sizes.
+Using Setting 1, we evaluate M INE D RAFT across varying numbers of sequences per request (n) and batch sizes (m). As
+shown in Figs. 18 and 19, M INE D RAFT consistently improves both average throughput and end-to-end latency over standard
+SD across all tested configurations of n and m. Specifically, varying n, M INE D RAFT achieves up to 72.64% improvement
+in throughput and 38.41% reduction in latency; varying m, the corresponding improvements reach 75.81% and 40.79%.
+As shown in Fig. 19, when the number of draft tokens per step reaches five, the performance of M INE D RAFT becomes
+comparable to that of standard SD with a doubled batch size (2m). This result highlights the effectiveness of M INE D RAFT
+as a batch PSD framework: with appropriate adaptive drafting strategies and model configurations, M INE D RAFT can further
+optimize performance even when a large number of draft tokens are generated per step.
+
+C.9. Analysis of Verification Success Rate
+The verification success rate (VSR) is defined as follows:
+                                                 VSR = TokensAccepted tokens
+                                                              sent for verification ,
+
+which is the proportion of tokens successfully verified out of the total number of tokens submitted for verification. VSR
+measures the quality of the selected draft tokens. We analyze the VSR of M INE D RAFT integrated with TETRIS under
+Settings 1 and 5. As shown in Figs. 20 and 22, VSR generally increases with the number of extra tokens, except on the
+Spec-Bench dataset, where VSR decreases more frequently than on the other datasets.
+We attribute this anomaly to the combined effects of Spec-Bench’s smaller sample size and TETRIS’s behavior on non-full
+batches. Because Spec-Bench contains fewer conversations than the other datasets, its requests are exhausted more quickly,
+causing both batches to fall below their nominal capacity m earlier in the lifespan of M INE D RAFT. When TETRIS operates
+on non-full batches, the reduced pool of candidate draft tokens increases the likelihood of selecting lower-quality drafts,
+thereby raising the target model’s rejection rate. As a result, VSR decreases during non-full-batch operation; since a larger
+fraction of SD steps occur under this regime, the aggregate VSR is negatively affected, effectively diluting the high VSR
+observed during the initial, fully saturated steps.
+To validate this explanation for the VSR degradation observed on Spec-Bench, we compute VSR over truncated portions
+of the execution, considering only the initial 70%–100% or 80%–100% of SD steps. As shown in Figs. 21 and 23, on
+Spec-Bench, the VSR of M INE D RAFT integrated with TETRIS remains comparable to or higher than that of standalone
+TETRIS until approximately 82–86% of SD steps for n = 1, and until approximately 92% for n = 2. In contrast, on the
+Arena, ShareGPT, and Tough datasets, the VSR of M INE D RAFT with TETRIS matches that of standalone TETRIS over the
+first 98% of SD steps for n = 1, and throughout the entire evaluation for n = 2.
+
+C.10. Additional Experiment Results on Larger Models
+We conduct additional experiments on a large Mixture-of-Experts (MoE) target model (Shazeer et al., 2017; Dai et al., 2024;
+Yang et al., 2025), Qwen3-235B-A22B-Instruct-2507-FP8 (Yang et al., 2025), to evaluate the compatibility of M INE D RAFT
+with modern MoE architectures. We use Qwen3-14B (Yang et al., 2025) as the draft model with m = 64, n = 2, a
+
+                                                                 23
+                             M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+   e=1
+   e=2
+   e=3
+   e=4
+   e=5              Arena                       ShareGPT                      Spec-Bench                        Tough
+
+
+
+
+Figure 21. VSR comparison for M INE D RAFT with TETRIS and standalone TETRIS across trimming percentiles on Setting 1. VSR of
+M INE D RAFT ’s integration with TETRIS becomes worse than that of standalone TETRIS from approximately 82–86% of SD steps on
+Spec-Bench. On the remaining datasets, VSR of M INE D RAFT integrated with TETRIS is consistent with that of standalone TETRIS over
+the first 98% of SD steps.
+
+
+
+                                                                24
+                             M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+                   Arena                       ShareGPT                       Spec-Bench                        Tough
+ Qwen3 32B-0.6B
+  Llama-3 70B-8B
+
+
+
+
+Figure 22. VSR comparison for M INE D RAFT with TETRIS across Settings 1 and 5 on n = 2 and temperature = 0.8. VSR of
+M INE D RAFT ’s integration with TETRIS generally increases as the number of extra tokens (e) increases except on Spec-Bench.
+
+                   Arena                       ShareGPT                      Spec-Bench                         Tough
+ e=1
+ e=2
+
+
+
+
+Figure 23. VSR comparison for M INE D RAFT with TETRIS and standalone TETRIS across trimming percentiles on Setting 1, n = 2 and
+temperature = 0.8. VSR of M INE D RAFT ’s integration with TETRIS becomes worse than that of standalone TETRIS from approximately
+92% of SD steps on Spec-Bench. On the remaining datasets, VSR of M INE D RAFT integrated with TETRIS is consistent with that of
+standalone TETRIS throughout the experiments.
+
+
+
+temperature of 0.8, and served on five H100 GPUs. Under this configuration, standard SD is infeasible due to VRAM
+constraints. As shown in Fig. 24, M INE D RAFT achieves its best performance when four draft tokens are generated per step,
+reaching an average throughput of approximately 1200–1600 tokens per second.
+
+                                                               25
+                             M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+                   Arena                        ShareGPT                       Spec-Bench                         Tough
+ Throughput
+  E2EL
+
+
+
+
+Figure 24. M INE D RAFT throughput and end-to-end latency results on Qwen3-235B-A22B-Instruct-2507-FP8 paired with Qwen3-14B,
+n = 2 and temperature = 0.8. The reported numbers reflect the mean and standard deviation over 2 independent trials. M INE D RAFT
+reaches the optimal performance when k = 4, producing an average throughput of 1200-1600 tokens/s. Standard SD fails in this setting
+due to OOM.
+
+
+
+C.11. Nsight Systems Profiling Results
+Nsight Systems profiling in Settings 1–3 using the Spec-Bench dataset shows that Qwen3-1.7B and Qwen3-0.6B exhibit
+similar drafting times, whereas Qwen3-4B has the longest drafting time among the three draft models. As illustrated in
+Fig. 25, Qwen3-4B spends significantly more time on drafting than on verification, limiting its ability to benefit from PSD.
+In contrast, Qwen3-1.7B, while slightly slower than Qwen3-0.6B, has greater model capacity and is thus more effective
+at generating draft tokens that pass verification. This observation supports the conclusion in Sec. C.6 that Qwen3-1.7B
+achieves the optimal balance between drafting speed and draft quality.
+
+C.12. Parallelization Coverage
+We assess the impact of the tail effect discussed in Sec. A by quantifying the proportion of decoding steps executed in parallel
+mode. Tab. 2 reports these rates across various model settings and datasets. The results show that M INE D RAFT achieves an
+overall average parallelization rate of 99.19%, indicating that the limitation imposed by the tail effect is negligible.
+
+D. Frequently Asked Questions
+Question 1. Why does M INE D RAFT not attain the maximum theoretical latency improvement of 50% in the experiments?
+Answer. The theoretical upper bound of a 50% latency reduction assumes an idealized setting in which drafting and
+verification times are perfectly matched throughout the execution of M INE D RAFT. In practice, both stages exhibit stochastic
+variation due to system overheads, resource contention, and time multiplexing, making the precise temporal alignment
+required to attain this bound infeasible in real-world deployments.
+Question 2. Why does M INE D RAFT maintain two batches instead of more? Why is the “Batch Parallelism size” fixed to 2?
+Answer. The design of M INE D RAFT is intrinsically tied to the two-stage structure of speculative decoding (SD): drafting
+and verification. Compared to autoregressive decoding, the additional drafting stage introduces extra latency, which can
+become prohibitive when either the number of draft tokens per step is large or the draft model is computationally expensive.
+
+                                                                26
+                              M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+
+
+
+
+(a) Sample segment of Nsight Systems profiling results with Set-          (b) Sample segment of Nsight Systems profiling results with Set-
+ting 1, Spec-Bench dataset, and k = 3. Median drafting and veri-          ting 1, Spec-Bench dataset, and k = 4. Median drafting and
+fication times are 49.60 ms and 48.62 ms, respectively, suggesting        verification times are 64.06 ms and 51.06 ms, respectively, sug-
+M INE D RAFT almost perfectly overlaps drafting with verification         gesting drafting time exceeds verification time by 25.48%, and the
+under this configuration.                                                 performance of M INE D RAFT may degrade under this configura-
+                                                                          tion.
+
+
+
+
+(c) Sample segment of Nsight Systems profiling results with Set-          (d) Sample segment of Nsight Systems profiling results with Set-
+ting 2, Spec-Bench dataset, and k = 3. Median drafting and veri-          ting 2, Spec-Bench dataset, and k = 4. Median drafting and
+fication times are 49.53 ms and 49.30 ms, respectively, suggesting        verification times are 65.75 ms and 50.70 ms, respectively, sug-
+M INE D RAFT almost perfectly overlaps drafting with verification         gesting drafting time exceeds verification time by 29.68%, and the
+under this configuration.                                                 performance of M INE D RAFT may degrade under this configura-
+                                                                          tion.
+
+
+
+
+(e) Sample segment of Nsight Systems profiling results with Set-          (f) Sample segment of Nsight Systems profiling results with Set-
+ting 3, Spec-Bench dataset, and k = 3. Median drafting and                ting 3, Spec-Bench dataset, and k = 4. Median drafting and
+verification times are 61.83 ms and 47.62 ms, respectively, sug-          verification times are 81.00 ms and 48.93 ms, respectively, sug-
+gesting drafting time exceeds verification time by 29.86%, and the        gesting drafting time exceeds verification time by 65.52%, and the
+performance of M INE D RAFT may degrade under this configura-             performance of M INE D RAFT is highly likely to degrade under this
+tion.                                                                     configuration.
+                         Figure 25. Comparison of Nsight Systems profiling across 6 different configurations.
+
+
+
+M INE D RAFT mitigates this overhead by overlapping the drafting of one set of requests with the verification of another. This
+design naturally requires exactly two batches: one for drafting and one for verification. Introducing additional batches would
+
+                                                                     27
+                               M INE D RAFT: A Framework for Batch Parallel Speculative Decoding
+Table 2. Percentage of total steps when standalone MineDraft operates in parallel vs. sequential mode across different settings and datasets.
+Reported numbers are averaged from three independent runs. MineDraft achieves an average parallelization percentage of 99.19%.
+
+                     Setting                                k     Arena      ShareGPT         Spec-Bench       Tough
+                     Qwen3 32B-0.6B (Setting 1)              1     99.84        99.96             94.32         99.88
+                                                             2     99.78        99.83             98.10         99.85
+                                                             3     99.86        99.84             98.61         99.76
+                                                             4     99.80        99.81             98.85         99.93
+                                                             5     99.86        99.61             98.79         99.87
+                     Qwen3 32B-1.7B (Setting 2)              1     99.90        99.75             93.61         99.94
+                                                             2     99.94        99.77             97.16         99.92
+                                                             3     99.72        99.79             98.13         99.81
+                                                             4     99.60        99.75             98.82         99.86
+                                                             5     99.78        99.66             98.02         99.86
+                     Qwen3 32B-4B (Setting 3)                1     99.96        99.86             93.00         99.90
+                                                             2     99.90        99.83             95.66         99.96
+                                                             3     99.89        99.81             97.52         99.88
+                                                             4     99.83        99.65             98.51         99.84
+                                                             5     99.83        99.71             99.31         99.73
+                     Qwen3 32B-8B (Setting 4)                1     99.93        99.95             93.48         99.94
+                                                             2     99.91        99.88             95.87         99.94
+                                                             3     99.95        99.70             98.91         99.81
+                                                             4     99.83        99.88             97.12         99.85
+                                                             5     99.65        99.83             98.16         99.74
+                     Llama-3 70B-8B (Setting 5)              1     99.77        99.88             99.59         99.81
+                                                             2     99.68        99.71             98.01         99.80
+                                                             3     99.64        99.60             97.02         99.81
+                                                             4     99.50        99.19             98.05         99.73
+                                                             5     98.86        99.53             95.62         99.63
+                     Vicuna 33B-EAGLE (Setting 6)            1     99.89        99.81             98.59         99.76
+                                                             2     99.78        99.69             97.63         99.91
+                                                             3     99.89        99.63             96.36         99.82
+                                                             4     99.86        99.72             98.58         99.71
+                                                             5     99.88        99.76             99.56         99.82
+                     Vicuna 13B-EAGLE (Setting 7)            1     99.89        99.91             96.01         99.92
+                                                             2     99.88        99.74             97.31         99.87
+                                                             3     99.75        99.87             99.57         99.83
+                                                             4     99.73        99.88             97.52         99.83
+                                                             5     99.76        99.68             98.18         99.75
+
+
+not produce further parallelism benefits, as there are no additional stages to overlap, and would instead incur unnecessary
+scheduling and management overhead.
+Question 3. Why does M INE D RAFT not incorporate prefill requests in the parallelism?
+Answer. The current design of M INE D RAFT assumes that chunked prefill is disabled. Under this configuration, vLLM
+completes the prefill stage for new requests in a dedicated step before transitioning them to decoding in subsequent steps,
+isolating prefill requests from the speculative decoding steps in which M INE D RAFT operates. As support for chunked prefill
+is a planned extension, future versions of M INE D RAFT will integrate prefill requests into its parallel execution workflow.
+
+
+
+
+                                                                    28
+

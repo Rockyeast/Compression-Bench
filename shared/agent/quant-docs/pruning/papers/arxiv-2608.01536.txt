@@ -1,0 +1,724 @@
+                                          Celty: SpMSpV GPU Kernel and SIMT Co-Design for
+                                                  Efficient Dual-Sparse LLM Inference
+                                                                    Ruokai Yin                                                 Priyadarshini Panda
+                                                                   Yale University                                         University of Southern California
+                                                                  New Haven, USA                                                  Los Angeles, USA
+                                        Abstract                                                                  1   Introduction
+                                        Large Language Models (LLMs) increasingly rely on spar-                   Large Language Models (LLMs) have demonstrated remark-
+                                        sity to cut inference cost, but most prior work exploits a                able capabilities across a wide range of tasks [1, 33], and
+arXiv:2608.01536v2 [cs.AR] 5 Sep 2026
+
+
+
+
+                                        single sparsity source and targets batched multi-user infer-              the vision of personal intelligence—where a capable LLM
+                                        ence. Dual-sparsity, which pairs unstructured weight prun-                serves as a dedicated assistant on a user’s own local de-
+                                        ing with runtime activation sparsity, offers a compelling                 vice—is rapidly gaining traction [19]. However, deploying
+                                        size–accuracy–latency tradeoff for single-user decoding, but              increasingly capable LLMs on personal devices faces two
+                                        forms a Sparse Matrix–Sparse Vector (SpMSpV) workload                     fundamental bottlenecks: growing model weights strain lim-
+                                        that existing GPU kernels handle poorly. We propose Celty,                ited device memory, and autoregressive decoding is bounded
+                                        a co-designed sparse format, GPU kernel, and SIMT microar-                by memory bandwidth when serving a single user. Together,
+                                        chitecture for SpMSpV in LLM inference. Celty’s Run-Length                they cap the scale and quality of models that can be practi-
+                                        Compressed CSC (RLC-CSC) format enables vectorized load-                  cally deployed outside data centers.
+                                        ing of compressed weight columns and exploits both spar-                     Sparsity—removing a subset of model weights—addresses
+                                        sity sources to skip memory accesses, accumulating par-                   both, shrinking the memory footprint and the data move-
+                                        tial products in shared memory. The Celty Sparse SIMT                     ment required per token. Structured pruning [24, 42] re-
+                                        Core then adds a pipelined RLC decoder that removes soft-                 moves entire blocks or sub-modules and is straightforward to
+                                        ware index reconstruction and repurposes local register files             accelerate on GPUs, but degrades accuracy sharply, pushing
+                                        for conflict-free accumulation, operating on the same com-                the community toward unstructured weight pruning [7, 32].
+                                        pressed representation. The kernel alone achieves up to 2.8×                 While unstructured weight sparsity delivers on accuracy
+                                        over cuBLAS; with the Sparse SIMT Core, speedup reaches                   and compression, translating it into wall-clock GPU speedup
+                                        5.3× over cuBLAS at 70% dual-sparsity.                                    remains a persistent challenge. Its irregular memory access
+                                                                                                                  pattern demands specialized kernels [6, 16, 35] and microar-
+                                        Keywords                                                                  chitectural support [13, 16, 34], and most such efforts target
+                                        Large Language Model; Sparsity; SIMT                                      batched multi-user inference, formulating the problem as
+                                                                                                                  Sparse Matrix–Dense Matrix (SpMM) multiplication on ten-
+                                        ACM Reference Format:                                                     sor cores, an assumption poorly suited to the single-user
+                                        Ruokai Yin and Priyadarshini Panda. 2026. Celty: SpMSpV GPU Ker-
+                                                                                                                  decoding central to personal-device deployment. And the
+                                        nel and SIMT Co-Design for Efficient Dual-Sparse LLM Inference.
+                                                                                                                  gains remain modest: Flash-LLM [35] achieves only 1.3×
+                                        In IEEE/ACM International Conference on Computer-Aided Design
+                                        (ICCAD ’26), November 08–12, 2026, San Jose, CA, USA. ACM, New            speedup over cuBLAS at 70% sparsity on a 4096×4096 layer.
+                                        York, NY, USA, 9 pages. https://doi.org/10.1145/3831252.3833936              Activation sparsity, identified at runtime through magni-
+                                                                                                                  tude thresholding [20, 38, 40], is a complementary source
+                                        This work was supported in part by CoCoSys, a JUMP2.0 center sponsored    of sparsity that skips entire weight columns during decod-
+                                        by DARPA and SRC, the NSF (CAREER Award, Grant #2312366, Grant            ing with minimal accuracy loss, directly addressing unstruc-
+                                        #2318152), the DARPA Young Faculty Award, the DoE MMICC center SEA-
+                                                                                                                  tured weight sparsity’s acceleration weakness for single-user
+                                        CROGS (Award #DE-SC0023198) and the Global Industrial Technology Co-
+                                        operation Center (GITCC) program. Correspondence: ruokai.yin@yale.edu.    decoding. Because it is input-dependent, however, the full
+                                                                                                                  weight matrix must remain in GPU memory, offering no
+                                                                                                                  model size reduction.
+                                                                                                                     Dual-sparsity [38] resolves this tension by pairing acti-
+                                        This work is licensed under a Creative Commons Attribution 4.0 Interna-   vation sparsity with moderate unstructured weight pruning:
+                                        tional License.                                                           the weight sparsity compresses the stored model while acti-
+                                        ICCAD ’26, San Jose, CA, USA
+                                                                                                                  vation sparsity drives runtime acceleration, and when both
+                                        © 2026 Copyright held by the owner/author(s).
+                                        ACM ISBN 979-8-4007-2873-0/2026/11
+                                                                                                                  are present, even fewer weights need to be fetched per token.
+                                        https://doi.org/10.1145/3831252.3833936                                   This combination represents a highly promising workload
+ICCAD ’26, November 08–12, 2026, San Jose, CA, USA                                                              Ruokai Yin and Priyadarshini Panda
+
+                                                                          sparse-load                             sparse-load
+for efficient single-user LLM decoding, formulated as Sparse                            decompress       (a)                    decompress        (b)
+Matrix–Sparse Vector (SpMSpV) multiplication. Yet existing                   L2 Cache                 dense-           L2 Cache
+                                                                                              dense   compute                                   sparse-
+SpMSpV kernels [15, 18, 36, 37] are designed for graph tra-                                                                           scatter
+                                                                                               load                                             compute
+                                                                               idx                                                     load
+versal workloads at near-99% sparsity, and no prior work has                                           TCs              idx idx
+                                                                                                                                                Cu
+investigated efficient GPU kernel support for SpMSpV under                   RFs        DKs           SMEM           RFs        DKs
+the moderate dual-sparsity characteristic of LLM inference.
+   To bridge this gap, we propose the Celty SpMSpV GPU                Figure 1: Illustration of (a) prior SpMM kernels. (b)
+kernel, which employs a Run-Length Compressed CSC (RLC-               prior SpMV kernels. DK stands for decompression ker-
+CSC) sparse format whose strict one-to-one mapping be-                nel. TC stands for tensor core and Cu denotes the CUDA
+tween indices and non-zero values enables efficient vec-              SIMT cores.
+torized loading of compressed weight columns and scatter-
+accumulation of partial products in shared memory. Although
+this kernel already exploits both sparsity sources effectively,       2   Background and Motivation
+profiling reveals that up to 40% of execution time is con-            2.1 Sparsity for LLM Inference. LLM sparsity techniques
+sumed by reconstructing row indices from the RLC-CSC                  span three categories, each offering a different tradeoff among
+format and by shared-memory bank conflicts during scatter-            accuracy, model size, and speedup.
+accumulation—bottlenecks that cannot be resolved at the                  Unstructured weight sparsity. Training-free pruning meth-
+kernel level alone. This motivates a co-design approach: the          ods such as SparseGPT [7] and Wanda [32] remove individual
+Celty Sparse SIMT Core integrates a lightweight pipelined             weights based on importance scores derived from Hessian
+RLC decoder that eliminates reconstruction overhead en-               estimates or activation magnitudes. The irregular zero pat-
+tirely in hardware and repurposes local register files as conflict-   tern preserves model accuracy well but demands dedicated
+free partial-product buffers, operating directly on the same          sparse kernels [6, 16] for speedup, which remains modest at
+RLC-CSC format without any data layout change. Our con-               moderate sparsity [21].
+tributions are summarized as follows:                                    Structured weight sparsity. Methods such as ShortGPT [24]
+   (1) We propose the Celty SpMSpV GPU kernel1 , the first            and BlockPruner [42] remove entire transformer blocks or
+       GPU kernel designed for dual-sparse LLM inference.             sub-modules. NVIDIA’s sparse tensor cores, introduced in
+       We introduce the RLC-CSC sparse format that en-                the Ampere architecture [27], natively accelerate a finer-
+       ables efficient vectorized loading of compressed weight        grained 2:4 semi-structured pattern, but enforcing this fixed
+       columns and leverage both input and weight sparsity            structure still incurs non-negligible accuracy degradation [7].
+       to skip unnecessary memory accesses during single-             In both cases, the coarse or rigid pattern is straightforward
+       user decoding, with shared memory employed for                 to accelerate [24, 29] but limits achievable model quality.
+       partial-product accumulation. The Celty GPU kernel                Input activation sparsity. Recent work induces runtime
+       alone achieves up to 2.8× speedup over cuBLAS and              sparsity through magnitude thresholding [20, 38] or SVD-
+       2.4× over Flash-LLM, the strongest sparse baseline.            based techniques [40], enabling column-skipping during
+   (2) We propose the Celty Sparse SIMT Core, a lightweight           decoding with minimal accuracy loss. However, the input-
+       micro-architectural enhancement that integrates a 3-           dependent pattern requires the full weight matrix to remain
+       stage pipelined RLC decoder to eliminate software-             resident in GPU memory.
+       level index reconstruction and repurposes local regis-            Dual-sparsity. DuoGPT [38] combines activation sparsity
+       ter files for conflict-free partial-product accumulation.      with moderate unstructured weight pruning, achieving a
+       With less than 0.1% area overhead, the Sparse SIMT             favorable tradeoff among speedup, model size, and accuracy
+       Core achieves up to 5.3× speedup over cuBLAS at 70%            for single-user decoding. This formulation motivates the
+       dual-sparsity and up to 2.8× over Coruscant’s sparse           SpMSpV workload targeted in this work. Throughout the
+       tensor core on single-user decoding workloads.                 paper, 𝑥% dual-sparsity refers to 𝑥% input activation sparsity
+   (3) We evaluate Celty end-to-end on LLaMA-2-13B, demon-            plus 𝑥% unstructured weight sparsity.
+       strating 2.28× decode speedup over cuBLAS at 50%                  2.2 GPU kernels for sparsity in LLMs. Most GPU ker-
+       dual-sparsity while maintaining a WikiText-2 perplex-          nel research on sparse LLM inference targets the sparse-
+       ity of 7.2, compared to 4.9 for the FP16 dense model. To       matrix–dense-matrix (SpMM) operation [6, 8, 16, 35, 41],
+       our knowledge, this is the first work to co-design the         which corresponds to batched multi-user decoding on a
+       sparse format GPU kernel and SIMT microarchitecture            pruned model. While batching improves GPU throughput, it
+       for SpMSpV in LLM inference.                                   introduces system-level complexity such as KV-cache man-
+                                                                      agement [17] and does not address the single-user decoding
+1 Code is available at https://github.com/RuokaiYin/Celty.            scenario.
+Celty: SpMSpV GPU Kernel and SIMT Co-Design for Efficient Dual-Sparse LLM Inference           ICCAD ’26, November 08–12, 2026, San Jose, CA, USA
+
+
+   Single-user decoding requires a Sparse Matrix–Dense Vec-                     Offline        value                                      (c) Working Example
+                                                                                                                  th0-31 64
+tor (SpMV) operation, equivalent to setting N=1 in SpMM.                        Sparse Matrix A 0.7
+                                                                                                0.2                1                             1          skip
+
+
+
+
+                                                                                                                                         selective
+                                                                                                                                                      0
+                                                                                                0.1                    1
+
+
+
+
+                                                                                                                                            load
+                                                                                                                                                      0
+However, state-of-the-art SpMM kernels perform poorly in                                                                                             0.6
+
+this regime. These kernels follow a load-sparse-compute-                                      indices                            warp0
+
+
+
+
+                                                                                                               Vector B
+
+
+
+
+                                                                                                                                                                           LDG.128
+                                                                                                                                                                     0.7
+
+
+
+
+                                                                                                                Input
+                                                                                                   0
+                                                                                                                                                                     0.2
+dense paradigm [6, 16]: sparse data is loaded into registers,                                      1
+                                                                                                                                 K                                   0.1
+                                                                                (a)                2
+                                                                                                                                                 thread0
+
+
+
+
+                                                                                                                                                                …
+
+                                                                                                                                                                       …
+decompressed into dense tiles via decompression kernel in
+                                                                                                                             1                                  skip
+shared memory (SMEM), and computed via tensor cores                             warp0                  8
+                                                                                                           1 th                            3         0.6
+                                                                                                                                                                       0
+
+
+
+
+                                                                                                                                                                           LDG.32
+(Figure 1 (a)). While pipelining can hide the decompression                                                    0                         scatter x
+
+
+
+
+                                                                                                   256
+                                                                                                                                                                       1
+                                                                                 M
+
+
+
+
+                                                                                                           …
+                                                                                                                                           .42       0.7               2
+latency at large N, at N=1 the tensor core computation is                                                                                  .12       0.2
+
+
+
+
+                                                                                                                                                                       …
+                                                                                                                                                 =
+
+
+
+
+                                                                                                                                                                …
+too short to mask the SMEM traffic overhead. Some existing                                K                th31                            .06       0.1    2
+                                                                                                                                                           compute
+
+
+
+
+                                                                                                                                            …
+
+
+                                                                                                                                                     …
+                                                                                 Packed Matrix A                           Output
+SpMV kernels [23, 26] avoid this overhead entirely by decod-                    (b)                         64                                   row indices
+ing sparse indices via decompression kernel to scatter-load
+inputs from global memory and computing directly on SIMT                  Figure 2: Celty SpMSpV kernel design. (a) Offline:
+cores (Figure 1 (b)). Other SpMV work [21] leverages tensor               weights are packed into RLC-CSC format, which run-
+core as well to accommodate the computation overhead at                   length compresses the row indices. (b) Loop ordering:
+very high sparsity regimes.                                               each warp is assigned a tile of 256 rows (M) and iter-
+   For dual-sparse workloads, the input vector is itself sparse,          ates over 64 columns (K). (c) Runtime example: zero-
+transforming the problem into a sparse-matrix–sparse-vector               valued inputs trigger a column skip; for non-zero in-
+(SpMSpV) operation. The intersection of two irregular spar-               puts, weights and indices are vector-loaded and scatter-
+sity patterns leads to highly unpredictable memory access                 accumulated into the output.
+and workload distribution that existing kernels—designed for
+a single sparsity source—handle poorly. Prior SpMSpV ker-                 𝑏 values, the unstructured input sparsity pattern causes dif-
+nels [15, 18, 36, 37] target optimization on graph algorithms             ferent threads to take different control-flow paths, resulting
+such as BFS, at near-99% sparsity and do not translate to                 in warp divergence that negates any speedup. To avoid this,
+the moderate sparsity levels (30–70%), which is the standard              all 32 threads within a warp share the same input value 𝑏,
+sparsity regime for LLM inference.                                        and each warp processes multiple rows of 𝐴 simultaneously.
+   2.3 Sparse SIMT Microarchitecture. NVIDIA’s Ampere                     At each iteration, the warp loads 𝑏 and checks whether it is
+architecture introduced sparse tensor cores that natively                 zero; if so, the entire warp skips to the next column without
+compute the 2:4 semi-structured format [27]. To support                   issuing any memory access.
+unstructured sparsity, prior works [13, 16, 34] have pro-                    Essentially, this resembles a split-K formulation [12] where
+posed microarchitectural enhancements to the tensor core                  the K-dimension is distributed across warps. However, in-
+pipeline. However, all of these target SpMM operations with               creasing K-parallelism also increases the cost of merging par-
+large N—either N≥ 2048 [13, 34] where the workload is                     tial sums—either through atomic additions to global memory
+strictly compute-bound and justifies the hardware overhead,               or a separate reduction kernel launch. To balance parallelism
+or N≥ 8 [16] where sufficient pipeline depth hides the de-                against atomic merge overhead, Celty assigns each warp a
+compression latency. In single-user decoding, N is strictly 1,            2D tile (Figure 2(b)): the M-dimension is partitioned across
+placing the workload firmly in the memory-bound regime,                   warps, each covering 256 rows, while each warp iterates
+where tensor cores offer no advantage. Rather than enhanc-                over 64 columns along K in an inner loop. We use 128-bit
+ing the tensor core, we propose a microarchitectural modifi-              vectorized loads [22] for data loading: at FP16 precision, each
+cation to the SIMT core’s CUDA core pipeline tailored to the              thread loads 8 consecutive weights (16 bytes), so each 32-
+SpMSpV workload, detailed in Section 4.                                   thread warp covers 256 rows. To guarantee alignment for
+                                                                          vectorized access, we apply reverse offset memory alignment
+                                                                          (ROMA) following [23].
+3 Celty SpMSpV GPU Kernel Design
+3.1 Celty SpMSpV Formulation                                              3.2     Celty Sparse Format
+The central design goal of the Celty SpMSpV kernel (Figure 2)             With the kernel formulation established, we now describe
+is to exploit input sparsity to skip loading the corresponding            the sparse format designed to complement it. Bitmap-based
+weight columns from global memory, thereby reducing mem-                  formats are a popular choice for storing unstructured pruned
+ory traffic and latency. To achieve this, each thread must first          weights [6, 16], offering better compression than traditional
+inspect the input activation value 𝑏 before deciding whether              Compressed Sparse Row (CSR) or Coordinate List (COO).
+to issue weight-fetch instructions. This introduces a critical            However, bitmaps are fundamentally incompatible with our
+design consideration: if threads within a warp fetch different            vectorized-loading strategy. The root issue is that the number
+ICCAD ’26, November 08–12, 2026, San Jose, CA, USA                                                   Ruokai Yin and Priyadarshini Panda
+
+
+               100
+                                           Exceeds origin size       Algorithm 1 Intra-warp prefix sum over RLC run-lengths
+      Compression
+
+
+                                                                      1: Inputs: 𝑙𝑎𝑛𝑒 and rlc_arrays
+       Ratio (%)
+
+
+
+                    50                                                2: 𝑠𝑖𝑧𝑒 ← 𝑙𝑒𝑛(rlc_arrays) − 1
+                    30                                                3: Initialize 𝑠𝑢𝑚 ← 0, 𝑎𝑙𝑙 ← 0xFFFFFFFF
+                            Weight Sparsity (%)                       4: Initialize prefix[0 : 𝑠𝑖𝑧𝑒] ← 0
+                                                                      5: for 𝑖 ← 0 to 𝑠𝑖𝑧𝑒 do
+Figure 3: Compression ratio of bitmap vs. RLC-CSC                     6:   𝑠𝑢𝑚 ← 𝑠𝑢𝑚 + rlc_arrays[𝑖]
+across different sparsity on a 4096×4096 layer.                       7: end for
+                                                                      8: for 𝑖 ← 0 to log2 32 − 1 do
+of set bits in a bitmap chunk is unpredictable: when a thread         9:   𝑝𝑜𝑠 ← 2𝑖
+loads 32 bitmap bits, the number of corresponding non-zero           10:   𝑝𝑟𝑒𝑣_𝑠𝑢𝑚 ← shfl_up_sync(𝑎𝑙𝑙, 𝑠𝑢𝑚, 𝑝𝑜𝑠)
+values varies, making it impossible to issue a fixed-width           11:   if 𝑙𝑎𝑛𝑒 ≥ 𝑝𝑜𝑠 then
+vectorized load for the values. Allowing only threads with           12:      𝑠𝑢𝑚 ← 𝑠𝑢𝑚 + 𝑝𝑟𝑒𝑣_𝑠𝑢𝑚
+sufficient non-zeros to issue vectorized loads reintroduces          13:   end if
+warp divergence.                                                     14: end for
+   We instead adopt a Compressed Sparse Column (CSC)-                15: for 𝑖 ← 𝑠𝑖𝑧𝑒 downto 0 do
+
+based format, which provides a strict one-to-one mapping             16:   prefix[𝑖] ← 𝑠𝑢𝑚
+                                                                     17:   𝑠𝑢𝑚 ← 𝑠𝑢𝑚 − rlc_arrays[i]
+between indices and non-zero values—exactly matching the
+                                                                     18: end for
+vectorized load granularity. Standard CSC uses a 32-bit row          19: Outputs: prefix {row index adds the entry’s ordinal; see code}
+index per non-zero entry, yielding poor compression at the
+moderate sparsity levels (30–70%) typical of LLM inference [6,
+16]. To address this, we compress each row index using n-bit         the absolute row index follows by adding each entry’s ordi-
+run-length coding (RLC) [3, 4, 10, 23], where each RLC value         nal. The reconstructed indices then serve as scatter addresses
+encodes the number of zeros preceding the corresponding              for accumulating partial products.
+non-zero entry. Gaps exceeding 2𝑛 − 1 are handled by in-                Naively writing partial sums directly to global memory
+serting zero-valued padding entries. For example, the sparse         incurs severe overhead from atomic operations, write con-
+column [0, 0, 4, 0, 0, 0, 0, 2, 8] is encoded with 2-bit RLC as a    tention, and high access latency. To mitigate this, each thread
+value array [4, 0, 2, 8] and a run-length array [2, 3, 0, 0]. Fig-   block accumulates into a local shared-memory (SMEM) buffer,
+ure 2(a) illustrates the offline packing process, where each         which is flushed to global memory only after all assigned
+column’s non-zero values and their RLC-CSC indices are               columns have been processed. This reduces the frequency of
+stored contiguously for vectorized access.                           expensive global writes, yielding on average 14.4× speedup
+   Celty uses 4-bit RLC-CSC, achieving approximately 63%             over direct global-memory accumulation on the A5000 GPU.
+compression efficiency on a 50% sparse 4096×4096 layer. Al-          However, SMEM bank conflicts during scatter-accumulation
+though bitmaps offer a theoretically lower bound of ∼ 56%            and the inherently higher access latency compared to reg-
+compression efficiency at the same sparsity, their deployment-       ister files limit the achievable performance, motivating the
+time compression efficiency is ∼ 64% because of the value-           hardware-level solution presented in Section 4.
+index decoupling discussed above. Figure 3 compares the
+two across sparsity levels: RLC-CSC is comparable to the
+                                                                     4     Celty Sparse SIMT Microarchitectural
+bitmap implementation of [16] at deployment time while ad-
+ditionally being compatible with vectorized loading, which                 Enhancements
+is the property the bitmap cannot provide.                           Profiling the SMEM-based Celty SpMSpV kernel reveals two
+                                                                     performance bottlenecks that cannot be resolved at the soft-
+3.3       SMEM-Based Scatter-Accumulation                            ware level: SMEM bank conflicts during scatter-accumulation
+As discussed, when a warp encounters a non-zero input                and the overhead of reconstructing row indices from RLC-
+activation, it must compute and accumulate partial prod-             CSC (Algorithm 1). We address each with a targeted microar-
+ucts from the corresponding weight column into the output            chitectural enhancement to the GPU’s SIMT core.
+vector. Figure 2(c) illustrates this process with a working ex-
+ample for a single thread. The key challenge is determining          4.1    Register-File-Based Accumulation
+the correct output row for each loaded weight. Each thread           In the SMEM-based kernel, scatter-accumulation writes par-
+loads 8 weights along with 8 RLC-CSC indices, but because            tial products to a shared-memory buffer indexed by the re-
+these indices are run-length encoded, threads within a warp          constructed row positions. Because a single SMEM bank
+must cooperate to reconstruct the absolute row positions via         group (32 banks) is shared across four SIMT cores, concur-
+an intra-warp prefix sum over the run-lengths (Algorithm 1);         rent write requests from multiple warps frequently collide on
+Celty: SpMSpV GPU Kernel and SIMT Co-Design for Efficient Dual-Sparse LLM Inference                                            ICCAD ’26, November 08–12, 2026, San Jose, CA, USA
+
+          warp0 access       bank conflict
+          warp1 access                            Average # of SMEM stalls           registers for accumulation reduces the budget: for M=5120,
+                      wrt (2, 31, 33, 34)
+         SIMT0
+
+                           output idx                            78.2%
+                                                                                     5120 reserved registers leave 60416, supporting 47 warps
+                         t3                     1 stall                  wrt group   (97.9%, a 2.1% drop in occupancy). Across all evaluated layer
+                    t2 t0           t1          2 stall      21.8%       = 32
+                                                                                     sizes the reduction stays under 7%.
+                                Bank 31
+                                Bank 30
+                   Bank 1
+                   Bank 2
+                   Bank 0
+            SMEM
+
+
+
+
+                            …                             9.8%
+                                                2 stall          81.9% wrt group
+                                                3 stall                              4.2    Hardware RLC Decoder
+                                                4 stall    8.3%        = 64
+                   t1 t3       t2 t0                                                 While the RLC-CSC format reduces index storage and en-
+         SIMT1
+
+
+
+
+                     wrt (63, 64, 94, 97)
+                          output idx      (a)     LLaMA-2-7B Block 10          (b)   ables efficient vectorized loading, current GPUs do not na-
+Figure 4: (a) Shared-memory bank conflicts during                                    tively support it. The kernel must therefore perform intra-
+scatter-accumulation: threads from different SIMT                                    warp prefix-sum reconstruction (Algorithm 1) at every itera-
+cores targeting the same bank serialize writes. (b)                                  tion before scatter-accumulation can proceed. Notably, this
+SMEM stall distribution profiled at 50% dual-sparsity.                               cost is largely masked by SMEM stalls in the baseline kernel,
+                                                                                     but once register-file accumulation eliminates the SMEM
+the same bank, serializing the writes and stalling the pipeline.                     bottleneck, reconstruction emerges as the dominant remain-
+Figure 4(a) illustrates this mechanism, and Figure 4(b) quan-                        ing overhead. As shown in Figure 5, it can occupy up to
+tifies the impact: on a representative LLaMA-2-7B layer at                           40% of total kernel execution time, representing a substantial
+50% dual-sparsity, over 90% of iterations incur 3 or more stall                      optimization opportunity.
+cycles when the write group size reaches 64.
+   To eliminate this bottleneck, we repurpose the abundant
+local register files within each SIMT core as partial-product
+buffers. The output vector is partitioned into four equal seg-
+ments, one per SIMT core within an SM sub-partition. For
+example, for 𝑀 = 5120, each SIMT core reserves 1280 reg-                             Figure 5: Percentage of RLC-CSC reconstruction la-
+isters as a local accumulation buffer. During computation,                           tency in total kernel execution time on A5000 across
+after the RLC-CSC indices are decoded into row positions,                            different dual-sparsity levels and layer shapes.
+each thread writes its partial products directly to the register
+                                                                                        We propose to eliminate this overhead through a light-
+file at the corresponding output position, bypassing SMEM
+                                                                                     weight microarchitectural addition to the SIMT core: a hard-
+entirely. These registers are reserved prior to kernel launch
+                                                                                     ware RLC decoder that reconstructs absolute row indices
+and shared among threads within each SM sub-partition2 .
+                                                                                     directly from the RLC-CSC stream, removing the need for
+   Since register-file access has both lower latency and higher
+                                                                                     software prefix-sum instructions and intra-warp shuffle com-
+bandwidth than SMEM, this approach eliminates bank-conflict
+                                                                                     munication. The modification is minimal and allows the
+stalls and reduces accumulation latency. As demonstrated in
+                                                                                     SIMT core to operate in both its original dense mode and the
+our ablation study (Section 6.4), even partial register alloca-
+                                                                                     Celty sparse mode.
+tion (e.g., 50%) yields significant speedup at low dual-sparsity
+where SMEM pressure is highest, while full register-resident                                      SM SIMT core (sub-partition)                                           Decompression Unit
+                                                                                                    Reserved
+
+
+
+
+accumulation provides up to 2.40× improvement over the                                                                                                                                              y0
+                                                                                                                                                                                  1
+                                                                                                                 RLC-Decoder
+
+
+
+
+pure SMEM baseline. Importantly, the register-accumulation                                                                                                          x0                              y1
+                                                                                                                                            Write Back
+
+
+
+
+                                                                                                                                                                    x1    +
+                                                                                            Register File
+
+
+
+
+ratio can be tuned to balance performance against occupancy                                                                                                                                 +       y2
+                                                                                                                                                                    x2                + 2
+constraints, making the approach practical across different                                                                                                                                         y3
+                                                                                                                               CUDA Cores                           x3    +       1             3
+layer dimensions and sparsity levels. In the rare case that                                                                                                                                 +       y4
+                                                                                           Decompression broadcast                                                            1       2
+a target output position falls outside the locally partitioned                                                                                                      x4                              y5
+                                                                                               Unit    offsets                                                      x5    +                 +
+                                                                                                                                                     RF addresses
+
+
+
+
+register range, SMEM serves as a fallback buffer to ensure                                                                          +
+                                                                                                                                    +                                                               y7
+                                                                                                      3-stages
+
+
+
+
+correctness; in practice, our profiling shows that such spills                                                                                                      x6                +     +
+                                                                                                                                                                    x7    +
+                                                                                                                                  …
+                                                                                                                 …
+                                                                                              …
+
+
+
+
+occur negligibly across all evaluated workloads.                                                                                                                                                    y6
+                                                                                                                                    +                                                       -
+   Here we additionally provide an analysis on register accu-                                                                       +
+                                                                                                                                                                         stage1 stage2 stage3
+mulation’s impact on the occupancy. From compiled register
+usage (ptxas -v), on the A5000 (sm_86, 65536 registers/SM,                           Figure 6: Celty Sparse SIMT Core microarchitecture.
+48 max warps/SM), the Celty kernel uses 40 registers/thread                          The RLC decoder reconstructs row indices; the output
+(1280/warp), allowing the full 48 warps/SM. Reserving the                            offsets address the register-file accumulation buffer.
+2 Details on inter-thread register sharing can be found in prior work on               Figure 6 illustrates the proposed RLC decoder, a 3-stage
+register-file virtualization, such as [14].                                          pipelined unit that ingests 8 RLC-CSC indices per cycle. Once
+ICCAD ’26, November 08–12, 2026, San Jose, CA, USA                                                   Ruokai Yin and Priyadarshini Panda
+
+
+
+
+                                                                    216us
+
+
+
+
+                                                                                                         569us
+                                                                                       149us
+                                132us
+            55us
+
+
+
+
+                                                     79us
+                          Figure 7: Comparison of kernel latency across workloads and sparsity.
+
+the pipeline is full, 8 reconstructed row indices are produced        and weight) to Celty and weight-only sparsity to all base-
+every cycle. The pipeline implements a modified parallel              lines, ensuring matched weight sizes across all kernels. For
+prefix adder tree that computes cumulative sums of the run-           the two SpMM baselines, the N dimension is padded to 8 to
+lengths, equivalent to Algorithm 1 but executed entirely in           satisfy tensor-core alignment requirements.
+hardware. The seventh output (𝑦6 ) is back-calculated via a              Hardware simulation and synthesis. For the Celty
+subtractor in parallel with the final adder-tree stage, eliminat-     Sparse SIMT Core, we estimate GPU-level performance fol-
+ing the need for an extra forward-carry stage. To illustrate,         lowing the methodology of VectorSparse [43] and Corus-
+the markers 1 – 3 trace the computation of 𝑦4 : stage one             cant [16]: we implement a modified version of the Celty
+( 1 ) computes partial sums 𝑥 0 +𝑥 1 and 𝑥 2 +𝑥 3 while buffering     kernel that removes the RLC reconstruction instructions
+                                                          Í3
+𝑥 4 ; stage two ( 2 ) aggregates these into a block sum 𝑖=0    𝑥𝑖     and replaces SMEM-based scatter-accumulation with direct
+with 𝑥 4 still buffered; stage three ( 3 ) adds the forwarded 𝑥 4     register-file access, while retaining the standard fmaf_rn
+to produce the final index 𝑦4 .                                       computation. This modified kernel is executed on A5000
+     To maximize thread utilization, the decoder ingests its 8        GPU, and the measured latency serves as an estimate of
+inputs from different thread lanes rather than from a single          the performance achievable with the proposed Celty Sparse
+thread. This requires the offline RLC compression stage to            SIMT Core enhancements. We synthesize the RTL implemen-
+interleave non-zero values and their RLC-CSC indices across           tation of the RLC decoder using Synopsys Design Compiler
+threads—for instance, thread 0 loads entries at positions             at 400 MHz targeting 32 nm technology and scale to 7 nm
+[0, 32, 64, 96, 128, 160, 192, 224] in the non-zero sequence. Be-     using the methodology of [31].
+cause scatter-accumulation is order-independent, interleav-
+ing does not affect correctness. The reconstructed offsets            6 Evaluation
+from the decoder are added to a broadcasted base pointer
+                                                                      6.1 Kernel Performance and Analysis
+to form the register-file address for the current partial prod-
+uct, which is then fetched and forwarded to the FP ALU for            Figure 7 reports kernel latency across all evaluated layer di-
+the fused multiply-accumulate operation. Together with the            mensions and sparsity levels. The SMEM-based Celty kernel
+kernel design in Section 3, the Sparse SIMT Core completes            (Section 3) consistently outperforms the tensor-core base-
+the Celty co-design stack, operating end-to-end on the same           lines Coruscant (SpMM), Flash-LLM (SpMM), and DASP
+RLC-CSC format from storage through computation.                      (SpMV) across all workloads and sparsity levels, as each
+                                                                      requires an additional decompression stage whose SMEM
+                                                                      traffic is not amortized at N=1. Against dense cuBLAS, Celty
+                                                                      is slightly slower at low sparsity on smaller layers (roughly
+5    Experimental Setup                                               1.2× at 30% for M=K=4096) but delivers speedup from 50%
+Workloads. We evaluate on linear layer dimensions drawn               dual-sparsity onward for most shapes, averaging 1.49× and
+from three widely used LLM models: 4096×4096 and 4096×11008           2.19× at 50% and 70% and peaking at 2.80× on the 5120×13824
+(LLaMA-2-7B [33]), 5120×5120 and 5120×13824 (LLaMA-2-                 layer at 70%. On that layer it reaches 2.41× over Flash-LLM,
+13B [33]), and 7168×7168 and 7168×28672 (OPT-30B [39]).               2.82× over DASP, and 2.84× over Coruscant, with margins
+   Baselines. We compare against two state-of-the-art SpMM            largest at 30% where the baselines’ decompression overhead
+kernels—Coruscant [16] and Flash-LLM [35]—and one SpMV                is least amortized. The advantage stems from dual-sparsity’s
+kernel, DASP [21], alongside dense cuBLAS. All kernels are            lower effective memory traffic, though gains remain bounded
+compiled with CUDA Toolkit 12.6 and GCC 12.2, and eval-               by the SMEM bank-conflict and RLC reconstruction over-
+uated on a single NVIDIA A5000 GPU (Ampere, compute                   heads discussed above.
+capability 8.6, 24 GB GDDR6). Since prior sparse kernels ex-             With the Celty Sparse SIMT Core enhancements, both
+ploit only weight sparsity, we apply dual-sparsity (both input        bottlenecks are resolved in hardware. Averaged across all
+Celty: SpMSpV GPU Kernel and SIMT Co-Design for Efficient Dual-Sparse LLM Inference            ICCAD ’26, November 08–12, 2026, San Jose, CA, USA
+
+                                                                          Table 1: Area overhead comparison to prior works.
+                   Ideal
+                                                                          Available numbers are taken from respective paper.
+                                                       60%
+                           50%
+                                                                          All area units are in mm2 . Overhead relative to full
+                    40%                                                   GPU is shown in parentheses for Celty.
+             30%
+                                                                                GPU           DS [34]     RM [13]       Coruscant [16]           Celty-SIMT
+                                                                                V100 (815)     12.85          –              0.51                0.22 (0.03%)
+                                                                                A100 (826)       –          14.87            0.68                0.33 (0.04%)
+                                                                                H100 (814)       –            –              1.44                0.68 (0.08%)
+
+Figure 8: End-to-end decode latency vs. perplexity
+(WikiText-2) under different dual-sparsity configura-
+                                                                             Performance comparison. Figure 9 compares the Celty
+tions. Each point represents different sparsity.
+                                                                          Sparse SIMT Core against Coruscant’s sparse tensor core [16]
+evaluated layer shapes, Celty achieves 1.78×, 2.73×, and                  on single-user decoding workloads. While Coruscant targets
+4.06× speedup over dense cuBLAS at 30%, 50%, and 70%                      SpMM with 𝑁 ≥ 8 and decompresses sparse data into dense
+dual-sparsity, respectively. The maximum speedup reaches                  tiles before tensor-core execution, Celty operates directly
+5.27× on the 5120×13824 layer at 70% dual-sparsity.                       on compressed RLC-CSC data at N=1. Across all evaluated
+                                                                          layers and sparsity levels, Celty achieves on average 2.13×
+6.2    End-to-End Model Performance                                       speedup over Coruscant-STC, with gains reaching up to 2.8×
+To evaluate the practical impact of Celty beyond individ-                 at 70% dual-sparsity.
+ual layers, we measure end-to-end single-token decode la-
+tency on LLaMA-2-13B with 161 prefill tokens [30] under                                                                              cuBLAS dense: 216 us
+                                                                                                                             1.78x
+varying sparsity configurations, reporting the corresponding                                                                          2.02x
+                                                                                                                                              2.32x
+                                                                                             cuBLAS dense: 79 us                                      2.59x
+WikiText-2 [25] perplexity in Figure 8. For Flash-LLM and                                                                                                     2.80x
+                                                                                      1.76x 1.77x
+DASP, models are pruned using Wanda [32]; for Celty, we use                                         1.9x 1.98x 2.38x
+
+DuoGPT’s [38] dual-sparsity framework. All configurations
+use FlashAttention [5] for the attention layers.
+   As shown in Figure 8, Celty consistently improves end-to-
+end decode latency over dense cuBLAS across all evaluated                 Figure 9: Comparison of sparse microarchitectural en-
+accuracy–sparsity tradeoff points. In contrast, DASP and                  hancements on 5120×5120 and 5120×13824 layers.
+Flash-LLM fail to achieve speedup below 50% sparsity despite
+operating in a similar perplexity range. At 50% dual-sparsity,              Energy Efficiency comparison. For energy efficiency,
+Celty reaches 2.28× end-to-end speedup while maintaining                  we report the normalized energy cost comparison between
+a WikiText-2 perplexity of 7.2, compared to 4.9 for the FP16              the dense cuBLAS kernel running on A5000, Coruscant-STC
+dense baseline. At higher sparsity, Celty reaches up to 2.63×             kernel running on Coruscant-STC enhanced A5000, and
+speedup with increased but bounded perplexity degrada-                    Celty kernel running on Celty-Sparse-SIMT enhanced A5000.
+tion. These results confirm that dual-sparsity, paired with               As shown in Figure 10, at 60% dual-sparsity, Celty reduces
+an efficient SpMSpV kernel and hardware support, delivers                 the energy cost by 1.85× compared to Coruscant-STC. En-
+meaningful model-level latency reduction for single-user                  ergy efficiency of Celty comes from the kernel’s speedup at
+decoding.                                                                 minimal cost (on A5000, Celty Sparse SIMT’s total power
+                                                                          overhead is 88.90 mW, which is 0.04% of the TDP).
+6.3    Celty Sparse SIMT Core Evaluation
+Area overhead. Table 1 reports the cumulative area over-
+head of the Celty Sparse SIMT Core scaled across GPU gener-
+                                                                                                                    1.57x
+                                                                                                                            1.65x        1.76x
+ations by the number of SIMT cores per chip. The overhead                                                                                               1.85x
+remains minimal across all generations, reaching at most
+0.08% of additional area on Hopper. For comparison, we in-
+clude the area overhead of prior sparse microarchitectural
+enhancements: DS-STC [34], RM-STC [13], and Coruscant-
+STC [16]. The Celty design is consistently the most area-                 Figure 10: Energy cost of different GPU kernels (nor-
+efficient, owing to its lightweight RLC decoder and the reuse             malized to cuBLAS on A5000), each running on its own
+of existing register files for accumulation rather than intro-            co-design-enhanced GPU.
+ducing dedicated compute structures.
+ICCAD ’26, November 08–12, 2026, San Jose, CA, USA                                                             Ruokai Yin and Priyadarshini Panda
+
+
+                                                                        Table 2: Perplexity and downstream accuracy under
+                                                                        different sparsity methods at 50% model sparsity.
+                                                                             Methods (Sparsity type)        LLM Model     Wiki2(↓)   Avg Acc(↑)
+                                                                             Dense                          LLaMA-2-7B     5.47         63.3
+                                                                             SparseGPT (50% unstructured)   LLaMA-2-7B     6.51         60.1
+                                                                             SparseGPT (2:4)                LLaMA-2-7B     12.1         53.4
+Figure 11: Kernel latency vs. Split-K parallelism at 50%                     ShortGPT (50% structured)
+                                                                             DuoGPT (50% dual-sparsity)
+                                                                                                            LLaMA-2-7B
+                                                                                                            LLaMA-2-7B
+                                                                                                                           368.8
+                                                                                                                           8.58
+                                                                                                                                        47.2
+                                                                                                                                        55.7
+dual-sparsity on 5120×5120 and 7168×7168 layers.                             Dense                          LLaMA-2-13B    4.88         68.3
+                                                                             SparseGPT (50% unstructured)   LLaMA-2-13B    5.63         64.8
+6.4    Ablation Study                                                        SparseGPT (2:4)                LLaMA-2-13B    9.56         56.9
+                                                                             ShortGPT (50% structured)      LLaMA-2-13B    191.3        48.0
+Effect of Split-K parallelism. We study the impact of the                    DuoGPT (50% dual-sparsity)     LLaMA-2-13B    7.17         59.7
+inner-K-loop size on kernel performance by varying the Split-
+K parallelism. Figure 11 shows kernel latency across config-
+urations for both 5120×5120 and 7168×7168 layers at 50%                 sparsity levels targeted by Celty remain within an acceptable
+dual-sparsity. Increasing Split-K parallelism (i.e., decreasing         accuracy budget.
+the inner-K-loop size) reduces latency up to an inner-loop
+size of 64, beyond which the cost of global atomic additions
+for partial-sum merging dominates. We fix the inner-K-loop
+size to 64 for all other experiments.
+   Comparison with Macko across sparsity. Macko [23]
+is an SpMV kernel that operates on an RLC-CSR format
+using SIMT cores. However, its execution flow dedicates
+each warp to a single weight row, an approach optimized for             Figure 13: Normalized speedup of Celty Sparse SIMT
+weight-only sparsity that cannot exploit activation sparsity.           Core as the register-accumulation portion varies from
+For a comprehensive evaluation, we provide the performance              0% (pure SMEM) to 100% (pure register) across dual-
+comparison of Celty against Macko across sparsity levels and            sparsity levels.
+layer dimensions in Figure 12. Both the SMEM-based Celty                   Register vs. SMEM accumulation tradeoff. We vary
+kernel and the Celty Sparse SIMT Core outperform Macko                  the register-accumulation portion on Celty sparse SIMT ker-
+across all configurations, with the dual-sparsity advantage             nel from 0% (pure SMEM) to 100% (pure register) in Fig-
+growing at higher sparsity: Celty achieves on average 2.3×              ure 13. The gains are largest at low dual-sparsity, where
+and 2.5× speedup over Macko at 50% and 70% dual-sparsity,               denser scatter updates intensify SMEM bank conflicts: on
+respectively.                                                           a 5120×5120 layer at 30% dual-sparsity, only 50% register
+                                                                        accumulation can yield 1.65× speedup over pure SMEM ac-
+                                                                2.56x
+                                                                        cumulation, reaching 2.40× at 100%. At 70% dual-sparsity,
+                                  2.38x                                 conflicts are less frequent and 50% register allocation pro-
+           cuBLAS: 79us                   cuBLAS: 216us 2.47x
+                          2.12x                                         vides only 1.07× improvement, yet full register accumulation
+                                                                        still achieves 1.86×, confirming that SMEM access latency
+                                                                        remains a bottleneck beyond conflicts alone. Crucially, this
+                                                                        study shows that fully register-resident accumulation is not
+Figure 12: Comparison between Celty and Macko                           required—the partition ratio can be tuned to balance speedup
+across sparsity levels and layer dimensions.                            against occupancy constraints.
+   Accuracy under dual-sparsity. Table 2 reports WikiText-
+2 perplexity for LLaMA-2-7B and LLaMA-2-13B under differ-               7   Conclusion
+ent sparsity methods at 50% sparsity. We also report the aver-          We presented Celty, a co-designed sparse format, GPU ker-
+age accuracy across three downstream tasks using LM Eval                nel, and SIMT microarchitecture for dual-sparse LLM infer-
+Harness [9]: 5-shot MMLU [11], 0-shot PiQA [2], and 0-shot              ence, formulated as SpMSpV operations. The Celty Sparse
+Winogrande [28]. Structured pruning (ShortGPT) and semi-                SIMT Core eliminates software reconstruction overhead and
+structured 2:4 pruning (SparseGPT) both incur severe per-               shared-memory bottlenecks through a hardware RLC de-
+plexity degradation. Unstructured pruning (SparseGPT) pre-              coder and register-file accumulation, achieving up to 5.3×
+serves accuracy best, while dual-sparsity (DuoGPT) achieves             speedup over cuBLAS with negligible area overhead and up
+8.58 (7.17) perplexity on LLaMA-2-7B (13B), a moderate in-              to 2.63× end-to-end decode speedup on LLaMA-2-13B with
+crease over the dense baseline of 5.47 (4.88) that confirms the         bounded accuracy degradation.
+Celty: SpMSpV GPU Kernel and SIMT Co-Design for Efficient Dual-Sparse LLM Inference                  ICCAD ’26, November 08–12, 2026, San Jose, CA, USA
+
+
+References                                                                       [21] Yuechen Lu et al. 2023. Dasp: Specific dense matrix multiply-
+ [1] Sandhini Agarwal et al. 2025. gpt-oss-120b & gpt-oss-20b model card.             accumulate units accelerated general sparse matrix-vector multiplica-
+     arXiv preprint arXiv:2508.10925 (2025).                                          tion. In Proceedings of the International Conference for High Performance
+ [2] Yonatan Bisk et al. 2020. Piqa: Reasoning about physical commonsense             Computing, Networking, Storage and Analysis. 1–14.
+     in natural language. In Proceedings of the AAAI conference on artificial    [22] Justin Luitjens et al. 2025. CUDA Pro Tip: Increase Performance with
+     intelligence, Vol. 34. 7432–7439.                                                Vectorized Memory Access. https://developer.nvidia.com/blog/cuda-
+ [3] Yu-Hsin Chen et al. 2016. Eyeriss: An energy-efficient reconfigurable            pro-tip-increase-performance-with-vectorized-memory-access/
+     accelerator for deep convolutional neural networks. IEEE journal of         [23] Vladimír Macko et al. 2025. MACKO: Sparse Matrix-Vector Multiplica-
+     solid-state circuits 52, 1 (2016), 127–138.                                      tion for Low Sparsity. arXiv preprint arXiv:2511.13061 (2025).
+ [4] Yu-Hsin Chen et al. 2019. Eyeriss v2: A flexible accelerator for emerging   [24] Xin Men et al. 2024. Shortgpt: Layers in large language models are
+     deep neural networks on mobile devices. IEEE Journal on Emerging                 more redundant than you expect. arXiv preprint arXiv:2403.03853
+     and Selected Topics in Circuits and Systems 9, 2 (2019), 292–308.                (2024).
+ [5] Tri Dao et al. 2022. Flashattention: Fast and memory-efficient exact        [25] Stephen Merity et al. 2016. Pointer sentinel mixture models. arXiv
+     attention with io-awareness. Advances in neural information processing           preprint arXiv:1609.07843 (2016).
+     systems 35 (2022), 16344–16359.                                             [26] Yuyao Niu et al. 2021. Tilespmv: A tiled algorithm for sparse matrix-
+ [6] Ruibo Fan et al. 2025. Spinfer: Leveraging low-level sparsity for effi-          vector multiplication on gpus. In 2021 IEEE International Parallel and
+     cient large language model inference on gpus. In Proceedings of the              Distributed Processing Symposium (IPDPS). IEEE, 68–78.
+     Twentieth European Conference on Computer Systems. 243–260.                 [27] NVIDIA Corporation. 2020. NVIDIA A100 Tensor Core GPU Archi-
+ [7] Elias Frantar et al. 2023. Sparsegpt: Massive language models can be             tecture. https://images.nvidia.com/aem-dam/en-zz/Solutions/data-
+     accurately pruned in one-shot. In International Conference on Machine            center/nvidia-ampere-architecture-whitepaper.pdf.
+     Learning. PMLR, 10323–10337.                                                [28] Keisuke Sakaguchi et al. 2021. Winogrande: An adversarial winograd
+ [8] Trevor Gale et al. 2020. Sparse GPU Kernels for Deep Learning. In                schema challenge at scale. Commun. ACM 64, 9 (2021), 99–106.
+     Proceedings of the International Conference for High Performance Com-       [29] Fabrizio Sandri et al. 2025. 2SSP: A Two-Stage Framework for Struc-
+     puting, Networking, Storage and Analysis, SC 2020.                               tured Pruning of LLMs. arXiv preprint arXiv:2501.17771 (2025).
+ [9] Leo Gao et al. 2021. A framework for few-shot language model evalu-         [30] ShareGPT. 2023. ShareGPT. https://sharegpt.com/
+     ation. Version v0. 0.1. Sept 10 (2021), 8–9.                                [31] Aaron Stillmaker et al. 2017. Scaling equations for the accurate predic-
+[10] Song Han et al. 2016. EIE: Efficient inference engine on compressed              tion of CMOS device performance from 180 nm to 7 nm. Integration
+     deep neural network. ACM SIGARCH Computer Architecture News 44,                  58 (2017), 74–81.
+     3 (2016), 243–254.                                                          [32] Mingjie Sun et al. 2023. A simple and effective pruning approach for
+[11] Dan Hendrycks et al. 2020. Measuring massive multitask language                  large language models. arXiv preprint arXiv:2306.11695 (2023).
+     understanding. arXiv preprint arXiv:2009.03300 (2020).                      [33] Hugo Touvron et al. 2023. Llama: Open and efficient foundation
+[12] Adnan Hoque et al. 2024. Accelerating a Triton Fused Kernel for                  language models. arXiv preprint arXiv:2302.13971 (2023).
+     W4A16 Quantized Inference with SplitK work decomposition. arXiv             [34] Yang Wang et al. 2021. Dual-side sparse tensor core. In 2021 ACM/IEEE
+     preprint arXiv:2402.00025 (2024).                                                48th Annual International Symposium on Computer Architecture (ISCA).
+[13] Guyue Huang et al. 2023. Rm-stc: Row-merge dataflow inspired gpu                 IEEE, 1083–1095.
+     sparse tensor core for energy-efficient sparse acceleration. In Pro-        [35] Haojun Xia et al. 2023. Flash-llm: Enabling cost-effective and highly-
+     ceedings of the 56th Annual IEEE/ACM International Symposium on                  efficient large generative model inference with unstructured sparsity.
+     Microarchitecture. 338–352.                                                      arXiv preprint arXiv:2309.10285 (2023).
+[14] Hyeran Jeon et al. 2015. GPU register file virtualization. In Proceedings   [36] Lei Xu et al. 2024. HAM-SpMSpV: An optimized parallel algorithm
+     of the 48th International Symposium on Microarchitecture. 420–432.               for masked sparse matrix-sparse vector multiplications on multi-core
+[15] Haonan Ji et al. 2022. Tilespmspv: A tiled algorithm for sparse matrix-          CPUs. In Proceedings of the 33rd International Symposium on High-
+     sparse vector multiplication on gpus. In Proceedings of the 51st Inter-          Performance Parallel and Distributed Computing. 160–173.
+     national Conference on Parallel Processing. 1–11.                           [37] Carl Yang et al. 2015. Fast sparse matrix and sparse vector multipli-
+[16] Donghyeon Joo et al. 2025. Coruscant: Co-Designing GPU Kernel and                cation algorithm on the GPU. In 2015 IEEE International Parallel and
+     Sparse Tensor Core to Advocate Unstructured Sparsity in Efficient LLM            Distributed Processing Symposium Workshop. IEEE, 841–847.
+     Inference. In Proceedings of the 58th IEEE/ACM International Symposium      [38] Ruokai Yin et al. 2025. DuoGPT: Training-free Dual Sparsity through
+     on Microarchitecture. 232–245.                                                   Activation-aware Pruning in LLMs. Advances in Neural Information
+[17] Woosuk Kwon et al. 2023. Efficient Memory Management for Large                   Processing Systems 38 (2025), 146883–146912.
+     Language Model Serving with PagedAttention. In Proceedings of the           [39] Susan Zhang et al. 2022. Opt: Open pre-trained transformer language
+     ACM SIGOPS 29th Symposium on Operating Systems Principles.                       models. arXiv preprint arXiv:2205.01068 (2022).
+[18] Min Li et al. 2020. Adaptive SpMV/SpMSpV on GPUs for input vectors          [40] Zhenyu Zhang et al. 2025. R-Sparse: Rank-Aware Activation Sparsity
+     of varied sparsity. IEEE Transactions on Parallel and Distributed Systems        for Efficient LLM Inference. In The Thirteenth International Conference
+     32, 7 (2020), 1842–1853.                                                         on Learning Representations.
+[19] Yuanchun Li et al. 2024. Personal llm agents: Insights and survey about     [41] Ningxin Zheng et al. 2022. {SparTA}:{Deep-Learning} Model Sparsity
+     the capability, efficiency and security. arXiv preprint arXiv:2401.05459         via {Tensor-with-Sparsity-Attribute}. In 16th USENIX Symposium on
+     (2024).                                                                          Operating Systems Design and Implementation (OSDI 22). 213–232.
+[20] James Liu et al. 2025. Training-free activation sparsity in large lan-      [42] Longguang Zhong et al. 2024. Blockpruner: Fine-grained pruning for
+     guage models. The Thirteenth International Conference on Learning                large language models. arXiv preprint arXiv:2406.10594 (2024).
+     Representations (2025).                                                     [43] Maohua Zhu et al. 2019. Sparse tensor core: Algorithm and hardware
+                                                                                      co-design for vector-wise sparse neural networks on modern gpus. In
+                                                                                      Proceedings of the 52nd Annual IEEE/ACM International Symposium on
+                                                                                      Microarchitecture. 359–371.
+

@@ -1,0 +1,1172 @@
+                                                   Is (Selective) Round-To-Nearest Quantization All You Need?
+
+                                                                                         Alex Kogan
+                                                                                          Oracle Labs
+                                                                                        Burlington, MA
+                                                                                             USA
+                                                                                    alex.kogan@oracle.com
+
+
+
+                                                               Abstract                               2024; Kwon et al., 2023; Kim et al., 2024), leaving
+                                                                                                      all those powerful GPUs underutilized.
+                                             Quantization became a necessary tool for serv-
+arXiv:2505.15909v1 [cs.LG] 21 May 2025
+
+
+
+
+                                             ing ever-increasing Large Language Models                   Over the past few years, quantization has
+                                             (LLMs). RTN (Round-to-Nearest) is perhaps                emerged as de-facto the standard way of tackling
+                                             the simplest quantization technique that has             both aforementioned issues. During a quantiza-
+                                             been around well before LLMs surged to the               tion process, model weights (and/or activations)
+                                             forefront of machine learning (ML) research.             are compressed into lower precision (e.g., from
+                                             Yet, it has been largely dismissed by recent and         16 bits down to 4 bits), therefore resulting in a
+                                             more advanced quantization methods that claim
+                                                                                                      smaller memory footprint for the model. This, in
+                                             superiority over RTN in nearly every aspect of
+                                             performance. This work aims to dispel this es-           turn, leads to reduced hardware requirements for
+                                             tablished point of view, showing that RTN is             inference and, arguably, to a more efficient token
+                                             not only much cheaper to apply, but also its             generation process.
+                                             token generation throughput can be better than              Due to its practical importance, quantization of
+                                             and accuracy can be similar to more advanced             LLMs has attracted lots of interest in the research
+                                             alternatives. In particular, we discuss our imple-       community. This lead to a number of impressive
+                                             mentation of RTN based on the recent Marlin              results, with methods like GPTQ (Frantar et al.,
+                                             kernels and demonstrate how the accuracy of
+                                                                                                      2022), AWQ (Lin et al., 2024), SmoothQuant (Xiao
+                                             RTN can be gradually improved by selectively
+                                             increasing the data precision format of certain          et al., 2023), QQQ (Zhang et al., 2024) and many
+                                             model layers and modules. Based on our re-               others, each aiming to produce a highly com-
+                                             sults, we argue that RTN presents a viable and           pressed model that is accurate and fast during in-
+                                             practical choice for quantizing LLMs.                    ference. Those advanced techniques often dismiss
+                                                                                                      or claim superiority over another simple quanti-
+                                         1   Introduction
+                                                                                                      zation method that has been around well before
+                                         LLM inference is an expensive process because                LLMs came to exist (Krishnamoorthi, 2018; Gho-
+                                         large models require expensive machines with a               lami et al., 2021). This method is RTN or Round-
+                                         large amount of high bandwidth memory (HBM).                 to-Nearest, which involves scaling given model
+                                         In fact, some of the largest models available today,         weights and, as its name suggests, rounding the
+                                         such as Llama3.1-405B (Meta, 2024) or DeepSeek               result to the nearest integer.
+                                         V3/R1 with their 671B parameters (DeepSeek-AI,                  A few favorable characteristics help RTN to
+                                         2025), do not even fit into one powerful server with         stand out from other, more advanced quantization
+                                         8 Nvidia H100 GPUs with 80GB HBM each. Fur-                  techniques, making it a desirable choice for quan-
+                                         thermore, LLM inference, especially if it involves           tizing LLMs. First, unlike most other quantization
+                                         a generative model such as Llama, is wasteful be-            methods, it is data-free (Tang et al., 2023), i.e., it
+                                         cause the token generation is a sequential process,          does not require any calibration data nor a corre-
+                                         producing new tokens one after another. As such,             sponding calibration process. As such, RTN can
+                                         the computation involved in token generation is              be applied on-the-fly (i.e., while loading a model),
+                                         comprised of vector by matrix multiplications that           and its application is fast (a few milliseconds or
+                                         do not allow much data to be reused once it is               seconds, depending on the size of the model) and
+                                         brought from memory to computing units. Con-                 cheap. Second, RTN can be applied to a model
+                                         sequently, the generation process is known to be             even on a machine that cannot fit the original (non-
+                                         memory-bound (Frantar et al., 2024; Agrawal et al.,          quantized) model in its GPU memory. For instance,
+
+                                                                                                  1
+we can use a server with 4 Nvidia H100 GPUs to                cost (Huang et al., 2024; Zhu et al., 2024), post-
+load, quantize with RTN and run inference on the              training quantization (PTQ) offers cheap, accurate
+Llama3.1-405B model. At the same time, RTN is                 and performant methods to reducing the size of
+often believed to lag behind more advanced quan-              LLMs. The majority of PTQ methods require cal-
+tization techniques in two crucial areas – accu-              ibration data, which they use to find optimal val-
+racy (Frantar et al., 2022; Lin et al., 2024; Huang           ues, i.e., values that reduce a rounding error in-
+et al., 2024) and generation latency.                         troduced when decreasing the number of bits rep-
+   In this paper, we tackle both those issues. First,         resenting model weights and/or activations. For
+through extensive evaluation we show that the re-             instance, AWQ uses calibration data to find salient
+covery rate of RTN (i.e., its accuracy across various         weights, which it then scales with factors computed
+tasks compared to the baseline model)                         to minimize the the mean-squared error of quan-
+                                                              tization (Lin et al., 2024). GPTQ uses calibration
+    1. is perfect when a model is quantized to 8 bits.
+                                                              data to calculate inverse Hessian matrix employed
+    2. is nearly perfect and on-par with other, more          to find quantized weights (Frantar et al., 2022). The
+       sophisticated quantization techniques on an            QQQ method (Zhang et al., 2024) uses calibration
+       extremely large model quantized to 4 bits.             data twice, once to identify and selectively smooth
+                                                              activation channels that contain outliers, similarly
+    3. falls behind on moderate and small scale mod-          to (Xiao et al., 2023), and then to calculate the in-
+       els quantized to 4 bits.                               verse Hessian matrix similarly to (Frantar et al.,
+                                                              2022).
+Focusing on the last case, we investigate selective
+                                                                 Calibration data-dependent quantization has sev-
+quantization, in which certain layers of the Trans-
+                                                              eral drawbacks. First, as noted by Tang et al. (Tang
+former stack of a given model are selected to be
+                                                              et al., 2023) and demonstrated by Wu et al. (Wu
+quantized to a different precision, and show the
+                                                              et al., 2023), it might weaken the ability of LLMs
+efficiency of this approach in recovering most ac-
+                                                              to generalize as it introduces the risk of overfitting
+curacy loss for RTN. In particular, we show that
+                                                              to the data selected for calibration. Second, it re-
+leaving just a part of one layer of Llama-3.1 70B
+                                                              quires a separate process for applying quantization,
+model in 8 bit precision, while quantizing the rest
+                                                              which results in a separate set of (quantized) model
+of that layer and all other 79 layers into 4 bits leads
+                                                              weights. This makes the application of quantiza-
+to nearly perfect recovery rate. Note that this adds
+                                                              tion more cumbersome in practice. Third, this pro-
+less than 0.05 bits per weight on average, resulting
+                                                              cess, albeit much shorter than model pre-training or
+in only insignificant memory increase.
+                                                              even fine-tuning, still requires non-trivial resources,
+   Second, we utilize recent Marlin kernels (Frantar
+                                                              such as several hours or even days of GPU time;
+et al., 2024) (developed originally for GPTQ (Fran-
+                                                              moreover, it requires at least the number of GPUs
+tar et al., 2022)) to provide highly efficient imple-
+                                                              with enough HBM to load the original model.
+mentation for RTN. We integrate those kernels into
+                                                                 Several papers do offer data-free quantization
+vLLM (Kwon et al., 2023), a popular framework
+                                                              techniques (Xiao et al., 2023; Dettmers et al., 2022;
+for serving LLMs, and show that a model quantized
+                                                              Tang et al., 2023). Their common theme is to sep-
+with RTN can generate tokens up to 37% faster,
+                                                              arate outliers (weights whose magnitude is sig-
+relative to the baseline model, when the model is
+                                                              nificantly large, e.g., more than 6.0 (Dettmers
+quantized into 4 bits and up to 25% faster when
+                                                              et al., 2022)) from other weights; the outliers
+quantized into 8 bits. To the best our knowledge,
+                                                              are then kept in full precision while the rest
+this is the first example of a data-free quantization
+                                                              of the model is quantized either with uniform
+technique that produces such savings; moreover,
+                                                              (RTN-like) (Dettmers et al., 2022) or non-uniform
+those savings are higher than those achieved with
+                                                              method (Xiao et al., 2023; Tang et al., 2023). While
+(calibration-data dependent) GPTQ and AWQ, and
+                                                              the number of outliers is typically small and has
+(data-free) BitsAndBytes (Dettmers et al., 2022).
+                                                              a negligible impact on the size of the quantized
+2     Related Work                                            model, their special treatment adds computational
+                                                              overhead, leading to increased token generation la-
+2.1    Post-training Quantization                             tency. We demonstrate that by including the results
+Unlike quantization-aware training (QAT) strate-              of the BitsAndBytes quantization (Dettmers et al.,
+gies that typically come with a high training                 2022) in our evaluation.
+
+                                                          2
+   Selective quantization maintains model weights            where max(|r|) calculates the maximum absolute
+in multiple data formats (e.g., FP16, INT8 and               value in the given input and b is the target precision
+INT4). As such, it can be considered related                 bit width.
+to prior work on mixed-precision quantization,                  As described, RTN is oblivious to the size of the
+e.g., (Dong et al., 2019; Chen et al., 2024). In             input vector r, however, choosing the “right” size
+fact, some of the aforementioned data-free meth-             for the vector has important practical implications.
+ods also belong to this group, as they store out-            Large vectors result in quantized models being sus-
+liers and non-outliers in different precision. Unlike        ceptible to a significant accuracy loss due to the
+prior work, however, selective quantization does             presence of outliers in the input data (An et al.,
+not require model retraining or fine-tuning (Dong            2025; Tang et al., 2023; Dettmers et al., 2022),
+et al., 2019) nor occasional re-quantization during          which tend to reduce the quantization resolution by
+inference (Chen et al., 2024). Generally speaking,           skewing the scaling factor. Hence, the common ap-
+selective quantization is more coarse-grained and            proach (also used in this paper) splits each weights
+simpler than most prior methods, which signifi-              tensor along its channels and then each channel
+cantly simplifies its integration into an inference          is split into groups of g values; RTN is applied
+framework in practice.                                       separately to each group. This sub-channel-wise
+                                                             application contains outliers better (now their im-
+2.2   RTN                                                    pact is limited to a group of g numbers rather than
+Round-to-nearest (RTN) quantization is, perhaps,             the entire channel/tensor), but elevates the memory
+the simplest quantization technique known well               cost as it requires storing more scaling factors. g is
+before large language models came to exist (Krish-           typically set to 2n , with n = 7 being seemingly a
+namoorthi, 2018; Gholami et al., 2021). RTN is               popular choice (Frantar et al., 2024; Zhang et al.,
+applied on a vector of real values in a floating point       2024). We note that the issue of dealing with out-
+format (e.g., FP16 or BFloat16) by dividing each             liers in the input is far from being unique to RTN,
+value in the vector by a scaling factor, rounding            and in fact, is in the heart of most quantization
+the result to the nearest integer (hence, the name           techniques for LLMs (Xiao et al., 2023; Tang et al.,
+of this method) and truncating, if necessary, the            2023; Dettmers et al., 2022; Zhang et al., 2024;
+final integer number so it fits into the target range        Lin et al., 2024); likewise, refining the application
+of values (e.g., [-128, 127] for INT8 or [-8, 7] for         of quantization by splitting input values into small
+INT4). This method is summarized by the follow-              groups is a common technique for improving ac-
+ing simple formula:                                          curacy of quantized models (Frantar et al., 2022;
+                                                             Zhang et al., 2024).
+              RT N (r) = Int(r/S),                (1)
+                                                             2.3   Marlin kernels
+where r is a vector of input values, S is a scaling
+                                                             Marlin kernels (Frantar et al., 2024) have been
+factor and Int is a function that maps a real value
+                                                             developed to support high-performance mixed-
+to an integer value through round-to-nearest and
+                                                             precision GEMM (general matrix multiplication)
+truncate operations. We note that we describe a
+                                                             operations. Such operations allow multiplying 16
+symmetric variant for RTN; an asymmetric vari-
+                                                             bit activations by 4 or 8 bit weights (commonly
+ant, more suitable for input values that are not dis-
+                                                             referred to as W4A16 or W8A16 in the litera-
+tributed around zero, subtracts an arbitrary integer
+                                                             ture (Zhang et al., 2024; Lin et al., 2024)). A com-
+zero point from the result of the Int function (Gho-
+                                                             mon, but inefficient way of implementing them
+lami et al., 2021).
+                                                             is by dequantizing the weights first and then ap-
+   Now we turn our attention to how the scaling
+                                                             plying GEMM in 16bit precision. Marlin hides
+factor S is chosen. The scaling factor essentially
+                                                             the overhead of dequantization by effectively over-
+maps given real values into a partition in a range
+                                                             lapping the data access latency with floating-point
+of integers, where the size of the range is set by
+                                                             operations involved in dequantization and GEMM
+the number of bits in the target precision. In the
+                                                             calculations. It does so through the combination of
+symmetric formulation of RTN, S is set according
+                                                             various techniques, such as an asynchronous mem-
+to the following formula:
+                                                             ory access and optimized data layout in memory,
+               2max(|r|)   max(|r|)                          According to Frantar et al. (Frantar et al., 2024),
+         S=      b
+                         = b−1       ,            (2)        Marlin achieves close to optimal 4x improvement
+                2 −1      2    − 0.5
+
+                                                         3
+over the 16 bit GEMM calculation for batches of up               Llama-3.1   #Bits   Method     Avg. (6 tasks) ↑   Wikitext ↓
+to 16-32 inputs, which translates to substantial end-                         16     Baseline        66.07           8.64
+to-end inference speedups. Originally developed                      8B
+                                                                              8       RTN            66.13           8.65
+for the Nvidia’s Ampere architecture and integrated                           4       RTN            64.32           9.57
+with the GPTQ technique, those kernels have been                              4       GPTQ           65.07           9.04
+                                                                              4       AWQ            65.30           9.10
+later extended to support AWQ as well as paved                                4        BnB           65.59           9.15
+the way to implementing similarly efficient ker-                              16     Baseline        71.67           3.94
+nels (Machete (Wilkinson, 2024)) developed for                                8       RTN            71.61           3.95
+                                                                     70B
+the more recent Nvidia’s Hopper architecture.                                 4       RTN            70.46           8.19
+                                                                              4       GPTQ           70.89           4.61
+3       Motivation                                                            4       AWQ            71.54           4.58
+                                                                              4        BnB           70.98           7.17
+We first evaluate the accuracy of RTN with the tar-                           16     Baseline        73.99           1.74
+get precision of 4 and 8 bits (which we refer to                              8       RTN            74.12           1.75
+                                                                     405B
+as RTN-8 and RTN-4, respectively), and compare                                4      RTN             73.88           2.08
+it to the accuracy of other, more advanced quan-                              4      GPTQ            73.31           1.99
+                                                                              4      AWQ             73.81           2.00
+tization techniques. We conduct our experiments
+                                                                              4       BnB            73.84           1.95
+using the vLLM framework (Kwon et al., 2023)
+v0.6.4, which we patch to support RTN1 . For all                 Llama-3.2   #Bits   Method     Avg. (6 tasks) ↑   Wikitext ↓
+our experiments, we use one system with 8 Nvidia                              16     Baseline        51.07           15.82
+H100 GPUs with 80GB GPU memory, except for                                    8       RTN            51.10           15.83
+when a model does not fit into memory (e.g., the                     1B
+                                                                              4       RTN            47.96           19.76
+original Llama3.1-405B model for which we use                                 4       GPTQ           46.34           17.64
+two such systems). All experiments are run with                               4       AWQ            49.26           17.32
+Python 3.11, PyTorch 2.5.1 and CUDA 12.6.                                     4        BnB           49.01           17.01
+                                                                              16     Baseline        59.26           12.29
+   We experiment with Llama models (Meta, 2024)
+                                                                              8       RTN            59.24           12.31
+of various sizes as well as with other open-source                   3B
+models, such as Phi, Dolly and Mistral, in or-                                4      RTN             55.74           13.34
+                                                                              4      GPTQ            57.55           13.16
+der to validate our findings beyond Llama mod-                                4      AWQ             57.40           12.69
+els. We use the wikitext dataset (Merity et al.,                              4       BnB            58.16           12.73
+2016) to measure perplexity and common zero-
+shot tasks, such as WinoGrande (Sakaguchi et al.,               Table 1: Average zero-shot accuracy on six common
+                                                                tasks (the higher is the better) and perplexity measured
+2019), ARC (Clark et al., 2018), TruthfullQA (Lin
+                                                                on the wikitext dataset (the lower is the better), mea-
+et al., 2022), CommonSenseQA (Talmor et al.,                    sured with three variants of the Llama3.1 model and
+2019) and PubMedQA (Jin et al., 2019), to measure               two variants of the Llama3.2 model.
+the accuracy of large language models. For all the
+experiments, we utilize the open-source lm_eval
+                                                                pendix A). Two important observations can be
+toolkit (Gao et al., 2024) with its default settings
+                                                                made: first, RTN-8 achieves full recovery com-
+unless specified otherwise.
+                                                                pared to the baseline versions. Second, the recov-
+   We compare the performance of baseline ver-
+                                                                ery rate of RTN-4 falls behind those achieved by
+sions (that utilize BFloat16 or FP16 data format)
+                                                                other quantization techniques, unless the model is
+to the one produced with RTN. We also include
+                                                                extremely large (e.g., for Llama 3.1 405B, RTN-
+results for models quantized with state-of-the-art
+                                                                4 performs on par with all other variants, includ-
+AWQ (Lin et al., 2024) and GPTQ (Frantar et al.,
+                                                                ing the baseline). Those findings motivate the fol-
+2022) quantization methods that use INT4 as their
+                                                                lowing question. Can we quantize only a part of
+target precision (those models are available on Hug-
+                                                                the given model to 8 bit (e.g., the first few layers)
+gingFace model hub (Face)) as well as for models
+                                                                and keep the rest in 4 bit precision to achieve full
+quantized on-the-fly with BitsAndBytes (Dettmers
+                                                                accuracy recovery? While some theoretical and
+et al., 2022) (BnB) to INT4.
+                                                                practical evidence exists that applying quantization
+   The results for Llama models are presented in
+                                                                non-uniformly across different parts of a model is
+Table 1 (with an extended version available in Ap-
+                                                                a viable approach (Zhou et al., 2018; Zhu et al.,
+    1
+        We intend to open-source all our changes to vLLM.       2018; Han and Han, 2025), we are not aware of any
+
+                                                            4
+                                                                                            9.6
+                                                           first layers                                                               first layers                                                                         first layers
+             19.5                                          last layers                                                                last layers                       8                                                  last layers
+                                                           middle layers                                                              middle layers                                                                        middle layers
+             19.0                                                                           9.4
+
+             18.5                                                                                                                                                       7
+perplexity
+
+
+
+
+                                                                               perplexity
+
+
+
+
+                                                                                                                                                           perplexity
+                                                                                            9.2
+             18.0
+                                                                                                                                                                        6
+             17.5
+                                                                                            9.0
+             17.0
+                                                                                                                                                                        5
+             16.5                                                                           8.8
+             16.0
+                                                                                                                                                                        4
+                    0          4           8          12             16                           0   4     8    12   16   20    24     28      32                          0 4 8 12 16 20 24 28 32 36 40 44 48 52 56 60 64 68 72 76 80
+                             number of layers in INT8                                                      number of layers in INT8                                                    number of layers in INT8
+                             (a) Llama3.2-1B                                                               (b) Llama3.1-8B                                                             (c) Llama3.3-70B
+
+                                                           first layers                 11.50                                         first layers                                                                         first layers
+             2.05                                          last layers                                                                last layers                                                                          last layers
+                                                           middle layers                11.25                                         middle layers                                                                        middle layers
+                                                                                                                                                                   18.0
+             2.00                                                                       11.00
+perplexity
+
+
+
+
+                                                                           perplexity
+
+
+
+
+                                                                                                                                                      perplexity
+             1.95                                                                       10.75                                                                      17.5
+             1.90                                                                       10.50
+                                                                                        10.25                                                                      17.0
+             1.85
+                                                                                        10.00
+             1.80
+                                                                                         9.75                                                                      16.5
+             1.75                                                                        9.50
+                    0 8 16 24 32 40 48 56 64 72 80 88 96 104112120                                0   4     8    12   16   20    24     28      32                          0      4      8     12      16     20     24     28      32
+                             number of layers in INT8                                                      number of layers in INT8                                                    number of layers in INT8
+                           (d) Llama3.1-405B                                                              (e) Phi-3-mini-3.8B                                                           (f) Dolly-v2-3B
+
+Figure 1: Perplexity of various models on the wikitext dataset (lower is better). Note that the range of the x-axis
+(number of layers) depends on the model. The y-axis does not start at zero for better readability.
+
+systematic study evaluating LLM accuracy across                                                                            quantized model on the wikitext dataset as we vary
+variety of tasks.                                                                                                          X from 1 to the number of layers in a model minus
+                                                                                                                           1.
+ 4                  Selective quantization                                                                                    The results in Figure 1 suggest that the model
+There are two dimensions in the Transformer archi-                                                                         accuracy, as measured by perplexity, is highly sen-
+tecture along which the quantization can be con-                                                                           sitive to the way Transformer layers are selected.
+sidered. First, there is the stack of Transformer                                                                          While for smaller Llama models (Figure 1a–c) the
+layers, and so we can select which layers (with all                                                                        perplexity improves the fastest when the first lay-
+their associated weights) would be quantized into                                                                          ers are kept in a higher precision, for the largest
+higher precision; we call it horizontal selection.                                                                         Llama model (Figure 1d) selecting middle layers
+Second, each layer typically consists of four linear                                                                       for higher precision is beneficial most of the time,
+modules (that contain weight parameters), two in                                                                           and yet for two non-Llama models (Figure 1e–f) it
+the attention component (one of them representing                                                                          appears the best strategy is to keep the last layers
+the linear projections of query, key and value, aka                                                                        in higher precision. The result for Llama3.3-70B is
+QKV) and two in the fully-connected feed-forward                                                                           especially noteworthy – the perplexity drops sub-
+component. Each of those modules across all Trans-                                                                         stantially after only one layer is kept in 8 bits.
+former layers can be selected to be quantized to a
+higher precision; we call it vertical selection. In                                                                        4.2        Vertical selection
+the following subsections, we discuss the empirical                                                                        In this section we consider how the accuracy of
+findings of selective quantization across those two                                                                        models depends on which linear modules are se-
+dimensions.                                                                                                                lected to be left in higher precision. Given four
+                                                                                                                           linear modules comprising each Transformer layer,
+ 4.1                 Horizontal selection                                                                                  we have 24 = 16 ways to make a vertical selec-
+Which layers should be kept in higher precision?                                                                           tion. In the following charts, we refer to the two
+We experiment with three strategies that select ei-                                                                        modules in the attention component as ’1’ and ’2’
+ther X first, last or middle layers of the Transformer                                                                     and, respectively, to the two modules in the fully-
+stack to be left in higher precision (i.e., quantized                                                                      connected feed-forward component as ’3’ and ’4’.
+to 8bit) while the rest of the model is quantized into                                                                     We use the ’+’ sign for the composition of mod-
+4 bits. We measure the perplexity of the resulting                                                                         ules, e.g., ’1+2+4’ designates a selection mode that
+
+                                                                                                                      5
+                                                                                  9.50
+                                                                                                                                                            8
+               19
+                                                                                  9.25
+
+
+               18                                                                 9.00                                                                      7
+  perplexity
+
+
+
+
+                                                                     perplexity
+
+
+
+
+                                                                                                                                               perplexity
+                                                                                  8.75
+               17                                                                                                                                           6
+
+                                                                                  8.50
+
+               16
+                                                                                                                                                            5
+                                                                                  8.25
+
+
+               15                                                                 8.00
+                                                                                                                                                            4
+                    all
+
+
+                          1+ 4
+                                4
+                               4
+
+                                4
+                               4
+                               4
+                                      4
+
+                                             3
+                                             3
+                                             3
+                                                       3
+
+                                                        2
+                                                       2
+                                                            1
+                                                                ne
+
+
+
+
+                                                                                         all
+
+
+                                                                                               1+ 4
+                                                                                                     4
+                                                                                                    4
+
+                                                                                                     4
+                                                                                                    4
+                                                                                                    4
+                                                                                                           4
+
+                                                                                                                  3
+                                                                                                                  3
+                                                                                                                  3
+                                                                                                                            3
+
+                                                                                                                             2
+                                                                                                                            2
+                                                                                                                                 1
+                                                                                                                                     ne
+
+
+
+
+                                                                                                                                                                all
+
+
+                                                                                                                                                                      1+ 4
+                                                                                                                                                                            4
+                                                                                                                                                                           4
+
+                                                                                                                                                                            4
+                                                                                                                                                                           4
+                                                                                                                                                                           4
+                                                                                                                                                                                  4
+
+                                                                                                                                                                                         3
+                                                                                                                                                                                         3
+                                                                                                                                                                                         3
+                                                                                                                                                                                                   3
+
+                                                                                                                                                                                                    2
+                                                                                                                                                                                                   2
+                                                                                                                                                                                                        1
+                                                                                                                                                                                                            ne
+                             3+
+                             3+
+                            3+
+
+                             2+
+                            2+
+                            1+
+
+
+                                          2+
+                                          2+
+                                          1+
+
+
+                                                     1+
+
+
+
+
+                                                                                                  3+
+                                                                                                  3+
+                                                                                                 3+
+
+                                                                                                  2+
+                                                                                                 2+
+                                                                                                 1+
+
+
+                                                                                                               2+
+                                                                                                               2+
+                                                                                                               1+
+
+
+                                                                                                                          1+
+
+
+
+
+                                                                                                                                                                         3+
+                                                                                                                                                                         3+
+                                                                                                                                                                        3+
+
+                                                                                                                                                                         2+
+                                                                                                                                                                        2+
+                                                                                                                                                                        1+
+
+
+                                                                                                                                                                                      2+
+                                                                                                                                                                                      2+
+                                                                                                                                                                                      1+
+
+
+                                                                                                                                                                                                 1+
+                                                                no
+
+
+
+
+                                                                                                                                     no
+
+
+
+
+                                                                                                                                                                                                            no
+                      2+
+
+
+
+
+                          1+
+
+
+
+
+                                        1+
+
+
+
+
+                                                                                           2+
+
+
+
+
+                                                                                               1+
+
+
+
+
+                                                                                                             1+
+
+
+
+
+                                                                                                                                                                  2+
+
+
+
+
+                                                                                                                                                                      1+
+
+
+
+
+                                                                                                                                                                                    1+
+                              number of layers in INT8                                             number of layers in INT8                                               number of layers in INT8
+
+                            (a) Llama3.2-1B                                                      (b) Llama3.1-8B                                                        (c) Llama3.3-70B
+
+                                                                                  11.5
+                                                                                                                                                       18.0
+              2.0
+                                                                                  11.0
+                                                                                                                                                       17.5
+
+
+              1.9                                                                 10.5                                                                 17.0
+ perplexity
+
+
+
+
+                                                                     perplexity
+
+
+
+
+                                                                                                                                          perplexity
+                                                                                                                                                       16.5
+                                                                                  10.0
+              1.8
+
+                                                                                                                                                       16.0
+                                                                                   9.5
+              1.7
+                                                                                                                                                       15.5
+
+                                                                                   9.0
+                                                                                                                                                       15.0
+              1.6
+                    all
+
+
+                          1+ 4
+                                4
+                               4
+
+                                4
+                               4
+                               4
+                                      4
+
+                                             3
+                                             3
+                                                    3
+                                                   3
+
+                                                    2
+                                                   2
+                                                            1
+                                                                ne
+
+
+
+
+                                                                                         all
+
+
+                                                                                               1+ 4
+                                                                                                     4
+                                                                                                    4
+
+                                                                                                     4
+                                                                                                    4
+                                                                                                    4
+                                                                                                           4
+
+                                                                                                                  3
+                                                                                                                  3
+                                                                                                                         3
+                                                                                                                        3
+
+                                                                                                                         2
+                                                                                                                        2
+                                                                                                                                 1
+                                                                                                                                     ne
+
+
+
+
+                                                                                                                                                                all
+
+
+                                                                                                                                                                      1+ 4
+                                                                                                                                                                            4
+                                                                                                                                                                           4
+
+                                                                                                                                                                            4
+                                                                                                                                                                           4
+                                                                                                                                                                           4
+                                                                                                                                                                                  4
+
+                                                                                                                                                                                         3
+                                                                                                                                                                                         3
+                                                                                                                                                                                                3
+                                                                                                                                                                                               3
+
+                                                                                                                                                                                                2
+                                                                                                                                                                                               2
+                                                                                                                                                                                                        1
+                                                                                                                                                                                                            ne
+                             3+
+                             3+
+                            3+
+
+                             2+
+                            2+
+                            1+
+
+
+                                          2+
+                                          2+
+                                                1+
+
+
+                                                 1+
+
+
+
+
+                                                                                                  3+
+                                                                                                  3+
+                                                                                                 3+
+
+                                                                                                  2+
+                                                                                                 2+
+                                                                                                 1+
+
+
+                                                                                                               2+
+                                                                                                               2+
+                                                                                                                     1+
+
+
+                                                                                                                      1+
+
+
+
+
+                                                                                                                                                                         3+
+                                                                                                                                                                         3+
+                                                                                                                                                                        3+
+
+                                                                                                                                                                         2+
+                                                                                                                                                                        2+
+                                                                                                                                                                        1+
+
+
+                                                                                                                                                                                      2+
+                                                                                                                                                                                      2+
+                                                                                                                                                                                            1+
+
+
+                                                                                                                                                                                             1+
+                                                                no
+
+
+
+
+                                                                                                                                     no
+
+
+
+
+                                                                                                                                                                                                            no
+                      2+
+
+
+
+
+                          1+
+
+
+
+
+                                        1+
+
+
+
+
+                                                                                           2+
+
+
+
+
+                                                                                               1+
+
+
+
+
+                                                                                                             1+
+
+
+
+
+                                                                                                                                                                  2+
+
+
+
+
+                                                                                                                                                                      1+
+
+
+
+
+                                                                                                                                                                                    1+
+                              number of layers in INT8                                             number of layers in INT8                                               number of layers in INT8
+
+                           (d) Llama3.1-405B                                                    (e) Phi-3-mini-3.8B                                                     (f) Dolly-v2-3B
+
+Figure 2: Perplexity of various models on the wikitext dataset (lower is better). The y-axis does not start at zero for
+better readability.
+
+includes modules ’1’, ’2’, and ’4’.                                                                                into 6 bit. However, since we also quantize one of
+   The perplexity results for various models and all                                                               the four linear modules into 4 bits, the average pre-
+possible selection modes can be found in Figure 2.                                                                 cision is even lower than that. Yet, for simplicity
+Overall, the perplexity rises as less modules are se-                                                              sake, we refer to those variants RTN-5̃ and RTN-6̃,
+lected to be left in higher precision. Notably, how-                                                               respectively. In addition, for the LLama-3.1 70B
+ever, the perplexity is barely changed when only                                                                   model we experiment with a variant in which only
+module ’2’ (the final projection in the self-attention                                                             modules ’1+3+4’ of the first layer are quantized to
+component) is quantized to 4 bits, comparing to                                                                    8 bit; the rest of the layers are quantized to 4 bit.
+the result when all modules kept in 8 bits. In other                                                               We refer to this variant as RTN-4̃.
+words, this experiment suggests that model accu-                                                                      The results for models RTN-4̃, RTN-5̃ and RTN-
+racy is not affected substantially when one specific                                                               6̃ are presented in Table 2. As expected, the ac-
+module is quantized to 4 bits across all layers.                                                                   curacy of the models increases with the increased
+                                                                                                                   precision. In particular, RTN-6̃ is able to recover
+4.3                  Hybrid selection                                                                              most accuracy lost by RTN-4. The recovery rate
+                                                                                                                   of RTN-5̃ improves over RTN-4, and although it
+Following the observations above, we experiment
+                                                                                                                   falls slightly below that of RTN-6̃, the accuracy of
+with a hybrid selections strategy, in which we select
+                                                                                                                   RTN-5̃ matches or exceeds performance of GPTQ,
+X layers (first for all models but Llama3.1-405B
+                                                                                                                   AWQ and BnB for all considered models. This
+and middle for Llama3.1-405B, based on the results
+                                                                                                                   suggests that RTN-5̃ is able to strike good tradeoff
+in Figure 1) and modules ’1+3+4’ in those selected
+                                                                                                                   point between the size of the resulting model and
+layers are quantized to 8 bit, while the rest of the
+                                                                                                                   its accuracy.
+model is quantized into 4 bit. We choose X to be
+1/4 or 1/2 of the number of the layers. Note that                                                                  5          Improving Latency with Marlin
+when 1/4 of the model uses 8 bit precision while
+the rest uses 4 bit, the model is effectively quan-                                                                We base our custom CUDA kernels for RTN on
+tized into 5 bit, on average. Similarly, for the case                                                              the Marlin project (Frantar et al., 2024) that imple-
+of half and half, the model is effectively quantized                                                               ments high performance mixed-precision GEMM
+
+                                                                                                               6
+ Llama-3.1    Method     Avg. (6 tasks) ↑   Wikitext ↓
+              Baseline        66.07            8.64                                                                            Marlin
+                                                                                                                               Dequant-and-Torch
+       8B      RTN-6̃         65.80            9.07
+                                                                                     2.0
+
+
+
+
+                                                                speedup over Torch
+               RTN-5̃         64.93            9.25
+              Baseline        71.67            3.94
+                                                                                     1.5
+       70B     RTN-6̃         71.27            4.47
+               RTN-5̃         71.32            4.73
+                                                                                     1.0
+               RTN-4̃         71.55            4.91
+              Baseline        73.99            1.74
+                                                                                     0.5
+       405B    RTN-6̃         74.24            1.86
+               RTN-5̃         73.81            1.95                                        1   2   4   8 16 32 64 128 256 512 1K 2K 4K 8K 16K
+                                                                                                              batch size
+ Llama-3.2    Method     Avg. (6 tasks) ↑   Wikitext ↓
+                                                                Figure 3: Speedup over the default GEMM implemen-
+              Baseline        51.07           15.82             tation in PyTorch for tensor shapes corresponding to
+       1B      RTN-6̃         50.77           17.21             linear modules of the LLama3.1-8B model
+               RTN-5̃         50.02           17.73
+              Baseline        59.26           12.29             the LLama3.1-8B model are depicted in Figure 3
+               RTN-6̃         58.46           12.91             where we show the speedup of the Marlin kernel
+       3B
+               RTN-5̃         57.54           13.13             relative to the GEMM operation implemented by
+                                                                PyTorch; the speedup falls below 1 for batch size
+Table 2: Zero-shot accuracy on six common tasks (the            over 128 tokens3 .
+higher is the better) and perplexity measured on the               We mitigate the issue above by introducing a
+wikitext dataset (the lower is the better), measured with       dual-path approach into the implementation of the
+three variants of the Llama3.1 model and two variants
+                                                                forward path for linear module of models quan-
+of the Llama3.2 model.
+                                                                tized with RTN (this path invokes the GEMM op-
+operations. The Marlin kernel expects a specific                erations). In particular, when the input dimension
+interleaved data layout for the tensor representing             of the activations tensor is larger or equal than a
+quantized weights. As a result, we reshuffle the                certain threshold (1024, in our case), we switch to
+data quantized with RTN to match that specific                  a path that dequantizes the weights into the full
+layout. This operation takes place once (for each               (16 bit) precision and invokes the PyTorch-based
+weights tensor), while loading and quantizing data,             GEMM kernel. As shown in Figure 3, the over-
+and does not have any impact on the runtime per-                head of dequantization relative to the latency of
+formance during inference.                                      the GEMM operation decreases as the size of the
+   Being designed specifically for batch sizes of               activations tensor grows. We note that the origi-
+16–32 tokens, we discover that the Marlin kernels               nal implementation of AWQ in vLLM (which is
+perform poorly when they are invoked with tensors               not based on Marlin) takes a similar dual-path ap-
+representing activations of a large input dimension.            proach4 .
+Such tensors are common in realistic workloads                     The practical consequence of the aforemen-
+since the input dimension is defined by a product               tioned discussion is that one needs to pay atten-
+of the batch size by the length of (number of to-               tion to the input dimension of the activations tensor
+kens in) each input. Hence, when the batch size                 during inference. Specifically, by default, vLLM
+is low (or even just 1), a long prompt can lead                 slices the given prompt into chunks of a certain
+to activations tensor with a large input dimension.             size (512 tokens in v0.6.4, changed later to 2048
+The issue is highlighted by the data collected with             tokens in v0.7.0). As Figure 3 shows, inputs of
+a built-in benchmark in the Marlin repo2 . This                    3
+                                                                     We note that the authors of Marlin mention that their
+benchmark varies the batch size and measures the                kernels target Nvidia’s Ampere architecture (Frantar et al.,
+average latency of running GEMM operations with                 2024). We performed the same experiment on a machine with
+                                                                A100 GPUs, and the results were qualitatively similar, though
+matrices corresponding to shapes employed by lin-               Marlin kept the advantage over PyTorch for longer, with the
+ear modules of a specific model; the results for                speedup falling below 1 for batches over 256 tokens.
+                                                                   4
+                                                                     See https://github.com/vllm-project/vllm/blob/
+   2
+    https://github.com/IST-DASLab/marlin/blob/                  main/vllm/model_executor/layers/quantization/
+master/bench.py                                                 awq.py
+
+
+                                                            7
+                                                                                             Input 256 / Output 32
+512 tokens lead to nearly the worst slowdown for             Llama-3.1 Batch Baseline RTN-8 RTN-6̃ RTN-5̃ RTN-4 GPTQ AWQ BnB
+Marlin kernels over the baseline GEMM imple-                           1     8.03    6.05 5.47    5.2  5.06 6.31 5.4 9.36
+mentation. As a result, we set the prompt chunk                        4      2.1    1.71 1.58 1.51 1.47 1.71 1.63 7.08
+                                                                       16     0.7    0.61 0.56 0.57 0.55 0.63 0.74 1.98
+size (controlled by the max_num_batched_tokens                   8B    64    0.36    0.35 0.35 0.35 0.35 0.38 0.58 0.69
+parameter in vLLM) to 16K in all latency exper-                       256    0.29    0.31 0.31 0.31 0.31 0.32 0.53 0.4
+                                                                      1024   0.29    0.31 0.31 0.31 0.31 0.32 0.53 0.4
+iments described below. We note that this setting                      1     19.38   14.86 13.31 12.73 12.13 18.32 13.22 25.24
+                                                                       4      5.3     4.3  3.93 3.77 3.65 5.39 4.09 17.57
+improves performance not only for RTN, but for                         16    1.79    1.53 1.44    1.4  1.36 2.26 1.89 4.88
+all other evaluated baselines, as it helps to utilize            70B   64    0.92    0.92 0.91 0.91     0.9 1.55 1.51 1.74
+                                                                      256    0.73    0.81 0.79 0.78 0.78 1.4 1.37 0.99
+better tensor cores involved in executing GEMM                        1024   0.73    0.81 0.79 0.78 0.78 1.4 1.37 0.99
+by increasing the amount of computation per each                       1      N/A    32.59 29.22 26.87 25.23 54.17 27.7 59.91
+                                                                       4      N/A     9.96 8.98 8.59 8.19 16.59 9.39 47.73
+GEMM invocation.                                                       16     N/A     3.88 3.63 3.54 3.43 7.31 4.99 13.38
+                                                                 405B 64      N/A     2.36 2.33 2.32 2.32 5.2 4.08 4.72
+    We evaluate the generation performance of sev-                    256     N/A     2.22 2.19 2.18 2.17 4.93 3.9 2.7
+eral Llama models, in its baseline configuration as                   1024    N/A     2.22 2.19 2.18 2.16 4.92 3.9 2.7
+well as when quantized using RTN (with various
+levels of precision) and using GPTQ and AWQ. We              Table 3: Token generation throughput (in msec/token)
+                                                             measured with three variants of the Llama3.1 model, on
+use two different setups – one with a short prompt
+                                                             prompts of 256 tokens and output length of 32 tokens.
+of 256 tokens and output length of 32 tokens, and
+another with a long prompt of 4096 tokens and out-           RTN variants trail closely the baseline thanks to its
+put length of 512 tokens. The first setup represents         dual-path approach discussed above. Marlin-based
+a short question-answer interaction with a chatbot,          kernels for AWQ and GPTQ do not utilize this
+while the other represents a query with more con-            approach and hence perform poorly in this case.
+text, such as one that might be generated by a code
+completion system. (Since the results were similar           6    Discussion
+for both setups, we include only figures for the first
+setup, for brevity). For all experiments, we use the         RTN is one of the simplest and easily applicable,
+built-in vLLM latency benchmark5 and run all vari-           data-free quantization techniques for LLMs and be-
+ants using the same hardware (1/4/8 H100 GPUs                yond. In this paper we demonstrate how enhancing
+for Llama-3.1 8B/70B/405B models, respectively).             RTN through selective quantization combined with
+Since the baseline Llama-3.1 405B model does not             efficient CUDA kernels can propel it to match and
+fit into 8 H100 GPUs, we do not collect results for          often surpass more sophisticated techniques that
+this configuration.                                          are not data-free. In particular, selective quantiza-
+    The generation throughput results are shown in           tion enables a fine-grained tradeoff between space
+Table 3. For small batches, RTN-8 outperforms the            and accuracy; in one particular case of the pop-
+baseline by up to 25%, while RTN-4 outperforms               ular open-source Llama-3.1/3.3 70B models, less
+the baseline by up to 37%. The speedup achieved              than 0.05 extra bits, on average, per each parameter
+by all RTN variants over BnB is substantial, espe-           is all that is needed to close the accuracy gap be-
+cially for small batches. This result highlights the         tween RTN and other state-of-the-art quantization
+performance cost paid by BnB for improving accu-             techniques. At the same time, the efficient CUDA
+racy by separating and handling outliers in model            kernel allows RTN to achieve higher generation
+weights. Note that RTN-4 also outperforms GPTQ               throughput than its more advanced competitors.
+and AWQ (on small batches) despite that all three            This positions RTN as a viable and practical choice
+methods employ Marlin-based kernels and 4bit pre-            for quantizing LLMs.
+cision. We attribute this advantage of RTN to its               As more extremely large LLMs adopt the MoE
+relative simplicity that, among other things, does           (mixture of experts) architecture (DeepSeek-AI,
+not consider zero points for its quantization groups         2025; Meta, 2025), the selective quantization is
+(unlike both GPTQ and AWQ), hence requiring less             well positioned to be applied to such models. For
+floating point operations for dequantization. As ex-         instance, certain experts (e.g., generalists) might
+pected, the performance of RTN-6̃ and RTN-5̃ falls           be more critical to the end-to-end accuracy of the
+in between RTN-8 and RTN-4. For large batches,               model than others; the selective quantization can
+                                                             seamlessly quantize the former to 8 bits and the
+   5
+    https://github.com/vllm-project/vllm/blob/               latter to 4. Exploring the application of the selective
+main/benchmarks/benchmark_latency.py                         quantization to such models is left for the future
+
+                                                         8
+work. Another interesting question we want to                 In Proc. International Conference for High Perfor-
+consider is automating the selection of layers and            mance Computing, Networking, Storage, and Analy-
+                                                              sis (SC).
+modules for higher precision under given memory
+budget and/or accuracy degradation target.                  Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot,
+                                                              Ashish Sabharwal, Carissa Schoenick, and Oyvind
+Limitations                                                   Tafjord. 2018. Think you have solved question an-
+                                                              swering? try ARC, the AI2 reasoning challenge.
+As presented, this work has several limitations,              CoRR, abs/1803.05457.
+which we aim to address in future work. First,              DeepSeek-AI. 2025. Deepseek-r1: Incentivizing reason-
+our evaluation puts heavy focus on Llama mod-                 ing capability in LLMs via reinforcement learning.
+els. Although those models are a popular choice               CoRR, abs/2501.12948.
+in open-source community, and we do compliment
+                                                            Tim Dettmers, Mike Lewis, Younes Belkada, and Luke
+our experiments with other open-source models,                Zettlemoyer. 2022. LLM.int8(): 8-bit matrix multi-
+robust evaluation of more models of various sizes             plication for transformers at scale. In Proc. of Inter-
+would strengthen our findings further. In particular,         national Conference on Neural Information Process-
+as newer models adopt the MoE (mixture of ex-                 ing Systems (NIPS).
+perts) architecture, including the latest generation        Zhen Dong, Zhewei Yao, Amir Gholami, Michael W.
+of Llama 4 models (Meta, 2025), it would be in-               Mahoney, and Kurt Keutzer. 2019. Hawq: Hessian
+teresting to confirm the application of our ideas to          aware quantization of neural networks with mixed-
+                                                              precision. In Proc. IEEE/CVF International Confer-
+such models as well. (We note that our experiments
+                                                              ence on Computer Vision (ICCV).
+with a Mixtral 8x22B model provide evidence that
+they apply).                                                Hugging Face.    The model hub.     https://
+   Second, while selective RTN can match and out-             huggingface.co/docs/hub/en/models-the-hub.
+perform other quantization techniques, the selec-           Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and
+tion of layers and modules for higher precision is             Dan Alistarh. 2022. GPTQ: accurate post-training
+limited to a manual process. Automating this pro-              quantization for generative pre-trained transformers.
+                                                               CoRR.
+cess, all while maintaining the practical advantages
+of RTN, including its data-free nature, remains an          Elias Frantar, Roberto L. Castro, Jiale Chen, Torsten
+open question.                                                 Hoefler, and Dan Alistarh. 2024. Marlin: Mixed-
+                                                               precision auto-regressive parallel inference on large
+Acknowledgements                                               language models. CoRR, 2408.11743.
+
+                                                            Leo Gao, Jonathan Tow, Baber Abbasi, Stella Bider-
+The author would like to thank Jingqiao Zhang,                man, Sid Black, Anthony DiPofi, Charles Foster,
+Ming Lin and Arthur Cheng for valuable discus-                Laurence Golding, Jeffrey Hsu, Alain Le Noac’h,
+sions and evaluation of ideas presented in this pa-           Haonan Li, Kyle McDonell, Niklas Muennighoff,
+per.                                                          Chris Ociepa, Jason Phang, Laria Reynolds, Hailey
+                                                              Schoelkopf, Aviya Skowron, Lintang Sutawika, and
+                                                              5 others. 2024. A framework for few-shot language
+                                                              model evaluation.
+References
+                                                            Amir Gholami, Sehoon Kim, Zhen Dong, Zhewei Yao,
+Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree          Michael W. Mahoney, and Kurt Keutzer. 2021. A
+ Mohan, Nipun Kwatra, Bhargav S. Gulavani, Alexey            survey of quantization methods for efficient neural
+ Tumanov, and Ramachandran Ramjee. 2024. Taming              network inference. CoRR, abs/2103.13630.
+ throughput-latency tradeoff in LLM inference with
+ sarathi-serve. In Proc. of USENIX Symposium on Op-         Daniel Han and Michael Han. 2025. Run DeepSeek
+ erating Systems Design and Implementation, OSDI,             R1 Dynamic 1.58-bit. https://unsloth.ai/blog/
+ pages 117–134.                                               deepseekr1-dynamic. Accessed on 03/01/2025.
+Yongqi An, Xu Zhao, Tao Yu, Ming Tang, and Jinqiao          Wei Huang, Yangdong Liu, Haotong Qin, Ying Li,
+  Wang. 2025. Systematic outliers in large language          Shiming Zhang, Xianglong Liu, Michele Magno, and
+  models. In Proc. of International Conference on            Xiaojuan Qi. 2024. BiLLM: pushing the limit of post-
+  Machine Learning (ICML).                                   training quantization for LLMs. In Proc. of Interna-
+                                                             tional Conference on Machine Learning (ICML).
+Yidong Chen, Chen Zhang, Rongchao Dong, Haoyuan
+  Zhang, Yonghua Zhang, Zhonghua Lu, and Jidong             Qiao Jin, Bhuwan Dhingra, Zhengping Liu, William
+  Zhai. 2024. Mixq: Taming dynamic outliers in                Cohen, and Xinghua Lu. 2019. Pubmedqa: A dataset
+  mixed-precision quantization by online prediction.          for biomedical research question answering. In Proc.
+
+
+                                                        9
+  Conference on Empirical Methods in Natural Lan-               Lucas Wilkinson. 2024. Introducing Machete, a
+  guage Processing and International Joint Conference             Mixed-Input GEMM Kernel Optimized for NVIDIA
+  on Natural Language Processing (EMNLP-IJCNLP).                  Hopper GPUs. https://neuralmagic.com/blog/
+                                                                  introducing-machete-a-mixed-input-gemm-
+Sehoon Kim, Coleman Hooper, Amir Gholami, Zhen                    kernel-optimized-for-nvidia-hopper-gpus.
+  Dong, Xiuyu Li, Sheng Shen, Michael W. Mahoney,                 Accessed on 02/07/2025.
+  and Kurt Keutzer. 2024. SqueezeLLM: dense-and-
+  sparse quantization. In Proc. of International Confer-        Xiaoxia Wu, Haojun Xia, Stephen Youn, Zhen Zheng,
+  ence on Machine Learning (ICML).                                Shiyang Chen, Arash Bakhtiari, Michael Wyatt,
+                                                                  Reza Yazdani Aminabadi, Yuxiong He, Olatunji
+Raghuraman Krishnamoorthi. 2018. Quantizing deep                  Ruwase, Leon Song, and Zhewei Yao. 2023. Ze-
+  convolutional networks for efficient inference: A               roquant(4+2): Redefining llms quantization with a
+  whitepaper. CoRR, abs/1806.08342.                               new fp6-centric strategy for diverse generative tasks.
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying                      CoRR, 2312.08583.
+ Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gon-                 Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu,
+ zalez, Hao Zhang, and Ion Stoica. 2023. Efficient                Julien Demouth, and Song Han. 2023. Smoothquant:
+ memory management for large language model serv-                 accurate and efficient post-training quantization for
+ ing with PagedAttention. In Proc. of ACM Sympo-                  large language models. In Proc. of International
+ sium on Operating Systems Principles (SOSP), page                Conference on Machine Learning (ICML).
+ 611–626.
+                                                                Ying Zhang, Peng Zhang, Mincong Huang, Jingyang
+Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Wei-
+                                                                  Xiang, Yujie Wang, Chao Wang, Yineng Zhang, Lei
+   Ming Chen, Wei-Chen Wang, Guangxuan Xiao,
+                                                                  Yu, Chuan Liu, and Wei Lin. 2024. QQQ: Quality
+   Xingyu Dang, Chuang Gan, and Song Han. 2024.
+                                                                  quattuor-bit quantization for large language models.
+   AWQ: activation-aware weight quantization for on-
+                                                                  CoRR, 2406.09904.
+   device LLM compression and acceleration. In Proc.
+   of Conference on Machine Learning and Systems                Yiren Zhou, Seyed-Mohsen Moosavi-Dezfooli, Ngai-
+   (MLSys).                                                       Man Cheung, and Pascal Frossard. 2018. Adaptive
+Stephanie Lin, Jacob Hilton, and Owain Evans. 2022.               quantization for deep neural network. In Proc. AAAI
+  TruthfulQA: Measuring how models mimic human                    Conference on Artificial Intelligence, volume 32.
+   falsehoods. In Proc. Annual Meeting of the Associa-          Xiaotian Zhu, Wengang Zhou, and Houqiang Li. 2018.
+   tion for Computational Linguistics (ACL).                      Adaptive layerwise quantization for deep neural net-
+Stephen Merity, Caiming Xiong, James Bradbury, and                work compression. In Proc. IEEE International Con-
+   Richard Socher. 2016. Pointer sentinel mixture mod-            ference on Multimedia and Expo (ICME), pages 1–6.
+   els. Preprint, arXiv:1609.07843.
+                                                                Xunyu Zhu, Jian Li, Yong Liu, Can Ma, and Weiping
+Meta. 2024. Introducing Llama 3.1: Our most capable               Wang. 2024. A survey on model compression for
+ models to date. https://ai.meta.com/blog/meta-                   large language models. Transactions of the Associa-
+ llama-3-1. Accessed on 02/20/2025.                               tion for Computational Linguistics, 12:1556–1577.
+
+Meta. 2025.  The Llama 4 herd: The begin-                       A    Extended Accuracy Results
+ ning of a new era of natively multimodal AI
+ innovation. https://ai.meta.com/blog/llama-
+ 4-multimodal-intelligence.     Accessed on
+ 04/09/2025.
+Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavat-
+  ula, and Yejin Choi. 2019. WINOGRANDE: an ad-
+  versarial winograd schema challenge at scale. CoRR,
+  abs/1907.10641.
+Alon Talmor, Jonathan Herzig, Nicholas Lourie, and
+  Jonathan Berant. 2019. CommonsenseQA: A ques-
+  tion answering challenge targeting commonsense
+  knowledge. In Proc. Conference of the North Amer-
+  ican Chapter of the Association for Computational
+  Linguistics: Human Language Technologies, Volume
+  1.
+Hanlin Tang, Yifu Sun, Decheng Wu, Kai Liu, Jianchen
+  Zhu, and Zhanhui Kang. 2023. EasyQuant: An effi-
+  cient data-free quantization algorithm for LLMs. In
+  Proc. of Conference on Empirical Methods in Natural
+  Language Processing (EMNLP), pages 9119–9128.
+
+
+                                                           10
+Llama-3.1 #Bits Method Winogrande ARC-e ARC-c TruthfulQA CommonSenseQA PubMedQA Avg. Wikitext
+            16 Baseline      73.64     81.94 51.71       36.96           77.15          75.00     66.07   8.64
+             8    RTN        73.72     81.78 51.79       36.84           77.07          75.60     66.13   8.65
+     8B
+            4   RTN          74.27     80.89   50.26     35.25           74.86          70.40     64.32   9.57
+            4 GPTQ           71.98     81.44   50.85     35.01           74.77          76.40     65.07   9.04
+            4   AWQ          73.09     80.89   51.02     34.76           75.84          76.20     65.30   9.10
+            4   BnB          73.56     81.06   51.54     36.47           75.51          75.40     65.59   9.15
+            16 Baseline      79.01     86.78   62.54     40.64           80.67          80.40     71.67   3.94
+             8    RTN        79.16     86.62 62.46       40.51           80.51          80.40     71.61   3.95
+     70B
+            4   RTN          77.27     85.56   60.92     40.27           80.34          78.40     70.46   8.19
+            4 GPTQ           78.14     86.11   61.18     40.39           79.93          79.60     70.89   4.61
+            4   AWQ          79.40     86.62   62.12     40.27           80.84          80.00     71.54   4.58
+            4   BnB          79.24     85.52   60.84     40.88           80.18          79.20     70.98   7.17
+            16 Baseline      82.64     88.38   64.76     46.27           84.68          77.20     73.99   1.74
+             8    RTN        82.79     88.17 64.85       46.51           84.77          77.60     74.12   1.75
+     405B
+             4    RTN        83.03     88.26   64.76     45.65           84.36          77.20     73.88   2.08
+             4    GPTQ       81.37     88.26   65.10     46.14           83.62          75.40     73.31   1.99
+             4    AWQ        82.72     88.26   64.59     45.90           84.19          77.20     73.81   2.00
+             4     BnB       82.79     88.17   64.33     47.12           84.44          76.20     73.84   1.95
+Llama-3.2 #Bits Method Winogrande ARC-e ARC-c TruthfulQA CommonSenseQA PubMedQA Avg. Wikitext
+            16 Baseline      59.67     68.73 35.58       27.05           55.36          60.00     51.07 15.82
+             8    RTN        59.43     68.35 35.41       27.17           55.45          60.80     51.10 15.83
+     1B
+            4   RTN          59.12     63.34   32.17     24.85           48.48          59.80     47.96   19.76
+            4 GPTQ           57.46     63.51   31.83     26.07           41.20          58.00     46.34   17.64
+            4   AWQ          59.19     66.67   34.73     25.46           51.52          58.00     49.26   17.32
+            4   BnB          57.38     65.32   35.32     25.46           53.15          57.40     49.01   17.01
+            16 Baseline      67.88     74.41   43.43     32.31           67.73          69.80     59.26   12.29
+             8    RTN        67.32     73.91 43.60       32.68           67.73          70.20     59.24 12.31
+     3B
+             4    RTN        66.30     69.74   39.93     31.33           62.57          64.60     55.74   13.34
+             4    GPTQ       65.75     71.89   41.72     30.97           65.77          69.20     57.55   13.16
+             4    AWQ        67.56     72.98   41.30     29.62           65.36          67.60     57.40   12.69
+             4     BnB       67.64     72.26   41.98     29.99           66.50          70.60     58.16   12.73
+
+
+Table 4: Zero-shot accuracy on six common tasks (the higher is the better) and perplexity measured on the wikitext
+dataset (the lower is the better), measured with three variants of the Llama3.1 model and two variants of the
+Llama3.2 model.
+
+
+
+
+                                                       11
+

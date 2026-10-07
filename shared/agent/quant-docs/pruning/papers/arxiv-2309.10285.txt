@@ -1,0 +1,1626 @@
+                                             Flash-LLM: Enabling Cost-Effective and Highly-Efficient Large
+                                                Generative Model Inference with Unstructured Sparsity
+                                                          Haojun Xia ∗ †                                         Zhen Zheng ∗                                    Yuchao Li
+                                                      Univeristy of Sydney                                       Alibaba Group                                 Alibaba Group
+                                                  hxia6845@uni.sydney.edu.au                                james.zz@alibaba-inc.com                    laiyin.lyc@alibaba-inc.com
+
+                                                        Donglin Zhuang                                         Zhongzhu Zhou                                    Xiafei Qiu
+                                                     Univeristy of Sydney                                  Univeristy of Sydney                               Alibaba Group
+                                                donglin.zhuang@sydney.edu.au                           zhongzhu.zhou@sydney.edu.au                    xiafei.qiuxf@alibaba-inc.com
+arXiv:2309.10285v1 [cs.DC] 19 Sep 2023
+
+
+
+
+                                                                Yong Li                                             Wei Lin                              Shuaiwen Leon Song
+                                                         Alibaba Group                                            Alibaba Group                           Univeristy of Sydney
+                                                   jiufeng.ly@alibaba-inc.com                               weilin.lw@alibaba-inc.com                shuaiwen.song@sydney.edu.au
+
+                                         Abstract                                                                          However, with the rapid growth of the parameter size (e.g. GPT-
+                                         With the fast growth of parameter size, it becomes increasingly chal-             2 [45] 1.5 billion parameters, GPT-3 [3] 175 billion, and Megatron-
+                                         lenging to deploy large generative models as they typically require               Turing NLG [50] 530 billion), it becomes increasingly challenging to
+                                         large GPU memory consumption and massive computation. Un-                         efficiently deploy these models. On one hand, their weights could
+                                         structured model pruning has been a common approach to reduce                     be too large to be placed on GPUs. For example, GPT-3 model
+                                         both GPU memory footprint and the overall computation while                       requires 350GB memory to store only the parameters with FP16
+                                         retaining good model accuracy. However, the existing solutions do                 data type, whereas the NVIDIA A100 GPU [36] only has a max of
+                                         not provide a highly-efficient support for handling unstructured                  80 GB memory. On the other hand, large generative models usually
+                                         sparsity on modern GPUs, especially on the highly-structured ten-                 cause very high inference latency even using multiple GPUs as
+                                         sor core hardware. Therefore, we propose Flash-LLM for enabling                   large amounts of computation and memory access are required.
+                                         low-cost and highly-efficient large generative model inference with                   There are three basic characteristics for practical model infer-
+                                         the sophisticated support of unstructured sparsity on high per-                   ence: accuracy, efficiency (i.e., latency and throughput), and cost
+                                         formance but highly restrictive tensor cores. Based on our key                    (i.e., how much hardware resource it consumes). The common ap-
+                                         observation that the main bottleneck of generative model inference                proach to deploy large models by partitioning the model weights
+                                         is the several skinny matrix multiplications for which tensor cores               onto multiple devices [49, 63] could suffer from high cost and low
+                                         would be significantly under-utilized due to low computational in-                efficiency. On one hand, for data-center production scenarios, using
+                                         tensity, we propose a general Load-as-Sparse and Compute-as-Dense                 multiple GPUs for a single inference of a single model leads to a low
+                                         methodology for unstructured sparse matrix multiplication (SpMM).                 ROI (return on investment) and can be too costly in practice. On the
+                                         The basic insight is to address the significant memory bandwidth                  other hand, this conventional approach requires extra cross-device
+                                         bottleneck while tolerating redundant computations that are not                   communication, further exacerbating the efficiency problem. GPU
+                                         critical for end-to-end performance on tensor cores. Based on this,               memory offloading and swapping is another approach to support
+                                         we design an effective software framework for tensor core based un-               large weights given limited GPU memory [1, 48]. However, the of-
+                                         structured SpMM, leveraging on-chip resources for efficient sparse                floading and swapping approaches usually result in a long inference
+                                         data extraction and computation/memory-access overlapping. Ex-                    latency and thus can be impractical for online inference services.
+                                         tensive evaluations demonstrate that (1) at SpMM kernel level,                        The weight pruning methods [16] (sparsification) have been
+                                         Flash-LLM significantly outperforms the state-of-the-art library, i.e.,           demonstrated to be effective in reducing memory usage and compu-
+                                         Sputnik and SparTA by an average of 2.9× and 1.5×, respectively.(2)               tations for model inference while retaining good accuracy through
+                                         At end-to-end framework level on OPT-30B/66B/175B models, for                     removing a portion of less salient connections in neural networks.
+                                         tokens per GPU-second, Flash-LLM achieves up to 3.8× and 3.6×                     In practice, unstructured pruning typically retains better accuracy
+                                         improvement over DeepSpeed and FasterTransformer, respectively,                   than more restrictive structured pruning [8, 12, 14, 16, 28, 51, 54].
+                                         with significantly lower inference cost. Flash-LLM’s source code is               However, it is difficult to support unstructured sparsity on mod-
+                                         publicly available at https://github.com/AlibabaResearch/flash-llm.               ern GPU architectures efficiently, especially since the unstructured
+                                                                                                                           sparse MatMul (SpMM) is hard to support on the high-performance
+                                         1    Introduction                                                                 but highly-structured tensor core architecture. Thus, this design di-
+                                                                                                                           rection has been largely neglected so far since higher performance
+                                         Generative models have demonstrated their effectiveness across a                  is very difficult to achieve. For example, the state-of-the-art unstruc-
+                                         wide range of language and data management tasks [3, 34, 45, 52, 53].             tured SpMM implementations (e.g. cuSPARSE [40], Sputnik [10])
+                                                                                                                           can not even outperform the dense counterpart (cuBLAS [39]) until
+                                         ∗ Haojun and Zhen contributed equally.                                            the model sparsity is higher than 98% and 86%, respectively. Note
+                                         † Part of the work was done when Haojun was interned at Alibaba.
+                                           Haojun Xia ∗ †, Zhen Zheng ∗ , Yuchao Li, Donglin Zhuang, Zhongzhu Zhou, Xiafei Qiu, Yong Li, Wei Lin, and Shuaiwen Leon Song
+
+
+that tensor cores on modern GPUs usually can achieve nearly an
+                                                                                         Text: I love dogs and they are the best             Prompt                         Attention
+order of magnitude higher peak performance than SIMT cores.                              companions I’ve ever had <End>                      K Cache:
+    To address this critical issue that bottlenecks LLM inference per-                                                                       V Cache:
+                                                                                            and         they         are           <End>                    KV Projection    I love dogs
+formance and cost, we propose Flash-LLM, an efficient GPU library                                                                            Step 0                         Attention
+to support unstructured sparsity on tensor cores for large generative                      Layer2      Layer2      Layer2          Layer2    K Cache:
+                                                                                                                                             V Cache:
+model inference. With unstructured sparsity, Flash-LLM addresses                                                                                                      KV Projection and
+                                                                                           Layer1      Layer1      Layer1          Layer1    Step 1                         Attention
+the memory footprint problem which leads to lower costs while re-                                                                            K Cache:
+taining high model accuracy. By being able to leverage tensor cores’                       Layer0      Layer0      Layer0          Layer0
+                                                                                                                                             V Cache:
+                                                                                                                                                                      KV Projection they
+high peak performance, Flash-LLM achieves lower latency for un-
+                                                                                                                                             Step n                         Attention
+structured SpMM compared to the existing sparse/dense MatMul                            I love dogs      and        they             had     K Cache:
+solutions. The high-level design insight of Flash-LLM is this Load-                        [B,L,H]     [B,1,H]     [B,1,H]         [B,1,H]   V Cache:
+                                                                                           Prompt      Step 0      Step 1          Step n                             KV Projection   had
+as-Sparse and Compute-as-Dense strategy. We make an important                          (a) Auto-regressive Token Generation                     (b) KV Cache within Layer-0
+observation that the key MatMuls in generative model inference
+are usually very skinny. Furthermore, the performance of these                             Figure 1: (a) Generative model inference; (b) KV-Cache.
+skinny MatMuls is bound by global memory access (or memory
+bandwidth) rather than the computation capability of tensor cores.                     • Flash-LLM is implemented and integrated into FasterTransformer
+Because of this, we propose an innovative approach to support                            for ease-of-use. Extensive evaluation results have shown that
+unstructured sparsity on tensor cores by leveraging sparse memory                        (1) at the kernel level, Flash-LLM outperforms the state-of-the-
+load to improve the limited memory bandwidth while effectively                           art solutions Sputnik and SparTA by an average of 2.9× and
+tolerating redundant tensor-core computation (Sec.3.2).                                  1.5×, respectively. (2) At end-to-end framework level on OPT-
+    Given the insight above, it is still challenging to actually de-                     30B/66B/175B models, for tokens per GPU-second, Flash-LLM
+sign and implement this high-level Load-as-Sparse and Compute-as-                        achieves up to 3.8× and 3.6× improvement over DeepSpeed and
+Dense approach. First, it requires a well-designed data format for                       FasterTransformer, with significantly lower inference cost.
+efficient sparse data storage and extraction. The sparse data extrac-
+tion is non-trivial, which requires a sophisticated design to load                     2      Background
+and extract sparse data with minimal access cost in the hierarchi-                     2.1          Generative Model Inference
+cal GPU memory given limited on-chip memory resources. It also
+introduces new challenges in designing the MatMul computation                          Inference Procedure of Modern Generative Models. Modern
+pipeline beyond conventional dense MatMul strategies. In Flash-                        generative models’ inference is typically conducted in two phases:
+LLM, we propose a new sparse format called (Tiled-CSL) to support                      prompt processing and token generation. As illustrated in Fig.1a,
+the tile-by-tile SpMM execution with tensor cores (Sec.4.3.1). Based                   the generative model first performs prompt processing to process
+on Tiled-CSL, we then design the sparse-to-dense transformation                        user input sequences (’I love dogs’) and generates the first new
+approach carefully by using the distributed registers and shared                       token (’and’). Then the model turns into the auto-regressive token
+memory buffers for sparse data extraction (Sec.4.1). Then, an ef-                      generation phase, where the single output token generated in step i-1
+ficient two-level overlapping strategy of memory and computation                       will be taken as input to generate the new token in step i iteratively.
+is introduced to coordinate the sparse-to-dense transformation on                         In the prompt processing phase, multiple tokens within the input
+weights, the dense feature map data loading, and the tensor core                       sequence will be processed at the same time, resulting in input ten-
+operations with a full software pipeline (Sec.4.2). Finally, we pro-                   sors with shape [𝐵, 𝐿, 𝐻 ] (Fig.1a). 𝐵, 𝐿, and 𝐻 indicate the inference
+pose an ahead-of-time sparse data reordering approach to further                       batch size, prompt sequence length, and the model hidden dimension,
+reduce shared memory bank conflicts1 (Sec.4.3.3). In summary, this                     respectively. Whereas in the token generation phase, only the single
+paper makes the following contributions:                                               token generated in the last iteration will be taken as input thus
+• We propose Flash-LLM, the first cost-effective and highly-efficient                  forming the input tensors in the shape of [𝐵, 1, 𝐻 ]. Note that to pre-
+   software framework for supporting large generative model in-                        vent re-computations on K and V vectors 2 of the previous tokens,
+   ference, opening up the scope of enabling unstructured sparsity                     a pre-allocated memory buffer (a.k.a. KV-Cache shown in Fig.1b) is
+   exploration on high-performance tensor cores.                                       usually used during token generation. At each step, a new KV pair
+• We propose a general Load-as-Sparse and Compute-as-Dense ap-                         is generated (in yellow) and written to the KV-Cache.
+   proach to reduce memory footprint and increase the efficiency of                       Inference Performance Hotspot of LLMs. Fig.2 illustrates the
+   the key skinny MatMuls by leveraging the insight of addressing                      typical decoder architecture of a single layer in modern attention-
+   the major memory bandwidth bottleneck in LLM inference while                        based generative models. There are in total four major matrix multi-
+   tolerating redundant tensor-core computations.                                      plications (or MatMuls) in the decoder layer: QKV Projection, Output
+• We propose an efficient software pipeline design to enable Flash-                    Projection, MLP1, and MLP2. Unlike previous encoder-centric non-
+   LLM by effectively leveraging our new sparse format, the sparse-                    generative language models (e.g., BERT [22]) of which the perfor-
+   to-dense transformation, and a two-level overlapping strategy.                      mance bottleneck is mainly at the multi-head attention computation,
+                                                                                       generative model inference’s performance is heavily bounded by
+                                                                                       these four MatMuls. According to our experiments on OPT-66B [61]
+1 GPU shared memory is divided into multiple memory banks that can be accessed
+simultaneously. Bank conflict means multiple addresses of a memory request map to
+the same memory bank, causing serialized accesses.                                     2 K and V vectors of previous tokens are needed by the attention [55] mechanism.
+Flash-LLM: Enabling Cost-Effective and Highly-Efficient Large Generative Model Inference with Unstructured Sparsity
+
+
+                                                               B              MLP2                                   CuSparse   Sputnik      cuBLAS      SparTA   Flash-LLM
+ Decoder Layer                                    4H                            B
+          Residual Add                                                                                         0.6
+                                         H                4H                  H
+
+
+
+
+                                                                                         Execution Time (ms)
+                        MLP2                                                                                   0.5
+      FFN
+
+
+
+
+                   MLP1+ReLU                                                  MLP1
+                                              H                                B                               0.4
+                    LayerNorm                                  B
+                                         4H                H                  4H                               0.3
+                  Residual Add
+                                                                                                               0.2
+                                                                   Output Projection
+      Attention
+
+
+
+
+                   Output Projection
+                                              H                B                 B                             0.1
+                  Multi-Head Attention   H                 H                   H
+                    QKV Projection
+                                                                     QKV Projection                             0
+                                              H                                B                                     60         70             80           90          100
+                                                               B
+                    LayerNorm                                                                                                             Sparsity (%)
+                                         3H                H                  3H
+
+                                                                                        Figure 3: Performance of an unstructured SpMM (M/K/N =hid-
+Figure 2: Decoder Layer Architecture. The H here means the                              den_size*4/hidden_size/batch_size=36K/9K/8) under differ-
+hidden dimension aka. model dimension, which equals 12K                                 ent designs on GPU. SIMT core centric designs are indicated
+for GPT-3. The B refers to the inference batch size which is                            with dash lines while tensor core centric designs are indi-
+typically small for real-time inference, e.g. 8, 16 or 32.                              cated with solid lines (including our solution Flash-LLM).
+model inference, these four MatMuls are the top contributors to the              values and then remove the weights with the smallest magnitude.
+overall latency which accounts for 76.8% of the end-to-end execu-                Another strategy (structured sparsity) is to prune the less salient
+tion time and also the top contributor of the memory consumption                 weights, but at the same time, some kind of structural criteria must
+which accounts for 83.8% of the overall memory usage.                            be enforced. For example, the weight matrices can be split into
+                                                                                 non-overlapping 8 × 1 vectors [4, 25] or 32 × 32 blocks [13], and
+2.2 Matrix Multiply in LLM Inference
+                                                                                 then each vector/block is either kept or removed during pruning.
+Skinny Matrix Multiply. The Matrix Multiply (MatMuls) in Fig.2                      In short, the major difference between structured and unstruc-
+can be formalized as 𝐶 = 𝐴 × 𝐵, where 𝐴 is the weight matrix of                  tured pruning is that extra constraints must be satisfied for struc-
+shape [𝑀, 𝐾] and 𝐵 is the feature map matrix of shape [𝐾, 𝑁 ]. In                tured pruning. Even though structured sparsity is friendly for hard-
+this paper, we call these MatMuls "Skinny MatMuls", as their 𝑁                   ware acceleration, it suffers from more severe model accuracy degra-
+dimensions are much smaller than the 𝑀 and 𝐾 dimensions. 3                       dation [8, 12, 14, 16, 51, 54] as it limits the freedom of deciding which
+    Differences between Tensor/SIMT cores. SIMT cores (aka. CUDA element to prune. As shown in [28], compared to structured sparsity
+cores) are general-purpose execution units that handle a wide range              which has 5% accuracy drop, unstructured sparsity only results in
+of instructions for parallel execution, while tensor cores [36, 38]              1% accuracy drop. In our experiments, the OPT-like models could
+are specialized units designed specifically to accelerate dense Mat-             greatly preserve accuracy through retraining-based unstructured
+Mul computations. Tensor cores provide significant acceleration                  pruning [15, 29] at 80% sparsity (e.g., the accuracy only decreases
+for dense MatMuls, e.g. 16× higher throughput than SIMT cores in                 from 85.55% to 84.11% for OPT-30B).
+A100 GPUs with FP32 accumulation.                                                   However, the conventional techniques for supporting random
+    Conventional techniques leveraging SIMT cores for sparse Mat-                unstructured sparsity in SpMM execution are not effective since
+Muls can not be directly applied to tensor cores as SIMT and tensor              they focus on leveraging SIMT cores without a sophisticated way
+cores work at very different granularity. SIMT cores work on the                 of utilizing high-performance tensor cores. Fig.3 shows the perfor-
+granularity of scalar values, e.g. the FMA instruction on scalar value.          mance comparison of different techniques for SpMM on an OPT-66B
+The per-element granularity makes it easy to do computation skip-                inference task with batch size 8. Note that the standard pruning for
+ping at the element level for SpMM. However, tensor cores work                   LLM inference typically requires a moderate level of sparsity (e.g.,
+at a much more coarse-grained granularity than SIMT cores, e.g.,                 80%) to preserve model quality while reducing memory footprint.
+perform a matrix multiply between two matrices with the shapes                   CuSparse [40], the NVIDIA SpMM library, shows poor performance
+of 16 × 16 and 16 × 8 in each instruction. Thus, tensor cores do not             as it is mainly designed for scientific applications where matrices
+allow skipping arbitrary element-level computations.                             are extremely (99%+) sparse. Sputnik [10], the state-of-the-art SIMT-
+                                                                                 core-centric optimization for unstructured SpMM on DL tasks still
+3 Opportunities and Insights
+                                                                                 cannot outperform cuBLAS(dense) until a high sparsity is reached.
+3.1 Unstructured Sparsity on Tensor Cores                                           We observe that sparse MatMul kernels in existing sparse li-
+                                                                                 braries are usually slower than their dense counterpart (cuBLAS[39]).
+There are two typical types of pruning principals. The most flexible
+                                                                                 The reason is that cuBLAS have leveraged the tensor cores, while
+pruning strategy (unstructured sparsity) is to remove less salient
+                                                                                 sparse MatMul kernels are leveraging SIMT cores in state-of-the-art
+elements without considering the distribution of the pruned ele-
+                                                                                 solutions. Note that A100 GPU [36] can provide 16× higher compu-
+ments in the weight matrix. Taking magnitude pruning for example,
+                                                                                 tational throughput using tensor cores than using SIMT cores for
+we can rank all the elements in the matrix based on their absolute
+                                                                                 dense MatMuls. Although Sputnik can effectively leverage SIMT
+                                                                                 cores for unstructured sparsity processing, its performance is still
+3 For these MatMuls, 𝑀 and 𝐾 are integer multiples of hidden size while 𝑁 equals
+                                                                                 limited by the peak performance of SIMT cores.
+inference batch size (typically orders of magnitude smaller than hidden size).
+                                      Haojun Xia ∗ †, Zhen Zheng ∗ , Yuchao Li, Donglin Zhuang, Zhongzhu Zhou, Xiafei Qiu, Yong Li, Wei Lin, and Shuaiwen Leon Song
+
+
+                                                                                                     100
+   Due to the clear peak performance discrepancy between SIMT                                                   12k/9k/BS    9k/4.5k/BS
+
+
+
+
+                                                                                   Utilization (%)
+                                                                                                     80
+and tensor cores, there is a strong demand for high-performance                                                 18k/9k/BS    9k/18k/BS
+                                                                                                     60
+unstructured SpMM support for LLM inference. However, it is non-                                     40
+trivial to enable high-performance unstructured SpMM onto the highly                                 20
+restrictive tensor cores as tensor cores do not allow skipping arbi-                                  0
+
+trary scalar-level computations (described in section 2.2). Previous                                       8     16 32 64    8   16 32 64   8   16 32 64   8   16 32 64
+SpMM works are based either on highly structured sparse matri-                                                 Tensor Core   L1/SharedMem        L2            HBM
+ces [4, 13, 18] (not random unstructured sparsity), or for extremely
+high sparsity ratio [57] (i.e., >95%, inappropriate for LLMs’ inference           Figure 4: GPU utilization Breakdown. The MatMuls profiled
+accuracy), rather than random unstructured sparsity at a moderate                 in this figure are the most time-consuming parts during OPT-
+sparsity ratio range for high accuracy. SparTA[65] leverages sparse               66B inference (with 2 GPUs) at batch sizes 16, 32, 64, and 128.
+tensor cores [32] for major computations. However, it cannot effec-
+tively exploit high sparsity as sparse tensor cores only support 50%              environments. Thus, the 𝐶𝐼 is strongly bounded by the 𝑁 dimension
+sparsity (i.e., 2:4 sparsity). As shown in Fig.3, the performance of              in real-time LLM inference. According to the roofline model [58],
+SparTA is lower than Flash-LLM especially as the sparsity increases.              the performance of a kernel with low computational intensity will
+                                                                                  be easily bounded by memory bandwidth.
+3.2    Design Opportunities
+                                                                                  3.2.2 Load as Sparse, Compute as Dense Given that the bottleneck
+Given the natural mismatch between the unstructured SpMM com-                     of skinny MatMul comes from memory access/memory bandwidth
+putation and the highly structured tensor core architecture, it is                rather than arithmetic computation, we propose the basic idea of
+essential to have a highly efficient SpMM solution on tensor cores                Load-as-Sparse and Compute-as-Dense here which leverages the
+according to the workload characteristics of modern LLMs. As dis-                 performance boost from reduced memory access while enabling
+cussed in Sec.2.2, MatMuls in modern LLMs inference are skinny. As                the efficient use of tensor cores for unstructured sparsity (refer to
+a result, the bottlenecks of the skinny MatMul computations are the               Sec.4 for details). Under this basic idea, given the sparsity ratio 𝛽
+off-chip memory access and bandwidth limitations, rather than the                 (the weight matrix 𝐴 is sparse while the feature map matrix 𝐵 is
+arithmetic processing on tensor cores. Based on this observation,                 dense), the computational intensity can be improved to:
+the basic idea to address this problem is through a Load-as-Sparse                                                        𝑀 ×𝑁
+and Compute-as-Dense approach. Specifically, the GPU kernel loads                                  𝐶𝐼𝑆𝑝𝑎𝑟𝑠𝑒𝐿𝑜𝑎𝑑 4 =                                  (2)
+                                                                                                                     𝑀 × (1 − 𝛽) + 𝑁
+the weight matrices from global memory in sparse format with
+                                                                                     Fig.5 shows the CIs and their corresponding achievable tensor
+reduced size and reconstructs the corresponding dense format in
+                                                                                  core performance of a typical MatMul (𝑀: 48k, 𝑁 : BS, 𝐾: 12k) in
+high-speed on-chip buffers for tensor core computation. The key
+                                                                                  OPT-175B model inference with different batch sizes. According to
+insight is that the bottleneck for LLM inference is not at the compu-
+                                                                                  the figure, MatMuls in generative model inference with different
+tation side thus we can tolerate the redundant computations with
+                                                                                  batch sizes all face memory wall issues. As a result, the dense
+tensor cores. We systematically describe how the off-chip mem-
+                                                                                  MatMuls kernels can only achieve 5.1%, 10.3%, 20.5%, and 40.1%
+ory transactions become the performance bottleneck in Sec.3.2.1,
+                                                                                  peak performance of tensor cores bounded by insufficient global
+and why it is possible to tolerate such redundant computation for
+                                                                                  memory bandwidth. These theoretical values are consistent with
+skinny SpMMs in LLMs’ inference in Sec.3.2.2.
+                                                                                  our actual measurements in Fig.4. In theory, with Load-as-Sparse
+3.2.1 Performance Bottleneck of Skinny MatMuls in LLM Inference.                  and Compute-as-Dense approach under 40% sparsity, the tensor
+We analyze the performance bottleneck of skinny MatMuls execu-                    cores utilization can be improved to 8.5%, 17.1%, 34.2%, and 68.2%.
+tion starting from dense MatMul workloads in LLMs. According
+to our profiling results for OPT-66B [61], the average utilization of             4                   Design Methodology
+tensor cores is around 5.0%, 10.1%, 19.9%, and 39.7% under typical                Flash-LLM leverages both SIMT cores and tensor cores effectively
+batch sizes of 8,16,32 and 64 as shown in Fig.4, while the bandwidth              for efficient unstructured SpMM computation. The flexible SIMT
+of global memory is already fully saturated. The underlining cause                cores are exploited for Sparse-to-Dense Transformation (i.e., Load-
+for this is that the compute intensity (i.e., FLOP/Byte) of skinny                as-Sparse) while tensor cores are used for compute-intensive tensor
+MatMul is very low. For a MatMul described in sec. 2.2, the total                 computations (i.e., Compute-as-Dense). We will give an overview of
+operations conducted are 2𝑀𝑁 𝐾 floating-point operations (FLOP),                  the high-level optimizations of Flash-LLM in Sec.4.1. Then we will
+and the corresponding data read is 2(𝑀𝐾 + 𝐾𝑁 ) bytes with FP16                    describe the design of Flash-LLM’s computation pipeline in Sec.4.2.
+data type. Thus, the computational intensity (𝐶𝐼 ) is:                            We illustrate the novel sparse format (tiled-CSL format) and the
+                                    𝑀 ×𝑁                                          efficient memory access techniques in Sec.4.3. Finally, we described
+                             𝐶𝐼 =                                   (1)
+                                    𝑀 +𝑁                                          the end-to-end inference system enabled by our Flash-LLM in Sec.5.
+    According to Equation.1, it is easy to demonstrate that the overall
+𝐶𝐼 of a MatMul can be easily restricted by either a small M or N
+                                                                                  4.1                      Design Overview
+dimension. For instance, for a skinny MatMul where 𝑁 is 16, 𝐶𝐼 will               We use the tiling-based approach for the SpMM computations in
+have a strict upper bound of 16 no matter how big the 𝑀 dimension                 Flash-LLM. Fig.6a shows the tiling method of Flash-LLM, where
+is. Note that in generative LLM models, the 𝑁 dimension equals
+the inference batch size which is usually very small in production                4 It’s worth noting that we do not take sparse index overhead into the theoretical
+                                                                                  consideration here. In practice, the real CI would be a bit lower than this equation.
+Flash-LLM: Enabling Cost-Effective and Highly-Efficient Large Generative Model Inference with Unstructured Sparsity
+
+
+                                                                                         each 𝐴𝑇 𝑖𝑙𝑒 . Specifically, it requires loading sparse encoding from
+                                                                                         global memory to the distributed registers (gmem2reg stage), reset-
+                                                                                         ting the target shared memory buffer with zero (rst_smem stage),
+                                                                                         and writing the sparse encoding from registers to the correspond-
+                                                                                         ing locations on shared memory buffer (extract stage). As for 𝐵𝑇 𝑖𝑙𝑒 ,
+                                                                                         which is already in dense format, it only requires loading directly
+                                                                                         from global memory to the target shared memory buffer (ld_dense
+                                                                                         stage). Finally, the smem2tc stage loads the shared memory data of
+                                                                                         𝐴𝑇 𝑖𝑙𝑒 and 𝐵𝑇 𝑖𝑙𝑒 and executes tensor core computations.
+                                                                                            As shown in Fig.6c, Flash-LLM exploits a two-level overlapping
+                                                                                         of the above memory and computation stages for efficient execution.
+Figure 5: Roofline model for skinny MatMuls. The solid
+                                                                                         On one hand, it leverages the software pipeline through double
+Squares refer to the CI and the performance upper bound for
+                                                                                         buffering to overlap off-chip memory loads and Sparse-to-Dense
+dense solutions (e.g. cuBLAS), while the solid Stars represent
+                                                                                         transformation with tensor core computation, called inter-iteration
+the improved CI and the new performance bound with our
+                                                                                         overlapping. On the other hand, it overlaps the stages of off-chip
+Load-as-Sparse Compute-as-Dense. Note that the vertical axis
+                                                                                         memory load within Sparse-to-Dense transformation for more effi-
+is displayed on a logarithmic scale.
+                                                                                         cient memory activities, called intra-iteration overlapping. The hori-
+each thread block (TB) is in charge of calculating a tile (e.g., the                     zontal axis of Fig.6c represents the execution time while the vertical
+green tile in the shape of 𝑀𝑇 𝐵 ∗ 𝑁𝑇 𝐵 ) in output matrix 𝐶. For                         axis represents the activities with the double buffer. It uses two
+each iteration, each thread block loads 𝐴𝑇 𝑖𝑙𝑒 (shape [𝑀𝑇 𝐵 , 𝐾𝑇 𝐵 ]) in                 shared memory buffers for 𝐴𝑇 𝑖𝑙𝑒 (corresponds to A1 and A2) and
+sparse and 𝐵𝑇 𝑖𝑙𝑒 (shape [𝐾𝑇 𝐵 , 𝑁𝑇 𝐵 ]) in dense from global memory.                    𝐵𝑇 𝑖𝑙𝑒 (corresponds to B1 and B2), and one register buffer reused in
+𝐴𝑇 𝑖𝑙𝑒 is then transformed to dense format with Sparse-to-Dense                          different iterations (corresponds to SE). Specifically, SE in Iteration-
+Transformation shown in Fig.6b and stored in shared memory while                         1/3 (Iteration-2/4) and A1 (A2) correspond to the Sparse-to-Dense
+𝐵𝑇 𝑖𝑙𝑒 is directly stored in shared memory. Finally, each thread block                   transformation process of 𝐴𝑇 𝑖𝑙𝑒 on the first (second) set of buffer,
+consumes the dense data in shared memory and generates the                               and B1 (B2) corresponds to the data movement of 𝐵𝑇 𝑖𝑙𝑒 on the first
+output tile through tensor core computations.                                            (second) set of buffer. As for inter-iteration overlapping, as shown
+   Fig.6b shows the overall kernel behavior of Flash-LLM from the                        in Iteration-2 in Fig.6c, while loading data from shared memory
+microarchitecture aspect. Shared memory is used as the workspace                         and executing tensor core computations for data on the first set of
+to store the extracted data from sparse to dense format, where                           buffers, Flash-LLM loads and extracts data from global memory to
+all threads within the thread block work together collaboratively                        shared memory for the second set of buffers. As for intra-iteration
+to load sparse encoding (SE) 5 of 𝐴𝑇 𝑖𝑙𝑒 from global memory and                          overlapping, the activities of A1 and B1 are processed in parallel,
+store them in shared memory with the dense format. Note that                             and the gmem2reg and rst_smem stages on 𝐴𝑇 𝑖𝑙𝑒 are also processed
+each tile on global memory is encoded into sparse encoding with                          in parallel. In this way, the sparse data loading, dense data loading,
+fewer bytes than the dense format, for which the corresponding                           and tensor core computations can be overlapped efficiently.
+global memory data movements can be reduced compared to dense                               A critical design for Sparse-to-Dense transformation is explicitly
+MatMul. Specifically, the basic idea of Sparse-to-Dense Transforma-                      using registers as data buffers between global memory and shared
+tion is extracting non-zero elements from the sparse encoding on                         memory. In Flash-LLM, the sparse encoding movement from global
+global memory to their corresponding locations in the dense format                       memory to shared memory is explicitly split into two stages, i.e.
+on shared memory while other locations are filled with zeros. We                         LDG (loading data from global memory to registers) instructions
+use the distributed registers as the intermediate buffer to store the                    during gmem2reg and STS (storing data to shared memory from
+non-zero elements before extracting them to shared memory. We                            registers) instructions during extract as shown in Fig.6c. On one
+do not use shared memory as this intermediate buffer to avoid the                        hand, the split two-stage design helps to increase instruction-level-
+turn-around shared memory access of the sparse encoding.                                 parallelism (ILP) to hide high global memory access latency. Note
+                                                                                         that each pair of LDG and STS instructions have load-use depen-
+4.2     Computation Pipeline Design of Flash-LLM                                         dency. If we do not split the gmem2reg and extract into two stages
+Given that each thread/thread-block consumes a large fraction                            but launch each pair of LDG and STS instructions in the adjacent
+of the overall registers/shared-memory as buffers for tiling, the                        cycles (e.g. directly storing to shared memory after loading from
+GPU thread-level parallelism (TLP) is inherently low. Thus, it is                        global memory) , each GPU thread will execute instructions in the
+important to optimize the instruction-level parallelism. We describe                     order of 𝐿𝐷𝐺 0, 𝑆𝑇 𝑆 0, 𝐿𝐷𝐺 1, 𝑆𝑇 𝑆 1, ... without ILP of global memory
+the software pipeline of Flash-LLM in this section where the off-                        load (i.e., LDGs). By splitting the two instructions into two stages as
+chip memory loading (Sparse-to-Dense Transformation) and tensor                          in Fig.6c, the execution order will be 𝐿𝐷𝐺 0, 𝐿𝐷𝐺 1, ..., 𝑆𝑇 𝑆 0, 𝑆𝑇 𝑆 1, ...
+core computations are processed in a pipeline manner efficiently.                        and results in a high ILP of global memory load. On the other hand,
+                                                                                         splitting the data movement into gmem2reg and extract enables the
+4.2.1 Two-level Overlapping of Memory and Computation. As de-
+                                                                                         overlapping opportunity between gmem2reg and rst_smem. Note
+scribed in Sec.4.1, it requires several stages to load the sparse encod-
+                                                                                         that STS instructions within extract should not be launched before
+ing from the global memory to shared memory in dense format for
+                                                                                         the completion of rst_smem stage, otherwise, the data written by
+5We refer to the data of 𝐴 in the sparse format as sparse encoding in this paper.        STS instructions might be overwritten by rst_smem incorrectly. The
+                                                         Haojun Xia ∗ †, Zhen Zheng ∗ , Yuchao Li, Donglin Zhuang, Zhongzhu Zhou, Xiafei Qiu, Yong Li, Wei Lin, and Shuaiwen Leon Song
+
+
+
+
+                                                                                                                                                                   Write                Read async_copy_barrier();                      __sync_threads();
+
+
+
+
+                                                                                                  warp3 warp1
+
+
+
+
+                                                                                                                                               warp3 warp1
+                                                                                  warp2 warp0
+
+
+
+
+                                                                                                                               warp2 warp0
+                      Input Dense Matrix
+                       [Stored in GMem]         Transformed to           Tensor
+                                                Dense Format.             Core                                                                               B2 On-chip                     ld_dense
+                                      KTB                                                                                                                                                                         smem2tc                   ld_dense
+      Stored in                                                                                                                                                   Buffers
+    Sparse Format.                                           BTile                                                                                           A2                          rst_smem                 smem2tc                rst_smem
+                                      B     k                             Using
+
+
+
+
+                                                                                                                                                                                                                                                       Extract
+                                                                                                                                                                                                       Extract
+                                                           SMem                                  RF                                           RF
+           k                                                             Dense
+                                                                         Format                 SMEM            Sparse-Dense                 SMEM            SE gmem2reg                  gmem2reg               gmem2reg                 gmem2reg
+
+
+
+
+                                                                                                                                                                                                                              Extract
+                                                                                                                                                                              Extract
+                                                         Warp 0 Warp 1                                           Transform
+                                                  SMem                                                          (SIMT Cores)                                 A1 rst_smem
+                          MTB         C m                Warp 2 Warp 3
+                                                                                                 RF                                           RF                                           smem2tc               rst_smem                  smem2tc
+
+    KTB    A                    NTB                                       Using                  L1                                           L1             B1    ld_dense                smem2tc                 ld_dense                smem2tc
+                                                                         Sparse                                                                                                                                                                        Time
+                                                 ATile       CTile                                                  L2
+    Input Sparse Matrix         n                                        Format
+     [Stored in GMem]                                                                                              DRAM                                           Iteration-1             Iteration-2             Iteration-3              Iteration-4
+
+          (a) Load-as-Sparse, Compute-as-Dense.                           (b) Sparse-to-Dense Transformation.                                                     (c) Pipelined memory and tensor core operations.
+
+                                                                                  Figure 6: Design Overview.
+
+
+execution of gmem2reg and rst_smem can be overlapped once the                                                              Algorithm 1 Flash-LLM SpMM kernel pseudo code.
+gmem2reg contains no shared memory write (all STS instructions                                                              1: Inputs: SparseMatrix 𝐴, Matrix 𝐵
+are assigned to the extract stage), which further increases ILP.                                                            2: Output: Matrix 𝐶
+                                                                                                                            3: 𝐼𝑛𝑖𝑡𝑖𝑎𝑙𝑖𝑧𝑒 _𝑃𝑖𝑝𝑒𝑙𝑖𝑛𝑒 ();
+4.2.2 Minimum Range of Synchronizations and Memory Barriers                                                                 4: 𝑜 𝑓 𝑓 𝑠𝑒𝑡 = 𝑠𝑢𝑏𝐴𝑟𝑟𝑎𝑦 (𝐴.𝑜 𝑓 𝑓 𝑠𝑒𝑡 );
+                                                                                                                            5: int 𝑠𝑡𝑎𝑟𝑡𝑝𝑟𝑒 𝑓 𝑒𝑡𝑐ℎ = 𝑜 𝑓 𝑓 𝑠𝑒𝑡 [1];
+Given the complex pipeline in Fig.6c, it requires a set of thread
+                                                                                                                            6: int 𝑛𝑛𝑧𝑝𝑟𝑒 𝑓 𝑒𝑡𝑐ℎ = 𝑜 𝑓 𝑓 𝑠𝑒𝑡 [2] − 𝑜 𝑓 𝑓 𝑠𝑒𝑡 [1];
+synchronizations and memory barriers to ensure correctness. Flash-                                                          7: for int 𝑖𝑑 = 0; 𝑖𝑑 < 𝐾𝐺𝑙𝑜𝑏𝑎𝑙 /𝐾; 𝑖𝑑 + + do
+LLM inserts the minimum range of synchronizations and memory                                                                8:      //Prefetch startIdx and nnz.
+                                                                                                                            9:      int 𝑠𝑡𝑎𝑟𝑡 = 𝑠𝑡𝑎𝑟𝑡𝑝𝑟𝑒 𝑓 𝑒𝑡𝑐ℎ ;
+barriers to ensure correctness while keeping the overlapping.                                                              10:      int 𝑛𝑛𝑧 = 𝑛𝑛𝑧𝑝𝑟𝑒 𝑓 𝑒𝑡𝑐ℎ ;
+   To avoid the data written by extract being overwritten by rst_smem                                                      11:      𝑠𝑡𝑎𝑟𝑡𝑝𝑟𝑒 𝑓 𝑒𝑡𝑐ℎ = 𝑜 𝑓 𝑓 𝑠𝑒𝑡 [𝑖𝑑 + 2];
+incorrectly, Flash-LLM inserts the explicit thread-block level syn-                                                        12:      𝑛𝑛𝑧𝑝𝑟𝑒 𝑓 𝑒𝑡𝑐ℎ = 𝑜 𝑓 𝑓 𝑠𝑒𝑡 [𝑖𝑑 + 3] − 𝑜 𝑓 𝑓 𝑠𝑒𝑡 [𝑖𝑑 + 2];
+chronization between the two stages to ensure that all the threads                                                         13:      //Set pointers for double-buffer.
+                                                                                                                           14:      half* 𝑠𝑚𝑒𝑚 _𝑤 = 𝑠𝑚𝑒𝑚 + ( (𝑖𝑑 + 1)%2) ∗ 𝑂𝐹 𝐹𝑆𝐸𝑇 ;
+have finished their work resetting the A1/A2 buffer in shared mem-                                                         15:      half* 𝑠𝑚𝑒𝑚 _𝑟 = 𝑠𝑚𝑒𝑚 + (𝑖𝑑%2) ∗ 𝑂𝐹 𝐹𝑆𝐸𝑇 ;
+ory, shown as the first yellow lines in each iteration in Fig.6c. Mean-                                                    16:      //Launch Asynchronous Memory Operations.
+                                                                                                                           17:      𝐼𝑛𝑖𝑡𝑆ℎ𝑎𝑟𝑒𝑑𝑀𝑒𝑚 (𝑠𝑚𝑒𝑚 _𝑤 );                                                                                        ⊲ rst_smem
+while, it also requires another synchronization to ensure that all                                                         18:      𝑐𝑝 _𝑎𝑠𝑦𝑛𝑐 _𝑐𝑜𝑚𝑚𝑖𝑡 ();
+data movements and tensor core operations of the current iter-                                                             19:      𝐶𝑜𝑝𝑦𝐺𝑙𝑜𝑏𝑎𝑙2𝑅𝑒𝑔 (𝐴.𝑛𝑧 + 𝑠𝑡𝑎𝑟𝑡, 𝑛𝑛𝑧 )                                                                             ⊲ gmem2reg
+ation are completed before starting the next iteration, shown as                                                           20:      𝐶𝑜𝑝𝑦𝐺𝑙𝑜𝑏𝑎𝑙2𝑆ℎ𝑎𝑟𝑒𝑑 (𝑠𝑚𝑒𝑚 _𝑤, 𝐵.𝑑𝑎𝑡𝑎)                                                                               ⊲ ld_dense
+                                                                                                                           21:      𝑐𝑝 _𝑎𝑠𝑦𝑛𝑐 _𝑐𝑜𝑚𝑚𝑖𝑡 ();
+the second yellow lines in each iteration in Fig.6c. Take Iteration-                                                       22:      //Math Computations.
+1 as an example, we should make sure that all the threads have                                                             23:      𝑃𝑖𝑝𝑒𝑙𝑖𝑛𝑒𝑑 _𝑆ℎ𝑎𝑟𝑒𝑑2𝑅𝑒𝑔_𝑇 𝑒𝑛𝑠𝑜𝑟𝐶𝑜𝑟𝑒𝑂𝑝𝑠 (𝑠𝑚𝑒𝑚 _𝑟 );
+finished writing the A1 and B1 shared memory buffers before we                                                             24:      //barrier: initSharedMem()
+                                                                                                                           25:      𝑐𝑝 _𝑎𝑠𝑦𝑛𝑐 _𝑤𝑎𝑖𝑡 <1> (); __𝑠𝑦𝑛𝑐𝑡ℎ𝑟𝑒𝑎𝑑𝑠 ();
+start Iteration-2, as the data on the shared memory buffers will be                                                        26:      𝐸𝑥𝑡𝑟𝑎𝑐𝑡𝑅𝑒𝑔𝑖𝑠𝑡𝑒𝑟 2𝑆ℎ𝑎𝑟𝑒𝑑 (𝑠𝑚𝑒𝑚 _𝑤 )                                                                                      ⊲ extract
+loaded to tensor cores as inputs in Iteration-2. Besides, we have to                                                       27:      //barrier: copyGlobal2Shared().
+                                                                                                                           28:      𝑐𝑝 _𝑎𝑠𝑦𝑛𝑐 _𝑤𝑎𝑖𝑡 <0> (); __𝑠𝑦𝑛𝑐𝑡ℎ𝑟𝑒𝑎𝑑𝑠 ();
+make sure that all the threads have finished reading the data from
+                                                                                                                           29: 𝑟𝑒𝑠𝑢𝑙𝑡𝑠 _𝑅𝑒𝑔2𝐺𝑙𝑜𝑏𝑎𝑙 (𝐶.𝑑𝑎𝑡𝑎);
+the register buffer for extract in Iteration-1 before letting them be
+overwritten by the rst_smem in Iteration-2.                                                                                4.2.3 Overall Implementation Alg.1 shows the implementations
+   Beside the thread-block synchronizations, it also requires mem-                                                         of the pipelined computation in Flash-LLM. In line 3, the software
+ory barriers after asynchronous copy activities of global-to-shared                                                        pipeline will be initialized, preparing the data of 𝐴𝑇 𝑖𝑙𝑒 and 𝐵𝑇 𝑖𝑙𝑒
+data movement. Flash-LLM makes use of the asynchronous copy                                                                on shared memory for the tensor core computations of the first
+primitives on GPU for the overlapping of data movement and other                                                           iteration in the main loop. The following iterations described in
+activities. Note that the asynchronous copy primitive cp.async, start-                                                     Fig.6c is implemented in lines 7-28. For each iteration, it issues
+ing from NVIDIA Ampere GPU [36], allows moving data from global                                                            the instructions for the asynchronous data loading for the next
+memory to shared memory in the background asynchronously                                                                   iteration and does the tensor core computation of the current it-
+while executing other computations in the foreground. Specifically,                                                        eration in a double buffer manner. Specifically, one 𝐴𝑇 𝑖𝑙𝑒 for the
+both the rst_smem and ld_dense stages use the cp.async primitives                                                          next iteration will be loaded and extracted from global memory to
+to enable the overlapped execution on the double buffer.                                                                   shared memory (rst_smem, gmem2reg, and extract), and one dense
+   To enable a fine-grained pipeline execution, Flash-LLM uses                                                             𝐵𝑇 𝑖𝑙𝑒 will be loaded directly from global memory (ld_dense). The
+different async-copy barriers for rst_smem and ld_dense stages. As                                                         rst_smem stage is in line 17, where each thread issues cp.async oper-
+shown in Fig.6c, the extract stage waits for the completion of only                                                        ation to set buffer A to zeros. In line 19, gmem2reg is accomplished,
+rst_smem, while the final thread-block barrier of each iteration                                                           where sparse encoding is loaded from global memory to the dis-
+waits for the completion of all previous cp.async operations. In this                                                      tributed registers. The ld_dense stage is in line 20, where the data for
+way, the extract stage could be overlapped with the ld_dense stages.                                                       𝐵𝑇 𝑖𝑙𝑒 is loaded from global memory to shared memory buffer with
+                                                                                                                           cp.async operations. After launching these asynchronous memory
+Flash-LLM: Enabling Cost-Effective and Highly-Efficient Large Generative Model Inference with Unstructured Sparsity
+
+
+            T1 T2 T3                                   ① TileOffsets                       extract the value (high 16 bits) and its location (low 16 bits). There
+            T4 T5 T6                  0 10 16 21 28 34 39 41 48 53 58 68 73 79 83 89 95    are some special considerations when using registers as intermedi-
+            … … …                                       ② NonZeros
+                                      T1                                                   ate buffers for sparse encoding. Different from shared memory and
+            a           b                                                                  global memory, GPU registers are not addressable, which means
+                    c
+        d               e                                                                  we can not access an array of registers using a variable offset. As
+                                MTB
+
+
+            f               g         a-1 b-4 c-9 d-12 e-16 f-19 g-23 h-26 i-30 j-34
+                h                                                                          a result, forcing an array defined in CUDA into registers requires
+        i               j
+                KTB
+                                        Value<half, 16 bits>    Location<short, 16 bits>   that, all the indices used to access the array can be determined
+        Figure 7: Tiled-CSL Format for sparse matrices.                                    statically at compile-time. Otherwise, the array will be stored in
+                                                                                           global memory instead. In line 1 in Alg.2, #pragma unrol is used to
+operations, tensor core operations are launched in line 23. Note                           notify the GPU compiler to fully unroll the main loop, so that all the
+that we load dense matrices from shared memory to registers us-                            indices used to access the 𝑅𝑒𝑔[] can be determined statically. Note
+ing ldmatrix.sync instruction and utilize tensor cores for the core                        that adding such compiling directive alone is not enough as a loop
+computations by explicitly launching mma.sync instruction in the                           with a variable number of iterations can not be fully unrolled. Thus,
+function Pipelined_Shared2Reg_TensorCoreOps().                                             we use a constant value #𝑅𝐸𝐺 (the upper bound of the number of
+   The first async-copy barrier in Fig.6c is in line 25, guaranteeing                      iterations, typically 32/64 in our implementation) in line 2 instead
+that all asynchronous operations launched in line 17 are completed                         of using the variable value 𝑛𝑛𝑧_𝑡ℎ𝑟𝑒𝑎𝑑.
+while the operations launched in line 20 can still be in progress. The                     Algorithm 2 ExtractRegister2Shared
+extract stage is in line 26, where the data on the distributed registers
+                                                                                            1: #pragma unroll
+are extracted to the shared memory buffer of 𝐴𝑇 𝑖𝑙𝑒 . Finally, the                          2: for int 𝑖 = 0; 𝑖 < #𝑅𝐸𝐺; 𝑖 + + do
+async-copy and thread-block barriers are called in line 28 to make                          3:     if 𝑖 ≥ 𝑛𝑛𝑧 _𝑡ℎ𝑟𝑒𝑎𝑑 then
+sure that all threads have completed their work in this iteration.                          4:         break
+                                                                                            5:    𝐴[𝑖𝑑𝑥 (𝑅𝑒𝑔[𝑖 ] ) ] = 𝑣 (𝑅𝑒𝑔[𝑖 ] )
+   Different from dense MatMul where the data size to be loaded
+from global memory can be inferred by the tile sizes, the size of
+                                                                                           4.3.3 Ahead of Time Sparse Data Reordering There are two types
+sparse encoding is determined by the number of non-zeros (nnz)
+                                                                                           of shared memory access in the computation pipeline for the sparse
+within 𝐴𝑇 𝑖𝑙𝑒 , which is unpredictable. Before loading the sparse
+                                                                                           weight matrix 𝐴. The one is shared memory load for tensor core
+encoding for each tile, Flash-LLM identifies its start offset and the
+                                                                                           computation in smem2tc stage. The other one is shared memory
+length in global memory buffers. Such information is maintained
+                                                                                           store in extract stage. It is essential to avoid bank conflict for good
+in TileOffsets array, which is stored in global memory (more details
+                                                                                           performance. However, the random sparsity makes it challenging
+in Sec.4.3). To avoid instruction stalls caused by long latency global
+                                                                                           to avoid bank conflict of both shared memory load and store.
+memory access, this metadata should be pre-fetched. In lines 5-6,
+                                                                                              As for the smem2tc stage, it makes use of ldmatrix intrinsic for
+the start offset and the size of sparse encoding for the first iteration
+                                                                                           efficient data loading from shared memory to registers for tensor
+are pre-fetched. At the beginning of each iteration, the start offset
+                                                                                           core computation. Fig.8a shows the behavior of ldmatrix where
+and the size of the current 𝐴𝑇 𝑖𝑙𝑒 are updated using the value in
+                                                                                           eight threads collectively load an 8 × 8 matrix in FP16 from shared
+registers pre-fetched in advance. In lines 11-12, it pre-fetches the
+                                                                                           memory. This 8 × 8 matrix reading can be served by a single shared
+start offset and the length for the next iteration.
+                                                                                           memory wavefront6 if there is no bank conflict. The bank-conflict-
+4.3     Sparse Encoding and Runtime Parsing                                                free memory load of ldmatrix requires that all scalars within the
+                                                                                           8 × 8 matrix can be read from disjoint memory banks. Fig.8a shows
+4.3.1 Tiled-CSL Format The sparse encoding format of 𝐴 matrix                              an example shared memory data layout demonstrating the bank
+is essential for efficient sparse data storage and Sparse-to-Dense                         assignment (bank ID ranging from 1 to 32) to achieve bank-conflict-
+Transformation. We propose a tile-by-tile sparse encoding format                           free ldmatrix. Thus, each scalar can be assigned a bank ID according
+to support the optimizations in Sec.4.2 effectively. The non-zero                          to its location within 𝐴𝑇 𝑖𝑙𝑒 , given a specific data layout.
+elements are organized tile-by-tile, where each tile maintains its                            However, this requirement will easily cause bank conflict of
+non-zero elements accompanied by the sparse index. As shown in                             shared memory store during extract stage due to the random po-
+Fig.7, the data of each tile within the sparse matrix are encoded into                     sition of the sparse elements in matrix 𝐴. In other words, we can
+a small array, and combining all tiles will form the overall array                         guarantee the bank-conflict-free load according to the layout re-
+(NonZeros Array). The TileOffsets Array maintains the starting offset                      quirement of ldmatrix, but cannot avoid bank conflict store in this
+of each tile in NonZeros Array. The number of non-zero elements                            way during extract stage. Fig.8b gives an example, where each non-
+of each Tiled-CSL tile is the difference between two corresponding                         zero (NonZero) value should be stored in a target shared memory
+elements in TileOffsets Array. For each tile in NonZeros Array, each                       bank (SMemBank) according to their relative position within 𝐴𝑇 𝑖𝑙𝑒
+element is stored along with its location within the tile. As shown                        to meet the requirement of bank-conflict-free ldmatrix. As the dis-
+in Fig.7, each non-zero weight is in 16-bit half-precision and each                        tribution of NonZeros is random, the target SMemBank for each
+location is encoded into a 16-bit short integer.                                           NonZero value is also random. As a result in Fig.8b, all CUDA
+4.3.2 Register to Shared Memory Data Extraction based on Tiled-CSL                         WARPs (the NonZeros with the same color are processed by the
+Format As described in Alg.2, each thread extracts 𝑛𝑛𝑧_𝑡ℎ𝑟𝑒𝑎𝑑 non-
+zero values from its sparse encoding buffer Reg[] to the shared mem-
+                                                                                           6 A wavefront is the maximum unit of work that can pass through the GPU hardware
+ory buffer A with a loop. The v() and idx() functions are used to
+                                                                                           pipeline per cycle. At most 1,024 bits can be loaded per wavefront for shared memory.
+                                                            Haojun Xia ∗ †, Zhen Zheng ∗ , Yuchao Li, Donglin Zhuang, Zhongzhu Zhou, Xiafei Qiu, Yong Li, Wei Lin, and Shuaiwen Leon Song
+
+
+                                                                                                              Alg.3 shows the algorithm to generate Tiled-CSL format from
+                                                 KTB                           8
+                                                                    1 1 2 2 3 3 4 4              T0
+                                                                                                           the original sparse matrix according to ahead of time sparse data
+                T1   T2   T3   T4
+                                                                    5 5 6 6 7 7 8 8
+                                                                    9 9 10 10 11 11 12 12
+                                                                                                 T1
+                                                                                                 T2
+                                                                                                           reordering approach. The input is the sparse matrix A with 𝑀 rows
+                T5   T6   T7   T8
+                                                                    13 13 14 14 15 15 16 16      T3
+                                                                                                           and 𝐾 columns in dense format, where some elements are already
+                                     MTB
+                                                               8    17 17 18 18 19 19 20 20      T4
+                …    …     …   …
+                                                                    21 21 22 22 23 23 24 24      T5
+                …    …     …   …                                    25 25 26 26 27 27 28 28      T6
+                                                                                                           set to 0 through model pruning. The outputs are NonZeros and
+                                                                    29 29 30 30 31 31 32 32      T7
+                 Sparse Matrix A            ATile in SMem          “ldmatrix.sync.aligned.m8n8”
+                                                                                                           TileOffsets, the key components of Tiled-CSL format. NonZeros are
+                                                                                                           split into groups each of which contains 32 non-zeros in line 2.
+             (a) The "ldmatrix" intrinsic loads an 8x8 matrix from
+             shared memory to registers as tensor core inputs.
+                                                                                                           Each group of non-zeros will be written to shared memory during
+                                                                                                           extract stage within one shared memory request. At lines 7-24, the
+      NonZeros 0.1 0.3 -1.1 7.4 -0.9 1.1 3.4 1.4 -0.7 0.5 3.2 0.2 1.5 -0.9 -0.5 0.3 -1.1 -0.3 3.1 1.7 …
+      Locations … … … … … ... … … … … … … … … … … ... … … … …                                              Tiled-CSL format of one tile (128 × 64) will be generated. At lines
+     SMemBank 1 4 4 1 3 3 2 4 3 2 2 2 1 2 3 1 3 4 1 4 …
+                 2 SMem WF.         2 SMem WF.         3 SMem WF.      2 SMem WF.             2 SMem WF.
+                                                                                                           11-14, each non-zero within matrix A will be encoded into a 32-bit
+                                                                                                           word containing (𝑣𝑎𝑙, 𝑙𝑜𝑐). Besides, non-zeros are distributed to
+   (b) Bank conflicts during ExtractRegister2Shared. (WARP size and SMem                                   32 different buckets (𝑁 𝑍 _𝐵𝑢𝑐𝑘𝑒𝑡 [32] at line 4) according to their
+   banks are reduced from 32 to 4 for simplicity.)
+      NonZeros 0.1 3.4 -0.9 0.3 7.4 0.5 1.1 -1.1 1.5 3.2 -0.7 1.4 0.3 0.2 -0.5 -0.3 3.1 -0.9 -1.1 1.7 …
+                                                                                                           target shared memory bank ID ranging from 0 to 31 as calculated in
+      Locations … … … … … ... … … … … … … … … … … ... … … … …                                              line 13. In line 16, the total number of non-zeros (NNZ) is counted.
+     SMemBank 1 2 3 4 1 2 3 4 1 2 3 4 1 2 3 4 1 2 3 4 …
+                 1 SMem WF.         1 SMem WF.         1 SMem WF.      1 SMem WF.             1 SMem WF.   At line 19-22, one group of non-zeros are formed by iteratively
+                                                                                                           picking non-zeros from NZ_Bucket[id] where 𝑁 𝑍 _𝐵𝑢𝑐𝑘𝑒𝑡 [𝑖𝑑] is
+                         (c) No conflict after Sparse Data Reorder.
+                                                                                                           the bucket with the most non-zeros not processed at that time.
+         Figure 8: Ahead of time sparse data reordering.
+                                                                                                           5     Implementation
+same WARP) suffer from bank conflict and lead to multiple shared
+                                                                                                           We provide a set of C++ APIs for high-performance Flash-LLM ker-
+memory wavefront (SMem WF).
+                                                                                                           nel. We integrate Flash-LLM kernel into FasterTransformer [37], en-
+    To reduce the bank conflict, we propose the ahead of time sparse
+                                                                                                           abling high-efficiency distributed inference with sparsified weight
+data reordering approach. The basic insight is that the bank-conflict-
+                                                                                                           matrices. Specifically, we extended its corresponding class defi-
+free ldmatrix already determines the target bank of each data el-
+                                                                                                           nition (i.e. DenseWeight class) to support the Tiled-CSL format.
+ement, we can thus reorder the data elements in each Tiled-CSL
+                                                                                                           Besides, we extended its library wrapper (i.e., cuBlasMMWrapper
+tile so that elements correspond to different banks could be orga-
+                                                                                                           class) to support calling either the dense MatMul library or Flash-
+nized into the same WARP for extract execution. Specifically, it
+                                                                                                           LLM SpMM kernel according to the given data format. Flash-LLM
+iteratively selects the sparse element that corresponds to different
+                                                                                                           can also be easily integrated into other deep learning frameworks
+memory banks when generating the NonZeros sub-array for each
+                                                                                                           through library calls with Flash-LLM API. We also provide a weight
+Tiled-CSL tile. Fig.8c shows an ideal case where only one shared
+                                                                                                           reformatting tool to generate sparse matrices in Tiled-CSL format
+memory wavefront is needed to serve one WARP executing extract
+                                                                                                           given the pre-trained dense PyTorch model.
+stage after data reordering. Note that the data reordering is within
+                                                                                                              In our implementation, the size of 𝑀𝑇 𝐵 in Fig. 6a is 128 or 256,
+Tiled-CSL tile scope, which only changes the data distribution on
+                                                                                                           𝐾𝑇 𝐵 is 64, and 𝑁𝑇 𝐵 is 8/16/32/32 when the 𝑁 dimension of MatMul
+global memory but does not change that on shared memory buffers.
+                                                                                                           (inference batch size) is 8/16/32/64. For larger 𝑁 dimensions, the
+In other words, it is a way to change the data placement on global
+                                                                                                           𝑁𝑇 𝐵 is 64. The thread block size is 128. These configurations work
+memory to achieve more efficient shared memory access.
+                                                                                                           well for the workloads we evaluated in Sec.6. The configurations
+Algorithm 3 Tiled-CSL_Gen_AOTSparseDataReordering                                                          can be reconfigured easily for other workloads. The configuration
+ 1: Input: Matrix A in size 𝑀 × 𝐾 ;                                                                        tuning is not in the research scope of this paper.
+ 2: Output1: vector< vector<unsigned int> > NonZeros;
+ 3: Output2: vecotr<int> TileOffsets;                                                                      6     Evaluation
+ 4: vector<unsigned int> 𝑁 𝑍 _𝐵𝑢𝑐𝑘𝑒𝑡 [32];
+ 5: for int 𝑖 = 0; 𝑖 < 𝑀/128; 𝑖 + + do                                                                     We evaluate the performance of Flash-LLM on two levels: kernel-
+ 6:     for int 𝑗 = 0; 𝑗 < 𝐾/64; 𝑗 + + do                                                                  level benchmarking and model-level evaluation. The evaluation is
+ 7:         // classifying NonZeros.
+ 8:         half ∗𝑇 𝑖𝑙𝑒𝑃𝑇 𝑅 = 𝐴 + 𝑖 ∗ 128 ∗ 𝐾 + 𝑗 ∗ 64;                                                    conducted on the NVIDIA A100-SMX8-80GB platform (128-core
+ 9:         for int 𝑥 = 0; 𝑥 < 128; 𝑥 + + do                                                               Intel Xeon Platinum 8369B CPU @2.90GHz, 8 NVIDIA A100 GPU
+10:              for int 𝑦 = 0; 𝑦 < 64; 𝑦 + + do
+11:                  𝑣𝑎𝑙 = 𝑇 𝑖𝑙𝑒𝑃𝑇 𝑅 [𝑥 ∗ 𝐾 + 𝑦 ];                                                         @80GB), with Ubuntu 18.04 and CUDA 11.8. We enable auto-mixed
+12:                  short 𝑙𝑜𝑐 = 𝑙𝑜𝑐𝑎𝑡𝑖𝑜𝑛 _𝑖𝑛 _𝑆𝑀𝑒𝑚 (𝑥, 𝑦);                                                precision (AMP) for all evaluations. We mainly do experiments on
+13:                  int 𝐵𝑎𝑛𝑘𝐼 𝐷 = (𝑥%8) ∗ 4 + (𝑦%8)//2;                                                   NVIDIA A100 GPUs. However, the method we proposed is also a
+14:                  𝑁 𝑍 _𝐵𝑢𝑐𝑘𝑒𝑡 [𝐵𝑎𝑛𝑘𝐼 𝐷 ].𝑝𝑢𝑠ℎ _𝑏𝑎𝑐𝑘 (𝑣𝑎𝑙, 𝑙𝑜𝑐 );
+15:         // iteratively picking 32 NonZeros as a group.
+                                                                                                           good reference for the kernel design of TPU and Intel CPUs that
+16:         int 𝑁 𝑁 𝑍 = 𝑐𝑜𝑢𝑛𝑡 _𝑁 𝑁 𝑍 (𝑁 𝑍 _𝐵𝑢𝑐𝑘𝑒𝑡 );                                                       are equipped with customized hardware for matrix multiplication.
+17:         for int 𝑔 = 0; 𝑔 < 𝑁 𝑁 𝑍 /32; 𝑔 + + do
+18:              vector<unsigned int> 𝑁 𝑍 _𝑔𝑟𝑜𝑢𝑝;                                                          6.1    Kernel Performance
+19:              for int 𝑏 = 0; 𝑏 < 32; 𝑏 + + do
+20:                  int 𝑖𝑑 = 𝐵𝑎𝑛𝑘𝐼 𝐷 _𝑀𝑎𝑥 (𝑁 𝑍 _𝐵𝑢𝑐𝑘𝑒𝑡 );                                                 Workloads, baselines, and settings. We evaluate Flash-LLM on
+21:                  𝑁 𝑍 _𝐺𝑟𝑜𝑢𝑝.𝑝𝑢𝑠ℎ _𝑏𝑎𝑐𝑘 (𝑁 𝑍 _𝐵𝑢𝑐𝑘𝑒𝑡 [𝑖𝑑 ].𝑏𝑎𝑐𝑘 ( ) );                                  MatMuls under different shapes, coming from the four MatMuls
+22:                  𝑁 𝑍 _𝐵𝑢𝑐𝑘𝑒𝑡 [𝑖𝑑 ].𝑝𝑜𝑝 _𝑏𝑎𝑐𝑘 ( );
+                                                                                                           described in Sec.2.1 within OPT-30B, OPT-66B, and OPT-175B [61]
+23:              𝑁 𝑜𝑛𝑍𝑒𝑟𝑜𝑠.𝑝𝑢𝑠ℎ _𝑏𝑎𝑐𝑘 (𝑁 𝑍 _𝑔𝑟𝑜𝑢𝑝 );
+24:              𝑇 𝑖𝑙𝑒𝑂 𝑓 𝑓 𝑠𝑒𝑡 .𝑝𝑢𝑠ℎ _𝑏𝑎𝑐𝑘 (𝑁 𝑁 𝑍 );                                                      given four different batch sizes (8, 16, 32, and 64). For each MatMul
+                                                                                                           shape, we evaluate the kernel latency under 70%, 80%, and 90% of
+Flash-LLM: Enabling Cost-Effective and Highly-Efficient Large Generative Model Inference with Unstructured Sparsity
+
+
+                          cuSPARSE                      Sputnik                    cuBLAS_TC                                          SparTA                              Flash-LLM
+          30   Batch Size = 8
+ TFLOPs
+
+
+
+
+          20
+
+          10
+
+           0
+          80
+          60
+               Batch Size = 16
+ TFLOPs
+
+
+
+
+          40
+          20
+           0
+         120
+         100   Batch Size = 32
+TFLOPs
+
+
+
+
+          80
+          60
+          40
+          20
+           0
+      7k 70%
+
+      7k 80%
+
+                  %
+
+
+
+
+      9k 70%
+
+      9k 80%
+
+                  %
+
+
+
+
+         12 %
+
+         12 %
+
+         12 %
+
+         12 %
+
+         12 %
+
+         12 %
+
+         12 %
+
+         12 %
+
+         48 %
+
+         48 %
+
+         48 %
+
+                  %
+                  %
+
+                  %
+      7k 90%
+
+
+
+
+                  %
+
+                  %
+
+                  %
+
+                  %
+
+                  %
+
+                  %
+
+                  %
+
+                  %
+      9k 90%
+
+
+
+
+                  %
+
+                  %
+
+                  %
+
+                  %
+
+                  %
+                0%
+     21 /70
+
+     21 /80
+
+
+
+
+     28 /70
+
+     28 /80
+
+     7k /90
+
+     7k /70
+
+     7k /80
+
+     27 /90
+
+     27 /70
+
+     27 /80
+
+
+
+
+     36 /70
+
+     36 /80
+
+     9k /90
+
+     9k /70
+
+     9k /80
+     28 /90
+
+
+
+
+     36 /90
+
+
+
+
+                0
+
+                0
+
+                0
+
+                0
+
+                0
+
+                0
+
+                0
+
+                0
+
+                0
+
+                0
+
+                0
+               90
+    36 k/7
+
+    36 k/8
+
+    12 k/9
+
+    12 k/7
+
+    12 k/8
+
+    48 k/9
+
+    48 k/7
+
+    48 k/8
+
+    12 k/9
+
+    12 k/7
+
+    12 k/8
+    36 k/9
+              /
+
+
+
+
+              /
+            k/
+
+            k/
+
+
+
+
+            k/
+
+            k/
+
+
+
+
+            k/
+          7k
+
+          7k
+
+          7k
+
+
+
+
+          7k
+
+          7k
+
+          7k
+
+          8k
+
+          8k
+
+          8k
+
+          9k
+
+          9k
+
+          9k
+
+
+
+
+          9k
+
+          9k
+
+          9k
+
+          6k
+
+          6k
+            k
+
+
+
+
+            k
+
+
+
+
+         12
+          6
+         /7
+
+         /7
+
+         /7
+
+
+
+
+         /9
+
+         /9
+
+         /9
+       k/
+
+       k/
+
+       k/
+
+
+
+
+       k/
+
+       k/
+
+       k/
+
+
+
+
+       k/
+
+       k/
+
+       k/
+
+
+
+
+       k/
+
+       k/
+
+       k/
+       /2
+
+       /2
+
+       /2
+
+
+
+
+       /3
+
+       /3
+
+       /3
+      k/
+
+      k/
+
+      k/
+
+      k/
+
+      k/
+
+      k/
+
+      k/
+
+      k/
+
+      k/
+
+      k/
+
+      k/
+
+      k/
+     21
+
+
+
+
+                                     Figure 9: Kernel Benchmarking (M/K/Sparsity; weight matrix: M × K).
+
+
+random sparsity in the weight matrices. The baselines we compare                                     100
+                                                                                                      90    cuSPARSE (90%)         Sputnik (90%)           SparTA (90%)      cuBLAS (0%) FlashLLM (90%)
+include cuSPARSE [40], Sputnik (commit: 46e380c) [10, 11], SparTA                         Utilization [%]
+                                                                                                      80
+                                                                                                      70
+(commit: 1f61a36) [64, 65], and cuBLAS [39]. CuSPARSE is part of                                      60
+                                                                                                      50
+the CUDA Toolkit for handling sparse matrices. Sputnik is a library                                   40
+                                                                                                      30
+
+of sparse linear algebra kernels for deep learning, which achieves                                    20
+                                                                                                      10
+                                                                                                       0
+state-of-the-art SpMM performance based on SIMT cores. SparTA                                               TC SIMT L1   L2 HBM   TC SIMT L1    L2 HBM SpTC SIMT L1   L2 HBM TC   L1   L2 HBM TC   L1   L2 HBM
+
+supports unstructured sparsity based on 2:4 structured sparsity                                                                                (a) Batch size = 16
+on tensor core [32]. As SparTA only supports FP32 precision, we
+extended SparTA to support input matrices in FP16. CuBLAS targets                                    100
+                                                                                                      90    cuSPARSE (90%)        Sputnik (90%)            SparTA (90%)      cuBLAS (0%) FlashLLM (90%)
+                                                                                          Utilization [%]
+
+
+
+
+                                                                                                      80
+dense MatMul rather than SpMM. We include it as a baseline here                                       70
+                                                                                                      60
+to show the practical performance gains/loss compared to the basic                                    50
+                                                                                                      40
+
+dense implementations of LLM inference.                                                               30
+                                                                                                      20
+                                                                                                      10
+   Results. Fig.9 shows the kernel performance (TFLOPs) of Flash-                                      0
+                                                                                                            TC SIMT L1   L2 HBM   TC SIMT L1    L2 HBM SpTC SIMT L1   L2 HBM TC   L1   L2 HBM TC   L1   L2 HBM
+LLM and the baselines. The throughput can be calculated by 2 ×
+𝑀 × 𝐾 × 𝑁 /𝑘𝑒𝑟𝑛𝑒𝑙_𝑙𝑎𝑡𝑒𝑛𝑐𝑦. As shown in Fig.9, Flash-LLM per-                                                                                   (b) Batch size = 32
+
+forms the best constantly compared to the baselines. On average,
+Flash-LLM outperforms Sputnik/SparTA by 3.6×/1.4×, 3.0×/1.4×,                            Figure 10: Kernel utilization breakdown with four MatMul
+and 2.0×/1.6× under 70%, 80%, and 90% sparsity respectively. Be-                         shapes (indicated with different colors) from OPT-66B.
+sides, Flash-LLM can also outperform the state-of-the-art dense                          6.2                  Kernel Analysis
+kernels cuBLAS with tensor core enabled by 1.4×, 1.7×, and 2.1×.
+CuSPARSE shows poor performance under such moderate-level                                Optimized GPU Utilization. Fig.10 7 . shows the utilization of
+sparsity, as it is designed for matrices with >95% sparsity[40]. As                      GPU hardware units including tensor cores (TC), combined L1 and
+for Sputnik, it is very challenging to outperform cuBLAS kernels                         shared memory (L1), L2 cache (L2), and GPU global memory (HBM)
+with tensor core enabled. According to the benchmark results, Sput-                      during Flash-LLM kernel execution. All the data is collected by the
+nik can outperform cuBLAS_TC only when the sparsity is >90%                              NSight Compute profiler [43]. We present the profiling results of
+when the N dimension is 8, 16, or 32. As for SparTA, as described                        N = 16 and N = 32 under 90% sparsity. We also include cuBLAS
+in Sec.3.1, it leverages sparse tensor core [32] for the major part                      here as the dense baseline (sparsity = 0%). cuSPARSE and Sputnik
+of the computations, which can not effectively exploit the sparsity                      are SIMT-based designs where tensor cores are not used at all.
+available as sparse tensor cores only support 50% sparsity (2:4 spar-                    Although Sputnik achieves good SIMT core utilization (29.8% at
+sity). If the sparsity available is higher than 50%, SparTA has to pad                   BS=16, 40.1% at BS=32), it achieves much slower performance than
+zeros to the sparse matrix resulting in redundant global memory                          other tensor-core-based kernels as SIMT cores show much lower
+access during runtime. Besides, for the non-zeros that can not meet                      peak computational throughput than tensor cores. SparTA utilizes
+the 2:4 requirement, another SIMT core based kernel is launched                          the tensor core but with lower utilization than cuBLAS. For cuBLAS,
+for the corresponding computations, resulting in extra overhead.
+                                                                                         7 For cuBLAS[39], the number of tensor core instructions (HMMA) executed will
+Therefore, Flash-LLM outperforms SparTA in our evaluations.
+                                                                                         not change as the N dimension varies (e.g. 8, 16, 32, 64). It means that there are
+                                                                                         redundant tensor core operations launched in cuBLAS kernels for N=8, 16, and 32.
+                                                                                         These redundant HMMA operations are excluded properly in our evaluations
+                                                                              Haojun Xia ∗ †, Zhen Zheng ∗ , Yuchao Li, Donglin Zhuang, Zhongzhu Zhou, Xiafei Qiu, Yong Li, Wei Lin, and Shuaiwen Leon Song
+
+
+                                                                                                                                                                         cuSPARSE      Sputnik       cuBLAS_TC       SparTA      Flash-LLM
+                                                                                                                                                                    2
+       1.2                                                                     1.2
+
+
+
+
+                                                                                                                                                         Speedup
+                                                                                                                                                                   1.5
+           1                                                                     1
+                                                                                                                                                                    1
+       0.8                                                                     0.8
+
+
+
+
+                                                                         Latency
+ Latency
+
+
+
+
+                                                                                                                                                                   0.5
+       0.6                                                                     0.6
+                                                                                                                                                                    0
+       0.4                                                                     0.4
+       0.2                                                                     0.2                                                                                        36k/9k/8   36k/9k/16   36k/9k/32   36k/9k/64 36k/9k/256 36k/9k/1024
+           0                                                                       0
+
+
+
+
+                                                                                                 Gmem
+
+                                                                                                        Smem
+                                                                                       Overall
+
+
+
+
+                                                                                                               TC
+                                                      Gmem
+                                            Overall
+
+
+
+
+                                                                    TC
+
+
+
+
+                                                                                                                              Gmem
+
+                                                                                                                                     Smem
+                                                                                                                    Overall
+
+
+
+
+                                                                                                                                            TC
+                         Gmem
+
+                                Smem
+
+
+
+
+                                                             Smem
+               Overall
+
+
+
+
+                                       TC
+
+
+
+
+                                                                                                                                                 Figure 12: Kernel speedups over cuBLAS [39] GeMM kernel
+                                                                                                                                                 with different shapes (M/K/N, sparsity=80%).
+                    Dense GeMM               Flash-LLM Kernel                               Dense GeMM               Flash-LLM Kernel
+
+                     (a) Batch size = 16                                                     (b) Batch size = 32                                                         Batch Size        8        16        32       64        128
+                                                                                                                                                                         Ours-1GPU        34.7     40.8      52.9     77.1      OOM
+                                                                                                                                                                          FT-1GPU         62.7     68.7      OOM      OOM       OOM
+Figure 11: Latency breakdown of Dense and Flash-LLM Ker-                                                                                                                  DS-1GPU         64.1     70.9      OOM      OOM       OOM
+nels (normalized to cuBLAS[39] kernel latency).                                                                                                                           FT-2GPU         65.6     71.7      83.9     108.3     OOM
+                                                                                                                                                                          DS-2GPU         68.3     75.7      90.6     120.4     OOM
+the bandwidth of the L2 cache and GPU DRAM is exhausted while                                                                                                            Table 1: Peak GPU memory usage (GB).
+the tensor cores only reach 10.7% and 21.0% of its peak performance
+on average when the N dimension is 16 and 32 respectively. In
+Flash-LLM, the sparse matrices are in Tiled-CSL format (Sec.3.2.2)                                                                               shown in Fig.12, Flash-LLM becomes slower than cuBLAS if the N
+with reduced size in bytes. The global memory bandwidth is no                                                                                    dimension is larger than 256, noting the memory footprint of Flash-
+longer the bottleneck with the Load-as-Sparse and Compute-as-                                                                                    LLM is still smaller than dense counterparts. The reason behind
+Dense method. On average, tensor core utilization is improved to                                                                                 this is twofold. First, the inefficiency of cuBLAS is no longer sig-
+24.4% and 42.6%. As tensor core utilization is improved, it consumes                                                                             nificant as the N dimension is large enough, which makes cuBLAS
+higher bandwidth of shared memory. In addition to that, the extract                                                                              more performant. Second, Flash-LLM has more complicated kernel
+in Fig.6c will cause extra shared memory stores. Thus, L1/shared-                                                                                designs and extra shared memory access, which slows it down a
+memory bandwidth is exhausted by Flash-LLM, which prohibits                                                                                      little bit. We also notice that Sputnik becomes much slower than
+further performance improvements. Note that the ahead of time                                                                                    other tensor-core-based designs as the N dimension increases. Even
+sparse data reordering (Sec.4.3.3) is designed to increase the shared                                                                            though SIMT-core-based solutions such as Sputnik can skip com-
+memory access efficiency, which helps to mitigate the bandwidth                                                                                  putations exploiting sparsity, such computational savings still can
+bottleneck of shared memory. How to further reduce the pressure                                                                                  not make up for the huge performance gap between SIMT cores
+on shared memory could be future work.                                                                                                           and tensor cores.
+   Balanced pipeline for memory/tensor core operations. Flash-                                                                                   6.3     End-to-End Model Evaluation
+LLM kernel contains three major types of operations: global mem-
+                                                                                                                                                 Baselines. We include NVIDIA FasterTransformer (FT) (git commit:
+ory access (Gmem), shared memory access (Smem), and tensor core
+                                                                                                                                                 9770d30) [37] and DeepSpeed (DS) [1] as baselines, the state-of-the-
+operations (TC). Ideally, these three types of operations should be
+                                                                                                                                                 art inference frameworks supporting model parallelism [49] to fit
+overlapped and conducted in parallel for maximum GPU hardware
+                                                                                                                                                 large models that would otherwise not fit in GPU memory.
+utilization. As shown in Fig.11, We measure the latency of each
+                                                                                                                                                     Workloads. We benchmark the end-to-end inference latency of
+type of operation separately by erasing other computations in the
+                                                                                                                                                 the OPT models [61], including OPT-30B, OPT-66B, and OPT-175B.
+source code. We also re-implement the dense GeMM kernel based
+                                                                                                                                                 In order to accommodate only the model parameters in dense for-
+on the design of NVIDIA cutlass [42], which achieves similar perfor-
+                                                                                                                                                 mat, 60/132/350GB GPU memory is required for OPT-30B/66B/175B.
+mance compared to cuBLAS. Due to the Buckets effect, the overall
+                                                                                                                                                 Note that SOTA GPUs only have 80GB of memory each, at least
+kernel time is mainly determined by the global memory operations
+                                                                                                                                                 1/2/8 GPUs are required 8 for the inference of OPT-30B/66B/175B.
+which require the longest execution time. With Load-as-Sparse and
+                                                                                                                                                 Besides, extra GPU memory is required to store the KV-Cache (refer
+Compute-as-Dense method, the latency of Gmem operations is sig-
+                                                                                                                                                 to Fig. 1b, with its size positively related to inference batch size)
+nificantly reduced, leading to overall performance improvements.
+                                                                                                                                                 during runtime. According to Table. 1, the existing inference frame-
+Although the Smem latency is increased due to the extra shared
+                                                                                                                                                 works (FT-1GPU, DS-1GPU) can easily run out of GPU memory
+memory access required by the extract in Fig.6c, it does not pre-
+                                                                                                                                                 during the inference of OPT-30B for batch sizes larger than 16 if
+vent Flash-LLM kernel from achieving better performance than
+                                                                                                                                                 storing the model parameters in dense format. For all experiments,
+cuBLAS. It is a good trade-off between global memory and shared
+                                                                                                                                                 the input/prompt sequence length is 64 and the output/generated
+memory utilization. What’s more, Flash-LLM shows similar latency
+                                                                                                                                                 sequence length is 512.
+with dense GeMM kernel in terms of tensor core operations as
+                                                                                                                                                     Metric. We propose the metric tokens per GPU-second to indicate
+we do not skip any computations here. However, it is clear that
+                                                                                                                                                 the normalized inference throughput with the consideration of both
+tensor core operations are not the bottleneck for the overall kernel
+                                                                                                                                                 execution time and hardware cost (i.e., the number of GPUs used).
+performance.
+                                                                                                                                                 It is calculated with the following equation:
+   Performance on more MatMul shapes. As discussed in Sec.3.2.1,
+we mainly want to mitigate the inefficiency caused by Skinny                                                                                                                             𝑁
+                                                                                                                                                                      𝑃𝑒𝑟 𝑓 𝑜𝑟𝑚𝑎𝑛𝑐𝑒 = Í𝑁𝑡𝑜𝑘𝑒𝑛                      (3)
+                                                                                                                                                                                            𝐺𝑃𝑈
+MatMuls in common LLM inference. For more comprehensive un-                                                                                                                               𝑖=1 𝑇𝑖
+derstanding evaluations, we provide kernel performance on more
+shapes even when the shape is not common for LLM inferences. As                                                                                  8 The number of GPUs must be a power of 2 for model parallelism[6].
+Flash-LLM: Enabling Cost-Effective and Highly-Efficient Large Generative Model Inference with Unstructured Sparsity
+
+
+
+                     1400                                                             1400                                                         BS=64                                                                             BS=64
+                                 FlashLLM - 1GPU                                             FlashLLM - 1GPU                                       BS=32                                                                             BS=32
+
+
+
+
+                                                                                                                             2 GPU
+
+
+
+
+                                                                                                                                                                                                          4 GPU
+                                                                #Token / GPU-Second
+   #Token / GPU-Second
+
+
+
+
+                                                                                                                               FT
+
+
+
+
+                                                                                                                                                                                                            FT
+                     1200                                                             1200                                                         BS=16                                                                             BS=16
+                                 FT-1GPU                                                     FT-2GPU                                               BS=8                                                                              BS=8
+                     1000                                                             1000
+                                 DS-1GPU                                                     DS-2GPU                                               BS=64                                                                             BS=64
+                                                                                                                                                   BS=32                                                                             BS=32
+
+
+
+
+                                                                                                                             1 GPU
+
+
+
+
+                                                                                                                                                                                                          2 GPU
+                         800                                                          800
+
+
+
+
+                                                                                                                               FT
+
+
+
+
+                                                                                                                                                                                                            FT
+                                                                                                                                                   BS=16                                                                             BS=16                              MatMul
+                                                                                                                                                                                            MatMul
+                         600                                                          600                                                          BS=8                                                                              BS=8
+                                                                                                                                                                                            SpMM                                                                        SpMM
+                                                                                                                                                   BS=64                                                                             BS=64
+
+
+
+
+                                                                                                                                                                                                          Flash-LLM
+                                                                                                                                                                                                                                                                        MHA
+
+
+
+
+                                                                                                                             Flash-LLM
+                         400                                                          400                                                          BS=32                                    MHA                                      BS=32
+
+
+
+
+                                                                                                                               1 GPU
+
+
+
+
+                                                                                                                                                                                                            2 GPU
+                                                                                                                                                   BS=16                                    Others                                   BS=16                              Others
+                         200                                                          200                                                                                                   Comm                                                                        Comm
+                                                                                                                                                   BS=8                                                                              BS=8
+                           0                                                            0                                                                    0         10        20        30        40                                      0       20     40    60    80    100
+                                8        16     32         64                                8        16     32         64                                              GPU-Seconds                                                                       GPU-Seconds
+                                    Inference Batch Size                                         Inference Batch Size
+                                                                                                                                                                 (a) OPT-30B.                                                                     (b) OPT-66B.
+                          (a) Single GPU solutions.             (b) Compared to 2-GPU solutions.
+
+                               Figure 13: OPT-30B Inference Throughput.                                                      Figure 14: Inference Time Breakdown. (MHA: multi-head
+                                                                                                                             attention, Comm: cross-GPU communications)
+𝑁𝑡𝑜𝑘𝑒𝑛 means the number of tokens generated, whereas 𝑁𝐺𝑃𝑈 and
+𝑇𝑖 mean the GPU number and the time spent on the i’th GPU for                                                                                      600                                                                         600
+execution. We use this metric to evaluate the system’s performance.                                                                                              FlashLLM - 2GPU                                                                 FlashLLM - 2GPU
+
+
+
+
+                                                                                                                                  Token / GPU-Second
+                                                                                                                                                   500           FT - 2GPU                                                     500               FT - 4GPU
+
+
+
+
+                                                                                                                                                                                                          Token / GPU-Second
+Note that for real-time inference serving, the inference throughput                                                                                              DS - 2GPU
+                                                                                                                                                   400                                                                         400               DS - 4GPU
+is the higher the better once the inference latency is less than a
+                                                                                                                                                   300                                                                         300
+specific threshold.
+                                                                                                                                                   200                                                                         200
+6.3.1 Case Study: OPT-30B Model Pruning. To show that pruned
+                                                                                                                                                   100                                                                         100
+model has comparable performance with the original model, we
+                                                                                                                                                       0                                                                         0
+evaluate the accuracy of the pruned model with OPT-30B [61] and                                                                                                  8          16        32        64                                           8         16        32      64
+GPT-NEOX-20B [2, 5] on Recognizing Textual Entailment task in                                                                                                        Inference Batch Size                                                        Inference Batch Size
+SuperGLUE [56]. To achieve better accuracy, we adopt the pop-                                                                                              (a) Two GPU solutions.                         (b) Compared to 4-GPU solutions.
+ular pruning method Taylor Pruning [33] to prune these models
+and keep the front quarter and the last quarter feedforward input                                                                                            Figure 15: OPT-66B Inference Throughput.
+layers dense. Based on that, we achieve 80% sparsity on OPT-30B
+                                                                                                                             mainly because of 1) the more efficient MatMul and 2) the elimina-
+and GPT-NEOX-20B with only 1.44% and 0.72% accuracy decrease,
+                                                                                                                             tion of cross-GPU communication overhead.
+respectively. Specifically, accuracy decreases from 85.55% to 84.11%
+on OPT-30B, and from 83.03% to 82.31% on GPT-NEOX-20B.                                                                       6.3.2 Case Study: OPT-66B Model Result As shown in Fig.15a,
+   Results. As shown in Fig.13a, Flash-LLM achieves 3.4× and                                                                 Flash-LLM achieves 3.8× and 3.6× higher token generation through-
+3.3× higher performance than DeepSpeed (DS) and FasterTrans-                                                                 put than DS and FT with two GPUs. DS and FT can at most achieve
+former(FT) with a single GPU. DS and FT can at most achieve 348                                                              139 and 144 tokens per GPU-second with batch size 16 as they will
+and 359 tokens per GPU-second with a single A100 GPU. If further                                                             run out of memory if further increasing the batch size. In contrast,
+increase the inference batch size, DS/FT will run out of memory                                                              Flash-LLM achieves up to 522 tokens per GPU-second at batch size
+as inference tasks with larger batch sizes need more GPU mem-                                                                64. We also compare the performance of Flash-LLM to DS-4GPU/FT-
+ory to store the cached-KV and activations. In contrast, Flash-LLM                                                           4GPU where Flash-LLM still uses two GPUs, while DS-4GPU/FT-
+achieves up to 1187 tokens per GPU-second on batch size 64. It is                                                            4GPU uses four GPUs to enable bigger batch sizes for the baselines.
+because the memory used for storing model weights is reduced with                                                            Compared to DS-4GPU/FT-4GPU, Flash-LLM achieves 1.85×/1.68×,
+the Tiled-CSL format, and thus more Cached-KV and activations                                                                1.78×/1.61×, 1.7×/1.58×, and 1.55×/1.45× higher performance of
+can be accommodated. We also compare the performance of Flash-                                                               tokens per GPU-second at batch sizes 8, 16, 32, and 64 respectively.
+LLM to DS and FT with two-way model-parallelism[49], with which                                                                 Breakdown. We conduct the time breakdown of end-to-end
+DS and FT can support batch size 64. As shown in Fig.13b, FT and                                                             inference with FT and Flash-LLM for OPT-66B as shown in Fig.14b.
+DS achieve similar performance in terms of tokens per GPU-second.                                                            Compared to FT-4GPU (FasterTransformer with 4 GPU used), Flash-
+Compared to DS/FT, Flash-LLM achieves 1.91×/1.75×, 1.87×/1.70×,                                                              LLM with two GPUs can achieve lower normalized inference latency
+1.67×/1.55×, and 1.54×/1.41× higher performance at batch sizes                                                               than FT-4GPU mainly because of 1) the reduction of MatMul time
+8, 16, 32, and 64 respectively. The detailed GPU memory usage of                                                             and 2) the reduction of cross-GPU communication overhead.
+Flash-LLM, FT, and DS are shown in Table.1.                                                                                  6.3.3 Case Study: OPT-175B Model Results & Breakdown We
+   Breakdown. In order to figure out why Flash-LLM can achieve                                                               successfully run the inference of OPT-175B models with Flash-LLM
+better performance, we conduct the time breakdown of end-to-end                                                              using 4 A100 GPUs. In contrast, the weight of OPT-175B can not fit
+inference shown in Fig.14a. Note that we conduct all the end-to-                                                             into 4 A100 GPUs with traditional solutions. Thus, we do not show
+end breakdowns in this paper leveraging the NSight System [44].                                                              the performance of FT/DS using 4 GPUs here as they all run out
+Compared to FT-2GPU (FasterTransformer with 2 GPU used), Flash-                                                              of GPU memory. In addition, we failed to run OPT-175B with DS
+LLM with 1 GPU can achieve lower normalized inference latency 9                                                              using 8 GPUs. Fig.16a compares the performance of Flash-LLM and
+9 To also take inference cost into consideration and compare the inference efficiency                                        FT where we only use 4 GPUs while FT uses 8 GPUs. Compared
+with different system configs (e.g. different numbers of GPUs may be used), we sum                                           to FT-8GPU, Flash-LLM achieves 2.0×, 1.9×, 1.7×, and 1.5× higher
+the execution time on all used GPUs as the normalized latency.
+                                                                     Haojun Xia ∗ †, Zhen Zheng ∗ , Yuchao Li, Donglin Zhuang, Zhongzhu Zhou, Xiafei Qiu, Yong Li, Wei Lin, and Shuaiwen Leon Song
+
+
+                                                                                                                         cuSPARSE and ASpT, but it struggles to beat its dense counterpart
+                     250
+                                  FlashLLM - 4GPU                         BS=64                                          cuBLAS [39] as it cannot utilize tensor cores. TC-GNN [57] sup-
+    Token / GPU-Second
+
+
+
+
+                     200          FT - 8GPU                               BS=32                                          ports unstructured sparsity with tensor cores, which is customized
+
+
+
+
+                                                              8 GPU
+                                                                FT
+                                                                          BS=16
+                     150
+                                                                          BS=8                           MatMul
+                                                                                                                         for GNN where the sparsity ratio is extremely high (e.g. >99%) and
+                     100                                                  BS=64                          SpMM            is not efficient for generative models requiring moderate-level spar-
+
+
+
+                                                              Flash-LLM
+                                                                          BS=32                          MHA             sity. SparTA [65] proposes to utilize both sparse tensor cores [32]
+
+
+
+                                                                4 GPU
+                         50                                               BS=16                          Others
+                                                                                                         Comm
+                                                                                                                         and SIMT cores to support unstructured sparsity by splitting the
+                                                                          BS=8
+                         0
+                                                                                  0   50   100   150   200   250   300
+                                                                                                                         original sparse matrix into a 2:4 structured sparse matrix for tensor
+                              8        16      32        64
+                                  Inference Batch Size                                     GPU-Seconds                   core execution (by cuSPARSELt [41])) and an unstructured sparse
+ (a) Token Generation Throughput.                                                (b) Breakdown.                          matrix for SIMT core execution (by Sputnik[10])). However, if the
+                                                                                                                         sparse ratio is high, it has to excessively pad zeros to the 2:4 sparse
+                                        Figure 16: OPT-175B Inference                                                    matrix. Besides, if there are too many non-zeros that can not meet
+                                                                                                                         the 2:4 requirement, the SIMT kernel would cause high latency
+performance at batch sizes 8, 16, 32, and 64 respectively. As shown                                                      and slow down the overall processing. Flash-LLM supports the
+in fig.16b, both the MatMul time and the cross-GPU communication                                                         moderate-level sparsity on tensor cores efficiently and does not
+time are significantly reduced using Flash-LLM.                                                                          require the 2:4-like distribution. SparseTIR [59] supports unstruc-
+                                                                                                                         tured sparsity with tensor cores by splitting sparse matrices into
+7                        Related Work and Discussion
+                                                                                                                         8 × 1 column vectors and omitting the vectors containing only zeros.
+The parallel and distributed ML task execution is widely used for                                                        It can not work well under moderate sparsity (e.g., 80%) as very few
+model training [6, 7, 19–21, 24, 26, 27, 30, 31, 35, 46, 49, 60, 62].                                                    vectors can be skipped. It can not outperform the dense baseline
+With the growth of the model size, people start to support the LLM                                                       cuBLAS until the sparsity is higher than 95%, while Flash-LLM can
+inference through tensor parallelism [21, 49] to put parameters                                                          outperform cuBLAS since 60% sparsity.
+onto distributed devices [1, 37]. However, the distributed execution                                                         The retraining-based pruning [15, 29] can achieve moderate-level
+of model inference introduces high communication costs and high                                                          sparsity with good accuracy, while the post-training pruning [8] can
+economic investment. Some works support LLM inference on a sin-                                                          only achieve quite low sparse ratios. Flash-LLM aims to optimize the
+gle GPU through memory offloading of data onto CPU memory and                                                            SpMM with the moderate-level sparsity (e.g. 60%-90%) generated
+even disk [1, 48]. The offloading approach only works for latency                                                        with the retraining-based pruning. The retraining-based pruning
+non-sensitive applications (e.g. offline inference with large batch                                                      usually consumes a high fine-tuning cost, which as a result becomes
+size), rather than the online inference tasks demanding very low                                                         one limitation of Flash-LLM.
+latency. In this work, we enable efficient LLM inference execution                                                           Model quantization [16] is another approach to reduce the mem-
+with fewer GPUs through efficient SpMM execution.                                                                        ory and computation for ML models, by transforming the data
+   Model pruning is a common approach to reducing parameter                                                              type into lower bits (e.g., 8-bits, 4-bits) [9, 25]. Model pruning and
+numbers. The structured sparsity is to enforce a structured distri-                                                      quantization are two orthogonal and complementary approaches
+bution of non-zero elements during pruning, which usually could                                                          to model compression. This paper mainly focuses on supporting
+be friendly to hardware acceleration. NVIDIA Ampere GPU [36]                                                             model pruning, which is orthogonal to model quantization.
+supports 2:4 structured sparsity [32] to execute on tensor cores.
+CuSPARSE[40] can support structured SpMM on tensor core based                                                            8   Conclusion
+on the Blocked-ELL [13] format, which is a coarse-grained struc-                                                         We propose Flash-LLM, a library for efficient large generative model
+tured sparsity where model parameters are pruned in the gran-                                                            inference through unstructured sparsity with tensor cores. We ob-
+ularity of a squared block (e.g. 32 × 32). Some works prune the                                                          serve that MatMuls in generative models inference are usually
+model parameters in the granularity of vectors to form the struc-                                                        skinny, and are bounded by off-chip memory access. We propose
+tured sparse format and make use of GPU tensor cores [4, 18, 25].                                                        the Load-as-Sparse and Compute-as-Dense approach for tensor core
+While tensor cores can be enabled with certain structured spar-                                                          SpMM, reducing global memory footprint, addressing the mem-
+sity, the major concern is that deep learning models pruned with                                                         ory access bottleneck, and tolerating redundant computations of
+structured sparsity usually suffer from more severe model accuracy                                                       skinny MatMuls. We propose an effective software pipeline for un-
+degradation than unstructured sparsity [8, 12, 14, 16, 51, 54].                                                          structured SpMM with tensor cores, efficiently leveraging on-chip
+   The unstructured sparsity is to prune the elements without form-                                                      resources for sparse data extraction and coordinating sparse data ex-
+ing a structured distribution, which is usually hard to accelerate on                                                    traction, dense data loading, and tensor core computation in an over-
+modern hardware architectures. STOREL [47] and TACO [23] are                                                             lapped manner. Flash-LLM outperforms cuBLAS/Sputnik/SparTA
+CPU-based designs that can support SpMM with unstructured spar-                                                          by 1.4×/3.6×/1.4×, 1.7×/3.0×/1.4×, 2.1×/2.0×/1.6× under 70%, 80%
+sity. Instead, Flash-LLM mainly focuses on the GPU-based SpMM                                                            and 90% sparsity. We integrate Flash-LLM kernels into Faster-
+with unstructured sparsity, as GPU is more widely used for large-                                                        Transformer for end-to-end generative model inference. For to-
+scale deep-learning tasks since it usually has higher memory band-                                                       kens per GPU-second, Flash-LLM achieves up to 3.8× and 3.6×
+width, computational throughput, and energy efficiency. The typical                                                      improvement over DeepSpeed and FasterTransformer on OPT-
+approach to execute the unstructured SpMM on GPU is through                                                              30B/66B/175B models with significantly lower inference cost.
+SIMT cores, e.g. cuSPARSE[40], ASpT[17], and Sputnik[10]. Under a
+moderate level of sparsity (<90%), Sputnik significantly outperforms
+Flash-LLM: Enabling Cost-Effective and Highly-Efficient Large Generative Model Inference with Unstructured Sparsity
+
+
+References                                                                                     In Proceedings of NAACL-HLT. 4171–4186.
+                                                                                          [23] Fredrik Kjolstad, Shoaib Kamil, Stephen Chou, David Lugato, and Saman Ama-
+ [1] Reza Yazdani Aminabadi, Samyam Rajbhandari, Ammar Ahmad Awan, Cheng Li,                   rasinghe. 2017. The Tensor Algebra Compiler. Proc. ACM Program. Lang. 1,
+     Du Li, Elton Zheng, Olatunji Ruwase, Shaden Smith, Minjia Zhang, Jeff Rasley,             OOPSLA, Article 77 (oct 2017), 29 pages. https://doi.org/10.1145/3133901
+     et al. 2022. DeepSpeed-inference: enabling efficient inference of transformer        [24] Alexandros Koliousis, Pijika Watcharapichat, Matthias Weidlich, Luo Mai, Paolo
+     models at unprecedented scale. In Proceedings of the International Conference on          Costa, and Peter Pietzuch. 2019. CROSSBOW: Scaling Deep Learning with Small
+     High Performance Computing, Networking, Storage and Analysis. 1–15.                       Batch Sizes on Multi-GPU Servers. Proceedings of the VLDB Endowment 12, 11
+ [2] Sid Black, Stella Biderman, Eric Hallahan, Quentin Anthony, Leo Gao, Laurence             (2019).
+     Golding, Horace He, Connor Leahy, Kyle McDonell, Jason Phang, Michael Pieler,        [25] Shigang Li, Kazuki Osawa, and Torsten Hoefler. 2022. Efficient quantized sparse
+     USVSN Sai Prashanth, Shivanshu Purohit, Laria Reynolds, Jonathan Tow, Ben                 matrix operations on tensor cores. In Proceedings of the International Conference
+     Wang, and Samuel Weinbach. 2022. GPT-NeoX-20B: An Open-Source Autore-                     on High Performance Computing, Networking, Storage and Analysis. 1–15.
+     gressive Language Model. In Proceedings of the ACL Workshop on Challenges &          [26] Shen Li, Yanli Zhao, Rohan Varma, Omkar Salpekar, Pieter Noordhuis, Teng Li,
+     Perspectives in Creating Large Language Models. https://arxiv.org/abs/2204.06745          Adam Paszke, Jeff Smith, Brian Vaughan, Pritam Damania, et al. 2020. PyTorch
+ [3] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan,                    Distributed: Experiences on Accelerating Data Parallel Training. Proceedings of
+     Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda                the VLDB Endowment 13, 12 (2020).
+     Askell, et al. 2020. Language models are few-shot learners. Advances in neural       [27] Youjie Li, Amar Phanishayee, Derek Murray, Jakub Tarnawski, and Nam Sung
+     information processing systems 33 (2020), 1877–1901.                                      Kim. 2022. Harmony: Overcoming the Hurdles of GPU Memory Capacity to
+ [4] Zhaodong Chen, Zheng Qu, Liu Liu, Yufei Ding, and Yuan Xie. 2021. Efficient               Train Massive DNN Models on Commodity Servers. Proc. VLDB Endow. 15, 11
+     tensor core-based GPU kernels for structured sparsity under reduced precision.            (jul 2022), 2747–2760.
+     In Proceedings of the International Conference for High Performance Computing,       [28] Mingbao Lin, Yuxin Zhang, Yuchao Li, Bohong Chen, Fei Chao, Mengdi Wang,
+     Networking, Storage and Analysis. 1–14.                                                   Shen Li, Yonghong Tian, and Rongrong Ji. 2022. 1xn pattern for pruning con-
+ [5] EleutherAI. 2022. GPT-NeoX-20B. https://huggingface.co/EleutherAI/gpt-neox-               volutional neural networks. IEEE Transactions on Pattern Analysis and Machine
+     20b                                                                                       Intelligence (2022).
+ [6] Hugging Face. 2023.        Model Parallelism.       https://huggingface.co/docs/     [29] Zhuang Liu, Mingjie Sun, Tinghui Zhou, Gao Huang, and Trevor Darrell. 2018.
+     transformers/v4.15.0/parallelism                                                          Rethinking the value of network pruning. arXiv preprint arXiv:1810.05270 (2018).
+ [7] Shiqing Fan, Yi Rong, Chen Meng, Zongyan Cao, Siyu Wang, Zhen Zheng, Chuan           [30] Xupeng Miao, Xiaonan Nie, Yingxia Shao, Zhi Yang, Jiawei Jiang, Lingxiao Ma,
+     Wu, Guoping Long, Jun Yang, Lixue Xia, Lansong Diao, Xiaoyong Liu, and Wei                and Bin Cui. 2021. Heterogeneity-aware distributed machine learning training via
+     Lin. 2021. DAPPLE: A pipelined data parallel approach for training large models.          partial reduce. In Proceedings of the 2021 International Conference on Management
+     In Proceedings of the 26th ACM SIGPLAN Symposium on Principles and Practice of            of Data. 2262–2270.
+     Parallel Programming. 431–445.                                                       [31] Xupeng Miao, Yujie Wang, Youhe Jiang, Chunan Shi, Xiaonan Nie, Hailin Zhang,
+ [8] Elias Frantar and Dan Alistarh. 2023. Massive Language Models Can Be Accu-                and Bin Cui. 2022. Galvatron: Efficient Transformer Training over Multiple GPUs
+     rately Pruned in One-Shot. arXiv preprint arXiv:2301.00774 (2023).                        Using Automatic Parallelism. Proc. VLDB Endow. 16, 3 (nov 2022), 470–479.
+ [9] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. 2022. GPTQ:        [32] Asit Mishra, Jorge Albericio Latorre, Jeff Pool, Darko Stosic, Dusan Stosic, Ganesh
+     Accurate Post-Training Quantization for Generative Pre-trained Transformers.              Venkatesh, Chong Yu, and Paulius Micikevicius. 2021. Accelerating Sparse Deep
+     arXiv preprint arXiv:2210.17323 (2022).                                                   Neural Networks. arXiv:2104.08378 [cs.LG]
+[10] Trevor Gale, Matei Zaharia, Cliff Young, and Erich Elsen. 2020. Sparse gpu           [33] Pavlo Molchanov, Arun Mallya, Stephen Tyree, Iuri Frosio, and Jan Kautz. 2019.
+     kernels for deep learning. In SC20: International Conference for High Performance         Importance estimation for neural network pruning. In Proceedings of the IEEE/CVF
+     Computing, Networking, Storage and Analysis. IEEE, 1–14.                                  conference on computer vision and pattern recognition. 11264–11272.
+[11] Trevor Gale, Matei Zaharia, Cliff Young, and Erich Elsen. 2020. sputnik github.      [34] Avanika Narayan, Ines Chami, Laurel Orr, and Christopher Ré. 2022. Can Foun-
+     https://github.com/google-research/sputnik/                                               dation Models Wrangle Your Data? Proc. VLDB Endow. 16, 4 (dec 2022), 738–746.
+[12] Aidan N Gomez, Ivan Zhang, Siddhartha Rao Kamalakara, Divyam Madaan, Kevin           [35] Xiaonan Nie, Xupeng Miao, Zilong Wang, Zichao Yang, Jilong Xue, Lingxiao Ma,
+     Swersky, Yarin Gal, and Geoffrey E Hinton. 2019. Learning sparse networks                 Gang Cao, and Bin Cui. 2023. FlexMoE: Scaling Large-scale Sparse Pre-trained
+     using targeted dropout. arXiv preprint arXiv:1905.13678 (2019).                           Model Training via Dynamic Device Placement. arXiv preprint arXiv:2304.03946
+[13] Scott Gray, Alec Radford, and Diederik P Kingma. 2017. Gpu kernels for block-             (2023).
+     sparse weights. arXiv preprint arXiv:1711.09224 3 (2017), 2.                         [36] NVIDIA. 2020.        NVIDIA A100 Tensor Core GPU Architecture.                https:
+[14] Song Han, Huizi Mao, and William J Dally. 2015. Deep compression: Compressing             //images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-
+     deep neural networks with pruning, trained quantization and huffman coding.               architecture-whitepaper.pdf
+     arXiv preprint arXiv:1510.00149 (2015).                                              [37] NVIDIA. 2022. NVIDIA Faster-Transformer.              https://github.com/NVIDIA/
+[15] Song Han, Jeff Pool, John Tran, and William Dally. 2015. Learning both weights            FasterTransformer
+     and connections for efficient neural network. Advances in neural information         [38] NVIDIA. 2022. NVIDIA H100 Tensor Core GPU Architecture. https://www.hpctech.
+     processing systems 28 (2015).                                                             co.jp/catalog/gtc22-whitepaper-hopper_v1.01.pdf
+[16] Torsten Hoefler, Dan Alistarh, Tal Ben-Nun, Nikoli Dryden, and Alexandra Peste.      [39] NVIDIA. 2023. cuBLAS Docs. https://docs.nvidia.com/cuda/cublas/index.html
+     2021. Sparsity in Deep Learning: Pruning and growth for efficient inference and      [40] NVIDIA. 2023. cuSPARSE Library. https://docs.nvidia.com/cuda/cusparse/index.
+     training in neural networks. J. Mach. Learn. Res. 22, 241 (2021), 1–124.                  html
+[17] Changwan Hong, Aravind Sukumaran-Rajam, Israt Nisa, Kunal Singh, and P               [41] NVIDIA. 2023. cuSPARSELt Library. https://docs.nvidia.com/cuda/cusparselt/
+     Sadayappan. 2019. Adaptive sparse tiling for sparse matrix multiplication. In Pro-   [42] NVIDIA. 2023. CUTLASS 3.2. https://github.com/NVIDIA/cutlass
+     ceedings of the 24th Symposium on Principles and Practice of Parallel Programming.   [43] NVIDIA. 2023. Nsight Compute Profiling Guide. https://docs.nvidia.com/nsight-
+     300–314.                                                                                  compute/ProfilingGuide/#introduction
+[18] Guyue Huang, Haoran Li, Minghai Qin, Fei Sun, Yufei Ding, and Yuan Xie.              [44] NVIDIA. 2023. Nsight System. https://developer.nvidia.com/nsight-systems
+     2022. Shfl-BW: Accelerating Deep Neural Network Inference with Tensor-Core           [45] Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya
+     Aware Weight Pruning. In Proceedings of the 59th ACM/IEEE Design Automation               Sutskever, et al. 2019. Language models are unsupervised multitask learners.
+     Conference (San Francisco, California) (DAC ’22). Association for Computing               OpenAI blog 1, 8 (2019), 9.
+     Machinery, New York, NY, USA, 1153–1158. https://doi.org/10.1145/3489517.            [46] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. 2020. Zero:
+     3530588                                                                                   Memory optimizations toward training trillion parameter models. In SC20: Inter-
+[19] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia                   national Conference for High Performance Computing, Networking, Storage and
+     Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V Le, Yonghui Wu, et al. 2019.                   Analysis. IEEE, 1–16.
+     Gpipe: Efficient training of giant neural networks using pipeline parallelism.       [47] Maximilian Schleich, Amir Shaikhha, and Dan Suciu. 2023. Optimizing Tensor
+     Advances in neural information processing systems 32 (2019).                              Programs on Flexible Storage. Proceedings of the ACM on Management of Data 1,
+[20] Xianyan Jia, Le Jiang, Ang Wang, Wencong Xiao, Ziji Shi, Jie Zhang, Xinyuan Li,           1 (2023), 1–27.
+     Langshi Chen, Yong Li, Zhen Zheng, Xiaoyong Liu, and Wei Lin. 2022. Whale:           [48] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Daniel Y
+     Efficient Giant Model Training over Heterogeneous GPUs. In 2022 USENIX Annual             Fu, Zhiqiang Xie, Beidi Chen, Clark Barrett, Joseph E Gonzalez, et al. 2023. High-
+     Technical Conference, USENIX ATC 2022, Carlsbad, CA, USA, July 11-13, 2022, Jiri          throughput generative inference of large language models with a single gpu.
+     Schindler and Noa Zilberman (Eds.). USENIX Association, 673–688.                          arXiv preprint arXiv:2303.06865 (2023).
+[21] Zhihao Jia, Matei Zaharia, and Alex Aiken. 2019. Beyond Data and Model               [49] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper,
+     Parallelism for Deep Neural Networks. Proceedings of Machine Learning and                 and Bryan Catanzaro. 2019. Megatron-lm: Training multi-billion parameter
+     Systems 1 (2019), 1–13.                                                                   language models using model parallelism. arXiv preprint arXiv:1909.08053 (2019).
+[22] Jacob Devlin Ming-Wei Chang Kenton and Lee Kristina Toutanova. 2019. BERT:           [50] Shaden Smith, Mostofa Patwary, Brandon Norick, Patrick LeGresley, Samyam
+     Pre-training of Deep Bidirectional Transformers for Language Understanding.               Rajbhandari, Jared Casper, Zhun Liu, Shrimai Prabhumoye, George Zerveas,
+                                             Haojun Xia ∗ †, Zhen Zheng ∗ , Yuchao Li, Donglin Zhuang, Zhongzhu Zhou, Xiafei Qiu, Yong Li, Wei Lin, and Shuaiwen Leon Song
+
+
+     Vijay Korthikanti, Elton Zhang, Rewon Child, Reza Yazdani Aminabadi, Julie               of the 28th ACM International Conference on Architectural Support for Program-
+     Bernauer, Xia Song, Mohammad Shoeybi, Yuxiong He, Michael Houston, Saurabh               ming Languages and Operating Systems, Volume 3. 660–678.
+     Tiwary, and Bryan Catanzaro. 2022. Using DeepSpeed and Megatron to                  [60] Xiaodong Yi, Shiwei Zhang, Ziyue Luo, Guoping Long, Lansong Diao, Chuan
+     Train Megatron-Turing NLG 530B, A Large-Scale Generative Language Model.                 Wu, Zhen Zheng, Jun Yang, and Wei Lin. 2020. Optimizing distributed training
+     arXiv:2201.11990 [cs.CL]                                                                 deployment in heterogeneous GPU clusters. In CoNEXT ’20: The 16th International
+[51] Mingjie Sun, Zhuang Liu, Anna Bair, and J. Zico Kolter. 2023. A Simple and               Conference on emerging Networking EXperiments and Technologies, Barcelona,
+     Effective Pruning Approach for Large Language Models. arXiv:2306.11695 [cs.CL]           Spain, December, 2020, Dongsu Han and Anja Feldmann (Eds.). ACM, 93–107.
+[52] Immanuel Trummer. 2022. From BERT to GPT-3 Codex: Harnessing the Potential          [61] Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui
+     of Very Large Language Models for Data Management. Proc. VLDB Endow. 15,                 Chen, Christopher Dewan, Mona Diab, Xian Li, Xi Victoria Lin, Todor Mihaylov,
+     12 (aug 2022), 3770–3773.                                                                Myle Ott, Sam Shleifer, Kurt Shuster, Daniel Simig, Punit Singh Koura, Anjali
+[53] Shreshth Tuli, Giuliano Casale, and Nicholas R. Jennings. 2022. TranAD: Deep             Sridhar, Tianlu Wang, and Luke Zettlemoyer. 2022. OPT: Open Pre-trained
+     Transformer Networks for Anomaly Detection in Multivariate Time Series Data.             Transformer Language Models. arXiv:2205.01068 [cs.CL]
+     Proc. VLDB Endow. 15, 6 (feb 2022), 1201–1214.                                      [62] Zhen Zhang, Shuai Zheng, Yida Wang, Justin Chiu, George Karypis, Trishul
+[54] Karen Ullrich, Edward Meeds, and Max Welling. 2017. Soft weight-sharing for              Chilimbi, Mu Li, and Xin Jin. 2022. MiCS: near-linear scaling for training gigantic
+     neural network compression. arXiv preprint arXiv:1702.04008 (2017).                      model on public cloud. Proceedings of the VLDB Endowment 16, 1 (2022), 37–50.
+[55] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,            [63] Lianmin Zheng, Zhuohan Li, Hao Zhang, Yonghao Zhuang, Zhifeng Chen, Yan-
+     Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. Attention is all               ping Huang, Yida Wang, Yuanzhong Xu, Danyang Zhuo, Eric P. Xing, Joseph E.
+     you need. Advances in neural information processing systems 30 (2017).                   Gonzalez, and Ion Stoica. 2022. Alpa: Automating Inter- and Intra-Operator Par-
+[56] Alex Wang, Yada Pruksachatkun, Nikita Nangia, Amanpreet Singh, Julian                    allelism for Distributed Deep Learning. In 16th USENIX Symposium on Operating
+     Michael, Felix Hill, Omer Levy, and Samuel Bowman. 2019. Superglue: A stickier           Systems Design and Implementation, OSDI 2022, Carlsbad, CA, USA, July 11-13,
+     benchmark for general-purpose language understanding systems. Advances in                2022, Marcos K. Aguilera and Hakim Weatherspoon (Eds.). USENIX Association,
+     neural information processing systems 32 (2019).                                         559–578.
+[57] Yuke Wang, Boyuan Feng, Zheng Wang, and Yufei Ding. 2023. TC-GNN: Accel-            [64] Ningxin Zheng. 2022. SparTA github. https://github.com/microsoft/SparTA/tree/
+     erating Sparse Graph Neural Network Computation Via Dense Tensor Core on                 sparta_artifact
+     GPUs. arXiv:2112.02052 [cs.LG]                                                      [65] Ningxin Zheng, Bin Lin, Quanlu Zhang, Lingxiao Ma, Yuqing Yang, Fan Yang,
+[58] Samuel Williams, Andrew Waterman, and David Patterson. 2009. Roofline: an                Yang Wang, Mao Yang, and Lidong Zhou. 2022. { SparTA } : { Deep-Learning }
+     insightful visual performance model for multicore architectures. Commun. ACM             Model Sparsity via { Tensor-with-Sparsity-Attribute } . In 16th USENIX Symposium
+     52, 4 (2009), 65–76.                                                                     on Operating Systems Design and Implementation (OSDI 22). 213–232.
+[59] Zihao Ye, Ruihang Lai, Junru Shao, Tianqi Chen, and Luis Ceze. 2023. SparseTIR:
+     Composable abstractions for sparse compilation in deep learning. In Proceedings
+

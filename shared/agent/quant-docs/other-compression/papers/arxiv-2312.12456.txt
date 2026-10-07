@@ -1,0 +1,1836 @@
+                                         PowerInfer: Fast Large Language Model Serving with a
+                                                         Consumer-grade GPU
+                                                                                    Yixin Song, Zeyu Mi, Haotong Xie and Haibo Chen
+                                                                       Institute of Parallel and Distributed Systems, SEIEE, Shanghai Jiao Tong University
+
+                                         Abstract                                                                             especially in areas such as creative writing and advanced
+                                         This paper introduces PowerInfer, a high-speed Large Lan-                            code generation. These models, widely deployed in data cen-
+                                         guage Model (LLM) inference engine on a personal computer                            ters equipped with high-end and expensive server-grade
+                                         (PC) equipped with a single consumer-grade GPU. The key                              GPUs, have significantly influenced our daily lives and work
+arXiv:2312.12456v2 [cs.LG] 12 Dec 2024
+
+
+
+
+                                         principle underlying the design of PowerInfer is exploiting                          practices. Meanwhile, there is an emerging trend of running
+                                         the high locality inherent in LLM inference, characterized                           LLMs on more accessible local platforms [10, 56], particu-
+                                         by a power-law distribution in neuron activation. This dis-                          larly personal computers (PCs) with consumer-grade GPUs.
+                                         tribution indicates that a small subset of neurons, termed                           This evolution is driven by the need for enhanced data pri-
+                                         hot neurons, are consistently activated across inputs, while                         vacy [32], model customization [29], and reduced inference
+                                         the majority, cold neurons, vary based on specific inputs.                           costs [51]. In contrast to data-center deployments, which
+                                         PowerInfer exploits such an insight to design a GPU-CPU                              prioritize high throughput [23, 43, 57], local deployments
+                                         hybrid inference engine: hot-activated neurons are preloaded                         focus on low latency in processing small batches.
+                                         onto the GPU for fast access, while cold-activated neurons                              Nonetheless, deploying LLMs on consumer-grade GPUs
+                                         are computed on the CPU, thus significantly reducing GPU                             presents significant challenges due to their substantial
+                                         memory demands and CPU-GPU data transfers. PowerIn-                                  memory requirements. LLMs, functioning as autoregressive
+                                         fer further integrates adaptive predictors and neuron-aware                          Transformers, sequentially generate text token-by-token,
+                                         sparse operators, optimizing the efficiency of neuron acti-                          each needing to access the entire model containing hundreds
+                                         vation and computational sparsity. The evaluation shows                              of billions of parameters. Therefore, the inference process is
+                                         that PowerInfer significantly outperforms llama.cpp by up                            fundamentally constrained by the GPU’s memory capacity.
+                                         to 11.69× while retaining model accuracy across various                              This limitation is particularly acute in local deployments
+                                         LLMs (including OPT-175B) on a single NVIDIA RTX 4090                                where the processing of individual requests (often one at a
+                                         GPU. For the OPT-30B model, PowerInfer achieves perfor-                              time) [7] leaves minimal opportunity for parallel processing.
+                                         mance comparable to that of a high-end server-grade A100                                Compression techniques like quantization [15, 55] and
+                                         GPU, reaching 82% of its token generation rate on a single                           pruning [30] can reduce the model size. However, even
+                                         consumer-grade RTX 4090 GPU.                                                         deeply compressed models remain too large for consumer-
+                                                                                                                              grade GPUs. For instance, an OPT-66B model with 4-bit pre-
+                                         CCS Concepts: • Computing methodologies → Machine                                    cision demands approximately 40GB of memory just to load
+                                         learning.                                                                            its parameters [27], exceeding the capacity of even high-end
+                                         Keywords: LLM serving, Sparsity                                                      GPUs like the NVIDIA RTX 4090.
+                                                                                                                                 Model offloading is another approach that partitions the
+                                         1     Introduction                                                                   model between GPU and CPU at the Transformer layer
+                                         Generative large language models (LLMs) have garnered                                level [4, 17, 43]. State-of-the-art systems like llama.cpp [17]
+                                         significant attention for their remarkable capabilities in so-                       distribute layers between CPU and GPU memories, lever-
+                                         phisticated natural language processing tasks [6, 51, 58],                           aging both for inference, thus reducing the GPU resources
+                                         Permission to make digital or hard copies of all or part of this work for            required. However, this method is hindered by the slow PCIe
+                                         personal or classroom use is granted without fee provided that copies                interconnect and the CPUs’ limited computational capabili-
+                                         are not made or distributed for profit or commercial advantage and that              ties, resulting in high inference latency.
+                                         copies bear this notice and the full citation on the first page. Copyrights             In this paper, we argue that the key reason for memory
+                                         for components of this work owned by others than the author(s) must
+                                         be honored. Abstracting with credit is permitted. To copy otherwise, or
+                                                                                                                              issues in LLM inference is the locality mismatch between
+                                         republish, to post on servers or to redistribute to lists, requires prior specific   hardware architecture and the characteristics of LLM in-
+                                         permission and/or a fee. Request permissions from permissions@acm.org.               ference. Current hardware architectures are designed with
+                                         SOSP ’24, November 4–6, 2024, Austin, TX, USA                                        a memory hierarchy optimized for data locality. Ideally, a
+                                         © 2024 Copyright held by the owner/author(s). Publication rights licensed            small, frequently accessed working set should be stored in
+                                         to ACM.                                                                              the GPU, which offers higher memory bandwidth but limited
+                                         ACM ISBN 979-8-4007-1251-7/24/11. . . $15.00
+                                         https://doi.org/10.1145/3694715.3695964
+                                                                                                                              capacity. In contrast, larger, less frequently accessed data are
+SOSP ’24, November 4–6, 2024, Austin, TX, USA                                                  Yixin Song, Zeyu Mi, Haotong Xie and Haibo Chen
+
+
+better suited for CPUs, which provide more extensive mem-                    iterative process reduces the size of the predictors while
+ory capacity but lower bandwidth. Nevertheless, each LLM                     maintaining their accuracy, thus freeing up GPU memory
+inference iteration requires accessing the entire set of model               for LLM inferences.
+parameters whose total size is too large for a single GPU,                      Second, leveraging LLM sparsity requires the use of sparse
+thus showing no locality at all and thus impeding efficient                  operators. Conventional libraries like cuSPARSE [37] are not
+locality exploitation.                                                       optimal due to their general-purpose design, which includes
+   Recent works have identified activation sparsity in LLM                   tracking each non-zero element and converting dense ma-
+inference [28, 34, 61]. During each inference iteration, only                trices into sparse formats [54, 63]. In contrast, PowerInfer
+a limited number of neurons1 are activated, significantly                    designs neuron-aware sparse operators that directly interact
+influencing token outputs. These sparse activations, which                   with individual neurons, thereby bypassing operations on en-
+can be accurately predicted at runtime, allow for accelerated                tire matrices. This approach enables efficient matrix-vector
+inference by computing only the activated neurons. However,                  multiplication at the neuron level and removes the need for
+the set of activated neurons varies across inputs and can only               specific sparse format conversions.
+be determined at runtime, necessitating the entire model to                     Lastly, the optimal placement of activated neurons be-
+be loaded into GPU memory. This requirement limits the                       tween the GPU and CPU in PowerInfer is a complex task.
+approach’s applicability in local deployment scenarios with                  It involves evaluating each neuron’s activation rate, intra-
+constrained GPU VRAM.                                                        layer communication, and available hardware resources like
+   Fortunately, we have observed that neuron activation in                   GPU memory sizes. To effectively manage this, PowerInfer
+an LLM follows a skewed power-law distribution across                        utilizes an offline phase to generate a neuron placement pol-
+numerous inference processes: a small subset of neurons                      icy. This policy uses a metric that measures each neuron’s
+consistently contribute to the majority of activations (over                 impact on LLM inference outcomes and is framed as an in-
+80%) across various inputs (hot-activated), while the majority               teger linear programming problem. The policy formulation
+are involved in the remaining activations, which are deter-                  considers factors such as neuron activation frequencies and
+mined based on the inputs at runtime (cold-activated). This                  the bandwidth hierarchy of CPU and GPU architectures.
+observation suggests an inherent locality in LLMs with high                     The online inference engine of PowerInfer was imple-
+activation sparsity, which could be leveraged to address the                 mented by extending llama.cpp with an additional 4,200
+aforementioned locality mismatch.                                            lines of C++ and CUDA code. Its offline component, com-
+   Building on this locality insight, we introduce PowerIn-                  prising a profiler and a solver, builds upon the transformers
+fer, an efficient LLM inference system optimized for local                   framework [53] with approximately 400 lines of Python code.
+deployments using a single consumer-grade GPU. The key                       PowerInfer is compatible with various popular LLM families,
+idea of PowerInfer is to exploit the locality in LLM infer-                  including OPT (7B-175B), LLaMA2 (7B-70B), and Falcon-40B,
+ence by assigning the minor hot neurons to the GPU, while                    and supports consumer-grade GPUs like the NVIDIA RTX
+cold neurons, which constitute the majority, are managed                     4090 and NVIDIA RTX 2080Ti.
+by the CPU. Specifically, PowerInfer exploits the locality in                   Performance evaluation reveals that PowerInfer, when
+LLM inference through a two-step process: (1) PowerInfer                     deployed on a PC equipped with a single NVIDIA RTX
+preselects hot and cold neurons based on their statistical                   4090 GPU, delivers an average generation speed of 13.20
+activation frequency, preloading them onto the GPU and                       tokens/s for quantized models and 8.32 tokens/s for non-
+CPU, respectively, during an offline phase. (2) At runtime, it               quantized models, maintaining model accuracy. These re-
+employs online predictors to identify which neurons (both                    sults significantly surpass llama.cpp’s performance, exhibit-
+hot and cold) are likely to be activated for each specific input.            ing up to 8.00× and 11.69× improvements for quantized and
+This approach allows the GPU and CPU to independently                        non-quantized models, respectively. Significantly, the infer-
+process their respective sets of activated neurons, thereby                  ence speed achieved on an NVIDIA RTX 4090 GPU (priced
+minimizing the need for costly PCIe data transfers.                          at approximately $2,000) is only 18% slower compared to
+   However, there are significant challenges that complicate                 the performance on a top-tier A100 GPU (costing around
+the design of PowerInfer. First, the online predictors, which                $20,000) that can fully accommodate the model. PowerInfer’s
+are essential for identifying active neurons in LLM layers                   code has been open sourced completely.
+and are typically situated on the GPU, occupy a considerable                 2     Background and Motivation
+amount of GPU memory. This memory could otherwise be
+used for the LLM. To address this, PowerInfer introduces                     2.1   LLM Inference & Architecture
+an adaptive method for constructing smaller predictors for
+layers with higher activation sparsity and skewness. This                    LLM inference, an autoregressive model, generates each to-
+                                                                             ken based on previous ones. The process starts with a prompt
+1 This paper defines a neuron as a specific row/column in a weight matrix.   and unfolds in two phases: first, the prompt phase outputs
+PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU                                                SOSP ’24, November 4–6, 2024, Austin, TX, USA
+
+
+an initial token, then the generation phase sequentially pro-                      Table 1. Average activation sparsity for various LLMs in
+duces tokens until a maximum limit or an end-of-sequence                           the MLP blocks. For ReLU-based models, sparsity is the pro-
+(<EOS>) token is reached. Each token generation, an infer-                         portion of neurons with zero activation. For SwiGLU-based
+ence iteration, requires running the full LLM model.                               models, it’s the proportion of neurons that can be dynami-
+                                                                                   cally pruned with less than 1% impact on perplexity.
+            …                                                                                LLM                   Activation Function                             Sparsity
+          FC2 Layer                                 ×             =
+                                                                                       OPT-30B                                      ReLU                             97%
+            ReLU                FC2 Weights                           FC2 Output     LLaMA2-13B                                    SwiGLU                            43%
+                                                          FC2 input
+                                                                                        Yi-34B                                     SwiGLU                            53%
+          FC1 Layer
+
+     MLP Block
+            …                                 ×       =          ReLU              CPU Mem                                           CPU Mem
+                                                                                                                                       CPU
+                                                                                                                                      Results
+      Self-Attention Block                                                           L4                                                                      2
+                                              FC1 Input                                                                  GPU Mem                                         GPU Mem
+                                                                                     L5               1                                L1                                       CPU
+                             FC1 Weights                              FC1 Output
+                                                                                     L6         CPU              GPU          L4       L2            CPU           GPU         Results
+
+                                                                                                                              L3       L3                                     3 Ln-2
+                                                                                     …                                    2
+Figure 1. The architecture of a Transformer layer and how                            Ln                                       L2        …              1
+                                                                                                                                                                              3
+                                                                                                                                                                                Ln-1
+neurons are sparsely activated in FC1 and FC2 layers due                                                                      L1       Ln-3                                     Ln
+                                                                                                          PCIe                                              PCIe
+to the ReLU function. The neurons that are activated are                                     (a) GPU-Centric Oﬄoading                           (b) GPU-CPU Hybrid Oﬄoading
+represented as green rows or columns encircled by red lines.
+The output vector from FC1 is then supplied to FC2 as its                          Figure 2. Typical existing offloading solutions. (a) shows
+input vector.                                                                      a GPU-centric approach, while (b) is the CPU-GPU hybrid
+                                                                                   offloading approach.
+   The LLM architecture includes multiple Transformer lay-
+ers, each comprising a self-attention and an MLP (Multi-                           approximately 80% of neurons in the OPT-30B model remain
+Layer Perceptron) block (see Figure 1, left). The self-attention                   inactive during inference. Moreover, this phenomenon is not
+block generates embedding vectors by capturing the relation-                       limited to ReLU-based models; it is also observed in archi-
+ships among input tokens. In this process, different heads                         tectures using other activation functions such as SwiGLU.
+focus on extracting distinct feature information. The com-                         For instance, Table 1 shows that LLaMA2-13B and Yi-34B,
+putation results from these different heads are aggregated                         which employ SwiGLU, exhibit sparsity levels of 43% and
+and then utilized as the input for the MLP block. The MLP                          53% respectively. These findings align with prior research
+block applies non-linear transformations via fully connected                       results from studies like CATS [24] and ReLU2 [61].
+layers and activation functions to refine the input sequence                          Moreover, it is possible to predict neuron activations a few
+representation. The output either advances to subsequent                           layers in advance within the ongoing model iteration. Based
+layers or forms the LLM’s final output.                                            on this observation, DejaVu [28] employs MLP-based online
+   In Figure 1 (right), the MLP block’s layers, FC1 and FC2,                       predictors during inference and only processes the activated
+generate vectors through matrix multiplication. Each output                        neurons, achieving over a 6x speedup while maintaining an
+element comes from the dot product of an input vector and a                        impressive accuracy rate of at least 93% in predicting neuron
+neuron (a row/column in a weight matrix). Activation func-                         activation. However, the activation sparsity is input-specific
+tions (like ReLU [2] and SiLU [40]) act as gates to selectively                    for each inference iteration, meaning that the activation of
+retain or discard values in a vector, influencing neuron activa-                   specific neurons is directly influenced by the current input
+tions in FC1 and FC2. For example, ReLU in this figure filters                     and cannot be predetermined before the model’s inference
+out negative values, allowing only positively valued neurons                       iteration begins.
+in FC1 to influence the output. These neurons, which con-                          2.2 Offloading-based LLM Serving
+tribute to the output, are considered activated in this paper.                     The offloading technique, which leverages the CPU’s ad-
+Similarly, these values also affect which neurons in FC2 are                       ditional computational and memory resources, presents a
+activated and involved in the computation of its output.                           more viable solution for accommodating LLMs that exceed
+   Activation Sparsity. LLM inference exhibits notable spar-                       the GPU’s memory capacity. In this section, we delve into
+sity in neuron activation, a phenomenon observed in both                           the analysis of offloading systems to uncover the factors con-
+self-attention and MLP blocks [26, 28, 59]. In self-attention,                     tributing to their sluggish performance. Figure 2 illustrates
+nearly half of the attention heads contribute minimally, while                     two main offloading approaches:
+in MLP blocks, sparsity is largely due to activation function                         GPU-centric offloading utilizes CPU memory to store
+characteristics. This MLP sparsity is particularly pronounced                      portions of the model parameters that exceed the GPU’s
+in ReLU-based architectures, with DejaVu [28] reporting that                       capacity. During each iteration, as depicted in Figure 2a), it
+SOSP ’24, November 4–6, 2024, Austin, TX, USA                                                                                                                                     Yixin Song, Zeyu Mi, Haotong Xie and Haibo Chen
+
+
+                               FlexGen   DejaVu(UM)       llama.cpp                    FlexGen-PCIe   DejaVu(UM)-PCIe       llama.cpp-CPU
+                                                                                                                                                   Hybrid offloading still faces the locality mismatch issue,
+  Latency per iteration (ms)
+
+
+                               4000                                                    FlexGen-GPU    DejaVu(UM)-GPU        llama.cpp-GPU
+                                                                            100
+
+
+
+
+                                                                      Breakdown (%)
+                               3200                                                   90~
+                                                                                       ~                                                    ~
+                                                                                                                                            ~
+                                                                                                                                                leading to suboptimal latency. Each inference iteration ac-
+                               2400
+                               1600
+                                                                                      8
+                                                                                                                                                cesses the entire model, resulting in poor locality for hierar-
+
+
+
+
+                                                                                              2.4
+                                                                                      4
+
+
+
+
+                                                                                                       1.7
+                                                                                                                                                chical GPU-CPU memory structures. GPUs, while computa-
+
+
+
+
+                                                                                                                   1.1
+
+
+
+
+                                                                                                                                 0.6
+                                                                                            0.5
+
+
+
+
+                                                                                                      0.5
+
+
+
+
+                                                                                                                  0.5
+
+
+
+
+                                                                                                                                 0.5
+                                                                                            0.4
+
+
+
+
+                                                                                                      0.4
+
+
+
+
+                                                                                                                  0.4
+
+
+
+
+                                                                                                                                 0.4
+                               800
+                                                                                      0
+                                 0
+                                         1     4      8     16
+                                                                                             1          4
+                                                                                                        Batch Size
+                                                                                                                        8          16
+                                                                                                                                                tionally powerful, are constrained by memory capacity. For
+                                             Batch size
+                                                                                                                                                instance, a 30B-parameter model on a 24GB NVIDIA RTX
+                                             (a)                                                         (b)                                    4090 GPU means only 37% of the model is on the GPU, shift-
+Figure 3. Performance comparison and analysis for serving OPT-                                                                                  ing most computational tasks to the CPU. The CPU, with
+30B on NVIDIA RTX 4090 GPU. The yellow blocks refer to FlexGen,                                                                                 higher memory but lower computational power, ends up
+the gray blocks refer to DejaVu (UM) and the blue blocks refer to                                                                               handling 98% of the total computational time(Figure 3b).
+llama.cpp. (a) The Y-axis indicates execution time for one iteration
+and the X-axis represents batch sizes for input. (b) The Y-axis in-                                                                             3            Insights into Locality in LLM Inference
+dicates the proportion of execution time, and the X-axis indicates                                                                              3.1           Insight-1: Power-law Activation
+batch sizes for input.
+                                                                                                                                                                        LLaMA2(ReGLU)-70B             LLaMA2(ReGLU)-70B
+                                                                                                                                                                                 OPT-30B                       OPT-30B
+                                                                                                                                                                       LLaMA2(SwiGLU)-70B            LLaMA2(SwiGLU)-70B
+                                                                                                                                                             100
+processes the parameters located in the GPU memory, trans-                                                                                                    80
+
+
+
+
+                                                                                                                                                    CDF(%)
+                                                                                                                                                              60
+ferring more from the CPU as needed. This strategy enables                                                                                                    40
+the inference of LLMs of varying sizes, provided that suffi-                                                                                                  20
+                                                                                                                                                                          26 43      69              17 26            75
+cient combined CPU memory and hard disk storage are avail-                                                                                                     0
+                                                                                                                                                                   0    20 40 60 80 100          0    20   40    60     80   100
+able. FlexGen [43] is a typical example that adopts a zig-zag                                                                                                          Neuron proportion (%)         Neuron proportion (%)
+
+scheduling approach to prioritize throughput over latency,                                                                                                                  (a)                                (b)
+processing batches sequentially for each layer. Nonetheless,                                                                                    Figure 4. Cumulative distribution function (CDF) of neuron activa-
+this method leads to substantial per-token latency in latency-                                                                                  tion in OPT-30B, LLaMA2(ReGLU)-70B and LLaMA2(SwiGLU)-70B.
+sensitive scenarios (Figure 3a), mainly due to frequent data                                                                                    (a) CDF in a single MLP block. (b) CDF across the entire model. The
+transfers between GPU and CPU. Over 99.5% of processing                                                                                         X-axis shows neuron proportion. The Y-axis represents the CDF of
+time is consumed by transferring LLM weights from CPU to                                                                                        neuron activation.
+GPU, significantly impacting overall latency, as illustrated                                                                                       LLM inference exhibits a high degree of locality, indicating
+in Figure 3b.                                                                                                                                   that a consistent group of neurons is frequently activated.
+   Although DejaVu [28] leverages activation sparsity to ac-                                                                                    Notwithstanding the input dependence of LLM activation
+celerate LLM inference, this approach, originally designed for                                                                                  sparsity, a power-law distribution is evident among activated
+data center environments, faces challenges when applied to                                                                                      neurons. We profile from wikipedia [13] dataset to collect
+consumer-grade GPUs incapable of hosting full-scale LLMs.                                                                                       the statistics of the activation sparsity about 1M tokens. Fig-
+The key challenge with DejaVu in such contexts stems from                                                                                       ure 4a reveals that in the MLP blocks of OPT-30B (using
+the need to frequently transfer activated neurons from the                                                                                      ReLU), LLaMA2 (ReGLU)-70B and LLaMA2 (SwiGLU)-70B,
+CPU to the GPU during runtime. For LLMs like OPT-30B                                                                                            26%, 43% and 69% of neurons respectively are responsible for
+that exceed GPU memory limits, DejaVu2 , albeit reducing the                                                                                    80% of total activations. This indicates that these neurons
+computational load on the GPU, is constrained by the data                                                                                       are frequently activated, which we termed as hot-activated
+transfer procedure (Figure 3a). Consequently, as shown in                                                                                       neurons. Conversely, the activation of the remaining 74%,
+Figure 3a, DejaVu experiences significant inference latency,                                                                                    57% and 31% of neurons is input-dependent, classifying them
+comparable to that of FlexGen.                                                                                                                  as cold-activated neurons. This distribution is particularly
+   Hybrid offloading distributes model parameters be-                                                                                           pronounced in ReLU-based models compared to those using
+tween GPU and CPU, splitting them at the Transformer layer                                                                                      other activation functions due to its higher sparsity.
+level (Figure 2b), with llama.cpp [17] as an example. The CPU                                                                                      Furthermore, this high locality is not confined to a sin-
+processes its layers first, then sends intermediate results to                                                                                  gle MLP block but extends throughout the entire model. As
+the GPU for token generation. This offloading method re-                                                                                        illustrated in Figure 4b, approximately 17% of neurons in
+duces inference latency to around 600ms (Figure 3a) by min-                                                                                     OPT-30B, 26% in LLaMA2 (ReGLU)-70B, and 75% in LLaMA2
+imizing data transfer and mitigating slow PCIe bandwidth.                                                                                       (SwiGLU)-70B are responsible for 80% of the total activations
+However, compared to the 45ms latency of the 30B model                                                                                          across all layers. Figure 5a clearly demonstrates that in the
+on A100, the speed is still too slow.                                                                                                           OPT-30B model, each transformer layer contains a small
+                                                                                                                                                portion of hot neurons, while the majority are cold neurons.
+2 Since DejaVu only works for GPU, we modified it by using NVIDIA Unified                                                                       Notably, in the initial 24 layers, OPT-30B exhibits exception-
+Memory (UM) [36] to fetch parameters from CPU memory.                                                                                           ally low activation, with less than 1% of neurons becoming
+PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU                                                                                           SOSP ’24, November 4–6, 2024, Austin, TX, USA
+
+
+active, resulting in a minimal presence of hot neurons within                                                                                neurons on the GPU versus direct CPU execution in OPT-
+these layers.                                                                                                                                30B. Results in Figure 6 indicate that for batch sizes under
+                                                                                                                                             32, the time taken to transfer the weights of these neurons
+         48                                                                                                      hot
+                                                                                                                                             and compute them on the GPU (NVIDIA RTX 4090) exceeds
+
+
+
+
+                                                                                                                        Activation Hotness
+                                                                      BoolQ
+                                                                TruthfulQA                                                                   the time required for calculation directly on the CPU using
+ Layer
+
+
+
+
+                                                         Task
+                                                                 Arc-easy
+                                                                                                                                             the AVX2 vector extension.
+                                                                       PIQA
+                                                                     General
+                                                                                                                                             4   PowerInfer Overview
+            0                                                                                                    cold
+                    0       25       50    75      100                         0     25     50    75    100
+                        Neuron Proportion(%)                                       Neuron Proportion(%)
+                                                                                                                                             We present PowerInfer, a low-latency LLM inference system
+                                (a)                                                        (b)                                               deployed in a PC equipped with a single consumer-grade
+Figure 5. Activation frequency in OPT-30B. (a) The activation                                                                                GPU. PowerInfer proposes a neuron-aware offloading strat-
+frequency of neurons in different layers. The Y-axis represents the
+                                                                                                                                             egy and an inference engine by fully leveraging the high
+layer id. (b) The activation frequency of neurons in different tasks
+for 30th layer. The Y-axis represents the tasks. The X-axis shows
+                                                                                                                                             locality insights described in §3. It utilizes both GPU and
+neuron proportion.                                                                                                                           CPU for weight storage, accommodating LLMs of various
+                                                                                                                                             sizes. This offloading approach, based on Insight-1, effec-
+   Interestingly, the same group of hot neurons consistently                                                                                 tively exploits the power-law distribution of LLM inference.
+remains active across various downstream tasks. To demon-                                                                                    Specifically, PowerInfer preloads the GPU with weights for
+strate this, we profiled neuron activation across diverse                                                                                    neurons that activate frequently, while less active neurons’
+datasets, including knowledge-based, truthfulness assess-                                                                                    weights are kept on the CPU.
+ment, and reasoning tasks. Figure 5b illustrates that these                                                                                     To reduce inference latency, the inference engine com-
+hot neurons are consistently activated consistently across                                                                                   putes only neurons predicted as active by online predictors,
+different tasks, indicating a stable pattern of power-law acti-                                                                              skipping most inactive ones. Moreover, the preloading strat-
+vation. Our analysis revealed that there is over 90% overlap in                                                                              egy enables PowerInfer to allocate the bulk of inference tasks
+the top 20% most frequently activated neurons across these                                                                                   to the GPU, given that hot-activated neurons that have been
+varied domains. This remarkable consistency suggests that                                                                                    loaded on the GPU constitute a major fraction of activations.
+the power-law distribution of neuron activations is an in-                                                                                   For cold-activated neurons not in GPU memory, PowerInfer
+trinsic property of the model architecture rather than being                                                                                 executes their computations on the CPU, eliminating the
+dataset-specific.                                                                                                                            need for weight transfers to the GPU (Insight-2).
+3.2 Insight-2: Fast In-CPU Computation                                                                                                          The effectiveness of PowerInfer is directly correlated with
+                                                                                                                                             the model’s activation sparsity. ReLU-family LLMs, exhibit-
+                Load-And-Execute                Direct-Execute                 Load-And-Execute            Direct-Execute                    ing over 90% sparse activations in their FFNs, are ideal can-
+         Time(ms)
+
+
+
+
+                    2
+                                                                               4                                                             didates for PowerInfer. While LLMs with other activation
+                    1                                                          2
+                    0                                                          0                                                             functions typically show around 50% sparsity, resulting in
+                        1        2     4      8     16          32                   1    2        4      8    16       32
+                                      Batch size                                                  Batch size                                 less pronounced acceleration, PowerInfer still offers some
+                            (a) MLP block                                          (b) Attention block                                       performance gains. Encouragingly, there is a growing trend
+                                                                                                                                             on enhancing LLM sparsity without compromising perfor-
+Figure 6. Comparison of execution time for load-then-execute
+versus direct-execute methods when 10% and 60% neuron weights
+                                                                                                                                             mance [44, 46], or directly training LLMs with ReLU-family
+of one MLP and attention block in OPT-30B are CPU-resident. The                                                                              activations, as seen in NVIDIA Nemotron [1] and Mini-
+X-axis shows input batch sizes, and the Y-axis measures execution                                                                            Tron [48]. This trend is expected to extend PowerInfer’s
+time (ms). Load-then-execute involves transferring these neuron                                                                              applicability across a more diverse spectrum of LLMs.
+weights to GPU memory for computation, whereas direct-execute                                                                                4.1 Architecture and Workflow
+computes them directly on the CPU.                                                                                                           Figure 7 presents an architectural overview of PowerInfer,
+  If activated neurons reside in CPU memory, computing                                                                                       comprising both offline and online components. Due to the
+them on the CPU is faster than transferring them to the GPU,                                                                                 variation in locality properties among different LLMs, the
+especially with the small number of activated neurons and                                                                                    offline component should profile LLMs’ activation sparsity,
+the small batch sizes typical in local deployments. Modern                                                                                   differentiating between hot and cold neurons. In the online
+CPUs with vector extensions can efficiently handle such                                                                                      phase, the inference engine loads two types of neurons into
+smaller matrix computations.                                                                                                                 both GPU and CPU, serving LLM requests with low latency
+  We compared the time to load and compute 10%3 sparisty                                                                                     during runtime.
+of the MLP block and 60% of attention block’s CPU-side                                                                                          LLM Profiler and Policy Solver (Offline): Based on
+3While Insight-1 indicates that 43% of neurons account for 80% of the total                                                                  Insight-1, the neuron’s activation pattern can be collected
+activations in a single MLP block, it is typically found that only about 10%                                                                 enough from general datasets, so we take an offline profiler
+of its neurons are activated during an individual inference iteration.                                                                       that collects activation data from inference processes using
+SOSP ’24, November 4–6, 2024, Austin, TX, USA                                                                    Yixin Song, Zeyu Mi, Haotong Xie and Haibo Chen
+
+
+     Hot           Cold
+                                  Predicated        CPU         GPU             Calculation   it predicts activation for neurons 3, 4, and 5. It is crucial to
+                                  Activation        Core        SM              Loading
+                                                              CPU      GPU
+                                                                                              note that hot-activated neurons, identified through offline
+                                                            Executor Executor                 statistical analysis, may not consistently match the runtime
+       LLM             …                                                        CPU
+                                                           CPU Mem                            activation behaviors. For example, neuron 7, though labeled
+                   1                                                                          as hot-activated, is forecasted to be inactive in this case.
+                                                                     4
+    Proﬁler & Solver                       3
+                                                                                                 Both the GPU and CPU concurrently process their respec-
+                                                                PCIe                          tive predicted active neurons, while efficiently bypassing
+                       2                                                        GPU           inactive ones. Specifically, the GPU computes neurons 3 and
+                                                                     4
+                                                                                              5, leveraging its parallel processing capabilities, while the
+                                           3               GPU Mem
+                                                                                              CPU simultaneously handles neuron 4. Upon completion of
+                 Oﬄine                                          Online
+                                                                                              neuron 4’s computation on the CPU, its output is swiftly
+                                                                                              transferred to the GPU. The GPU then performs a final inte-
+Figure 7. The architecture and inference workflow of Pow-
+                                                                                              gration step, combining the results from all activated neurons
+erInfer.
+                                                                                              (3, 4, and 5) using an optimized add operator.
+                                               Layer Output
+           7
+           6
+                                               Calculate & Merge                              5     Neuron-aware Inference Engine
+                           CPU Mem                                           GPU Mem
+
+           5
+                 Oﬄine        1      2    4     6               3        5        7
+           4      Split                                                                       5.1   Adaptive Sparsity Predictors
+           3
+                                                     Activate
+           2
+                                               Online Predictor                               The online inference engine in PowerInfer reduces compu-
+           1
+                                                                                              tational loads by only processing those neurons that are
+       Layer i
+                                                 Layer Input
+                                                                                              predicted to be activated. This method was also used in De-
+Figure 8. An illustrative example shows how PowerInfer                                        jaVu [28], which advocates for training a set of fixed-size
+calculates different neurons for one LLM layer.                                               MLP predictors. Within each Transformer layer, DejaVu uti-
+                                                                                              lizes two separate predictors to forecast the activation of
+requests derived from general datasets (e.g., C4 [39]). It mon-
+                                                                                              neurons in the self-attention and MLP blocks. Consequently,
+itors neuron activation across all layers (Step ①), followed
+                                                                                              the inference computation is confined to neurons predicted
+by a policy solver categorizing neurons as hot or cold. The
+                                                                                              to be active.
+solver aims to allocate frequently activated neurons to the
+                                                                                                 However, designing effective predictors for local deploy-
+GPU and others to the CPU. It uses a neuron impact metric
+                                                                                              ments with limited resources is challenging, balancing pre-
+and hardware specifications to balance the workload, using
+                                                                                              diction accuracy and model size. These predictors, frequently
+integer linear programming to maximize the GPU’s impact
+                                                                                              invoked for neuron activation prediction, should be stored
+metric for neurons (Step ②).
+                                                                                              in GPU memory for fast access. Yet, the considerable mem-
+   Neuron-aware LLM Inference Engine (Online): Before
+                                                                                              ory requirements of numerous fixed-size predictors can en-
+processing user requests, the online engine assigns the two
+                                                                                              croach upon the space needed for storing LLM parameters.
+types of neurons to their respective processing units (Step
+                                                                                              For example, predictors for the OPT-175B model require
+③), as per the offline solver’s output. During runtime, the
+                                                                                              around 27GB of GPU memory, surpassing an NVIDIA RTX
+engine creates GPU and CPU executors, which are threads
+                                                                                              4090 GPU’s capacity. On the other hand, naively reducing
+running on the CPU side, to manage concurrent CPU-GPU
+                                                                                              predictor size impairs accuracy; a decrease from 480MB to
+computations (Step ④). The engine also predicts neuron
+                                                                                              320MB in predictor size dropped its accuracy from 92% to
+activation and skips non-activated ones. Activated neurons
+                                                                                              84%, further adversely affecting the overall LLM accuracy
+preloaded in GPU memory are processed there, while the
+                                                                                              (e.g., winogrande [41] task accuracy from 72.77% to 67.96%).
+CPU calculates and transfers results for its neurons to the
+                                                                                                 We have observed that the size of predictors is influenced
+GPU for integration. The engine uses sparse-neuron-aware
+                                                                                              by two main factors: the sparsity of LLM layers and their
+operators on both CPU and GPU, focusing on individual
+                                                                                              internal skewness. As shown in Figure 9, layers with higher
+neuron rows/columns within matrices.
+                                                                                              activation sparsity simplify the task of identifying activated
+4.2 Single Layer Example                                                                      neurons, allowing for smaller predictor models. In contrast,
+Figure 8 illustrates how PowerInfer coordinates GPU and                                       layers with lower activation sparsity necessitate larger mod-
+CPU in processing a layer’s neurons. It classifies neurons                                    els with more parameters, as accurately pinpointing acti-
+based on offline data, assigning hot-activated ones (e.g., in-                                vated neurons becomes increasingly challenging. Addition-
+dices 3, 5, 7) to GPU memory and others to CPU memory.                                        ally, in cases of high skewness, where activations are heavily
+Upon receiving an input, a predictor identifies which neurons                                 concentrated in a few neurons, even a compact predictor can
+in the current layer are likely to be activated. For instance,                                achieve high accuracy.
+PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU                         SOSP ’24, November 4–6, 2024, Austin, TX, USA
+
+
+                                                                          5.3   GPU-CPU Hybrid Execution
+
+               Parameters (MB)
+                                 200
+                                                Low skewness              PowerInfer implements a GPU-CPU hybrid execution model
+                                 150             High skewness
+                                 100
+                                                                          where both units independently compute their respective
+                                 50                                       activated neurons. This approach balances the computational
+                                  0                                       workload between GPU and CPU, leveraging the strengths
+                                       0.97 0.975 0.98 0.985 0.99 0.995
+                                                   Sparsity               of each unit while minimizing transfer time inefficiencies.
+Figure 9. Correlation between predictor parameter size and layer          The GPU processes preloaded hot neurons, while the CPU
+sparsity at a guaranteed 95% accuracy level for OPT-175B. The             handles cold neurons, with results combined on the GPU.
+X-axis represents sparsity, and the Y-axis represents the predictor          Before inference, PowerInfer constructs a computationally
+parameter size. The bar indicates the average parameter size for          directed acyclic graph (DAG) with each node representing
+the model in the corresponding sparsity, while the error bar reflects     a computational LLM inference operator and stores it in a
+fluctuations in the predictor parameter size due to skewness within
+                                                                          global queue in the CPU memory. Each operator in the queue
+the layer.
+                                                                          is tagged with its prerequisite operators. During inference,
+                                                                          two types of executors, pthreads created by the host OS, man-
+   To optimize for these factors, We design an iterative train-           age calculations on both CPU and GPU. They pull operators
+ing method for non-fixed-size predictors for each Trans-                  from the global queue, check dependencies, and assign them
+former layer. The process begins by establishing a baseline               to the appropriate processing unit. The GPU and CPU use
+model size based on the layer’s sparsity profile (Figure 9).              their neuron-aware operators, with the GPU executor launch-
+Subsequently, the model size is iteratively adjusted, consid-             ing GPU operators using APIs like cudaLaunchKernel, and
+ering the internal activation skewness to maintain accuracy.              the CPU executor coordinating unoccupied CPU cores for
+An MLP predictor typically comprises a input, a single hid-               calculations. Before executing an operator, the CPU executor
+den, and an output layers. Since the dimensions of the input              also determines the necessary thread count for parallel com-
+and output layers are determined by the Transformer layer’s               putation. To manage operator dependencies, especially when
+structure, modifications primarily target the hidden layer.               a parent node of a CPU operator is processed on the GPU, a
+   In training predictors, model perplexity on the WikiText-2             barrier ensures GPU computations are complete before the
+dataset served as the benchmark for the predictive accuracy.              CPU starts its operator.
+Initially, the predictor’s dimensionality was set in accordance              In scenarios where activated neurons are split between
+with the sparsity level of the layer. We then engaged in an               GPU and CPU, synchronization between these processing
+iterative process to tune the size of the hidden layer. This              units also becomes crucial. After one unit finishes its neuron
+process was continued until the perplexity of the model with              calculations, it waits for the other to merge results. As GPU
+the integrated predictor closely approximated that of the                 neurons are activated more frequently, PowerInfer assigns
+baseline model, achieving a discrepancy of less than 0.1%.                merging operations to the GPU.
+Through this approach, PowerInfer effectively limits predic-              5.4   Neuron-aware Operator
+tor parameters to a mere 6% of the total LLM parameters.
+                                                                          Considering the activation sparsity in LLMs, matrix multi-
+5.2   Neuron Management                                                   plication operations can bypass inactive neurons and their
+When the offline solver determines a neuron placement pol-                weights, necessitating the use of sparse operators. However,
+icy, the online inference engine of PowerInfer loads the                  current sparse matrix multiplication tools, including state-of-
+model into the CPU and GPU memory as per the policy.                      the-art sparse-aware compilers like SparTA [64] and Flash-
+For each layer, which may consist of multiple weight matri-               LLM [54], as well as libraries like cuSPARSE [37], fall short
+ces, PowerInfer assigns each neuron to either the GPU or                  in this regard. They either support only static compilation
+CPU based on whether the neuron is hot-activated.                         of sparse-aware kernels or require dynamic conversion of
+   Ensuring the accurate computation of these segmented                   sparse matrices into dense formats, leading to significant
+neurons in their proper sequence is vital for precise results.            performance overhead, especially with the dynamic spar-
+To this end, PowerInfer creates two neuron tables, one lo-                sity in our scenario. Additionally, the dynamic JIT compiler
+cated in the CPU and the other in the GPU memory. These                   PIT [63], though efficient for general sparse matrix multipli-
+tables correlate each neuron to its original position in the ma-          cation on GPUs, is not suited for CPU-GPU hybrid execution
+trix. During the process of multiplying with an input tensor,             where CPU computational capabilities are limited.
+each neuron interacts with its corresponding tensor value,                   To overcome these limitations, PowerInfer introduces
+guided by the mappings in the neuron tables. The additional               neuron-aware operators that directly compute activated neu-
+memory required for these neuron tables is relatively min-                rons and their weights on both GPU and CPU without the
+imal, totaling only about 9MB for an LLM like OPT-175B,                   need for runtime conversion to dense format. These opera-
+which needs 350GB of storage.                                             tors differ from traditional ones as they focus on individual
+SOSP ’24, November 4–6, 2024, Austin, TX, USA                                            Yixin Song, Zeyu Mi, Haotong Xie and Haibo Chen
+
+
+row/column vectors within a matrix rather than the entire          Table 2. Terminology for ILP formulation. The Par repre-
+matrix. They first determine a neuron’s activation status          sents the parameters gathered from the profiler or the ex-
+and then process it if predicted to be active, alongside the       pressions used to define constraints, none of which need to
+corresponding row or column of the parameter matrix.               be solved by the solver. The Var refers to the constraint and
+   Neuron-aware Operators for GPU: Despite vector-                 objective variables that emerge from the modeling process,
+vector calculations being less efficient than matrix-vector cal-   which need to be solved by the solver.
+culations on GPU, neuron-aware operators based on vector-
+                                                                       Symbol      Type     Description
+vector computation are advantageous when the batch size is
+                                                                          L        Par      All layers
+small. They avoid unnecessary computations and memory                     N        Par      All neurons
+operations associated with inactive neurons and do not need               U        Par      CPU and GPU
+                                                                          𝑓𝑖       Par      Activation frequency of neuron i
+costly matrix conversions. Furthermore, these operators al-              𝑁𝑖        Par      Neuron in layer i
+low all thread blocks to concurrently check neuron activa-                𝑣𝑖       Par      Neuron impact for neuron i
+                                                                         𝑀𝑖        Par      The memory size for neuron i
+tions and compute corresponding vectors if activated. No-              𝑀𝐶𝑎𝑝 𝑗      Par      The memory size for processing unit j
+tably, PowerInfer assigns independent computational tasks            𝐵𝑎𝑛𝑑𝑤𝑖𝑑𝑡ℎ 𝑗   Par      The memory bandwidth for processing unit j
+                                                                        𝑇𝑠𝑦𝑛𝑐      Par      The time required for one synchronization between
+to different thread blocks on the GPU. Each thread block                                    the CPU and GPU
+processes a distinct set of neurons, eliminating the need for             𝐾        Par      A large positive number
+                                                                         𝑎𝑖𝑛       Var      Whether neuron n is placed on processing unit i
+synchronization or divergence across blocks.                             𝑇𝑙
+                                                                            𝑗
+                                                                                   Var      The time for computing one neuron in layer 𝑙 on
+   Neuron-aware Operators for CPU: Neuron-aware op-                                         processing unit j
+erators are particularly beneficial for CPUs, which gener-               𝐶𝑙        Var      The minimum number of neurons required to be
+                                                                                            allocated on the GPU when the solver opts to split
+ally have lower parallelism. The CPU executor assigns a                                     neurons in layer 𝑙
+neuron-aware operator to multiple cores, dividing neurons                 𝑦𝑙       Var      Binary auxliary variable for layer 𝑙 to facilitate the
+                                                                                            modeling of conditional constraints
+into smaller batches for concurrent activation checking. Each
+core processes only the activated neurons in its batch, op-
+                                                                   leveraging the fact that profiled activation frequency mirrors
+timizing vector-vector calculations with hardware vector
+                                                                   runtime behavior accurately, provided the profiling involves
+extensions like AVX2.
+                                                                   a substantial amount of input data. As Equation 1 shows, this
+6    Neuron Placement Policy                                       metric for a neuron is defined by its activation frequency
+To fully harness the computational power of GPUs and CPUs,         obtained during profiling.
+a locality-aware policy is crucial for optimizing performance.
+                                                                                          𝑣𝑖 = 𝑓𝑖             ∀𝑖 ∈ N                                 (1)
+If we randomly place neurons on GPU and CPU, the GPU can-
+not fully utilize its powerful computation capability because      6.3 Modeling of Neuron Placement
+some hot neurons are placed on CPU. Further, simply assign-        Based on the neuron impact metric, PowerInfer utilizes a
+ing the hotest neurons to the GPU may lead to excessive data       solver to optimize the total impacts of all neurons in the
+transfers between the CPU and GPU, undermining efficiency.         GPU. This cumulative impact is formulated as the objective
+To tackle this challenge, PowerInfer’s offline component de-       function, as defined in Equation 2. This function is then input
+vises a placement policy using a solver that determines the        into an integer linear programming framework to identify a
+allocation of each neuron to GPU or CPU.                           specific solution that maximizes the objective function. The
+6.1 Offline Profiling                                              binary variable 𝑎𝑖𝑛 , defined in Equation 3 indicates whether
+Before determining the placement of each neuron, it is im-         the neuron 𝑛 is placed on processing      unit 𝑖.
+                                                                                                ∑︁
+portant to profile the activation information of each neuron.                 𝑀𝑎𝑥𝑖𝑚𝑖𝑧𝑒 𝑡𝑖 =         𝑎𝑖𝑒 ∗ 𝑣𝑒 ∀𝑖 ∈ {𝐺𝑃𝑈 }        (2)
+Based on Insight-1 that the hot neurons in general corpus                                           𝑒 ∈N
+are also activated frequently across different scenarios, we                              ∑︁
+                                                                                                 𝑎𝑖𝑛 = 1 ∀𝑛 ∈ N                                      (3)
+achieve the profile with an offline profiler, which deploys
+                                                                                          𝑖 ∈U
+the LLM to handle requests generated from multiple general
+datasets, such as C4 [39] and Wikipedia [13]. To accurately          When maximizing the objective function, the solver also
+measure activation information, the profiler inserts a mon-        needs to consider two sets of constraints. First, minimize
+itoring kernel after each block within a Transformer layer.        the communication overhead between processing units.
+Additionally, it builds a neuron information table on the GPU,     Second, ensure the GPU memory is fully utilized.
+designed to track the activation count of each neuron.             6.3.1 Communication Constraint The number of neu-
+6.2 Neuron Impact Metric                                           rons preloaded onto the GPU is limited by layer communica-
+The neuron impact metric measures each neuron’s contribu-          tion overheads, constrained by hardware PCIe bandwidth.
+tion to the LLM’s overall inference outcome, crucial for GPU       Preloading too few neurons negates the GPU’s computa-
+neuron allocation. We calculate this metric effectively by         tional benefits. Consequently, the solver must determine a
+PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU                        SOSP ’24, November 4–6, 2024, Austin, TX, USA
+
+
+minimum neuron allocation for optimal GPU processing ef-                  the primary strategy involves aggregating neurons within
+ficiency, as detailed in Inequality 4. In this inequality, 𝐶𝑙 is          each layer into batches for collective placement analysis.
+the minimum count of neurons that must be assigned to the                 Specifically, the solver groups 64 neurons with similar im-
+GPU for layer 𝑙.                                                          pacts from a layer into a single batch. This batching strategy
+   When solving Inequality 4, it is essential to profile both             dramatically reduces the total neuron count, N, from several
+the computation time for an individual neuron and the intra-              millions to roughly tens of thousands, thereby significantly
+layer communication overhead, 𝑇𝑠𝑦𝑛𝑐 . In LLM inference,                   decreasing the time to solve the ILP problem to approxi-
+particularly with smaller batch sizes, the limiting factor is             mately 10 seconds.
+memory bandwidth. Hence, a neuron’s computation time is                   7   Implementation
+roughly equal to the duration required to access its weights
+                                                                          The online inference engine of PowerInfer has been imple-
+once, as shown in Equation 5. And the extent of intra-layer
+                                                                          mented by incorporating 4,200 lines of C++ and CUDA code
+data transfer tends to be consistent across layers, leading
+                                                                          into llama.cpp [17], a state-of-the-art open-source LLM in-
+to a uniform synchronization cost. Consequently, we de-
+                                                                          ference framework designed for PCs. The extensions made
+scribe 𝑇𝑠𝑦𝑛𝑐 as the profiled overhead for a single instance of
+                                                                          by PowerInfer include modifications to the model loader
+intra-layer communication.
+                                                                          for distributing an LLM across GPU and CPU, following the
+             𝐶𝑙 · 𝑇𝑙𝐺𝑃𝑈 + 𝑇𝑠𝑦𝑛𝑐 ≤ 𝐶𝑙 · 𝑇𝑙𝐶𝑃𝑈 ∀𝑙 ∈ L            (4)        guidance from the offline solver’s outputs. We have also
+                                                                          optimized the inference engine for GPU-CPU hybrid exe-
+           𝑇𝑖𝑗 = 𝑀𝑖 /𝐵𝑎𝑛𝑑𝑤𝑖𝑑𝑡ℎ 𝑗         ∀𝑗 ∈ U, ∀𝑖 ∈ L        (5)
+                                                                          cution and introduced 10 neuron-aware operators for both
+6.3.2 Memory Constraint Neuron placement is further                       processing units. All other components and functionalities
+constrained by the memory capacities of the processing units,             of llama.cpp remains unchanged. For instance, the KV cache
+as defined in Inequality 6. Moreover, the solver ensures that             continues to reside in CPU memory, allowing more GPU
+when allocating neurons of a layer to the GPU, it either                  memory for hot-activated neurons. Furthermore, around 400
+assigns at least the minimum number of neurons specified                  lines of Python code were added to the transformers frame-
+in Inequality 4 to offset communication costs or opts not to              work [53], enabling it to function as an offline profiler and
+allocate any neurons from that layer to the GPU. Specifically,            solver for PowerInfer.
+the number of neurons for layer 𝑙 on the GPU must either                     The current implementation of PowerInfer supports a
+exceed 𝐶𝑙 or be equal to zero.                                            range of mainstream LLM families with varying parameter
+   To model this constraint, we introduce an auxiliary bi-                sizes. For these models, PowerInfer utilized general corpora
+nary variable, 𝑦𝑙 , which can be either 1 or 0. This variable             such as Wikipedia [13] to train online activation predictors,
+determines whether any neurons are assigned to the GPU                    Notably we deliberately avoided using any of the down-
+for layer 𝑙. For computational convenience, a sufficiently                stream task datasets in our predictor training process. Train-
+large number 𝐾 is also introduced. Inequalities 7 and 8 are               ing predictors, though time-consuming (often several hours),
+formulated to model this constraint. When 𝑦𝑙 is 1, indicating             is a one-time task that can be expedited with multiple GPUs.
+neuron placement on the GPU for this layer, and given that 𝐾
+is adequately
+      Í       large, these two inequalities effectively become
+𝐶𝑙 ≤ 𝑒 ∈𝑁𝑙 𝑎𝑖𝑒 ≤ 𝐾. Conversely, if 𝑦𝑙 is set to 0, signifying             8   Evaluation
+no neuron placement on the GPU for layer 𝑙, the inequalities
+           Í
+reduce to 𝑒 ∈𝑁𝑙 𝑎𝑖𝑒 = 0.                                                  8.1 Experimental Setup
+               ∑︁                                                         Hardware. All experiments were conducted on two distinct
+                    𝑎 𝑗𝑛 · 𝑀𝑛 < 𝑀𝐶𝑎𝑝 𝑗 ∀𝑗 ∈ U               (6)           PC configurations, representing both high-end and low-end
+               𝑛∈𝑁
+            ∑︁                                                            hardware scenarios:
+                    𝑎𝑖𝑒 ≥ 𝐶𝑙 · 𝑦𝑙   ∀𝑙 ∈ L, ∀𝑖 ∈ {𝐺𝑃𝑈 }        (7)            • PC-High: Intel i9-13900K processor (eight 5.4GHz
+           𝑒 ∈𝑁𝑙
+            ∑︁                                                                  cores), 192GB host memory (bandwidth of 67.2 GB/s),
+                    𝑎𝑖𝑒 ≤ 𝐾 · 𝑦𝑙    ∀𝑙 ∈ L, ∀𝑖 ∈ {𝐺𝑃𝑈 }        (8)              an NVIDIA RTX 4090 GPU (24GB), and PCIe 4.0 inter-
+            𝑒 ∈𝑁𝑙                                                               face (64GB/s bandwidth).
+6.3.3 ILP Optimization The solver utilizes Integer Lin-                       • PC-Low: Intel i7-12700K processor (eight 4.9GHz
+ear Programming (ILP) to maximize the objective function,                       cores), 64GB host memory (bandwidth 38.4 GB/s), an
+conforming to all the constraints from Equation/Inequality                      NVIDIA RTX 2080Ti GPU (11GB), and PCIe 3.0 inter-
+3 to 8. Given that ILP problems are inherently NP-complete,                     face (32GB/s bandwidth).
+directly solving them for an LLM with hundreds of billions                Models. Table 3 shows the LLMs evaluated in this section,
+of parameters poses a considerable computational challenge.               including average activation sparsity for various LLMs in
+To expedite the process and achieve an approximate solution,              the MLP blocks. These LLMs include OPT [58] models with
+SOSP ’24, November 4–6, 2024, Austin, TX, USA                                                                      Yixin Song, Zeyu Mi, Haotong Xie and Haibo Chen
+
+
+Table 3. All LLMs used for evaluation and their average acti-                                                      llama.cpp                          SpecInfer                          PowerInfer
+
+
+
+
+                                                                                                                                                                                                                                  Input length=64 Input length=128
+vation sparsity in the MLP blocks. The sparsity is measured                     16             OPT 30B                           OPT 66B                  Falcon(ReLU) 40B                   LLaMA2(ReGLU) 70B
+
+
+
+
+                                                                                                                                                                                       13
+                                                                      Speedup
+
+
+
+
+                                                                                                                                                                           11
+                                                                                                                 16
+                                                                                12
+using the same method in Table 1.
+
+
+
+
+                                                                                                      13
+
+
+
+
+                                                                                                                                                               4.4
+                                                                                 8
+
+
+
+
+                                                                                                                                                  2.3
+                                                                                                                                      2.2
+                                                                                                                            1.2
+
+
+
+
+                                                                                                                                                                                                                            2.0
+                                                                                                                                                                                                                1.7
+                                                                                         2.7
+
+
+
+
+                                                                                                                                                                                                 0.6
+                                                                                                                                                0.8
+                                                                                                             1.7
+
+
+
+
+                                                                                                                                    0.6
+                                                                                 4
+
+
+
+
+                                                                                                  1.4
+                                                                                     1.0
+
+                                                                                                1.6
+
+                                                                                                           1.6
+
+
+
+                                                                                                                       0.3
+
+                                                                                                                                  0.6
+
+                                                                                                                                              0.6
+
+
+
+                                                                                                                                                         0.8
+
+                                                                                                                                                                     1.1
+
+                                                                                                                                                                                 1.1
+
+
+
+                                                                                                                                                                                              0.4
+
+                                                                                                                                                                                                          0.6
+
+                                                                                                                                                                                                                      0.6
+                                                                                                                         0.1
+                                                                                       0.3
+            Model               Activation Function   Sparsity
+
+
+
+
+                                                                                                                                                           x
+
+                                                                                                                                                                       x
+
+                                                                                                                                                                                   x
+
+
+
+                                                                                                                                                                                                x
+
+                                                                                                                                                                                                            x
+
+                                                                                                                                                                                                                        x
+                                                                                 0
+
+       Bamboo-7B                        dReLU           90%
+
+
+
+
+                                                                                                                 16
+
+
+
+
+                                                                                                                                                                                       11
+                                                                      Speedup
+                                                                                12
+
+
+
+
+                                                                                                                                                                           8.8
+                                                                                                      13
+ OPT-7B/13B/30B/66B/175B                 ReLU         96%-98%                    8
+
+
+
+
+                                                                                                                                                  2.3
+                                                                                                                                      2.1
+                                                                                                                           0.8
+
+
+
+
+                                                                                                                                                                                                                            1.9
+                                                                                                                                                                                                                1.8
+                                                                                         2.6
+
+
+
+
+                                                                                                                                                               1.7
+
+
+
+
+                                                                                                                                                                                                    0.7
+                                                                                                                                    0.8
+
+                                                                                                                                                0.8
+                                                                                                                         0.3
+                                                                                 4
+
+
+
+
+                                                                                                             1.8
+    Falcon(ReLU)-40B                    ReLU            95%
+
+
+
+
+                                                                                       0.9
+
+                                                                                                  1.5
+                                                                                     0.9
+
+                                                                                                1.6
+
+                                                                                                           1.6
+
+
+
+                                                                                                                       0.2
+
+                                                                                                                                  0.5
+
+                                                                                                                                              0.6
+
+
+
+                                                                                                                                                         0.8
+
+                                                                                                                                                                     1.1
+
+                                                                                                                                                                                 1.1
+
+
+
+                                                                                                                                                                                              0.4
+
+                                                                                                                                                                                                          0.6
+
+                                                                                                                                                                                                                      0.6
+                                                                                                                                                           x
+
+                                                                                                                                                                       x
+
+                                                                                                                                                                                   x
+
+
+
+                                                                                                                                                                                                x
+
+                                                                                                                                                                                                            x
+
+                                                                                                                                                                                                                        x
+                                                                                 0
+   LLaMA2(ReGLU)-7B                    ReGLU            70%                                8       8
+                                                                                                 12 51
+                                                                                                       2                     8       8
+                                                                                                                                   12 51
+                                                                                                                                         2      8     8
+                                                                                                                                                    12 51
+                                                                                                                                                         2                                          8        8
+                                                                                                                                                                                                           12 51
+                                                                                                                                                                                                                 2
+
+   LLaMA2(ReGLU)-13B                   ReGLU            78%                                                                           Output length
+
+   LLaMA2(ReGLU)-70B                   ReGLU            82%       Figure 10. Speedup of various models on PC-High in FP16 format.
+       Qwen1.5-4B                      SwiGLU           40%       The X axis and Y axis indicate the output length and speedup
+  LLaMA2(SwiGLU)-13B                   SwiGLU           43%       compared with llama.cpp. The number above each bar in-
+         Yi-34B                        SwiGLU           53%
+                                                                  dicates the end-to-end generation speed (tokens/s). The up
+                                                                  and down figures represent input length of 64 and 128.
+parameters from 13B to 175B, Bamboo 7B [45], as well as                                                            llama.cpp                          SpecInfer                          PowerInfer
+
+
+
+
+                                                                                                                                                                                                                                  Input length=64 Input length=128
+                                                                                10
+Falcon(ReLU)-40B [3] and LLaMA(ReGLU)-70B [47] models.                                     Bamboo 7B                             OPT 13B                        OPT 30B                      LLaMA2(ReGLU) 13B
+
+
+
+
+                                                                                                                                                    13
+                                                                      Speedup
+                                                                                 8
+
+
+
+
+                                                                                                                                        12
+
+
+
+
+                                                                                                                                                                                                                            9.5
+                                                                                                                                                                                                                8.6
+                                                                                 6
+In addition to LLMs using ReLU-family activation functions,
+
+
+
+
+                                                                                                                                                                                       2.0
+                                                                                                                                                                           1.8
+                                                                                                                 26
+                                                                                                      23
+
+
+
+
+                                                                                                                            3.1
+                                                                                 4
+
+
+
+
+                                                                                                                                                               0.7
+
+
+
+
+                                                                                                                                                                                                  2.5
+                                                                                         7.6
+
+
+
+
+                                                                                                                                                                                                                        2.4
+                                                                                                                                                2.1
+                                                                                                                                    1.7
+                                                                                     5.6
+
+                                                                                                7.2
+
+                                                                                                           7.3
+
+
+
+                                                                                                                       1.3
+
+                                                                                                                                  1.9
+
+                                                                                                                                              1.9
+
+
+
+                                                                                                                                                         0.3
+
+                                                                                                                                                                     0.6
+
+                                                                                                                                                                                 0.6
+
+
+
+                                                                                                                                                                                              1.6
+
+                                                                                                                                                                                                          2.0
+
+                                                                                                                                                                                                                      2.0
+                                                                                                                                                                                                            1.4
+                                                                                                             3.4
+
+
+
+
+                                                                                                                                                                                                0.7
+                                                                                                  2.7
+
+
+
+
+                                                                                                                         0.3
+                                                                                       0.7
+                                                                                 2
+we also evaluate SiLU-family LLMs, with sparsity levels of
+
+
+
+
+                                                                                                                                                           x
+
+                                                                                                                                                                       x
+
+                                                                                                                                                                                   x
+                                                                                 0
+approximately 50%. For our experiments, all models in our                        8
+
+
+
+
+                                                                                                                                                    12
+                                                                                                                                        9.3
+                                                                      Speedup
+
+
+
+
+                                                                                                                                                                                                                9.4
+
+                                                                                                                                                                                                                            9.3
+                                                                                 6
+experiments use FP16 and INT4 quantized parameters, with
+
+
+
+
+                                                                                                                                                                                       1.9
+                                                                                                                 24
+
+
+
+
+                                                                                                                                                                           1.6
+                                                                                                      21
+                                                                                 4
+
+
+
+
+                                                                                                                                                                                                    3.3
+                                                                                                                                                3.8
+                                                                                                                           2.1
+
+
+
+
+                                                                                                                                                               0.5
+                                                                                        5.6
+intermediate activations in FP32, consistent with recent LLM
+
+
+
+                                                                                     5.2
+
+                                                                                                7.2
+
+                                                                                                           7.2
+
+
+
+                                                                                                                       1.2
+
+                                                                                                                                  1.8
+
+                                                                                                                                              1.9
+
+
+
+                                                                                                                                                         0.3
+
+                                                                                                                                                                     0.6
+
+                                                                                                                                                                                 0.6
+
+
+
+                                                                                                                                                                                              1.5
+
+                                                                                                                                                                                                          2.0
+
+                                                                                                                                                                                                                      2.0
+                                                                                                                         1.0
+
+
+
+
+                                                                                                                                                                                                            1.3
+
+                                                                                                                                                                                                                        1.2
+                                                                                                                                    1.0
+                                                                                                  3.1
+                                                                                 2
+
+
+
+
+                                                                                       1.4
+
+
+
+
+                                                                                                             1.6
+
+
+
+
+                                                                                                                                                           x
+
+                                                                                                                                                                       x
+
+                                                                                                                                                                                   x
+
+
+
+                                                                                                                                                                                                x
+                                                                                 0
+research practices [15, 57].                                                               8       8
+                                                                                                 12 51
+                                                                                                       2                     8       8
+                                                                                                                                   12 51
+                                                                                                                                         2      8     8
+                                                                                                                                                    12 51
+                                                                                                                                                          2                                         8        8
+                                                                                                                                                                                                           12 51
+                                                                                                                                                                                                                 2
+
+Workloads. The workloads for our experiments are de-                                                                                  Output length
+
+rived from chatbot arena [62] ChatGPT prompts [35] and            Figure 11. Speedup of various models on PC-Low in FP16 format.
+Alpaca [50] datasets. covering a wide spectrum of language        The up and down figures represent input length of 64 and
+model uses. These datasets are the most representative ex-        128, respectively.
+amples of real LLM services. ChatGPT prompts include user         with average speedups of 7.23× and 6.19×, and for Falcon-
+interactions with ChatGPT [38], and Alpaca features instruc-      40B, up to 11.69× compared with llama.cpp. Although SpecIn-
+tion sets generated by GPT3.5 through self-instruction.           fer utilizes speculative decoding, since the large model size
+Baseline System. We compare PowerInfer with                       exceeds the GPU’s capacity, there is still a significant amount
+llama.cpp [17] and SpecInfer [33], state-of-the-art lo-           of swapping during the verify phase, accounting for over
+cal LLM inference frameworks. llama.cpp is the most widely        95% of the time. As a result, SpecInfer does not significantly
+used LLM inference framework for local scenarios. For a           outperform llama.cpp. The performance superiority of Pow-
+fair comparison, we extended llama.cpp to support the             erInfer becomes more pronounced as the number of output
+OPT model, as it does not natively do so. SpecInfer is            tokens increases since the generation phase plays a more
+representative speculative decoding framework, that utilizes      significant role in the overall inference time. In this phase, a
+smaller draft models to generate tokens and subsequently          small number of neurons are activated on both CPU and GPU,
+verifies these tokens in batches using the original model.        leading to fewer unnecessary computations compared to
+While other alternatives like FlexGen [43] and DejaVu [28]        llama.cpp. For example, in the case of OPT-30B, only around
+exist, they exhibit higher latency in the latency-sensitive       20% of neurons are activated for each token generated, with
+scenarios discussed in this paper, as analyzed in §2.2.           the majority processed on the GPU, a benefit of PowerInfer’s
+8.2 End-to-End Performance                                        neuron-aware inference engine.
+We first compare the end-to-end inference performance of             Figure 11 shows that on a lower-end PC (PC-Low), Pow-
+PowerInfer , llama.cpp and SpecInfer with a batch size of         erInfer still attains considerable performance enhancement
+one, the typical setting for local deployments [7]. Given real-   over llama.cpp and SpecInfer, averaging a speedup of 4.71×,
+world dialog input/output length variability [23], we sample      5.97× and peaking at 7.06× and 7.47×. However, these im-
+prompts from Alpaca and ChatGPT datasets, ranging from 8          provements are smaller compared to those on a higher-end
+to 128 tokens and measure the generation speed.                   PC (PC-High), primarily due to the 11GB GPU memory limi-
+   Figure 10 illustrates the generation speeds for various mod-   tation of PC-Low. This limitation affects the number of neu-
+els and input-output configurations on a PC-High equipped         rons that can be allocated to the GPU, particularly for models
+with an NVIDIA RTX 4090. On average, PowerInfer achieves          with around 30B parameters or more, leading to a greater
+a generation speed of 8.32 tokens/s, reaching up to 16.06 to-     dependence on the CPU for processing a larger number of
+kens/s, significantly outperforming llama.cpp and SpecInfer       activated neurons.
+PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU                                                                                                       SOSP ’24, November 4–6, 2024, Austin, TX, USA
+ Neuron Load Breakdown (%)
+
+
+
+                                                llama.cpp-CPU              PowerInfer-CPU
+                                                llama.cpp-GPU              PowerInfer-GPU
+                             100                                                                                                                                                         llama.cpp                          PowerInfer
+                              80
+                              60                                                                                             6           OPT 66B                                   OPT 175B                         Falcon(ReLU) 40B                   LLaMA2(ReGLU) 70B
+                              40
+
+
+
+
+                                                                                                                                                    12
+                                                                                                                                        7.6
+                                                                                                                   Speedup
+
+
+
+
+                                                                                                                                                                    12
+
+
+
+
+                                                                                                                                                                                                                                                                                               PC-High
+                              20                                                                                             4
+
+
+
+
+                                                                                                                                                                                                                                                                             9.5
+
+                                                                                                                                                                                                                                                                                         10
+                                                                                                                                                                                                1.9
+
+
+
+
+                                                                                                                                                                                                                                                                 6.4
+                                                                                                                                                                                                             1.8
+                                                                                                                                                                                   1.2
+                               0   OPT-30B   OPT-66B   OPT-175B(INT4)      OPT-13B   OPT-66B(INT4)   OPT-30B
+
+
+
+
+                                                                                                                                                                                                                                 29
+                                                                                                                                                                                                                      22
+
+
+
+
+                                                                                                                                                                                                                                            27
+                                                                                                                                  1.9
+
+                                                                                                                                              2.9
+
+                                                                                                                                                             2.9
+
+
+
+
+                                                                                                                                                                             0.5
+
+                                                                                                                                                                                          0.7
+
+                                                                                                                                                                                                       0.7
+
+
+
+
+                                                                                                                                                                                                                                                           2.4
+
+                                                                                                                                                                                                                                                                       3.2
+
+                                                                                                                                                                                                                                                                                   3.2
+                                                                                                                                                                                                                     15
+
+                                                                                                                                                                                                                                17
+
+                                                                                                                                                                                                                                           17
+                                                                                                                             2
+
+                                                                                                                             0
+                                     (a) PC-High                              (b) PC-Low                                            8           8
+                                                                                                                                              12 51
+                                                                                                                                                    2                          8            8
+                                                                                                                                                                                          12 51
+                                                                                                                                                                                                2       8     8
+                                                                                                                                                                                                            12 51
+                                                                                                                                                                                                                 2                                           8
+                                                                                                                                                                                                                                                                       12
+                                                                                                                                                                                                                                                                              8
+                                                                                                                                                                                                                                                                                   51
+                                                                                                                                                                                                                                                                                          2
+                                                                                                                                                                                              Output length
+Figure 12. Neuron load distribution on CPU and GPU during infer-
+ence. The yellow block refers to llama.cpp, and blue block refers to                                                         10               OPT 30B                                    OPT 66B                    Falcon(ReLU) 40B                   LLaMA2(ReGLU) 70B
+
+
+
+
+                                                                                                                                                                                                                                      16
+
+                                                                                                                                                                                                                                                 15
+                                                                                                                   Speedup
+                                                                                                                              8
+PowerInfer.
+
+
+
+
+                                                                                                                                                                                                                           11
+
+
+
+
+                                                                                                                                                                                                                                                                                               PC-Low
+                                                                                                                                                                                                 5.3
+
+                                                                                                                                                                                                              5.0
+                                                                                                                              6
+
+
+
+
+                                                                                                                                                                                    3.3
+
+
+
+
+                                                                                                                                                                                                                                                                                         4.2
+                                                                                                                                                                                                                                                                             4.2
+                                                                                                                                                                                                                                                             2.9
+                                                                                                                                                                       12
+                                                                                                                                                  13
+                                                                                                                                     7.6
+                                                                                                                              4
+
+
+
+
+                                                                                                                                    2.9
+
+                                                                                                                                                3.9
+
+                                                                                                                                                                    3.8
+
+
+
+
+                                                                                                                                                                              0.8
+
+                                                                                                                                                                                           1.1
+
+                                                                                                                                                                                                        1.1
+
+
+
+
+                                                                                                                                                                                                                     1.7
+
+                                                                                                                                                                                                                                2.0
+
+                                                                                                                                                                                                                                           2.0
+
+
+
+
+                                                                                                                                                                                                                                                           1.0
+
+                                                                                                                                                                                                                                                                       1.1
+
+                                                                                                                                                                                                                                                                                   1.1
+                                                                                                                              2
+Table 4. End-to-end latency comparison for different models                                                                   0
+                                                                                                                                         8        8  2                             8         8   2       8     8  2                                           8          8   2
+                                                                                                                                                12 51                                      12 51             12 51                                                     12 51
+with 1.5K input length and 256 output length on PC-High.                                                                                                                                       Output length
+
+           LLMs                                            llama.cpp (ms) PowerInfer (ms)        Speedup       Figure 13. Speedup of different models on PC-High and PC-Low
+  LLaMA(ReGLU)-13B-FP16                                         49.91         14.38               3.47×        in INT4 format. The upper row of the figure presents perfor-
+   Falcon(ReLU)-40B-FP16                                       321.63         56.48               5.69×
+  LLaMA(ReGLU)-70B-FP16                                         92.76         37.17               2.50×        mance on PC-High, while the lower row details those on
+                                                                                                               PC-Low.
+
+   Figure 12 presents the distribution of neuron loads be-                                                                                                                         llama.cpp                                PowerInfer
+                                                                                                                                                                     40
+tween the CPU and GPU for both PowerInfer and llama.cpp.                                                                                                             32
+                                                                                                                                                                                                                                      4.69X           4.38X
+                                                                                                                                                                                                                    4.85X
+
+
+
+
+                                                                                                                                                         Tokens/s
+Neuron loads refer to the proportion of activated neuron                                                                                                             24                                 5.73X
+
+computations carried out by each processing unit. Notably,                                                                                                           16            11.69X
+                                                                                                                                                                         8
+on PC-High, PowerInfer significantly increases the GPU’s                                                                                                                 0
+share of neuron load, from an average of 20% to 70%. This                                                                                                                            1                       4       8                16              32
+                                                                                                                                                                                                               Batch size
+indicates that the GPU processes 70% of activated neurons.
+However, in cases where the model’s memory requirements                                                        Figure 14. Batch inference speedup of Falcon-40B on PC-High. The
+                                                                                                               X axis indicates the request batch size, the Y axis represents the
+far exceed the GPU’s capacity, such as running a 60GB model
+                                                                                                               end-to-end token generation speed (tokens/s). The number above
+on an 11GB 2080Ti GPU, the GPU’s neuron load is reduced                                                        each bar shows the speedup compared with llama.cpp.
+to 42%. This decrease is due to the GPU’s limited memory,
+which is insufficient to host all hot-activated neurons, neces-
+sitating that the CPU compute a portion of these neurons.                                                      Inference with Quantization. Figure 13 illustrates that
+Inference with different input length. In scenarios in-                                                        PowerInfer effectively supports LLMs that are compressed
+volving long input prompts with extremely short output                                                         using INT4 quantization. We fail to run SpecInfer with INT4
+lengths (less than 8 tokens), which are less common [35],                                                      quantization due to the lack of support. On a high-end PC
+PowerInfer demonstrates limited performance gains, ranging                                                     (PC-High), PowerInfer delivers responses at an average speed
+from 1.07× (Figure 11) to 4× (Figure 10). In such situations,                                                  of 13.20 tokens/s, reaching a peak of 29.08 tokens/s. The av-
+the prompt phase, where a substantial number of tokens                                                         erage speedup achieved compared with llama.cpp is 2.89×,
+are processed simultaneously, becomes a crucial factor in                                                      with a maximum of 4.28×. On a lower-end setup (PC-Low),
+determining inference speed. This results in each token ac-                                                    the average speedup is 5.01×, peaking at 8.00×. The reduc-
+tivating a unique set of neurons, substantially diminishing                                                    tion in memory requirements due to quantization enables
+activation sparsity. As a consequence, the CPU becomes the                                                     PowerInfer to more efficiently manage larger models. For
+primary bottleneck in the inference process, tasked with                                                       instance, in our experiment with the OPT-175B model on
+processing a considerable number of cold-activated neurons                                                     PC-High, PowerInfer nearly reaches two tokens per second,
+but constrained by its computational capabilities.                                                             surpassing llama.cpp by a factor of 2.66×.
+   For relatively long input sequences, PowerInfer still                                                       Batching Inference. We also evaluate the end-to-end infer-
+achieves a 3.47× to 5.69× speedup, as shown in Table 4.                                                        ence performance of PowerInfer with different batch sizes, as
+This is because when the input sequence is lengthy, all neu-                                                   shown in Figure 14. PowerInfer demonstrates a significant ad-
+rons are activated collectively by the input tokens. In this                                                   vantage when the batch size is smaller than 32, achieving an
+case, PowerInfer switches to dense GPU computation during                                                      average 6.08× improvement in performance compared with
+the prefill stage, resulting in prefill latency comparable to                                                  llama.cpp. As the batch size increases, the speed-up ratio of-
+llama.cpp. During the generation phase, where only one to-                                                     fered by PowerInfer decreases. This reduction is attributed to
+ken is processed at a time, sparsity emerges in each inference                                                 the diminished sparsity of model joint activations. However,
+step. Here, PowerInfer leverages its hybrid engine to achieve                                                  even with the batch size set to 32, PowerInfer still maintains
+significant acceleration.                                                                                      a considerable speedup, achieving a 4.38× speedup.
+SOSP ’24, November 4–6, 2024, Austin, TX, USA                                                                     Yixin Song, Zeyu Mi, Haotong Xie and Haibo Chen
+
+
+          llama.cpp       +PO        +Engine        +Policy          Table 5. Generation latency (ms) distribution on various
+              12
+              10
+          Speedup                                                    Tasks.
+               8
+               6
+                                                                                                                  STEM      HumanEval           Roleplay Table-Extraction
+               4
+               2                                                                                     Avg.         38.05         36.71            37.08                  37.42
+                                                                                           Bamboo-7B
+               0                                                                                      P95         40.75         40.48            40.61                  40.74
+                         Bamboo-7B             Falcon-40B                                  on PC-Low
+                                                                                                      P99         42.33         42.37            43.87                  42.93
+Figure 15. Performance breakdown for each component of PowerIn-
+fer. The Falcon-40B is running on PC-High and Bamboo-7B is running
+                                                                                                   Dense           PowerInfer                   Dense          PowerInfer
+on PC-Low.
+
+
+
+
+                                                                     Execution Time (ms)
+                                                                                           PyTorch sparse                                         PIT
+                                                                                             3
+                                                                                           2.5                                       0.3
+8.3   Ablation Studies                                                                       2
+                                                                                           1.5                                       0.2
+                                                                                             1
+8.3.1 Performance Breakdown Figure 15 breaks down                                          0.5
+                                                                                                                                     0.1
+                                                                                             0                                          0
+the contributions of each PowerInfer component to the over-                                      0    0.2   0.4   0.6     0.8    1          0    0.2     0.4      0.6       0.8   1
+all performance speedup. Using a step-by-step integration                                            Sparse operator on CPU                     Sparse operator on GPU
+method, we progressively incorporate PowerInfer features
+                                                                     Figure 16. Comparing Neuron-aware operator with different sparse
+into llama.cpp. First, we add PowerInfer’s predictors and            operators on PC-Low. The X axis indicates the sparsity level, the Y
+neuron-aware operators into llama.cpp (labeled "+PO"), en-           axis represents the execution time (ms).
+abling computation of only activated neurons on both GPU
+and CPU. Yet, +PO still adheres to layer-wise computation,           PowerInfer exhibits a highly consistent inter-token genera-
+where each layer is processed entirely by either GPU or CPU.         tion latency across different tasks, with only a 10% difference
+   Building on +PO, we introduce PowerInfer’s hybrid in-             between the P95 latency and the average. It is due to Power-
+ference engine (denoted "+Engine"), which allows neuron-             Infer’s policy that places the general hot neurons on GPU.
+aware operators to process neurons within the same layer             This fluctuation is caused by the sparsity variation of dif-
+simultaneously on both GPU and CPU. +Engine uses a naive             ferent tokens from 80% to 86%. When encountering tokens
+neuron partitioning policy that assigns neurons randomly to          with lower sparsity, the computation introduces 10% more
+the GPU. The final step involves integrating our optimized           latency compared with the average.
+policy ("+Policy"), formulated by the offline solver as de-
+scribed in §6, into the +Engine setup, showcasing the full           8.3.3 Neuron-aware Operator Performance This sec-
+capabilities of PowerInfer.                                          tion evaluates the performance of PowerInfer’s sparse oper-
+   The initial integration of +PO into llama.cpp yields per-         ators on both CPU and GPU across various sparsity levels.
+formance boosts of 1.87× and 3.32× for Bamboo-7B and                 We benchmark PowerInfer against leading sparse libraries:
+Falcon-40B, respectively, primarily by reducing unnecessary          for CPU benchmarks, we use PyTorch sparse, the state-of-
+inactive neurons. +Engine further escalates these gains to           the-art sparse kernels within PyTorch, as our baseline. In
+2.60× and 7.80×, thanks to precise neuron placement and              GPU, PowerInfer is compared with PIT [63]. Given that the
+intra-layer calculations that significantly increase the GPU’s       sparsity in LLMs is typically based on neuron granularity,
+computational share. Finally, incorporating +Policy results          our experiments are specifically designed to evaluate sparse
+in improvements of 3.62× and 11.69×. The enhancement                 matrices of this nature. We focus on sparse matrix-vector
+achieved by our policy lies in its ability to finely balance the     multiplication using a [4096, 4096] × [4096, 1] configura-
+intra-layer communication overhead. The naive partitioning           tion, a common setup in local LLM inference [7]. To adjust
+policy in +Engine overlooks the hotness of neurons and the           sparsity, we introduce zero values to matrix rows.
+GPU-CPU intra-layer communication, often offsetting the                 Figure 16 shows that PowerInfer’s operator achieves
+benefits of assigning high-frequency activation neurons to           nearly linear acceleration with increasing sparsity levels,
+the GPU. Conversely, our policy in PowerInfer more adeptly           a stark contrast to dense matrix computations. On the CPU,
+balances processing loads and communication costs between            traditional sparse operators do not outperform dense com-
+the CPU and GPU.                                                     putation until sparsity surpasses 87%. However, PowerIn-
+                                                                     fer’s CPU operator outperforms dense matrix multiplication
+8.3.2 Generation Latency Analysis In this section, we                even at sparsity levels below 10%. For the GPU, PowerInfer
+investigate the robustness of PowerInfer’s speedup across            matches PIT in performance. Its primary advantage, how-
+different tasks and inter-token generation latency distritbu-        ever, is its unified CPU-GPU framework. This design allows
+tion. We sample from the most representative tasks on the            for flexible execution of sparse operators on both processing
+Hugging Face community, including STEM, coding, roleplay-            units, unlike PIT, which is optimized solely for GPU-based
+ing and information extraction. We measure the inter-token           sparse matrix multiplication and does not support hybrid
+generation latency distribution across different tasks. Table 5      CPU-GPU environments.
+presents the evaluation results of Bamboo-7B on PC-Low.
+PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU                                                                            SOSP ’24, November 4–6, 2024, Austin, TX, USA
+
+
+                                                                                                                    Table 7. Comparison of LLM accuracy between PowerInfer-
+                                                      Inference          Prediction
+                    Breakdown (%)
+
+
+                                    100                                                                             optimized models (termed as "model-PowerInfer") and their
+                                     80
+                                     60                                                                             original counterparts. Arc-Challenge [11] is a dataset for
+                                     40                                                                             evaluating AI systems’ comprehension and reasoning in nat-
+                                     20
+                                      0         OPT-7B             OPT-13B            OPT-30B(INT4)    OPT-30B
+                                                                                                                    ural language. MMLU [21] benchmarks model performance
+                                                                                                                    across various domains. PIQA [5] and Winogrande [41] as-
+Figure 17. End-to-end prediction overhead of PowerInfer on PC-
+                                                                                                                    sess common sense reasoning and understanding of physical
+Low. The Y-axis displays the percentage breakdown between
+                                                                                                                    interactions in LLMs.
+predictor overhead and LLM inference time.
+                                                                                                                                                   PIQA     Winogrande    Arc-Challenge MMLU      GSM8K     Average
+Table 6. Predictor parameter sizes and ratios for various                                                                      OPT-7B              75.78%     65.19%            30.63%   24.95%   1.90%     39.69%
+                                                                                                                          OPT-7B-PowerInfer        75.67%     65.51%            30.63%   24.73%   1.82%     39.67%
+LLMs. The predictor ratio represents the percentage of pre-                                                                    OPT-13B             76.01%     64.96%            32.94%   25.02%   2.12%     40.21%
+dictor parameters relative to the original model parameters.                                                              OPT-13B-PowerInfer       76.28%     65.98%            33.19%   24.76%   2.20%     40.48%
+
+ Model                                                OPT-13B OPT-66B        Falcon(ReLU)-40B    LLaMA(ReGLU)-70B        LLaMA(ReGLU)-13B          76.44%     70.09%            36.52%   50.21%   25.40%    51.73%
+                                                                                                                     LLaMA(ReGLU)-13B-PowerInfer   74.06%     69.93%            36.60%   49.47%   23.90%    50.79%
+ Predictor-params                                      0.88B   3.23B               3.63B              5.66B
+ Predictor-ratio(%)                                    6.71%   4.88%               8.68%              8.08%                    Falcon-40B          81.23%     75.45%            50.68%   51.78%   21.99%    56.23%
+                                                                                                                         Falcon-40B-PowerInfer     81.01%     75.92%            50.68%   51.68%   20.45%    55.95%
+                                                                                                                         LLaMA(ReGLU))-70B         82.01%     75.93%            52.39%   62.30%   62.30%    66.99%
+                                    llama.cpp(4090)          PowerInfer(4090)               vLLM(A100)               LLAMA(ReGLU)-70B-PowerInfer   82.05%     75.53%            51.45%   61.90%   61.90%    66.57%
+                    30
+ Average tokens/s
+
+
+
+
+                                          18%                                    28%
+                    20
+                                                             23%                                      29%
+                                                                                                                    Table 8. Generation speed (tokens/s) comparison for
+                    10
+                                       93%
+                                                           92%
+                                                                                93%
+                                                                                                 94%
+                                                                                                                    SwiGLU and ReLU-based LLMs.
+                                                                                                                     Setting                  Model              PowerInfer llama.cpp Speedup
+                        0
+                                          OPT-30B           Falcon-40B           OPT-30B          Falcon-40B         PC-High         Yi(SwiGLU)-34B                      1.7             1.0               1.7×
+                                          (a) Input length = 1                  (b) Input length = 64                PC-Low       LLaMA(SwiGLU)-2-13B                    3.1             2.1               1.5×
+                                                                                                                     PC-High             OPT-30B                         12.0            1.1              10.9×
+Figure 18. Generation speed of NVIDIA RTX 4090 compared with
+single A100. The X axis represents various models, while the                                                        input lengths of 1 and 64 to measure pure generation speed
+Y axis represents generation speed (tokens/s) under various                                                         and conversational interactions, respectively.
+inference framework. The percentages within the arrows                                                                 Figure 18a demonstrates that PowerInfer significantly nar-
+represent the slowdown relative to vLLM on the A100.                                                                rows the performance gap between the NVIDIA 4090 and
+                                                                                                                    A100 in generation tasks with input length 1. On PC-High,
+8.3.4 Predictor Overhead The execution time of the on-                                                              llama.cpp lags behind vLLM on the A100 by 93% and 92%
+line predictors for different models is also measured, as de-                                                       for OPT-30B and Falcon-40B, respectively, but PowerInfer
+picted in Figure 17. On average, the execution of predictors                                                        reduces this to 18% and 23%. Figure 18b shows that despite
+constitutes less than 10% of the total inference time in Pow-                                                       reduced cumulative sparsity in the prompt phase, PowerInfer
+erInfer. The execution time of predictors correlates directly                                                       still reduces the performance gap to 28% and 29%. The re-
+with the predictor sizes, which, as shown in Table 6, com-                                                          maining disparity mainly stems from the CPU’s considerable
+prise only 7.09% of the model weights. The efficiency of these                                                      computational load, which has become a bottleneck.
+predictors stems from adaptive construction methods that                                                            8.4 SiLU-based LLM Performance
+minimize both size and computational load. Furthermore,
+                                                                                                                    While PowerInfer demonstrates remarkable speedups on
+PowerInfer integrates these predictors into its solver for
+                                                                                                                    ReLU-based models due to their high activation sparsity, it
+neuron placement decisions, preferentially allocating them
+                                                                                                                    also shows effectiveness in accelerating SiLU-based mod-
+to GPUs. This strategy exploits the parallel processing ca-
+                                                                                                                    els. Our evaluation of SiLU-based LLMs, as presented in
+pabilities of GPUs, further reducing the runtime overhead
+                                                                                                                    Table 8, reveals that PowerInfer achieves a speedup of 1.47×
+associated with prediction.
+                                                                                                                    to 1.7×. This performance gain, albeit less pronounced than
+8.3.5 Performance Comparison with A100 In our                                                                       for ReLU-based counterparts (like OPT-30B in Table 8), un-
+study, we analyze the extent to which PowerInfer reduces                                                            derscores the efficacy of PowerInfer’s sparse computation
+the performance gap between a consumer-grade GPU and                                                                mechanisms across different activation functions. The com-
+its top-tier server-grade counterpart. Therefore, we evaluate                                                       paratively lower speedup can be attributed to the reduced
+the generation speed of PowerInfer, deployed on PC-High, in                                                         sparsity in SiLU-based models, where a larger proportion of
+comparison to the performance of llama.cpp and vLLM [23]                                                            neurons remain active during inference. Consequently, CPU
+executed on a single 80GB NVIDIA A100 GPU. We chose                                                                 computation emerges as a potential bottleneck in these sce-
+the OPT-30B and Falcon-40B models for comparison, consid-                                                           narios. The speedup observed in SiLU models indicates that
+ering their exact memory requirements matching precisely                                                            the effectiveness of PowerInfer’s acceleration is correlated
+with the capacity of the A100 GPU. Our evaluation used                                                              with the extent of the model’s sparsity.
+SOSP ’24, November 4–6, 2024, Austin, TX, USA                                                 Yixin Song, Zeyu Mi, Haotong Xie and Haibo Chen
+
+
+Table 9. Performance comparison between SLM (Qwen-1.5-                     SparTA [64] leverages both sparse tensor and SIMT cores by
+4B) and PowerInfer (Bamboo-7B).                                            dividing sparse matrices. Flash-LLM [54] introduces a "Load-
+ Model                  TBT(ms)   Average(%) MMLU(%) GSM8K(%)   ARC-C(%)   as-Sparse and Compute-as-Dense" approach for tensor core
+ Qwen1.5-4B              10.83      52.23    55.26     53.9      47.53     SpMM. However, these methods, orthogonal to LLMs’ in-
+ Bamboo-7B-PowerInfer    11.85      65.65    62.26     70.54     64.16
+ Bamboo-7B-dense         18.54      65.49    62.46     70.28     63.74     trinsic sparse activations, usually incur accuracy losses and
+                                                                           wall-clock model acceleration challenges [34]. In contrast,
+8.5 LLM Accuracy                                                           PowerInfer uses natural sparse activations to maintain per-
+Since PowerInfer selectively omits neurons predicted to be                 formance and efficiency.
+inactive, we investigated whether this approach affects the                   LLM Attention Sparsity: PowerInfer leverages the
+inference accuracy of LLMs, focusing on models using ReLU                  sparse activation characteristics of MLP layers. It’s worth
+or related activation functions. Table 7 compares the accu-                noting that attention blocks also exhibit sparsity, which pri-
+racy of models from the OPT, Falcon (ReLU), and LLaMA2                     marily stems from two sources: attention heads, where only
+(ReGLU) families, both with and without differentiating acti-              some need computation for the current token [28], and spar-
+vated/inactivated neurons, across a variety of representative              sity within heads, where unimportant KV cache is pruned
+downstream tasks. The results show that PowerInfer causes                  or offloaded to alleviate memory-bound bottleneck of LLMs
+negligible loss in inference accuracy, regardless of the model             serving, as in H2o [60] and InfiniGen [25]. The sparse activa-
+size or type of task, consistent with previous research find-              tions used by PowerInfer are orthogonal to attention sparsity
+ings [28]. Although the predictors in each Transformer layer               and can further reduce inference latency.
+maintain an accuracy rate above 95%, they may occasionally                    Speculative LLM Inference: Speculative inference [7, 8,
+miss some active neurons. As a result, there are minor fluc-               16, 52] can also be leveraged to serve models exceeding GPU
+tuations in LLM accuracy, leading to slight fluctuations in                memory, which uses a smaller model to pre-decode tokens,
+performance on specific downstream tasks.                                  later validated by the main model in a batch. SpecInfer [33]
+   We further analyze the nature and impact of mispredicted                effectively reduces the number of LLM decoding steps. While
+neurons on inference accuracy. Our investigation reveals                   separate from our focus, integrating speculative inference
+that neurons mispredicted by the predictor typically have                  into PowerInfer could further boost LLM inference speed.
+minimal influence on the layer’s output. This characteristic                  LLM-Specific Serving Optimizations: There are many
+makes these neurons more susceptible to misprediction, as                  ML serving systems [18] for general ML models. The promi-
+their activation or non-activation has little effect on the over-          nence of Transformers has led to specialized serving sys-
+all result. To quantify this impact, we conducted an analysis              tems [9, 12, 22, 42, 65]. Orca [57] introduces iteration-level
+on the OPT-7B model. By comparing the cosine similarity                    scheduling. vLLM [23] implements PagedAttention for to-
+between outputs from original dense computations and our                   ken storage in varied GPU memory addresses, overcoming
+predictor-based computations, we found that mispredictions                 KV cache’s continuous storage limit. These methods do not
+only affect results by approximately 0.4%. This minimal dif-               address the challenge of deploying models on PCs where the
+ference further supports our observation that PowerInfer                   entire model cannot fit within the GPU memory.
+maintains the accuracy of the original model, despite the
+occasional misprediction of neurons.
+                                                                           10    Conclusion
+   Comparison with Smaller Language Models. To bet-                        PowerInfer is a fast inference system optimized for LLMs
+ter understand PowerInfer’s performance gains, we com-                     that exploits the locality property in LLM inference. It utilizes
+pare it with a common acceleration approach: using smaller                 adaptive predictors and neuron-aware operators for neuron
+language models (SLMs). However, the SLM approach of-                      activation and computational sparsity. PowerInfer achieves
+ten comes at the cost of reduced model accuracy. To fully                  up to 11.69× faster LLM inference compared to systems like
+understand the benefits of PowerInfer, we compare its per-                 llama.cpp, without compromising accuracy.
+formance using a larger model to that of a state-of-the-art
+                                                                           11    Acknowledgments
+SLM, evaluating both speed and accuracy. Table 9 shows
+that the Bamboo-7B model outperforms the Qwen-1.5-4B (a                    We sincerely thank our shepherd Shivaram Venkataraman
+state-of-the-art 4B model) across various tasks, and Power-                and anonymous reviewers for their insightful suggestions.
+Infer (Bamboo-7B-PowerInfer) maintains the original dense                  We are deeply grateful to Rong Chen and Yubin Xia for their
+model’s accuracy while achieving 4B-level decoding speed.                  comprehensive and constructive feedback, which greatly
+                                                                           enhanced the quality of this paper. This work was par-
+9    Related Work                                                          tially supported by National Key R&D Program of China
+LLM Weight Sparsity: Model pruning [19, 20, 31] re-                        (2023YFB4503702) and NSFC (No. 62372287 and 61925206).
+duces parameters by setting weights to zero, as seen in                    Zeyu Mi (yzmizeyu@sjtu.edu.cn) is the corresponding au-
+SparseGPT [14] and Wanda [49], achieving 50% sparsity.                     thor.
+PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU                                   SOSP ’24, November 4–6, 2024, Austin, TX, USA
+
+
+References                                                                           https://lmsys.org/blog/2023-11-21-lookahead-decoding/
+                                                                                [17] Georgi Gerganov. 2023. ggerganov/llama.cpp: Port of Facebook’s
+ [1] Bo Adler, Niket Agarwal, Ashwath Aithal, Dong H Anh, Pallab Bhat-               LLaMA model in C/C++. https://github.com/ggerganov/llama.cpp.
+     tacharya, Annika Brundyn, Jared Casper, Bryan Catanzaro, Sharon            [18] Arpan Gujarati, Reza Karimi, Safya Alzayat, Wei Hao, Antoine Kauf-
+     Clay, Jonathan Cohen, et al. 2024. Nemotron-4 340B Technical Report.            mann, Ymir Vigfusson, and Jonathan Mace. 2020. Serving DNNs like
+     arXiv preprint arXiv:2406.11704 (2024).                                         Clockwork: Performance Predictability from the Bottom Up. In 14th
+ [2] Abien Fred Agarap. 2018. Deep learning using rectified linear units             USENIX Symposium on Operating Systems Design and Implementation
+     (relu). arXiv preprint arXiv:1803.08375 (2018).                                 (OSDI 20). USENIX Association, 443–462. https://www.usenix.org/
+ [3] Ebtesam Almazrouei, Hamza Alobeidli, Abdulaziz Alshamsi, Alessan-               conference/osdi20/presentation/gujarati
+     dro Cappelli, Ruxandra Cojocaru, Merouane Debbah, Etienne Goffinet,        [19] Song Han, Huizi Mao, and William J Dally. 2015. Deep compression:
+     Daniel Heslow, Julien Launay, Quentin Malartic, Badreddine Noune,               Compressing deep neural networks with pruning, trained quantization
+     Baptiste Pannier, and Guilherme Penedo. 2023. Falcon-40B: an open               and huffman coding. arXiv preprint arXiv:1510.00149 (2015).
+     large language model with state-of-the-art performance. (2023).            [20] Song Han, Jeff Pool, John Tran, and William J. Dally. 2015. Learn-
+ [4] Reza Yazdani Aminabadi, Samyam Rajbhandari, Ammar Ahmad Awan,                   ing Both Weights and Connections for Efficient Neural Networks. In
+     Cheng Li, Du Li, Elton Zheng, Olatunji Ruwase, Shaden Smith, Minjia             Proceedings of the 28th International Conference on Neural Information
+     Zhang, Jeff Rasley, et al. 2022. DeepSpeed-inference: enabling efficient        Processing Systems - Volume 1 (Montreal, Canada) (NIPS’15). MIT Press,
+     inference of transformer models at unprecedented scale. In SC22: In-            Cambridge, MA, USA, 1135–1143.
+     ternational Conference for High Performance Computing, Networking,         [21] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas
+     Storage and Analysis. IEEE, 1–15.                                               Mazeika, Dawn Song, and Jacob Steinhardt. 2021. Measuring Massive
+ [5] Yonatan Bisk, Rowan Zellers, Jianfeng Gao, Yejin Choi, et al. 2020.             Multitask Language Understanding. Proceedings of the International
+     Piqa: Reasoning about physical commonsense in natural language. In              Conference on Learning Representations (ICLR) (2021).
+     Proceedings of the AAAI conference on artificial intelligence, Vol. 34.    [22] Alind Khare, Dhruv Garg, Sukrit Kalra, Snigdha Grandhi, Ion Sto-
+     7432–7439.                                                                      ica, and Alexey Tumanov. 2023. SuperServe: Fine-Grained Inference
+ [6] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D                  Serving for Unpredictable Workloads. arXiv:2312.16733 [cs.DC]
+     Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish        [23] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+     Sastry, Amanda Askell, et al. 2020. Language models are few-shot                Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Sto-
+     learners. Advances in neural information processing systems 33 (2020),          ica. 2023. Efficient Memory Management for Large Language Model
+     1877–1901.                                                                      Serving with PagedAttention. In Proceedings of the 29th Symposium
+ [7] Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, and Tri Dao.                on Operating Systems Principles (Koblenz, Germany) (SOSP ’23). As-
+     2023. Medusa: Simple Framework for Accelerating LLM Generation                  sociation for Computing Machinery, New York, NY, USA, 611–626.
+     with Multiple Decoding Heads. https://github.com/FasterDecoding/                https://doi.org/10.1145/3600006.3613165
+     Medusa.                                                                    [24] Je-Yong Lee, Donghyun Lee, Genghan Zhang, Mo Tiwari, and Aza-
+ [8] Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste                lia Mirhoseini. 2024. CATS: Contextually-Aware Thresholding for
+     Lespiau, Laurent Sifre, and John Jumper. 2023.               Accelerat-         Sparsity in Large Language Models. arXiv preprint arXiv:2404.08763
+     ing Large Language Model Decoding with Speculative Sampling.                    (2024).
+     arXiv:2302.01318 [cs.CL]                                                   [25] Wonbeom Lee, Jungi Lee, Junghwan Seo, and Jaewoong Sim. 2024. In-
+ [9] Lequn Chen, Zihao Ye, Yongji Wu, Danyang Zhuo, Luis Ceze, and                   finiGen: Efficient Generative Inference of Large Language Models with
+     Arvind Krishnamurthy. 2023. Punica: Multi-tenant lora serving. arXiv            Dynamic KV Cache Management. In 18th USENIX Symposium on Op-
+     preprint arXiv:2310.18547 (2023).                                               erating Systems Design and Implementation (OSDI 24). USENIX Associ-
+[10] Byung-Gon Chun, Sunghwan Ihm, Petros Maniatis, Mayur Naik, and                  ation, Santa Clara, CA, 155–172. https://www.usenix.org/conference/
+     Ashwin Patti. 2011. CloneCloud: elastic execution between mobile                osdi24/presentation/lee
+     device and cloud. In Proceedings of the Sixth Conference on Computer       [26] Zonglin Li, Chong You, Srinadh Bhojanapalli, Daliang Li, Ankit Singh
+     Systems (Salzburg, Austria) (EuroSys ’11). Association for Computing            Rawat, Sashank J Reddi, Ke Ye, Felix Chern, Felix Yu, Ruiqi Guo, et al.
+     Machinery, New York, NY, USA, 301–314. https://doi.org/10.1145/                 2022. The Lazy Neuron Phenomenon: On Emergence of Activation
+     1966445.1966473                                                                 Sparsity in Transformers. In The Eleventh International Conference on
+[11] Peter Clark, Isaac Cowhey, Oren Etzioni, Tushar Khot, Ashish Sabhar-            Learning Representations.
+     wal, Carissa Schoenick, and Oyvind Tafjord. 2018. Think you have           [27] Peiyu Liu, Zikang Liu, Ze-Feng Gao, Dawei Gao, Wayne Xin Zhao,
+     Solved Question Answering? Try ARC, the AI2 Reasoning Challenge.                Yaliang Li, Bolin Ding, and Ji-Rong Wen. 2023. Do Emergent Abili-
+     arXiv:1803.05457v1 (2018).                                                      ties Exist in Quantized Large Language Models: An Empirical Study.
+[12] Jiarui Fang, Yang Yu, Chengduo Zhao, and Jie Zhou. 2021. TurboTrans-            arXiv:2307.08072 [cs.CL]
+     formers: an efficient GPU serving system for transformer models. In        [28] Zichang Liu, Jue Wang, Tri Dao, Tianyi Zhou, Binhang Yuan, Zhao
+     Proceedings of the 26th ACM SIGPLAN Symposium on Principles and                 Song, Anshumali Shrivastava, Ce Zhang, Yuandong Tian, Christopher
+     Practice of Parallel Programming. 389–402.                                      Re, and Beidi Chen. 2023. Deja Vu: Contextual Sparsity for Efficient
+[13] Wikimedia Foundation. 2024. Wikimedia Downloads. https://                       LLMs at Inference Time. In Proceedings of the 40th International Confer-
+     dumps.wikimedia.org.                                                            ence on Machine Learning (Proceedings of Machine Learning Research,
+[14] Elias Frantar and Dan Alistarh. 2023. SparseGPT: Massive Lan-                   Vol. 202), Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara
+     guage Models Can Be Accurately Pruned in One-Shot. arXiv preprint               Engelhardt, Sivan Sabato, and Jonathan Scarlett (Eds.). PMLR, 22137–
+     arXiv:2301.00774 (2023).                                                        22176. https://proceedings.mlr.press/v202/liu23am.html
+[15] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. 2022.    [29] Hanjia Lyu, Song Jiang, Hanqing Zeng, Qifan Wang, Si Zhang, Ren
+     GPTQ: Accurate Post-training Compression for Generative Pretrained              Chen, Chris Leung, Jiajie Tang, Yinglong Xia, and Jiebo Luo. 2023. LLM-
+     Transformers. arXiv preprint arXiv:2210.17323 (2022).                           Rec: Personalized Recommendation via Prompting Large Language
+[16] Yichao Fu, Peter Bailis, Ion Stoica, and Hao Zhang. 2023. Breaking the          Models. arXiv:2307.15780 [cs.CL]
+     Sequential Dependency of LLM Inference Using Lookahead Decoding.
+SOSP ’24, November 4–6, 2024, Austin, TX, USA                                                        Yixin Song, Zeyu Mi, Haotong Xie and Haibo Chen
+
+
+[30] Xinyin Ma, Gongfan Fang, and Xinchao Wang. 2023. LLM-Pruner:              [49] Mingjie Sun, Zhuang Liu, Anna Bair, and J. Zico Kolter. 2023. A Simple
+     On the Structural Pruning of Large Language Models. arXiv preprint             and Effective Pruning Approach for Large Language Models. arXiv
+     arXiv:2305.11627 (2023).                                                       preprint arXiv:2306.11695 (2023).
+[31] Xinyin Ma, Gongfan Fang, and Xinchao Wang. 2023. LLM-Pruner:              [50] Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen
+     On the Structural Pruning of Large Language Models. In Advances in             Li, Carlos Guestrin, Percy Liang, and Tatsunori B. Hashimoto. 2023.
+     Neural Information Processing Systems.                                         Stanford Alpaca: An Instruction-following LLaMA model. https://
+[32] Iván Martínez Toro, Daniel Gallego Vico, and Pablo Orgaz. 2023. Pri-           github.com/tatsu-lab/stanford_alpaca.
+     vateGPT. https://github.com/imartinez/privateGPT                          [51] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-
+[33] Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Zeyu                 Anne Lachaux, Timothée Lacroix, Baptiste Rozière, Naman Goyal, Eric
+     Wang, Rae Ying Yee Wong, Alan Zhu, Lijie Yang, Xiaoxiang Shi, Chu-             Hambro, Faisal Azhar, et al. 2023. Llama: Open and efficient foundation
+     nan Shi, Zhuoming Chen, Daiyaan Arfeen, Reyna Abhyankar, and                   language models. arXiv preprint arXiv:2302.13971 (2023).
+     Zhihao Jia. 2023. SpecInfer: Accelerating Generative Large Language       [52] Yiding Wang, Kai Chen, Haisheng Tan, and Kun Guo. 2023. Tabi: An
+     Model Serving with Speculative Inference and Token Tree Verification.          Efficient Multi-Level Inference System for Large Language Models. In
+     arXiv:2305.09781 [cs.CL]                                                       Proceedings of the Eighteenth European Conference on Computer Systems
+[34] Iman Mirzadeh, Keivan Alizadeh, Sachin Mehta, Carlo C Del Mundo,               (Rome, Italy) (EuroSys ’23). Association for Computing Machinery, New
+     Oncel Tuzel, Golnoosh Samei, Mohammad Rastegari, and Mehrdad                   York, NY, USA, 233–248. https://doi.org/10.1145/3552326.3587438
+     Farajtabar. 2023. ReLU Strikes Back: Exploiting Activation Sparsity in    [53] Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond,
+     Large Language Models. arXiv:2310.04564 [cs.LG]                                Clement Delangue, Anthony Moi, Pierric Cistac, Tim Rault, Rémi Louf,
+[35] MohamedRashad. 2023.                https://huggingface.co/datasets/           Morgan Funtowicz, Joe Davison, Sam Shleifer, Patrick von Platen,
+     MohamedRashad/ChatGPT-prompts.                                                 Clara Ma, Yacine Jernite, Julien Plu, Canwen Xu, Teven Le Scao, Syl-
+[36] NVIDIA. 2021.         Unified Memory Programming.              https://        vain Gugger, Mariama Drame, Quentin Lhoest, and Alexander M. Rush.
+     docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#um-                   2020. Transformers: State-of-the-Art Natural Language Processing.
+     unified-memory-programming-hd.                                                 In Proceedings of the 2020 Conference on Empirical Methods in Natural
+[37] NVIDIA. 2023. cuSPARSE: Basic Linear Algebra for Sparse Matrices               Language Processing: System Demonstrations. Association for Computa-
+     on NVIDIA GPUs. https://developer.nvidia.com/cusparse.                         tional Linguistics, Online, 38–45. https://www.aclweb.org/anthology/
+[38] OpenAI. 2023. https://openai.com/blog/chatgpt.                                 2020.emnlp-demos.6
+[39] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan           [54] Haojun Xia, Zhen Zheng, Yuchao Li, Donglin Zhuang, Zhongzhu Zhou,
+     Narang, Michael Matena, Yanqi Zhou, Wei Li, and Peter J Liu. 2020.             Xiafei Qiu, Yong Li, Wei Lin, and Shuaiwen Leon Song. 2023. Flash-
+     Exploring the limits of transfer learning with a unified text-to-text          LLM: Enabling Cost-Effective and Highly-Efficient Large Generative
+     transformer. The Journal of Machine Learning Research 21, 1 (2020),            Model Inference with Unstructured Sparsity. arXiv:2309.10285 [cs.DC]
+     5485–5551.                                                                [55] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and
+[40] Prajit Ramachandran, Barret Zoph, and Quoc V Le. 2017. Searching               Song Han. 2023. Smoothquant: Accurate and efficient post-training
+     for activation functions. arXiv preprint arXiv:1710.05941 (2017).              quantization for large language models. In International Conference on
+[41] Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavatula, and Yejin               Machine Learning. PMLR, 38087–38099.
+     Choi. 2021. Winogrande: An adversarial winograd schema challenge          [56] Zhenliang Xue, Yixin Song, Zeyu Mi, Le Chen, Yubin Xia, and Haibo
+     at scale. Commun. ACM 64, 9 (2021), 99–106.                                    Chen. 2024. PowerInfer-2: Fast Large Language Model Inference on a
+[42] Ying Sheng, Shiyi Cao, Dacheng Li, Coleman Hooper, Nicholas Lee,               Smartphone. arXiv preprint arXiv:2406.06282 (2024).
+     Shuo Yang, Christopher Chou, Banghua Zhu, Lianmin Zheng, Kurt             [57] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and
+     Keutzer, Joseph E. Gonzalez, and Ion Stoica. 2023. S-LoRA: Serving             Byung-Gon Chun. 2022. Orca: A Distributed Serving System for
+     Thousands of Concurrent LoRA Adapters. arXiv:2311.03285 [cs.LG]                Transformer-Based Generative Models. In 16th USENIX Symposium on
+[43] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin,             Operating Systems Design and Implementation (OSDI 22). USENIX Asso-
+     Beidi Chen, Percy Liang, Christopher Re, Ion Stoica, and Ce Zhang.             ciation, Carlsbad, CA, 521–538. https://www.usenix.org/conference/
+     2023. FlexGen: High-Throughput Generative Inference of Large Lan-              osdi22/presentation/yu
+     guage Models with a Single GPU. (2023).                                   [58] Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen,
+[44] Chenyang Song, Xu Han, Zhengyan Zhang, Shengding Hu, Xiyu Shi,                 Shuohui Chen, Christopher Dewan, Mona Diab, Xian Li, Xi Victoria
+     Kuai Li, Chen Chen, Zhiyuan Liu, Guangli Li, Tao Yang, et al. 2024.            Lin, et al. 2022. Opt: Open pre-trained transformer language models.
+     ProSparse: Introducing and Enhancing Intrinsic Activation Sparsity             arXiv preprint arXiv:2205.01068 (2022).
+     within Large Language Models. arXiv preprint arXiv:2402.13516 (2024).     [59] Zhengyan Zhang, Yankai Lin, Zhiyuan Liu, Peng Li, Maosong Sun,
+[45] Yixin Song, Haotong Xie, Zeyu Mi, Li Ma, and Haibo Chen. 2024.                 and Jie Zhou. 2022. MoEfication: Transformer Feed-forward Layers
+     Bamboo: Harmonizing Sparsity and Performance in Large Language                 are Mixtures of Experts. In Findings of ACL 2022.
+     Models. (2024).                                                           [60] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin
+[46] Yixin Song, Haotong Xie, Zhengyan Zhang, Bo Wen, Li Ma, Zeyu                   Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Ré, Clark
+     Mi, and Haibo Chen. 2024. Turbo Sparse: Achieving LLM SOTA                     Barrett, et al. 2024. H2o: Heavy-hitter oracle for efficient generative
+     Performance with Minimal Activated Parameters. arXiv preprint                  inference of large language models. Advances in Neural Information
+     arXiv:2406.05955 (2024).                                                       Processing Systems 36 (2024).
+[47] SparseLLM. 2024.       ReLULLaMA-70B.         https://huggingface.co/     [61] Zhengyan Zhang, Yixin Song, Guanghui Yu, Xu Han, Yankai Lin, Chao-
+     SparseLLM/ReluLLaMA-70B.                                                       jun Xiao, Chenyang Song, Zhiyuan Liu, Zeyu Mi, and Maosong Sun.
+[48] Sharath Turuvekere Sreenivas, Saurav Muralidharan, Raviraj Joshi,              2024. ReLU2 Wins: Discovering Efficient Activation Functions for
+     Marcin Chochowski, Mostofa Patwary, Mohammad Shoeybi, Bryan                    Sparse LLMs. arXiv:2402.03804 [cs.LG]
+     Catanzaro, Jan Kautz, and Pavlo Molchanov. 2024. LLM Pruning              [62] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhang-
+     and Distillation in Practice: The Minitron Approach. arXiv preprint            hao Wu, Yonghao Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric. P Xing,
+     arXiv:2408.11796 (2024).                                                       Hao Zhang, Joseph E. Gonzalez, and Ion Stoica. 2023. Judging LLM-as-
+                                                                                    a-judge with MT-Bench and Chatbot Arena. arXiv:2306.05685 [cs.CL]
+PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU                            SOSP ’24, November 4–6, 2024, Austin, TX, USA
+
+
+[63] Ningxin Zheng, Huiqiang Jiang, Quanlu Zhang, Zhenhua Han, Lingx-          Deep-Learning Model Sparsity via Tensor-with-Sparsity-Attribute. In
+     iao Ma, Yuqing Yang, Fan Yang, Chengruidong Zhang, Lili Qiu, Mao          16th USENIX Symposium on Operating Systems Design and Implemen-
+     Yang, and Lidong Zhou. 2023. PIT: Optimization of Dynamic Sparse          tation (OSDI 22). USENIX Association, Carlsbad, CA, 213–232. https:
+     Deep Learning Models via Permutation Invariant Transformation.            //www.usenix.org/conference/osdi22/presentation/zheng-ningxin
+     In Proceedings of the 29th Symposium on Operating Systems Prin-      [65] Zhe Zhou, Xuechao Wei, Jiejing Zhang, and Guangyu Sun. 2022.
+     ciples (Koblenz, Germany) (SOSP ’23). Association for Computing           PetS: A Unified Framework for Parameter-Efficient Transformers Serv-
+     Machinery, New York, NY, USA, 331–347. https://doi.org/10.1145/           ing. In 2022 USENIX Annual Technical Conference (USENIX ATC 22).
+     3600006.3613139                                                           USENIX Association, Carlsbad, CA, 489–504. https://www.usenix.org/
+[64] Ningxin Zheng, Bin Lin, Quanlu Zhang, Lingxiao Ma, Yuqing Yang,           conference/atc22/presentation/zhou-zhe
+     Fan Yang, Yang Wang, Mao Yang, and Lidong Zhou. 2022. SparTA:
+

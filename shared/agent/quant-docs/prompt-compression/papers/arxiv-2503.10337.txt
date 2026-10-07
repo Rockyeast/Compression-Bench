@@ -1,0 +1,698 @@
+                                          KV- DISTILL : Nearly Lossless Learnable Context Compression for LLMs
+
+
+                                                                   Vivek Chari1 , Guanghui Qin2 , Benjamin Van Durme1,2
+                                                                          1
+                                                                            Johns Hopkins University 2 Microsoft
+                                                                               {vchari2,vandurme}@jhu.edu
+
+
+
+
+                                                                   Abstract                                Much work has been devoted to architectural im-
+                                                 Sequence-to-sequence tasks often benefit from          provements to attention in order to reduce memory
+                                                 long contexts, but the quadratic complexity            during generation. Strategies include augmenting
+arXiv:2503.10337v1 [cs.CL] 13 Mar 2025
+
+
+
+
+                                                 of self-attention in standard Transformers ren-        sequences with memory tokens (Rae et al., 2020;
+                                                 ders this non-trivial. During generation, tempo-       Wu et al., 2022), sparsifying attention patterns
+                                                 rary representations – stored in the so-called         (Beltagy et al., 2020), and using conditional com-
+                                                 KV cache – account for a large portion of
+                                                                                                        putation to only process essential tokens (Ainslie
+                                                 GPU memory usage and scale linearly with
+                                                                                                        et al., 2023). However, such techniques have
+                                                 context length. We introduce KV- DISTILL ,
+                                                 a Transformer compression framework that               seen little widespread adoption due to performance
+                                                 distills long context KV caches into signifi-          drops on downstream tasks, or inefficient train-
+                                                 cantly shorter representations in a question-          ing/inference procedures. Even when given long
+                                                 independent fashion. KV- DISTILL can be                contexts without compression, LLMs fail to fully
+                                                 trained as a parameter-efficient adaptor for pre-      utilize them (Qin et al., 2022; Liu et al., 2024; Lu
+                                                 trained models, and enables the compression            et al., 2024). Together this suggests long contexts
+                                                 of arbitrary spans of a context while preserv-
+                                                                                                        may allow for significant compression while yield-
+                                                 ing pre-trained model capabilities. We treat a
+                                                 compressed-uncompressed cache as a student-
+                                                                                                        ing large memory savings.
+                                                 teacher pairing and apply a KL-type diver-                In what follows, we suppose that a prompt to a
+                                                 gence to match the generated outputs. KV-              LLM is composed of contextual text(s) followed
+                                                 DISTILL outperforms other compression tech-            by a question whose answer is dependent on the
+                                                 niques in worst-case extractive tasks and ap-          provided context. KV compression can be divided
+                                                 proaches uncompressed performance in long              into two paradigms: question-aware, and question-
+                                                 context question answering and summarization,          independent. In question-aware compression, we
+                                                 and it can be fine-tuned on domain-specific con-
+                                                                                                        have access to the question that we need answered,
+                                                 texts to reduce lengths by up to 99% while pre-
+                                                 serving downstream performance. We demon-              and can compress the context with this in mind.
+                                                 strate the generalizability of KV- DISTILL across      In question-independent compression, we do not
+                                                 various model sizes and architectures.1                know what questions will be asked in the future.
+                                                                                                        For instance, consider a scenario in which a fixed
+                                         1       Introduction
+                                                                                                        textual context will be used to respond to many
+                                         Harnessing the full potential of attention-based               questions; the goal of question-independent com-
+                                         large language models (LLMs) often requires them               pression is to compress this context once for reuse
+                                         to condition on long contexts. However, use of                 across many question.
+                                         expansive contexts is complicated by the quadratic                Prior work in training-free context compression
+                                         complexity of self-attention. In particular, during            has primarily focused on which representations in
+                                         generation, one must maintain a store of all past key          the KV cache to select for eviction, with excellent
+                                         and value representations of past tokens (called the           results (Zhang et al., 2023; Li et al., 2024). In
+                                         KV cache) that grows linearly with sequence length.            practice we observe that the performance of this
+                                         The memory burden imposed by the KV cache is                   selection procedure suffers greatly in the question-
+                                         significant, and often limits the length of the se-            independent paradigm. Furthermore, we anticipate
+                                         quences that a model can handle.                               that there is room for performance improvements
+                                             1
+                                              Our code and checkpoints will be made available soon at   in general-purpose context compression when the
+                                         this link                                                      model is trained to handle for compression.
+               Figure 1: We subselect tokens from the KV cache and distill into the smaller subset
+
+
+   Prior work in trainable context compression have       2     Background
+typically utilized a combination of cross-entropy
+and autoencoding objectives to pre-train general          2.1    Key-Value Cache
+context compressors (Qin et al., 2024; Ge et al.,         Transformer-based language models (LMs)
+2024; Rae et al., 2020), which are suitable for           (Vaswani et al., 2017) use self-attention to aggre-
+question-independent compression. These loss              gate context information and make predictions. A
+functions have led to significant performance loss        decoder-only transformer LM autoregressively
+at high compression rates.                                predicts new tokens, and each step requires the
+   In this work we design a general-purpose train-        LM to obtain the key and value states of all past
+able context compression method for LLMs that             tokens. To avoid re-computing the KV state of
+outperforms prior methods in both the question-           past tokens, most LM implementations (e.g. Wolf
+independent and question-aware paradigms. Our             et al. (2020)) cache the key and values states, in
+method, KV- DISTILL , accomplishes this, while            a structure called the KV cache. When making
+also maintaining pretrained model capabilities, be-       new predictions, self-attention is performed on
+ing suitable for long contexts, and having minimal        query states of the new token and the KV -cache,
+performance penalty on downstream tasks. KV-              and the new token’s key and value representations
+DISTILL can support coherent, useful generation at        are appended to the KV cache. Because the
+compression ratios as high as 1000x.                      KV cache grows proportional to the number of
+
+   To achieve this we train a scorer which retains        tokens generated, maintaining the full KV cache in
+the most important context tokens, while apply-           memory is a primary bottleneck when conditioning
+ing a parameter efficient adapter to conditionally        on large contexts. The goal of this work is to
+modify important tokens’ activations in-place. We         alleviate this by compressing KV cache in the
+further apply a token-level KL-type divergence to         dimension of sequence length, especially in the
+match the next-token prediction distributions, treat-     question-independent regime
+ing the compressed cache as a student, and the
+                                                          2.2    Related Work
+uncompressed cache as a teacher. KV- DISTILL only
+need be applied once to a fixed context, has zero         Much prior work has tackled the problem of reduc-
+overhead during auto-regressive decoding, and can         ing the complexity of the self-attention mechanism
+compress arbitrary (sub)spans of a given context.         itself. Previous work tries to sparsify the attention
+We show improvements on several model fami-               patterns(Beltagy et al., 2020; Zaheer et al., 2020),
+lies, considering extractive and abstractive tasks,       use recurrence attention(Yang et al., 2019), or
+with both short and long contexts, and at multiple        kernelize the attention matrix(Choromanski et al.,
+model scales. KV- DISTILL is general purpose and          2021), but they require a considerable amount of
+has broad applicability to the LLM community.             further training.
+   Similar to our work, one line of work involves       lated attention scores include scores from tokens
+compressing the hidden states (KV cache) of past        in the question attending to the context. This effec-
+tokens into a shorter sequence of representations.      tively uses the question to scan for important details
+For example, some methods learns “soft represen-        in the context. This allows H2 to maintain nearly
+tations” of context (Qin and Eisner, 2021). Mu          uncompressed performance at moderate compres-
+et al. (2023) compress particular prompts into much     sion ratios, by focusing on tokens most relevant to
+shorter “gist tokens”, but do not attempt more          the current question. However, performance still
+general context compression. Furthermore, their         degrades when compression ratios exceed 20×.
+method demonstrates poor generalizability, as per-         In the question-independent paradigm, the H2
+formance does not scale with the number of gist         selection mechanism is applied solely to the con-
+tokens used. Zeng et al. (2023) propose to rec-         text (as opposed to the context and question in
+ognize and prioritize some important tokens (VIP        the question-aware setting). We then allow the
+tokens) during inference. Most relevant here, the       question to attend to only to this compressed
+following methods employ a similar idea of dynam-       context. We empirically observe that in the
+ically compressing the context prior to inference.      question-independent paradigm, H2 performance
+                                                        plummets drastically, highlighting the need for im-
+2.3   Trainable Compression                             proved question-independent compression meth-
+Ge et al. (2024) design In-Context Autoencoder          ods. Lastly, H2 offers no way to further im-
+(ICAE) to compress long contexts for use in large       prove compressive performance given prior domain
+language models (LLMs). ICAE consists of two            knowledge.
+main components: a learnable encoder and a fixed           Similarly SnapKV (Li et al., 2024) uses the at-
+decoder. The encoder compresses the input con-          tentions of a window of recent tokens to determine
+text into a small number of memory slots. These         which context tokens are “heavy-hitters"; in the
+memory slots are then used by the frozen LLMs           question-independent setting, this is undesirable,
+(decoder) to reconstruct the context or respond to      as the last tokens of a context may not necessarily
+prompts. ICAE is pretrained using autoencoding          provide additional information regarding attention
+and language modeling objectives on a large pre-        patterns. In the question-independent paradigm we
+training corpus and further fine-tuned using instruc-   find that SnapKV performs similarly to H2 , so do
+tion data to maintain instruction-tuning. However,      not compare against it in the remainder here.
+there is still a gap in downstream task performance
+when using an ICAE-compressed context, com-             3     Key-Value Distillation
+pared to an uncompressed context, and the method
+falters under high compression ratios.                  We consider a transformer-based language model
+   Qin et al. (2024) propose DODO to compress           (Vaswani et al., 2017), denoted by LM, that is de-
+sub-select KV activations to a set of “nugget” to-      fined on the vocabulary V. The KV- DISTILL pro-
+kens, which grow proportionally with the length of      cess is then: (1) a set of important tokens in the
+context sequence. Their method is trained with          input context is determined; (2) an adapted lan-
+auto-encoding or language modeling objectives.          guage model LMθ is used to encode the context into
+However, DODO models operate at a fixed com-            a KV cache, and sub-select the aforementioned im-
+pression ratio, require training both an encoder and    portant tokens from the generated KV cache; and (3)
+decoder, and still show a large gap in downstream       the unmodified LM conditions on the compressed
+task performance when compared to an uncom-             KV cache to auto-regressively generate it’s output.
+pressed context.
+                                                        3.1    State Selection for Cache Compression
+2.4   Training-Free Compression                         Let c = {wi }N i=1 represent a context consisting of
+Zhang et al. (2023) propose H2 to reduce mem-           N tokens, where wi ∈ V and ⃗c ∈ V N . In a typi-
+ory usage during generation. H2 identifies “heavy-      cal scenario, LM predicts a sequence of new tokens,
+hitter” tokens, which significantly influence atten-    denoted by ⃗y , conditioning on c. For example, c
+tion scores during inference. Specifically, H2 cal-     may be a prompt and LM generates ⃗y as a response.
+culates the accumulated attention for each key and      Future token prediction draws on information from
+retains the top-k key-value pairs with the highest      past tokens via attention by having LM encode the
+scores. In the question-aware setting, the accumu-      context tokens into key and value hidden states
+X⃗ (K) , X
+         ⃗ (V ) ∈ RN ×d , which taken together form
+   l        l
+the KV cache (Section 2.1), where d is the dimen-
+sion of the transformer and l is the layer of LM. We
+may drop the subscript l and superscripts (K) and
+(V ) and use X     ⃗ to generally denote the key/value
+states of transformers at any layer.
+    Transformers assume that X         ⃗ fully describes and
+represents the context ⃗c. However, attending to X         ⃗
+can be inefficient when ⃗c is long. Therefore, we
+further assume that retaining a subset of key/value
+                                                                  Figure 2: Selected tokens are routed to trainable, LoRA-
+states is sufficient for approximating the next-token                       ⃗ Q and W   ⃗ O matrices (W ⃗ O is omitted in
+                                                                  adapted W
+distribution conditioned on all key/value states.                 this figure); all other tokens pass through the original
+That is, we could retain rows from X              ⃗ to form
+                                                                  (frozen) model parameters.
+X⃗˜ ∈ Rk×d , where k ≤ N is the number of se-
+lected rows. We use a subset of the tokens’ hidden
+                                                                                                       ⃗˜ with unnor-
+                                                                  state of a single token attending to X
+states to represent the complete context, which is
+                                                ⃗˜ are condi-     malized attention weights α:
+plausible because representations in X
+tioned on the prior context. Suppose we determine                                                 ⊤
+                                                                                           ⃗˜ (K)
+                                                                                       
+                                                                                      ⃗Q X
+                                                                                α = ⃗zW                               (3)
+the (i1 , . . . , ik )-th tokens are to be retained in layer
+l. We use a hard selection matrix S         ⃗l ∈ {0, 1}k×N
+                                 ⃗˜ l from X⃗ l by                we decay α to produce scorer-informed attention
+to derive (layer-specific) X
+                                                                  weights α′ :
+                                                                                  α′ = σ(⃗s) ⊙ α,              (4)
+        ⃗˜ l = S
+        X      ⃗l X
+                  ⃗ l,    ⃗l = [⃗e(i ) , . . .⃗,⃗e(i ) ],
+                          S                                 (1)
+                                    1               k
+                                                                  where ⊙ denotes the element-wise (Hadamard)
+where ⃗e(i) ∈     {0, 1}N        is the i-th standard basis       product and σ the sigmoid function. We note that
+vector. Note that this formulation does not require               the above formulation is one of many possible scor-
+that the same tokens be selected across each layer.               ing functions that can be used with KV- DISTILL ,
+   The problem of determining which indices                       that could be learnable or parameter-free, and could
+(i1 , . . . , ik ) to retain still remains. We would like         potentially have layer-wise specificity. We leave ex-
+the subselection S       ⃗ to retain most of the context          ploring different scoring functions as future work.
+information given a fixed k. One possibility is to                3.2   Architecture
+use a feedforward neural network to measure the
+importance of each token position:                                After sub-selecting important token indices, we
+                                                                  pass the context ⃗c through a modified LMθ that uses
+                             
+                               ⃗ ′η
+                                                                 conditional computation to condense the context
+                    ⃗s = FFNθ X                             (2)         ⃗˜ This allows for the representations of im-
+                                                                  into X.
+                                                                  portant tokens to be “packed" with information
+where θ is the parameters of the FFN, ⃗s ∈ RN and                 from unselected tokens, and is strictly more ex-
+⃗si indicate the “importance score” of the i-th token             pressive than only subselection. We instantiate LMθ
+ and X⃗ ′ indicates the hidden states at the η-th layer.
+        η                                                         with LoRA adaptors (Hu et al., 2022) to minimize
+The indices i1:k can then be derived by taking the                the number of trainable parameters.
+ tokens with the top-k scores. We can control the                    More importantly, within LMθ , the subselected
+ percent of the KV cache retained by scaling k with               tokens are routed to trainable W ⃗ Q, W
+                                                                                                        ⃗ O matrices,
+ the length of the context. In our we retain the same                     ⃗ Q  ⃗  O
+                                                                  where W , W are the query and output matrices
+ i1:k across all layers and take η = 6.                           of transformers, while discarded tokens are routed
+    The above selection procedure is rendered non-                to the original (frozen) matrices, as shown in Fig-
+ differentiable by the top-k operator. We may prop-               ure 2. This has the effect of informing LMθ as to
+ agate gradients to the scorer by decaying the at-                which tokens are selected, allowing for special-
+ tention weights of tokens attending to X  ⃗˜ inversely           ized aggregation of the value representations for
+ proportionally to their computed importance scores.              selected tokens. This method of informing LMθ has
+ More precisely, let ⃗z ∈ Rd represent the hidden                 minimal overhead (the LoRA matrices account for
+under 500MB of GPU memory for a 27B parame-                 into the objective, we sum the forward and reverse
+ter model), and only a single set parameters must           divergences:
+be maintained in memory.
+   We anticipate that other architectural forms              L(θ) = λ·DKL (p∥qθ )+(1−λ)·DKL (qθ ∥p), (6)
+could make KV- DISTILL effective. However, we
+find that applying conditional computation to in-           where a hyperparameter λ controls the balance be-
+form LMθ of selected tokens is important to the             tween forward and reverse KL divergence.
+performance of KV- DISTILL . We find that some                 Given both p and qθ are categorical distribution,
+methods of informing the model of selected tokens,          both KL divergences in eq. (5) can be analytically
+such as by adding a trainable embedding to these            solved. Tthe L1-norm of the gradient of the reverse
+tokens, do not work well (see Appendix B). The              divergence dominates nearly everywhere. As such
+particular architecture chosen has the advantage of         we propose scaling the forward and reverse terms
+lower memory usage during training, and provides            by having λ > 0.5 in eq. (6). The benefit of λ is
+excellent performance. We leave the task of finding         confirmed with the ablations in Appendix B.
+even more efficient architectures to future work.
+                                                            4   Experiments
+3.3   Objective Function                                    To assess the efficacy of KV- DISTILL , we conduct
+After generating compressed cache X,      ⃗˜ we aim to      experiments on LLAMA -2 7 B, LLAMA -3 8 B, MIS -
+ match the output of LM when conditioned on X          ⃗˜   TRAL 7 B, GEMMA -2 9 B and GEMMA -2 27 B. In all
+
+ to the output of LM when conditioned on X. Pre-            cases we use the instruction-tuned model. A KV-
+                                                            DISTILL model is obtained by distilling on a large
+vious compression methods (Ge et al., 2024; Qin
+ and Van Durme, 2023) rely on the autoencoding              corpus to obtain strong general-purpose context
+ objective to pretrain LMθ . However, given that LM         compressors.
+ predicts future tokens during inference, there is a        Data We curate a large instruction dataset from
+ discrepancy in pretraining and downstream usage,           Self-Instruct, P3, LongAlpaca, and Super-Natural
+which could result in performance loss. Instead             Instructions (Soboleva et al., 2023; Wang et al.,
+we propose matching the next-token probability              2022a; Sanh et al., 2021; Chen et al., 2023; Wang
+                                             ⃗ and X. ⃗˜    et al., 2022b). Training instances are split into
+ distribution of tokens conditioned on X
+                                                            (Context, Instruction, Answer) triples. In cases
+ Consider a generative language model that predicts
+                                                            where the context is sufficiently long (more than
+ the next token ⃗yt conditioned on the past tokens
+                                                            1536 tokens), we pad to a multiple of 1536 and
+⃗y<t and a fixed context ⃗c that is represented by
+                                                            fold the context to a batch of N × 1536 instances,
+ either X⃗ or X. ⃗˜ We would like to minimize the dif-
+                                                            compress the resulting KV cache, and then unfold
+ ference   between  their next-token distributions, i.e.   the cache. Empirically, we observe little perfor-
+                                       ˜
+                                       
+                 ⃗                    ⃗
+ p ⃗yt | ⃗y<t , X and qθ ⃗yt | ⃗y<t , X . Let qθ indi-      mance degradation when applying folding during
+ cate the distribution that conditions on the distilled     pretraining, while allowing the model to see longer
+ KV cache X.    ⃗˜ Also note that the only learnable        examples. We also always leave the first few (< 10)
+ parameters in this formulation arise from encoding         tokens of the context uncompressed, as we find that
+  ⃗˜ during auto-regressive generation we use the
+ X;                                                         retaining them improves performance; this is not
+ original frozen parameters of LM.                          a new observation, see Han et al. (2024) and Xiao
+     Given probability distributions p, qθ , we use the     et al. (2023).
+ forward and reverse KL divergences to measure              Training The general training procedure is as fol-
+ their similarity. With simplified notations we have:       lows: (1) pass the (Context, Instruction, Answer)
+                                                            triple through the original model to obtain target
+                                                            logits, (2) apply the KV- DISTILL architecture to ob-
+                                   
+                              p(y)
+  DKL (p∥qθ ) = Ey∼p(·) log                                 tain logits conditioned on the compressed cache
+                              qθ (y)
+                            
+                                   qθ (y)
+                                                          (we compress the context, and leave the instruction
+    DKL (qθ ∥p) = Ey∼qθ (·) log              (5)            uncompressed), (3) apply Equation 6 between the
+                                   p(y)
+                                                            obtained and target logits.
+   The mode-seeking and mean-seeking behavior                  We use rank-stabilized LoRA on the Q, K, V, O
+of the reverse- and forward- KL divergences respec-         matrices with r = 128 to train LMθ (Hu et al.,
+tively is well known. To incorporate both behaviors         2022; Kalajdzievski, 2023). Note that the K, V
+                                                                                                                                      1.0
+                 100%
+                   75%
+                                                                                                                                      0.8
+                   50%
+                   25%
+                                                                                                                                      0.6
+                   20%
+  KV retention
+
+
+
+
+                                                                                                                                        Accuracy
+                   10%
+                                                                                                                                      0.4
+                    5%
+                    1%
+                                                                                                                                      0.2
+                  0.5%
+                  0.1%
+                                                                                                                                      0.0
+                         1k   2k   3k   4k    5k   6k    7k   8k   9k     10k       1k    2k   3k   4k   5k   6k   7k   8k   9k 10k
+                                                                        Num. Tokens
+
+Figure 3: Needle-in-a-Haystack results; The x-axis shows the length of the document, the y-axis indicates the
+compression ratio applied, and the color the accuracy of retrieval under those settings averaged across different
+locations in the document. Left: H2 I. Right: KV- DISTILL .
+
+
+are trainable for all tokens, not just selected to-                             5        Results
+kens. The behavior of the Q, O adapters is dis-
+cussed in Section 3.2. Optimization is done using                               5.1       Needle-In-a-Haystack
+Deepspeed Stage 2, and the AdamW optimizer                                      Motivation The Needle-in-a-Haystack test
+(Rasley et al., 2020). During pretraining, we sam-                              (Kamradt, 2023) evaluates a model’s ability to
+ple KV retention fractions between 0.1-80%. As                                  accurately retrieve information from a sentence
+such, all KV- DISTILL models support arbitrary re-                              (a "needle") embedded within a large document
+tention rates. All models are distilled on a cluster                            (a "haystack"), in which a sentence is randomly
+of 8 NVIDIA A100 80GB GPUs. All models ex-                                      positioned. In our experiments, the needle is a
+cept GEMMA 27 B converged within 3 days, while                                  semantic one. In Figure 3, we show the results
+GEMMA 27 B took 4 days. See Appendix A for                                      of H2 I (left) and KV- DISTILL (right) at various
+further details.                                                                compression ratios at different document lengths.
+                                                                                The accuracy is computed across the placement
+                     Dataset            Average         Max                     of the needle within a document. Crucially, at
+                                                                                compression time, the model does not know that a
+                     SQuAD                   225         1k                     is needle being sought, nor that a needle is placed
+                     QuALITY                 6k          9k                     within the context.
+                     SQuALITY                7k         11k                     Results We see that KV- DISTILL significantly
+                     GovReport               10k        71k                     outperforms H2 I at almost all compression ra-
+                                                                                tios and document lengths. In particular, KV-
+Table 1: Evaluation dataset example length statistics in
+                                                                                DISTILL demonstrates near-perfect accuracy even
+tokens under the LLAMA -3 tokenizer
+                                                                                after removing 90% of the KV .
+
+Evaluation In all datasets, we have a natural                                   5.2       Extractive Question Answering
+(Context, Question) pairing. We always compress                                 Motivation SQuAD is an extractive question-
+the context and leave the question uncompressed.                                answering task. We hypothesize that extractive
+Evaluations are performed with greedy decoding.                                 tasks will suffer the largest performance loss under
+Summary statistics regarding the context length of                              context compression. As such, we choose to use
+evaluation dataset are provided in Table 1.                                     performance on SQuAD as a proxy for general-
+Methods Tested We evaluate against DODO (Qin                                    purpose compressive ability of a model. In all the
+et al., 2024), ICAE (Ge et al., 2024), and H2                                   following experiments, we choose the pretraining
+in both the question-aware (H2 A) and question-                                 checkpoint with the best SQuAD performance for
+independent (H2 I) forms. Please refer to Sec 2.2                               further experimentation. To assess accuracy we
+for further description about the selected methods.                             generate an answer conditioned on the compressed
+To improve the performance of H2 , we also retain a                             context, checking if the generated response is con-
+set of sink tokens as described in Xiao et al. (2023).                          tained in the ground-truth answer.
+    Model                  % KV     0-Shot Acc.
+     LLAMA 3       BASE    100%     87.6 ± .6%                         80
+                    KVD     25%     86.6 ± .7%
+                    KVD     20%     86.0 ± .7%
+
+
+
+
+                                                        Accuracy (%)
+                   H2 A     25%     84.0 ± .7%
+                   H2 A     20%     83.0 ± .7%                         60
+                   H2 I     25%     56.6 ± .9%
+                   H2 I     20%     51.7 ± 1%
+                   DODO     20%     73.3 ± .8%                                LLAMA -3 8 B
+                                                                       40     GEMMA -2 9 B
+     LLAMA 2 7 B   BASE    100%     82.5 ± .7%
+                                                                              MISTRAL 7 B
+                   KVD      25%     79.1 ± .8%
+                   KVD      20%     77.6 ± .8%                          100    80       60        40      20   0
+                   H2 A     25%     77.9 ± .7%                                         KV retention (%)
+                   H2 A     20%     76.7 ± .7%
+                   H2 I     25%     55.2 ± .9%               Figure 4: QuALITY accuracy against compression.
+                   H2 I     20%     50.3 ± 1%
+                   ICAE     57%     75.0 ± .8%
+                                                        mance of most models can be improved with hyper-
+     GEMMA 9 B     BASE    100%     85.15 ± .7%
+                                                        parameter tuning during the pre-training process.
+                   KVD      25%     84.55 ± .7%
+                   KVD      20%      83.1 ± .7%
+                                                        5.3            Long Context Question Answering
+     GEMMA 27 B    BASE    100%     85.3 ± .8%
+                                                        Motivation QuALITY is a long document
+                   KVD      25%      83.1 ± 1%
+                   KVD      20%      82.2 ± 1%          multiple-choice question answering dataset that
+     MISTRAL 7 B   BASE    100%     87.1 ± .6%
+                                                        assesses reading comprehension. We use QuAL-
+                                                        ITY to assess the decision making capabilities of
+                   KVD      25%     84.1 ± .7%
+                   KVD      20%     82.5 ± .7%          models equipped with distilled contexts. To assess
+                                                        QuALITY accuracy, we use the same evaluation
+Table 2: Zero-shot accuracy on SQuAD at selected        procedure used by LLAMA-3 (AI@Meta, 2024).
+KV retention ratios.                                    Results Figure 4 shows the experiment results
+                                                        on QuALITY, with data points at the follow-
+                                                        ing retention rates highlighted: {100%, 25%,
+Results Table 2 contains SQuAD accuracy re-             20%, 10%, 5%, 1%, 0.1%}. We observe that KV-
+sults. We see that in all cases, KV- DISTILL models     DISTILL performs similarly to the uncompressed
+perform within a few percentage points of base          cache, with only minor losses in performance at
+models, even under a “worst-case" task. Further-        10x compression. Although not included in Figure
+more, KV- DISTILL models significantly outperform       4, 0% cache retention results in accuracy of 32.4%,
+prior trainable methods (ICAE, DODO), even when         25.8%, and 24.4% for the LLAMA -3, MISTRAL,
+retaining less of the KV cache. KV- DISTILL models      and GEMMA -2 models respectively, demonstrating
+significantly outperform H2 I, demonstrating the        the neccessity of the context for the task. Impres-
+ability of the pretraining objective and architecture   sively, we see significant improvements over the
+to create reusable compressed KV representations.       random accuracy even when distilling to as few as
+KV- DISTILL models also enjoy a slight improve-         7 tokens from a 7k input passage; for example, on
+ment over H2 A at similar compression ratios,           LLAMA -3 we observe only a 20% drop in accuracy
+demonstrating the effectiveness of its compression      despite eliminating 99.9% of the context.
+at capturing almost all salient information in the
+context, even without question-awareness.               5.4 Long Context Abstractive Summarization
+   When retaining under 20% of KV , we observe          Motivation SQuALITY is a question-focused
+rapid declines in performance across all methods,       summarization dataset based on the same collection
+indicating the difficulty of the task under high con-   of long documents as the QuALITY benchmark.
+text compression. Lastly, we note that initial pre-     We use it to evaluate the abstractive summarization
+training hyperparameters for all models were set        capabilities of models trained with distilled con-
+based on initial experimentation with LLAMA -3          texts. We compute the Rouge-L scores (Lin, 2004)
+and SQuAD; as such, we anticipate that perfor-          between the generated summaries and ground-truth
+                                                                                                     KVD
+
+                                                               KV retention   H2 A   H2 I   Zero Shot   Finetune
+            15
+                                                               100%           23.7   23.7     23.7         23.7
+                                                               20%            22.8   20.6     22.3         23.5
+                                                               10%            22.4   18.6     21.8         23.3
+ROUGE - L
+
+
+
+
+                                                               5%             21.9   18.5     21.1         23.2
+            14                                                 1%             21.1   18.3     20.1         22.8
+
+                                                               Table 3: ROUGE - L on GovReport summarization.
+                      LLAMA -3 8 B
+                     GEMMA -2 9 B
+            13
+                      MISTRAL 7 B
+                                                           tuning (zero-shot) and KV- DISTILL after finetuning
+             100       80       60        40      20   0   on LLAMA-3. We observe that KV- DISTILL and
+                               KV retention (%)            query-aware H2 perform close to each other on
+                                                           this evaluation in the zero-shot setting, while KV-
+                 Figure 5: Rouge-L on SQuALITY             DISTILL outperforms H2 I at all compression ratios.
+                                                           However, upon finetuning, we observe a practical
+answers, following the same evaluation protocol            improvement in performance with KV- DISTILL ,
+used by LLAMA-3 (AI@Meta, 2024).                           with little degradation from uncompressed perfor-
+Result Figure 5 show Rouge-L performance on                mance across all compression rates. In particular,
+SQuALITY. We observe that KV- DISTILL models               we note the improvement in performance is greater
+perform as well or better than uncompressed mod-           at more severe compression ratios, confirming the
+els when retaining more that 20% of the KV cache.          utility of KV- DISTILL in supporting ultra-high com-
+When retaining under 20%, we observe different             pression ratios.
+performance falloff behaviors for different mod-           6     Discussion and Conclusion
+els; in particular, we observe that textscLlama-
+3 and G EMMA -2 have stable performance until              We develop a method to reduce the memory re-
+100x compression, at which point performance               quirements of long-context conditioned LM gen-
+dips drastically. This difference in the behavior of       eration. Our method sub-selects tokens from the
+the compression-performance trade-off could be at-         KV cache, and applies a token-level KL-type loss
+tributed to the larger vocabulary sizes of LLAMA -3        between the output of the LM when conditioned on
+and GEMMA -2, which allows the KL-loss to cap-             sub-selected tokens and when conditioned on the
+ture more fine-grained features of the output dis-         uncompressed cache. We evaluate our method on
+tribution during pretraining. These results demon-         long-context extractive and abstractive tasks, and
+strate that KV- DISTILL can support very high com-         demonstrate improved performance over compet-
+pression ratios with minimal performance penalty           ing compression methods. We further demonstrate
+on abstractive tasks.                                      that continued training on domain-specific data can
+                                                           allow for use of compression ratios as high as 100x
+5.5         Finetuned Long Context Summarization           with negligible losses in performance.
+Motivation GovReport is a long document sum-                  As part of this work we release distilled check-
+marization dataset that consists (Report, Summary)         points across various model language families.
+pairs written by government research agencies.             These artifacts allow efficient text generation con-
+In contrast to the evaluations on QuALITY and              ditioned on significantly larger inputs than before,
+SQuALITY (which are performed in a zero-shot               with much lower memory burden, and support com-
+fashion using the best pretraining checkpoint),            pression ratios as high as 1000x. We anticipate
+we perform additional finetuning distillation with         these artifacts will be of great practical benefit,
+Equation 6 on the GovReport training set before            enabling exciting new applications and research
+evaluation. As with SQuALITY, we use GovRe-                directions in language processing.
+port to assess the abstractive summarization ability
+                                                           7     Limitations
+of models equipped with KV- DISTILL .
+Results Table 3 shows results for GovReport for            The time-consuming and stochastic nature of dis-
+both query-aware H2 A and query-independent H2 I           tilling a model means that it cannot be guaranteed
+paradigms, as well as KV- DISTILL prior to fine-           that the process will work well across all model
+families. Furthermore, we are unsure as to the root        Edward Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-
+cause of performance discrepancies between model             Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu
+                                                             Chen. 2022. LoRA: Low-Rank Adaptation of Large
+architectures after distillation; this issue merits fur-
+                                                             Language Models. In Proceedings of International
+ther research. Lastly, the 8k token context-capacity         Conference on Learning Representations (ICLR).
+of LLAMA -3 limited many of our experiments, and
+is small by the standards of currently available lan-      Damjan Kalajdzievski. 2023. A rank stabilization scal-
+                                                             ing factor for fine-tuning with LoRA. Preprint,
+guage models; to address this, we will be releasing          arXiv:2312.03732.
+a KV- DISTILL LLAMA -3.1 model with a 128k to-
+ken context capacity.                                      G Kamradt. 2023. Needle in a haystack–pressure testing
+                                                             llms.
+Used Artifacts In this work, we used the publicly
+released codes and checkpoints of LLAMA. Per               Yuhong Li, Yingbing Huang, Bowen Yang, Bharat
+the license attached to LLAMA, we agree not to               Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle Cai,
+re-distribute their parameters and limit the usage of        Patrick Lewis, and Deming Chen. 2024. Snapkv:
+                                                             Llm knows what you are looking for before genera-
+the models for research purposes only                        tion. arXiv preprint arXiv:2404.14469.
+
+                                                           Chin-Yew Lin. 2004. ROUGE: A package for auto-
+References                                                   matic evaluation of summaries. In Text Summariza-
+                                                             tion Branches Out, pages 74–81, Barcelona, Spain.
+AI@Meta. 2024. Llama 3 model card.                           Association for Computational Linguistics.
+
+Joshua Ainslie, Tao Lei, Michiel de Jong, Santiago On-     Nelson F. Liu, Kevin Lin, John Hewitt, Ashwin Paran-
+   tañón, Siddhartha Brahma, Yury Zemlyanskiy, David         jape, Michele Bevilacqua, Fabio Petroni, and Percy
+   Uthus, Mandy Guo, James Lee-Thorp, Yi Tay, Yun-           Liang. 2024. Lost in the Middle: How Language
+   Hsuan Sung, and Sumit Sanghai. 2023. CoLT5:               Models Use Long Contexts. Transactions of the
+   Faster Long-Range Transformers with Conditional           Association for Computational Linguistics (TACL),
+   Computation. In Proceedings of Conference on Em-          12:157–173.
+   pirical Methods in Natural Language Processing
+  (EMNLP).                                                 Taiming Lu, Muhan Gao, Kuai Yu, Adam Byerly, and
+                                                             Daniel Khashabi. 2024. Insights into LLM long-
+Iz Beltagy, Matthew E. Peters, and Arman Cohan. 2020.        context failures: When transformers know but don’t
+   Longformer: The Long-Document Transformer.                tell. Preprint, arXiv:2406.14673.
+
+Yukang Chen, Shaozuo Yu, Shengju Qian, Haotian Tang,       Jesse Mu, Xiang Lisa Li, and Noah Goodman. 2023.
+  Xin Lai, Zhijian Liu, Song Han, and Jiaya Jia. 2023.        Learning to Compress Prompts with Gist Tokens. In
+  Long alpaca: Long-context instruction-following             Proceedings of Conference on Neural Information
+  models. https://github.com/dvlab-research/                  Processing Systems (NeurIPS).
+  LongLoRA.
+                                                           Guanghui Qin and Jason Eisner. 2021. Learning How to
+Krzysztof Choromanski, Valerii Likhosherstov, David          Ask: Querying LMs with Mixtures of Soft Prompts.
+  Dohan, Xingyou Song, Andreea Gane, Tamas Sar-              In Proceedings of Conference of the North Ameri-
+  los, Peter Hawkins, Jared Davis, Afroz Mohiuddin,          can Chapter of the Association for Computational
+  Lukasz Kaiser, David Belanger, Lucy Colwell, and           Linguistics (NAACL).
+  Adrian Weller. 2021. Rethinking Attention with Per-      Guanghui Qin, Yukun Feng, and Benjamin Van Durme.
+  formers. In Proceedings of International Conference        2022. The nlp task effectiveness of long-range trans-
+  on Learning Representations (ICLR).                        formers. In Conference of the European Chapter of
+                                                             the Association for Computational Linguistics.
+Tao Ge, Jing Hu, Xun Wang, Si-Qing Chen, and Furu
+  Wei. 2024. In-context Autoencoder for Context Com-       Guanghui Qin, Corby Rosset, Ethan C. Chau, Nikhil
+  pression in a Large Language Model. In Proceedings         Rao, and Benjamin Van Durme. 2024. Dodo: Dy-
+  of International Conference on Learning Representa-        namic Contextual Compression for Decoder-only
+  tions (ICLR).                                              LMs. In Proceedings of Annual Meeting of the Asso-
+                                                             ciation for Computational Linguistics (ACL).
+Chi Han, Qifan Wang, Hao Peng, Wenhan Xiong,
+  Yu Chen, Heng Ji, and Sinong Wang. 2024. LM-             Guanghui Qin and Benjamin Van Durme. 2023. Nugget:
+  infinite: Zero-shot extreme length generalization for      Neural Agglomerative Embeddings of Text. In Pro-
+  large language models. In Proceedings of the 2024          ceedings of International Conference on Machine
+  Conference of the North American Chapter of the            Learning (ICML).
+  Association for Computational Linguistics: Human
+  Language Technologies (Volume 1: Long Papers),           Jack W. Rae, Anna Potapenko, Siddhant M. Jayakumar,
+  pages 3991–4008, Mexico City, Mexico. Association           and Timothy P. Lillicrap. 2020. Compressive Trans-
+  for Computational Linguistics.                              formers for Long-Range Sequence Modelling. In
+  Proceedings of International Conference on Learn-           Lhoest, and Alexander Rush. 2020. Transformers:
+  ing Representations (ICLR).                                 State-of-the-Art Natural Language Processing. In
+                                                              Proceedings of Conference on Empirical Methods in
+Jeff Rasley, Samyam Rajbhandari, Olatunji Ruwase,             Natural Language Processing (EMNLP).
+   and Yuxiong He. 2020. DeepSpeed: System Opti-
+   mizations Enable Training Deep Learning Models         Y. Wu, M. N. Rabe, D. Hutchins, and C. Szegedy. 2022.
+   with Over 100 Billion Parameters. In Proceedings of       Memorizing Transformers. In Proceedings of Inter-
+   International Conference on Knowledge Discovery           national Conference on Learning Representations
+   and Data Mining (KDD).                                    (ICLR).
+
+Victor Sanh, Albert Webson, Colin Raffel, Stephen H.      Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song
+  Bach, Lintang Sutawika, Zaid Alyafeai, Antoine            Han, and Mike Lewis. 2023. Efficient streaming
+  Chaffin, Arnaud Stiegler, Teven Le Scao, Arun Raja,       language models with attention sinks. arXiv.
+  Manan Dey, M Saiful Bari, Canwen Xu, Urmish
+  Thakker, Shanya Sharma Sharma, Eliza Szczechla,         Zhilin Yang, Zihang Dai, Yiming Yang, Jaime Car-
+  Taewoon Kim, Gunjan Chhablani, Nihal Nayak, De-           bonell, Ruslan Salakhutdinov, and Quoc V. Le. 2019.
+  bajyoti Datta, Jonathan Chang, Mike Tian-Jian Jiang,      XLNet: Generalized Autoregressive Pretraining for
+  Han Wang, Matteo Manica, Sheng Shen, Zheng Xin            Language Understanding. In Proceedings of Con-
+  Yong, Harshit Pandey, Rachel Bawden, Thomas               ference on Neural Information Processing Systems
+  Wang, Trishala Neeraj, Jos Rozen, Abheesht Sharma,        (NeurIPS).
+  Andrea Santilli, Thibault Fevry, Jason Alan Fries,
+  Ryan Teehan, Stella Biderman, Leo Gao, Tali Bers,       Manzil Zaheer, Guru Guruganesh, Avinava Dubey,
+  Thomas Wolf, and Alexander M. Rush. 2021. Multi-         Joshua Ainslie, Chris Alberti, Santiago Ontanon,
+  task prompted training enables zero-shot task gener-     Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang,
+  alization. Preprint, arXiv:2110.08207.                   and Amr Ahmed. 2020. Big Bird: Transformers for
+                                                           Longer Sequences. In Proceedings of Conference on
+Daria Soboleva, Faisal Al-Khateeb, Robert Myers, Ja-       Neural Information Processing Systems (NeurIPS).
+  cob R Steeves, Joel Hestness, and Nolan Dey. 2023.
+  SlimPajama: A 627B token cleaned and deduplicated       Zhanpeng Zeng, Cole Hawkins, Mingyi Hong, Aston
+  version of RedPajama.                                     Zhang, Nikolaos Pappas, Vikas Singh, and Shuai
+                                                            Zheng. 2023. VCC: Scaling Transformers to 128K
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob            Tokens or More by Prioritizing Important Tokens. In
+  Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz            Proceedings of Conference on Neural Information
+  Kaiser, and Illia Polosukhin. 2017. Attention Is All      Processing Systems (NeurIPS).
+  You Need. In Proceedings of Conference on Neural
+                                                          Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong
+  Information Processing Systems (NeurIPS).
+                                                            Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuan-
+Yizhong Wang, Yeganeh Kordi, Swaroop Mishra, Alisa          dong Tian, Christopher Ré, Clark Barrett, Zhangyang
+  Liu, Noah A. Smith, Daniel Khashabi, and Hannaneh         Wang, and Beidi Chen. 2023. H2o: Heavy-Hitter
+  Hajishirzi. 2022a. Self-instruct: Aligning language       Oracle for Efficient Generative Inference of Large
+  model with self generated instructions.                   Language Models. In Proceedings of Conference on
+                                                            Neural Information Processing Systems (NeurIPS).
+Yizhong Wang, Swaroop Mishra, Pegah Alipoormo-
+  labashi, Yeganeh Kordi, Amirreza Mirzaei, Atharva       A     Training & Evaluation Details
+  Naik, Arjun Ashok, Arut Selvan Dhanasekaran,
+  Anjana Arunkumar, David Stap, Eshaan Pathak,            We train all KV- DISTILL models with the following
+  Giannis Karamanolakis, Haizhi Lai, Ishan Puro-          parameters at bf16 precision on 8 NVIDIA A100s.
+  hit, Ishani Mondal, Jacob Anderson, Kirby Kuznia,       Please see Table 4 for further details. All models
+  Krima Doshi, Kuntal Kumar Pal, Maitreya Patel,
+  Mehrad Moradshahi, Mihir Parmar, Mirali Purohit,        had 150M trainable parameters. The QuALITY,
+  Neeraj Varshney, Phani Rohitha Kaza, Pulkit Verma,
+  Ravsehaj Singh Puri, Rushang Karia, Savan Doshi,                    Hyperparameter         Value
+  Shailaja Keyur Sampat, Siddhartha Mishra, Sujan
+  Reddy A, Sumanta Patro, Tanay Dixit, and Xudong                         Optimizer         AdamW
+  Shen. 2022b. Super-NaturalInstructions: Generaliza-                   Learning Rate        5e-5
+  tion via declarative instructions on 1600+ NLP tasks.                  Batch Size           32
+  In Proceedings of the 2022 Conference on Empirical
+  Methods in Natural Language Processing.                                LoRA Rank           128
+                                                                              λ               0.6
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien                              η                6
+  Chaumond, Clement Delangue, Anthony Moi, Pier-
+  ric Cistac, Tim Rault, Remi Louf, Morgan Funtowicz,
+  Joe Davison, Sam Shleifer, Patrick Von Platen, Clara             Table 4: Hyperparameters for training
+  Ma, Yacine Jernite, Julien Plu, Canwen Xu, Teven
+  Le Scao, Sylvain Gugger, Mariama Drame, Quentin         SQuALITY, GovReport, and SQuAD evaluations
+are performed on the test set, if public, else results
+are reported on the development set. To measure
+SQuAD accuracy, we generate up to 128 tokens,
+normalize the output by stripping punctuation, and
+                                                                              (a) 100% KV retention
+check if the correct answer is contained in the gen-
+                                                           The story follows Willard, a space explorer who is left
+erated answer. For SQuALITY and QuALITY,                   alone after his friend and space mate, Dobbin, dies.
+we follow the evaluation procedure of AI@Meta              Willard is haunted by the memory of Dobbin’s final
+(2024). For GovReport, we prompt the model to              words, “I saw the Ghost Ship," and becomes obsessed
+                                                           with finding the ship. He spends years searching for it,
+summarize the report, and then greedily generate           and eventually, he sees a strange, ghostly ship that
+630 tokens.                                                seems to be heading towards him. As he gets closer, he
+                                                           realizes that it’s not just a hallucination, but a real ship
+                                                           from Earth that’s been traveling through space for
+B     Pretraining Objective Ablations                      centuries. In the end, Willard is taken aboard the ship,
+                                                           but learns that the ship and its crew are mere shells of
+We assess the necessity of both the forward and            their former selves, and that they are doomed to remain
+reverse terms in the loss by evaluating SQuAD per-         in space forever. Ultimately, Willard is forced to
+formance on multiple different pre-training losses         confront the reality that he’ll never return to Earth.
+with varying λ values in Equation 6. In Table 5                              (b) 2.5% KV retention
+we observe that using either the pure forward or           The story follows the journey of Willard, a space
+reverse divergences performs markedly worse than           traveler who has been alone in space for years after the
+                                                           death of his friend and partner, Dobbin. Willard is
+using a mixture of both. Furthermore, using solely         struggling to come to terms with his isolation and the
+the auto-encode + cross-entropy (used in ICAE and          loss of his friend, and is haunted by the legend of the
+DODO), performs significantly worse than Equation          Ghost Ship, a mythical vessel that is said to roam the
+                                                           solar system, never to be seen again. One day, Willard
+6, demonstrating the significant benefits that the         spots a strange, rocket-shaped object approaching him,
+weighted distillation objective provide. We also           and as it draws closer, he realizes it is the Mary Lou.
+note that replacing the routing mechanism with a           The ship is now a mere shadow of its former self, and
+                                                           Willard is invited to board it, where he is greeted by a
+learnable embedding (added to important tokens)            rescue team who have been sent to retrieve him. As he
+does not perform well.                                     adjusts to life on the rescue ship, Willard comes to
+                                                           terms with his past and the reality of his situation, and
+            Loss           SQuAD Acc. (%)                  ultimately accepts that he will never return to Earth.
+                                                           The story concludes with Willard’s poignant realization
+            λ=1                  83.4%                     that he and the crew of the rescue ship are the Ghosts,
+            λ = 0.6              86.0%                     doomed to roam the solar system forever.
+            λ = 0.4              85.3%
+            λ=0                  82.7%                                        (c) .25% KV retention
+            AE + LM             79.1%                      The story follows the journey of Willard, a space
+            NO ROUTING          67.4 %                     explorer who has been traveling through the galaxy for
+                                                           years, searching for a new home for humanity. He has
+                                                           lost his friend and companion, Dobbin, and is
+    Table 5: Effect of Pretraining Loss wrt LLAMA -3.      struggling to come to terms with his own mortality. One
+                                                           day, he discovers a faint light in the distance, which he
+                                                           believes to be a sign of life. As he approaches the light,
+C     Qualitative Analysis of Generated Text               he realizes it is a ghost ship, a ship that has been
+                                                           drifting through space for millions of years, its crew and
+In Figure 6 we present representative summaries            passengers long dead. The ship is a relic of a bygone
+                                                           era, and Willard is forced to confront the reality that he
+of the short story “Galactic Ghost". LLAMA -3 was          will never be able to return to Earth, as the ship would
+prompted to summarize the short story in a few             pass through it, making it impossible to survive. In the
+sentences. As the KV retention ratio decreases, we         end, Willard comes to accept his fate, realizing that he
+                                                           and the crew of the ghost ship are doomed to drift
+observe an increase in statements that are unfaithful      through space forever, a reminder of the transience of
+to the original context. Particularly, at extremely        human existence.
+high compression ratios, the model begins to hal-
+lucinate details, but impressively still maintains       Figure 6: LLAMA -3 was tasked with summarizing a 6k
+understanding of the general plot of the story. Note     token short story at low KV retention rates. Inaccura-
+the varying degrees of semantic compression in           cies in the summary are highlighted yellow, and were
+summaries generated under high compression ra-           determined by hand.
+tios; qualitatively, we observe that models with
+severely compressed contexts generally understand
+the text, but resort to making vague statements.
+

@@ -1,0 +1,1040 @@
+                                                           Scaling Sparse Fine-Tuning to Large Language Models
+
+
+                                                         Alan Ansell 1 Ivan Vulić 1 Hannah Sterz 1 Anna Korhonen 1 Edoardo M. Ponti 2 1
+
+
+                                                                 Abstract                                    to their state-of-the-art performance (Kaplan et al., 2020).
+                                                                                                             However, this scale is both a blessing and a curse as tailor-
+                                             Large Language Models (LLMs) are difficult to                   ing LLMs to specific applications via fine-tuning presents
+                                             fully fine-tune (e.g., with instructions or human               a formidable challenge: if performed naı̈vely, this incurs
+arXiv:2401.16405v2 [cs.CL] 2 Feb 2024
+
+
+
+
+                                             feedback) due to their sheer number of parameters.              the cost of updating an incredibly large set of parameters.
+                                             A family of parameter-efficient sparse fine-tuning              A family of lightweight methods for LLM adaptation have
+                                             methods have proven promising in terms of per-                  been proposed to mitigate this issue, known collectively
+                                             formance but their memory requirements increase                 as Parameter-Efficient Fine-Tuning (PEFT). PEFT meth-
+                                             proportionally to the size of the LLMs. In this                 ods learn a small number of new parameters, denoted as ϕ,
+                                             work, we scale sparse fine-tuning to state-of-the-              which augment the frozen LLM weights θ (Pfeiffer et al.,
+                                             art LLMs like LLaMA 2 7B and 13B. We propose                    2023; Lialin et al., 2023). For instance, Low-Rank Adapters
+                                             SpIEL, a novel sparse fine-tuning method which,                 (LoRA; Hu et al., 2022) learn additional low-rank matrices
+                                             for a desired density level, maintains an array of              to modify the linear layers in Transformer blocks.
+                                             parameter indices and the deltas of these parame-
+                                             ters relative to their pretrained values. It iterates           PEFT methods based on unstructured sparse fine-tuning
+                                             over: (a) updating the active deltas, (b) pruning               (SFT1 ), where ϕ is a sparse vector added to θ, have recently
+                                             indices (based on the change of magnitude of their              shown promise (Sung et al., 2021; Guo et al., 2021; Ansell
+                                             deltas) and (c) regrowth of indices. For regrowth,              et al., 2022). These offer a strong trade-off between low
+                                             we explore two criteria based on either the accu-               number of parameters and high model performance without
+                                             mulated gradients of a few candidate parameters                 inserting additional layers into the LLM’s neural architec-
+                                             or their approximate momenta estimated using                    ture, which would reduce model efficiency. In addition,
+                                             the efficient SM3 optimizer. We experiment with                 multiple SFTs are composable while avoiding interference
+                                             instruction-tuning of LLMs on standard dataset                  (Ansell et al., 2022), which facilitates the integration of
+                                             mixtures, finding that SpIEL is often superior to               multiple sources of knowledge into LLMs. Formally, SFT
+                                             popular parameter-efficient fine-tuning methods                 can be conceived of as performing joint optimization over
+                                             like LoRA (low-rank adaptation) in terms of per-                the fixed-size set of non-zero indices of ϕ and their deltas
+                                             formance and comparable in terms of run time.                   with respect to the LLM weights. Due to the intricacies of
+                                             We additionally show that SpIEL is compatible                   this optimization, however, SFT has so far been severely
+                                             with both quantization and efficient optimizers, to             limited by a major drawback, namely, its high memory re-
+                                             facilitate scaling to ever-larger model sizes. We re-           quirements: existing methods for selecting non-zero indices
+                                             lease the code for SpIEL at https://github.                     include learning a mask (Sung et al., 2021), estimating the
+                                             com/AlanAnsell/peft and for the instruc-                        Fisher information (Guo et al., 2021), or calculating the
+                                             tion-tuning experiments at https://github.                      difference between initialization and convergence (Ansell
+                                             com/ducdauge/sft-llm.                                           et al., 2022) for all LLM parameters. Hence, SFT is not
+                                                                                                             currently suitable for adapting LLM at large scales.
+                                                                                                             The main goal of this work is to overcome these challenges
+                                                                                                             by devising memory-efficient methods to update Large Lan-
+                                        1. Introduction                                                      guage Models (LLMs) sparsely, while maintaining perfor-
+                                        The scale of Large Language Models (LLMs), such as Fal-              mance benefits, that is, retaining the same performance of
+                                        con (Almazrouei et al., 2023), LLaMA 2 (Touvron et al.,              full-model fine-tuning or even surpassing it. Specifically,
+                                        2023), and Mistral (Jiang et al., 2023), is one of the keys          we wish for the memory use during training (beyond that
+                                                                                                             required to store the pretrained model weights) to scale
+                                           1
+                                             University of Cambridge 2 University of Edinburgh. Corre-           1
+                                        spondence to: Alan Ansell <aja63@cam.ac.uk>.                               Note the unfortunate confusion of nomenclature with super-
+                                                                                                             vised fine-tuning (also frequently referred to as SFT).
+
+
+
+                                                                                                         1
+                                      Scaling Sparse Fine-Tuning to Large Language Models
+
+
+
+
+Figure 1. A visualization of the proposed Sparse Fine-Tuning (SFT) method scaled to a Large Language Model (LLM). PEFT parameters
+consist of indices (arrows) and corresponding deltas (red squares) with respect to LLM parameters (blue squares). After initialization
+(1), PEFT deltas are updated for S steps (2). Next, obsolete indices are dropped (3) and new indices are grown (4) according to either
+accumulated gradients or approximate momenta. The algorithm then returns to the update step (2) and is repeated iteratively.
+
+linearly with the number of SFT parameters O(dϕ ) rather              We compare our SpIEL variants with the state-of-the-art
+than LLM parameters O(dθ ). To achieve this, we introduce             PEFT methods LoRA (Hu et al., 2022) and (IA)3 (Liu et al.,
+SpIEL (Sparse Iterative Efficient Learning), an iterative             2022), as well as with full fine-tuning, starting from LLaMA
+paradigm for SFT that alternates between updating deltas of           2 (Touvron et al., 2023) as a base model. We instruction-
+active indices, deleting obsolete indices, and growing new            tune them on multi-task data such as Flan v2 (Longpre et al.,
+ones (Evci et al., 2020). Deletion is determined by change            2023), data generated by proprietary models such as GPT4-
+of magnitude between training steps whereas growth by                 Alpaca (Peng et al., 2023), or a mixture of both with Tülu v2
+(transiently calculated) gradients. The growth criterion is           (Ivison et al., 2023). We extensively evaluate the resulting
+inspired by Evci et al. (2020), which we further improve              models on standard benchmarks for factuality (MMLU;
+upon by efficiently accumulating gradients to reduce their            Hendrycks et al., 2021), reasoning (GSM and BBH; Cobbe
+variance. Moreover, while our algorithm (SpIEL-AG) is                 et al., 2021; Suzgun et al., 2023), multilinguality (TyDiQA;
+reminiscent of sparse training (Evci et al., 2020), the scat-         Clark et al., 2020), and coding (HumanEval; Chen et al.,
+tering of the SFT onto the base LLM effectively yields a              2021).
+dense model. This entirely side-steps the problem of the
+                                                                      The main results reveal that SpIEL outperforms the PEFT
+‘hardware lottery’ due to cumbersome sparse tensor opera-
+                                                                      and full fine-tuning baselines on most tasks and configura-
+tions (Hooker, 2021). We provide a visual overview of our
+                                                                      tions we test, both with and without 4-bit LLM quantization
+algorithms in Figure 1.
+                                                                      during fine-tuning (Dettmers et al., 2023). In combination
+When extreme memory efficiency is required, we show how               with the SpIEL-MA variant, this allows for scaling fine-
+SpIEL can be combined with efficient optimizers such as               tuning to very large LLMs with a modest memory footprint.
+SM3, where the momenta of parameter matrices are approxi-
+mated by row-wise and column-wise summary metrics (Anil               2. Background and Related Work
+et al., 2019). In these settings, gradients become unreliable,
+as their variance increases in single-example mini-batches            2.1. Parameter-Efficient and Memory-Efficient
+and it is costly memory-wise to accumulate even a subset                   Fine-Tuning
+of them. Hence, we propose that approximate momenta can
+                                                                      Parameter-efficient fine-tuning (PEFT) methods have gener-
+additionally substitute gradients as a criterion for growth,
+                                                                      ally been defined as those which fine-tune a small number
+yielding the SpIEL-MA model variant.
+                                                                      of parameters relative to the total size of the pretrained
+
+
+                                                                  2
+                                    Scaling Sparse Fine-Tuning to Large Language Models
+
+model. The possible benefits of using a PEFT method as                2.3. Sparse Fine-Tuning
+opposed to full model fine-tuning include: (1) reduced GPU
+                                                                      A sparse fine-tuning f ′ of a neural function f entails the
+memory usage during training; (2) faster training; (3) faster
+                                                                      addition of a sparse “difference” or “delta” vector δ ∈ Rdθ
+saving and loading of the fine-tuning with less permanent
+                                                                      to its parameters θ ∈ Rdθ , i.e. f ′ ( ; θ) = f ( ; θ + δ). A
+storage required as the “frozen” original weights of the large
+                                                                      delta vector δ with dϕ non-zero values can be expressed in
+underlying model are shared across multiple tasks and ap-
+                                                                      terms of a vector of unique indices η ∈ {1, 2, ..., dθ }dϕ and
+plications; (4) the “composability” property of some PEFT
+                                                                      their corresponding values ϕ ∈ Rdϕ . Typically, the SFT
+methods, which allows modules to be combined with less                         d
+interference than with full fine-tuning (Pfeiffer et al., 2020;       density dϕθ is a user-definable hyperparameter. To illustrate
+Ansell et al., 2022); and (5) less tendency to overfit due to         the difference between LoRA and SFT visually, Figure 3
+the reduced capacity of PEFT with respect to the full model.          shows how they adapt a Transformer block.
+
+Of these, (1) is perhaps the most critical in the era of Large        In its most general form, sparse fine-tuning can be inter-
+Language Models whose GPU memory requirement for                      preted as performing joint optimization over η and ϕ:
+full fine-tuning is beyond the reach of researchers and de-                      η ⋆ , ϕ⋆ = arg max log p(D | θ, η, ϕ).          (3)
+velopers without multiple high-end GPUs. Nonetheless,                                         η,ϕ
+parameter-efficiency alone does not guarantee a reduction in
+GPU memory usage, though it almost certainly implies that             A specialized optimization approach is required for η since
+less space is required to save the fine-tuning in permanent           it is a discrete latent variable and cannot be directly op-
+memory. It is thus important to draw a distinction between            timized through stochastic gradient descent. Approaches
+(i) efficiency in number of fine-tuned parameters versus (ii)         proposed in previous works include: DiffPruning (Guo et al.,
+the peak GPU memory usage during fine-tuning: we refer to             2021), which applies a continuous relaxation of a binary
+the former as parameter efficiency and the latter as memory           mask to δ during fine-tuning which is sparsified with a regu-
+efficiency.                                                           larization term, and takes η to be the dϕ indices with mask
+                                                                      values closest to 1 at the end; FISH Mask (Sung et al., 2021),
+2.2. LoRA                                                             where η is fixed at the beginning of training to be the indices
+                                                                      of the dϕ weights with highest observed Fisher information;
+As a solution, Low-Rank Adaptation (LoRA; Hu et al.,                  and Lottery-Ticket SFT (LT-SFT; Ansell et al., 2022), where
+2022) is of the best-performing and most popular PEFT                 η is fixed to be the indices of the dϕ weights which change
+techniques to date. In brief, it conceptually fine-tunes only         the most during an initial round of full fine-tuning. These
+a low-rank subspace of each weight matrix. In practice,               methods share a common drawback, namely that the amount
+LoRA is typically applied only to the linear modules of a             of memory they use during training in addition to that re-
+Transformer, and is implemented as follows:                           quired to store the pretrained model weights is proportional
+                                  α                                   to dθ , the total number of model parameters. As discussed
+                   y = W x + BAx,                         (1)         above, this makes these methods prohibitively expensive in
+                                  r
+                                                                      many LLM fine-tuning scenarios, especially with very large
+where x ∈ Rdin , y ∈ Rdout , W ∈ Rdout ×din , A ∈ Rr×din ,
+                                                                      models; we thus seek a method whose memory overhead is
+B ∈ Rdout ×r , the subspace rank r ≪ din , dout , and α is a
+                                                                      instead proportional to dϕ , the number of parameters which
+hyperparameter. Like bottleneck adapters (Houlsby et al.,
+                                                                      are actually modified during fine-tuning.
+2019), LoRA employs a successive down- and up-projection,
+but the fact that it places them in parallel rather than in           Finally, there exists a separate but related literature on pre-
+series with the full-rank matrix multiplication without a non-        training sparse neural networks, for which we refer the
+linearity enables LoRA adapters to be “merged” at inference           reader to Hoefler et al. (2021) for a detailed overview. This
+time into their W matrix as follows:                                  work owes most to Evci et al. (2020), whose dropping and
+                                     α                                growth paradigm we extend to sparse fine-tuning in §3.2.
+                y = W ′ x = (W + BA)x.                     (2)
+                                     r                                Contrary to them, however, SpIEL results in a dense model,
+This allows LoRA-adapted models to achieve inference                  which side-steps the problem that available hardware is
+speed equal to the underlying LLM.                                    not well suited to sparse tensor operations (Hooker, 2021).
+                                                                      Moreover, we introduce novel and enhanced growth criteria
+With the recent development of efficient quantization meth-           in Section 3.2 and Section 3.3.
+ods suitable for LLMs, LoRA has emerged as the de facto
+standard PEFT method for LLM instruction tuning (Wang,
+                                                                      2.4. Quantized PEFT
+2023; Dettmers et al., 2023). This is also why we provide its
+short self-contained description here and treat it as our prin-       A significant recent advance in efficient methods for NLP
+cipal baseline, while we conduct additional comparisons to            has been the development of quantization methods which
+(IA)3 (Liu et al., 2022), another established PEFT method.            are suitable for LLMs and incur minimal degradation in
+
+                                                                  3
+                                        Scaling Sparse Fine-Tuning to Large Language Models
+
+performance. Dettmers et al. (2022) and later Dettmers et al.               2022) which, instead of vectors η and ϕ, maintain a binary
+                                                                                                   (i)
+(2023) proposed 8-bit and 4-bit quantization techniques for                 mask b(i) ∈ {0, 1}dθ which is applied to the gradient of
+LLM parameter tensors that yield close to full-precision                    θ (i) after it is calculated. Since b and the gradient of θ
+performance during inference or parameter-efficient fine-                   both have size proportional to dθ , the memory overhead of
+tuning. The qLoRA fine-tuning method of Dettmers et al.                     this implementation is O(dθ ). Although the above imple-
+(2023) reduces memory usage by applying 4-bit quantiza-                     mentation would enable the fixed-η stage of FISH Mask or
+tion to most of the pretrained LLM parameters while storing                 LT-SFT to be performed with acceptable memory overhead,
+the small number of additional trainable LoRA parameters                    both methods incur O(dθ ) memory cost when selecting η.
+in full precision and dequantizing the pretrained weights
+only when required. We show that sparse fine-tuning is also                 3.2. SpIEL-AG: Accumulated Gradient SpIEL
+amenable to quantization of the pretrained weights. We use
+QUANT (·) and DEQUANT (·) to denote 4-bit NormalFloat                       Building on Evci et al. (2020)’s “Rigging the Lottery”
+quantization and dequantization respectively with double                    (RigL) method for pretraining sparse neural networks, we
+quantization (Dettmers et al., 2023).                                       propose SpIEL-AG. SpIEL-AG maintains a fixed-size η (i)
+                                                                            and ϕ(i) for each parameter subvector θ (i) , but unlike the
+                                                                            methods discussed in the previous section, it allows η (i) to
+3. Method                                                                   change dynamically during training. ϕ(i) is initialized2
+                                                                                   d
+3.1. Efficient SFT with Fixed η                                             as [0] ϕ(i) and η (i) is initialized as a random subset of
+                                                                            {1, 2, ..., dθ(i) }. Every S training steps, η (i) is updated
+In practice, the weights θ of a neural function are partitioned             by freezing some of the currently trainable weights after re-
+into a sequence of np “parameter tensors.” To simplify                      setting them to their pretrained values (“dropping”), while
+indexing, we think in terms of the flattened versions of these              unfreezing some of the currently frozen weights (“growth”).
+tensors and refer to them as “parameter subvectors”, denoted                A family of possible SpIEL methods arises from the choice
+as {θ (1) ∈ Rdθ(1) , θ (2) ∈ Rdθ(2) , ..., θ (np ) ∈ Rdθ(np ) }.            of criteria for dropping and growth. For SpIEL-AG, we use
+Similarly, we denote the sections of η and ϕ corresponding                  the following criteria:
+to parameter subvector θ (i) as η (i) and ϕ(i) respectively. We
+observe that, for a fixed η and assuming maxi dθ(i) < dϕ ,                  • D ROP : the k(i, t) weights in η (i) which have changed
+it is possible to perform sparse fine-tuning with the desired                                                                  (i)
+                                                                              the least from their pretrained values, i.e. ηdrop =
+O(dϕ ) memory overhead by scatter-adding each ϕ(i) into
+                                                                                                  (i)
+its corresponding θ (i) (which stays frozen) before it is used:               argtopk(i, t) − |ϕ |, where k(i, t) is a schedule defin-
+                                                                              ing the number of weights in parameter subvector i to
+          θ ′(i) = θ (i) + scatter(η (i) , ϕ(i) , dθ(i) ),        (4)         replace at step t.
+                                                                            • G ROW: the k(i, t) weights in θ (i) with largest esti-
+where scatter(η, ϕ, d) ∈ Rd such that                                                                                       (i)
+                                                                              mated “long-run” gradient magnitudes, i.e. ηgrow =
+                                      dϕ                                                                       ′
+                                      X                                       argtopk(i, t) Êx∼D [∇θ(i) L(x; θ )] .
+            [scatter(η, ϕ, d)]i =             Iηj =i ϕj .         (5)
+                                      j=1                                   The gradients required for growth selection are estimated
+                                                            (i)             over the γ training steps before η is updated, which we refer
+The simplest way of calculating the gradient of ϕ during
+                                                                            to as the gradient estimation phase. Here we diverge from
+the backward pass of backpropagation is by gathering the
+                                                                            Evci et al. (2020), who select the weights to grow on the
+relevant indices of the gradient of θ ′(i) :
+                                                                            basis of gradients from a single instantaneous minibatch.3
+                         ∂L          ∂L                                     It is not possible to maintain an estimate of the full gradient
+                                =      ′(i)
+                                              .                   (6)
+                          (i)
+                        ∂ϕj         ∂θηj                                    of dimension dθ(i) without exceeding our memory budget.
+                                                                            Therefore, we restrict ourselves to maintaining such an es-
+While Equation (6) requires the computation of the dense                    timate for just Ki “growth candidates.” These are selected
+gradient of each θ (i) , this can be disposed of as soon as the             as the weights in θ (i) with top Ki gradient magnitudes dur-
+required values are gathered from it. Because dθ(i) ≪ dθ ,                  ing the first batch of the gradient estimation phase. The
+this does not add significantly to the peak memory usage.                      2
+                                                                                 The total number of tunable parameters dϕ is a hyper-
+Furthermore, we show in Appendix E that for a linear layer,
+                                                                            parameter, and dϕ(i) is set such that the proportion of tunable
+it is possible in principle to calculate the gradient of ϕ(i)                           d (i)
+without needing to compute the full gradient of θ (i) , which               parameters dϕ        is the same for each i-th parameter subvector.
+                                                                                         θ (i)
+                                                                               3
+we will explore in future work.                                                  In a memory-constrained setting where it may be possible
+                                                                            to process just a single training example at a time, the high level
+This implementation of sparse fine-tuning stands in contrast                of variance in the gradients from one minibatch may harm the
+to previous approaches (e.g. Sung et al., 2021; Ansell et al.,              selection of weights to grow.
+
+                                                                        4
+                                     Scaling Sparse Fine-Tuning to Large Language Models
+
+long-run gradients of the growth candidates are estimated              Algorithm 1 Accumulated Gradient SpIEL
+by averaging their gradients over all batches in the gradient           1: procedure S P IEL-AG(θ, D, γ, k)
+estimation phase:                                                       2:    ϕ ← [0]dϕ                    ▷ Initialize SFT values
+                            t                                           3:    ϕ0 ← ϕ
+            (i)        1 X        ∂                                           η ∼dϕ [1..dθ ]              ▷ Initialize SFT indices
+           ĝj (t) =                   L(xs ; θ ′ ).        (7)         4:
+                       γ s=t−γ+1 ∂θ(i)                                  5:    for t in 1..T do
+                                     j
+                                                                        6:        xt ∼ D
+Note that although it is necessary to calculate the dense gra-          7:        θ ′ ← scatter-add(ϕ, η, θ)
+dient ∇θ(i) L(x; θ ′ ) at each step of the gradient estimation          8:        UPDATE(ϕ, ∇ϕ L(fθ ′ (xt )))
+phase, we never need to store it since we can immediately               9:        if γ | t then
+gather the Ki values we need from it. This can be imple-               10:             d ← top-k(t)(−|ϕ − ϕ0 |)
+mented with a backward hook in PyTorch, for instance. In               11:             ϕ, η = DROP(ϕ, η, d)
+our experiments, we set Ki = dϕ(i) .                                   12:
+                                                                                                   Pt
+                                                                                      g ← top-k(t)[ i=t−γ+1 ∇θ L(fθ′ (xi ))]
+There is some additional housekeeping to do after updating             13:            ϕ, η = GROW(ϕ, η, g)
+η. We must reset ϕ(i) to zero at indices DROP(η (i) ). We              14:            ϕ0 ← ϕ
+also need to set the optimizer buffers for the newly grown             15:     return ϕ, η
+weights GROW(η (i) ) to appropriate values. In our experi-
+ments, we use the Adam optimizer (Kingma & Ba, 2015),
+which tracks the exponentially smoothed mean of the first              dates and their estimated momenta. We propose an alterna-
+and second momenta of the parameter gradients. Conve-                  tive algorithm for the most memory-constrained scenarios,
+niently, the gradient estimation phase already produces an             which we call SpIEL-MA, employing the SM3 memory-
+estimate of the first momentum of the newly grown weights,             efficient adaptive optimizer of Anil et al. (2019). For a
+and we extend it to estimate the second as well so that we             two-dimensional parameter tensor Θ of size r × c, the SM3
+can use these values to seed the optimizer momenta. A                  optimizer maintains buffers r ∈ Rr and c ∈ Rc , which con-
+minor complication here is that Adam multiplies the i-th               tain running sums of the maximum squared gradients over
+                               1
+momentum by a factor of 1−β      t before use to correct for its       the columns and rows of Θ, respectively. We can obtain
+                                 i
+bias toward zero. Since in SpIEL, different weights are “ini-          a (low-quality but cheap) estimate of the absolute value of
+tialized” at different times, we track the age of each weight          the momentum mij for each element θij of Θ by taking the
+(i.e. the number of steps since it was last grown) individu-           elementwise fourth root of the outer product of r and c:
+ally, and use it to calculate the appropriate bias correction.
+                                                                                              ˆ =√
+                                                                                             |m|    4 r c .
+                                                                                                       i j                      (9)
+                                                                                                 ij
+For simplicity, we set the update rate schedule k(i, t) to
+decrease linearly to 0 over the course of training, as follows:        SpIEL-MA uses this estimate to rank weights for growth,
+                      (                                                and otherwise it is the same as SpIEL-AG. Since the SM3
+                        dϕ(i)          if t = γ,                       optimizer is very memory efficient, storing only r + c values
+            k(i, t) = ξ(T   −t)                             (8)
+                           T    dϕ(i)  otherwise,                      in its buffers for an r × c parameter tensor compared to
+                                                                       Adam’s 2rc, and SpIEL-MA uses no additional persistent
+where T is the total number of training steps and ξ is a               memory to track statistics to inform η updates, significantly
+hyperparameter denoting the peak replacement rate. Note                less memory in total is required than for SpIEL-AG. Inci-
+that during the first η update at step γ, we replace all the           dentally, we remark that the growth criterion of SpIEL-MA
+weights, since the indices in η are randomly initialized;              assumes locality, i.e., that the importance of a parameter
+there is no reason to believe that they are relevant to the            is correlated to those in the same row and column. This is
+task.                                                                  reminiscent of the locality-driven synaptic growth in human
+We provide high-level pseudocode for SpIEL-AG in Algo-                 brains, which results in dense hubs but a globally sparse
+rithm 1. Note that some details such as the selection of               anatomy (Betzel et al., 2017; Hoefler et al., 2021). We pro-
+candidates and optimizer momenta seeding are omitted for               vide high-level pseudocode for SpIEL-MA in Algorithm
+conciseness.                                                           2.
+                                                                       Regularizing SpIEL Similar to LoRA, which is regularized
+3.3. SpIEL-MA: Momentum-Approximation SpIEL                            by its dropout, SpIEL is also likely to overfit as the model
+                                                                       diverges from its pretrained state. We therefore regularize
+The SpIEL-AG method prioritizes making a high-quality se-
+                                                                       SpIEL by applying L2 regularization to the ϕ parameters in
+lection of weights to grow when updating η, but this comes
+                                                                       the form of weight decay with strength λ.
+at the cost of the extra memory required during the gradient
+estimation phase to store the indices of the growth candi-             Quantized SpIEL As another contribution, we extend the
+
+                                                                   5
+                                          Scaling Sparse Fine-Tuning to Large Language Models
+
+Algorithm 2 Momentum-Approximation SpIEL                                          dataset of 50K outputs generated by davinci-003 and
+                                  (1)             (np )                           GPT-4 (OpenAI, 2023) prompted with inputs from Alpaca
+ 1: procedure S P IEL-MA(θ              , .., θ           , D, γ, k)
+                                                                                  (Taori et al., 2023); or (iii) the Tülu v2 mixture (Ivison
+ 2:    for i in 1..P do
+                      d                                                           et al., 2023), consisting of 326K examples from multiple
+ 3:        ϕ(i) ← [0] ϕ(i)
+               (i)                                                                instruction following datasets.
+ 4:          ϕ0 ← ϕ(i)
+ 5:          η (i) ∼dϕ(i) [1..dθ(i) ]                                             Following Wang et al. (2023) and Ivison et al. (2023), we
+                         (i)                                                      evaluate instruction-tuned LLMs on the following bench-
+ 6:          r(i) = [0]h            ▷ Initialize row accumulator
+                           (i)                                                    marks to capture a range of abilities: Massively Multitask
+ 7:          c(i) = [0]w        ▷ Initialize column accumulator                   Language Understanding (MMLU; Hendrycks et al., 2021),
+ 8:      for t in 1..T do                                                         Grade School Math (GSM; Cobbe et al., 2021), BIG-Bench
+ 9:          x∼D                                                                  Hard (BBH; Suzgun et al., 2023), Typologically Diverse
+10:          θ ′ ← concati scatter-add(ϕ(i) , η (i) , θ (i) )                     Question Answering (TyDiQA; Clark et al., 2020) and Hu-
+11:          for i in 1..np do                                                    manEval (Chen et al., 2021). We report combinations of
+12:               UPDATE - SM 3[ϕ(i) , η (i) , r(i) , c(i) ,                      training data mixtures and downstream evaluation bench-
+13:                                 ∇ϕ(i) L(fθ′ (x))]                             marks where Wang et al. (2023) reports the highest gains.
+14:              if γ | t then                                                    See Appendix B for full details of our evaluation setup.
+                                                             (i)
+15:                   d(i) ← top-k(i, t)(−|ϕ(i) − ϕ0 |)
+16:                   ϕ , η = DROP(ϕ , η , d(i) )
+                        (i)    (i)                (i)   (i)
+                                                                                  4.2. Models and Baselines
+17:                   g (i) ← top-k(i, t)[r(i) ⊗ c(i) ]
+                                                                                  As LLMs to fine-tune, we choose state-of-the-art LLaMA 2
+18:                   ϕ(i) , η (i) = GROW(ϕ(i) , η (i) , g (i) )
+                        (i)                                                       (Touvron et al., 2023) at both 7b and 13b parameter scales.
+19:                   ϕ0 ← ϕ(i)                                                   We report the performance of the unmodified “vanilla” mod-
+20:      return ϕ(1) , .., ϕ(np ) , η (1) , .., η (np )                           els as a baseline for a series of PEFT methods. Specifi-
+                                                                                  cally, we compare SpIEL with LoRA (Hu et al., 2022, see
+                                                                                  §2.2), as it offers the best performance–efficiency trade-off
+proposed SpIEL techniques to quantized LLMs (“qSpIEL”).                           (Pfeiffer et al., 2023) and is arguably the most widespread
+                                 (i)
+Consider parameter matrix WPT ∈ Rh×o in its pre-trained                           pre-existing PEFT method (Dettmers et al., 2023), as well
+                                            (i)
+data type (e.g., FP32). Instead of storing WPT itself on GPU,                     as (IA)3 (Liu et al., 2022). We use the LoRA and (IA)3
+                                    (i)              (i)
+we store its quantized version WNF4 = QUANT(WPT ). Dur-                           implementations in the peft library (Mangrulkar et al.,
+ing the forward pass of the linear module, qSpIEL computes                        2022). For the Tülu v2 fine-tuning mixture, we include the
+the following:                                                                    fully fine-tuned LLaMA 2 models of Ivison et al. (2023) as
+                                                                                  a baseline (“FullFT”), which we would expect to provide a
+                                        (i)
+            Y = X(DEQUANT(WPT ) + ∆W (i) ),                            (10)       soft upper bound on the performance of the PEFT methods.4
+                                                                                  At 7b scale, we also perform our own full fine-tuning on the
+where X ∈ Rb×h is the input to the linear module, Y ∈                             Flan v2 and GPT4-Alpaca splits. We did not perform these
+Rb×o is the output, and                                                           experiments at 13b scale due to the computational expense.
+
+      ∆W (i) = reshape(scatter(η (i) , ϕ(i) , ho), [h, o]).                       Note that the pre-existing SFT methods (see §2.3) such as
+                                                                                  DiffPruning (Sung et al., 2021), FISH Mask (Guo et al.,
+This is equivalent to the behavior of a linear module in                          2021), and LT-SFT (Ansell et al., 2022) are not viable as
+ordinary, non-quantized SpIEL except that the pretrained                          baselines for LLM fine-tuning as their memory complexity
+parameter matrix gets quantized at the beginning of training                      scales as O(dθ ), similar to full fine-tuning. Full details
+and temporarily dequantized each time it is used.                                 of the training setup and hyperparameters can be found in
+                                                                                  Appendix C.
+4. Experimental Setup
+                                                                                  5. Results
+4.1. Training and Evaluation Data
+                                                                                  5.1. Main Results
+To demonstrate the effectiveness of SpIEL, we loosely
+base our experimental setup on that of Wang et al. (2023),                        We present the main results of our experiments in Table 1.
+who compare different data mixtures. In particular, we                            For Llama2-7b, we find that SpIEL-AG outperforms LoRA
+instruction-tune LLMs on (i) Wang et al. (2023)’s 50K sub-                        and (IA)3 consistently across evaluation benchmarks and in-
+sample of Flan v2 (Longpre et al., 2023), a dataset collecting                      4
+                                                                                      These follow a similar hyper-parameter setup except for a
+manually annotated examples for multiple tasks augmented                          much higher maximum context length of 8,192.
+with instructions; (ii) GPT4-Alpaca (Peng et al., 2023), a
+
+                                                                              6
+                                                    Scaling Sparse Fine-Tuning to Large Language Models
+
+
+Table 1. Performance of PEFT methods on a range of evaluation tasks for various instruction tuning datasets. † indicates results obtained
+using the models of Ivison et al. (2023). Tülu v2 ⊕ GPT4-Alpaca refers to a setting where we compose the respective PEFTs.
+
+                                          Flan v2           GPT4-Alpaca                            Tülu v2                         Tülu v2 ⊕
+                                                                                                                                   GPT4-Alpaca
+   Model / Method              MMLU           TyDiQA        HumanEval        MMLU       GSM      BBH      TyDiQA      HumanEval    HumanEval
+                Original           45.8         50.9           13.5          45.8       13.0     40.6         50.9      13.5            -
+   Llama2-7b
+
+
+
+
+                FullFT             50.5         55.5           15.2          51.3†      34.5†    45.3†        56.5†     22.6†           -
+                (IA)3              46.7         51.6           14.7          47.8       17.0     40.6         52.2      15.5           16.6
+                LoRA               49.3         55.3           15.7          51.3       22.0     43.8         58.0      15.5           16.1
+                SpIEL-AG           50.7         56.2           15.6          51.5       23.0     44.8         59.4      17.1           18.8
+                SpIEL-MA           48.8         55.8           16.2          49.5       16.5     44.7         56.7      15.3           17.0
+                Original           55.3         60.3           17.8          55.3       23.0     47.8         60.3      17.8            -
+   Llama2-13b
+
+
+
+
+                FullFT              -            -              -            56.7†      50.0†    51.9†        62.9†     26.7†           -
+                (IA)3              55.1         60.1           18.5          55.6       27.5     50.6         62.8      18.1           18.4
+                LoRA               55.8         61.4           19.8          56.2       29.0     54.6         63.9      19.5           22.4
+                SpIEL-AG           55.8         62.5           20.0          55.9       31.5     52.8         63.5      20.3           22.7
+                SpIEL-MA           55.5         62.5           19.9          55.9       29.0     51.2         62.8      20.2           20.8
+
+
+                                                                                     formance of full fine-tuning on most tasks, except GSM
+Table 2. Performance of quantized PEFT methods on a range of
+                                                                                     and HumanEval when fine-tuned on Tülu v2, where FullFT
+evaluation tasks for various instruction tuning datasets.
+                                                                                     vastly outperforms all PEFT methods. This effect was also
+                                             Flan v2           GPT4-Alpaca           observed by Ivison et al. (2023) in their qLoRA evaluation.
+         Model / Method             MMLU            TyDiQA     HumanEval             We note that the maximum sequence length we use during
+                                                                                     fine-tuning is 2,048, whereas Ivison et al. (2023) use 8,192
+                Original (4-bit)      44.8           50.2             11.0
+  Ll2-7b
+
+
+
+
+                qLoRA                 47.7           54.3             13.3           for full fine-tuning and 4,096 for qLoRA. It is possible that
+                qSpIEL-AG             48.8           54.9             15.3           the shorter sequence length for PEFT has a significant ef-
+                qSpIEL-MA             48.3           52.7             15.3           fect on downstream performance for open-ended generation
+                Original (4-bit)      54.7           59.6             15.5           tasks, or that PEFT is weaker on these tasks in general,
+  Ll2-13b
+
+
+
+
+                qLoRA                 55.0           60.7             18.2
+                qSpIEL-AG             55.5           61.5             18.8           perhaps due to its inability to modify the input and output
+                qSpIEL-MA             55.4           61.7             18.4           embedding layers. This warrants further investigation as
+                                                                                     part of future work.
+                                                                                     Quantization According to the scores in Table 2, we find
+struction tuning datasets, including Flan v2, GPT4-Alpaca,                           that 4-bit quantization results in only a modest reduction
+and Tülu v2. For Llama2-13b, SpIEL-AG similarly outper-                             in performance across PEFT methods, and their relative
+forms all baselines when fine-tuned on Flan v2 and GPT4-                             performance remains similar. In fact, SpIEL-AG is superior
+Alpaca; however, we report more mixed results for Tülu v2.5                         again to both LoRA and (IA)3 by an even higher margin
+Nonetheless, SpIEL-AG is superior in 5 out of the 6 com-                             compared to Table 1. These results demonstrate that SpIEL
+binations of scales and instruction tuning datasets. Hence,                          is a competitive PEFT method even in extremely resource-
+SpIEL-AG appears to be the strongest method overall.                                 constrained scenarios.
+AG vs MA Comparing the two SpIEL growth criteria, there                              Compositionality Finally, in Table 1 we also study whether
+appears to be a trade-off between performance and memory                             multiple PEFT adapters, trained on different data mixtures,
+usage, with the more memory-efficient SpIEL-MA gener-                                can be composed with the LLM. We find that composing
+ally performing a little worse than SpIEL-AG, except for a                           GPT4-Alpaca and Tülu v2 adapters increases the perfor-
+few cases, such as HumanEval evaluation for Llama2-7b.                               mance on HumanEval for PEFT, compared to the individual
+Since GPT4-Alpaca (used for HumanEval evaluation) has                                adapters. However SpIEL-AG performs favorably in com-
+the same amount of training examples as Flan v2, we rule                             position compared to LoRA as it yields a larger boost for 7B
+out that this difference is due to different levels of sample                        (+1.7 vs +0.4) and an overall better performance on 13B.
+efficiency between SpIEL-AG and SpIEL-MA.
+Ceiling We find that SpIEL-AG generally matches the per-                             5.2. Training Speed and Memory Efficiency
+    5
+      It is possible that the hyperparameters chosen for SpIEL dur-                  In Table 3, we compare the memory requirements and train-
+ing the hyperparameter search on Flan v2 do not always transfer                      ing time of LoRA, SpIEL and their quantized variants. We
+well to Tülu v2, which is a much larger dataset with a different                    consider two settings, with and without activation check-
+distribution of task types.
+
+                                                                                7
+                                        Scaling Sparse Fine-Tuning to Large Language Models
+
+                                                                                                        5
+Table 3. GPU memory requirements (in GB) and average time per                                                                               SpIEL-AG-7B
+                                                                                                                                            SpIEL-MA-7B
+
+
+
+
+                                                                             Proportion of Indices
+training step (in seconds) for fine-tuning SFT and LoRA on Flan                                         2
+
+v2 on an A100 GPU. We report values either without (left) or with                                                                           SpIEL-AG-13B
+                                                                                                      0.1
+(right) activation checkpointing.                                                                                                           SpIEL-MA-13B
+                                                                                                        5
+
+
+                                                                                                        2
+ Method              LlaMA 2 7b                LlaMA 2 13b
+                  Mem. ↓   Time ↓           Mem. ↓    Time ↓                                         0.01
+                                                                                                        5
+ LoRA             40 / 18     30.5 / 42.5    66 / 31     45.9 / 64.0
+ SpIEL-AG         34 / 20     33.4 / 44.8    56 / 36     56.2 / 76.3
+                                                                                                            0   10            20           30
+ SpIEL-MA         30 / 17     30.6 / 41.7    51 / 31     50.6 / 70.9
+                                                                                                                     Iteration of Growth
+ qLoRA            30 / 8      38.5 / 55.2    46 / 12    63.6 / 95.3
+ qSpIEL-AG        26 / 13     42.8 / 58.4    40 / 19    73.4 / 101.1
+ qSpIEL-MA        22 / 10     39.6 / 55.5    35 / 14    70.1 / 97.3        Figure 2. Proportion of indices with a certain age (i.e., the iteration
+                                                                           when they were last grown) of the converged η after training on
+                                                                           the Flan v2 dataset.
+pointing.6 We define the memory requirements to be the
+minimum amount of GPU memory needed to complete
+training successfully. We provide more details on our mea-
+surements in Appendix F.
+                                                                           of indices grown at a certain iteration in Figure 2, based
+We find that LoRA, SpIEL-AG and SpIEL-MA are broadly                       on models trained on Flan v2. In general, SpIEL-MA in-
+similar in terms of speed and memory requirements. SpIEL-                  troduces fewer new parameter indices later in training com-
+MA is consistently somewhat faster and more memory ef-                     pared to SpIEL-AG. We also find that 13b models tend to
+ficient than SpIEL-AG. Without activation checkpointing,                   retain parameter indices found earlier in training compared
+we find that the SpIEL methods are more memory efficient                   to their 7b counterparts. This preference for earlier index
+than LoRA; however, activation checkpointing is especially                 sets is not necessarily desirable as it might reflect the fact
+effective in reducing LoRA’s memory consumption, likely                    that SpIEL-MA and 13b models tend to get stuck in early lo-
+because LoRA stores more intermediate activations due                      cal minima. We speculate that better schedules for dropping
+to the parallel computation of the LoRA update. When                       and growth might alleviate this issue in the future.
+both quantization and activation checkpointing are applied,
+LoRA is the most memory-efficient technique by a small
+margin.7 We also find that LoRA is generally slightly faster               6. Conclusions and Future Work
+than the SpIEL methods, despite being generally outper-                    We have proposed SpIEL, the first method (to our knowl-
+formed by SpIEL-AG, especially with quantization.                          edge) for Sparse Fine-Tuning (SFT) that is not only
+As expected, quantization and activation checkpointing both                parameter-efficient but also memory-efficient. This allows it
+trade a slowdown in training speed for a reduction in mem-                 to scale to Large Language Models. Taking inspiration from
+ory usage. However, as a more general finding, these results               iterative methods for sparse pre-training, we alternate among
+would suggest that activation checkpointing should be prior-               phases where we update, drop, and then grow parameters.
+itized ahead of quantization in most cases when performing                 In particular, we introduce two new criteria for parameter
+PEFT on LLMs of this size (≥ 7B), as a larger memory                       growth: Accumulated Gradients across multiple iterations
+saving is achieved for an only marginally larger slowdown,                 (SpIEL-AG) and Momentum Approximation (SpIEL-MA),
+and without incurring any cost in performance.                             where we reuse information tracked by optimizers like SM3.
+                                                                           We find that SpIEL often surpasses alternative PEFT meth-
+5.3. Parameter Ages                                                        ods such as (IA)3 and LoRA in terms of performance and is
+                                                                           comparable to them in terms of memory and time efficiency.
+To shed light on the training dynamics of SpIEL, we study
+the age of each index (i.e., the iteration when it was last                We hope that these promising results will encourage further
+grown) of the converged parameters. We plot the proportion                 research into sparse fine-tuning. Future work may include
+                                                                           extending SpIEL to the embedding layers of LLMs; improv-
+   6
+      Note that “activation checkpointing” is a synonym of “gradient       ing the efficiency of the backward pass for a linear layer (see
+checkpointing”.                                                            Appendix E); considering more advanced dropping/growth
+    7
+      We note that, unlike our qSpIEL implementation, qLoRA                criteria, especially those which would enable adaptive redis-
+employs a paged optimizer, which might explain why there is
+a larger memory reduction for qLoRA. While qSpIEL is also                  tribution of tunable parameters across parameters tensors.
+compatible with the use of paged optimizers, we leave the actual           This would stand in contrast to the current setup where the
+implementation for future work.                                            number of tunable parameters in each tensor is fixed.
+
+                                                                       8
+                                   Scaling Sparse Fine-Tuning to Large Language Models
+
+Acknowledgments                                                     Clark, J. H., Choi, E., Collins, M., Garrette, D.,
+                                                                      Kwiatkowski, T., Nikolaev, V., and Palomaki, J. TyDi QA:
+Alan Ansell wishes to thank David and Claudia Harding                 A benchmark for information-seeking question answering
+for their generous support via the Harding Distinguished              in typologically diverse languages. Transactions of the
+Postgraduate Scholarship Programme. This work has been                Association for Computational Linguistics, 8:454–470,
+in part supported by the UK Research and Innovation                   2020.
+(UKRI) Frontier Research Grant EP/Y031350/1 (the UK
+government’s funding guarantee for ERC Advanced Grants)             Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H.,
+awarded to Anna Korhonen. Ivan Vulić has also been sup-              Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano,
+ported by a personal Royal Society University Research                R., Hesse, C., and Schulman, J. Training verifiers to solve
+Fellowship ‘Inclusive and Sustainable Language Technol-               math word problems. arXiv preprint arXiv:2110.14168,
+ogy for a Truly Multilingual World’ (no 221137; 2022-).               2021.
+Hannah Sterz thanks the Cambridge Trust for their support
+via the International Scholarship.                                  Dettmers, T., Lewis, M., Belkada, Y., and Zettlemoyer, L.
+                                                                      GPT3.int8(): 8-bit matrix multiplication for transformers
+                                                                      at scale. In Advances in Neural Information Processing
+References                                                            Systems 35: Annual Conference on Neural Information
+Almazrouei, E., Alobeidli, H., Alshamsi, A., Cappelli, A.,            Processing Systems 2022, NeurIPS 2022, New Orleans,
+  Cojocaru, R., Debbah, M., Goffinet, E., Heslow, D., Lau-            LA, USA, November 28 - December 9, 2022.
+  nay, J., Malartic, Q., Noune, B., Pannier, B., and Penedo,
+  G. Falcon-40B: An open large language model with state-           Dettmers, T., Pagnoni, A., Holtzman, A., and Zettlemoyer, L.
+  of-the-art performance. Technical report, Technology                QLoRA: Efficient finetuning of quantized LLMs. arXiv
+  Innovation Institute, 2023.                                         preprint arXiv:2305.14314, 2023.
+
+Anil, R., Gupta, V., Koren, T., and Singer, Y. Memory-              Evci, U., Gale, T., Menick, J., Castro, P. S., and Elsen,
+  efficient adaptive optimization. In Proceedings of the              E. Rigging the lottery: Making all tickets winners. In
+ 33rd International Conference on Neural Information                  III, H. D. and Singh, A. (eds.), Proceedings of the 37th
+ Processing Systems, Red Hook, NY, USA, 2019.                         International Conference on Machine Learning, volume
+                                                                      119 of Proceedings of Machine Learning Research, pp.
+Ansell, A., Ponti, E., Korhonen, A., and Vulić, I. Com-              2943–2952, 13–18 Jul 2020.
+  posable sparse fine-tuning for cross-lingual transfer. In
+ Proceedings of the 60th Annual Meeting of the Associ-              Guo, D., Rush, A., and Kim, Y. Parameter-efficient transfer
+  ation for Computational Linguistics (Volume 1: Long                 learning with diff pruning. In Proceedings of the 59th
+ Papers), pp. 1778–1796, Dublin, Ireland, May 2022.                  Annual Meeting of the Association for Computational Lin-
+                                                                      guistics and the 11th International Joint Conference on
+Betzel, R. F., Medaglia, J. D., Papadopoulos, L., Baum,               Natural Language Processing (Volume 1: Long Papers),
+  G. L., Gur, R., Gur, R., Roalf, D., Satterthwaite, T. D.,           pp. 4884–4896, Online, August 2021.
+  and Bassett, D. S. The modular organization of human
+  anatomical brain networks: Accounting for the cost of             Hendrycks, D., Burns, C., Basart, S., Zou, A., Mazeika, M.,
+  wiring. Network Neuroscience, 1(1):42–68, 2017.                     Song, D., and Steinhardt, J. Measuring massive multitask
+                                                                      language understanding. In International Conference on
+Chen, M., Tworek, J., Jun, H., Yuan, Q., de Oliveira Pinto,           Learning Representations, 2021.
+  H. P., Kaplan, J., Edwards, H., Burda, Y., Joseph, N.,
+  Brockman, G., Ray, A., Puri, R., Krueger, G., Petrov,             Hoefler, T., Alistarh, D., Ben-Nun, T., Dryden, N., and
+  M., Khlaaf, H., Sastry, G., Mishkin, P., Chan, B., Gray,            Peste, A. Sparsity in deep learning: Pruning and growth
+  S., Ryder, N., Pavlov, M., Power, A., Kaiser, L., Bavar-            for efficient inference and training in neural networks.
+  ian, M., Winter, C., Tillet, P., Such, F. P., Cummings, D.,        The Journal of Machine Learning Research, 22(1):10882–
+  Plappert, M., Chantzis, F., Barnes, E., Herbert-Voss, A.,          11005, 2021.
+  Guss, W. H., Nichol, A., Paino, A., Tezak, N., Tang,              Hooker, S. The hardware lottery. Communications of the
+  J., Babuschkin, I., Balaji, S., Jain, S., Saunders, W.,            ACM, 64(12):58–65, 2021.
+  Hesse, C., Carr, A. N., Leike, J., Achiam, J., Misra,
+  V., Morikawa, E., Radford, A., Knight, M., Brundage,              Houlsby, N., Giurgiu, A., Jastrzebski, S., Morrone, B.,
+  M., Murati, M., Mayer, K., Welinder, P., McGrew, B.,                De Laroussilhe, Q., Gesmundo, A., Attariyan, M., and
+  Amodei, D., McCandlish, S., Sutskever, I., and Zaremba,             Gelly, S. Parameter-efficient transfer learning for NLP.
+  W. Evaluating large language models trained on code.                In Chaudhuri, K. and Salakhutdinov, R. (eds.), Proceed-
+  arXiv preprint arXiv:2107.03374, 2021.                              ings of the 36th International Conference on Machine
+
+                                                                9
+                                    Scaling Sparse Fine-Tuning to Large Language Models
+
+  Learning, volume 97 of Proceedings of Machine Learn-                 OpenAI.    GPT-4 technical report.            arXiv preprint
+  ing Research, pp. 2790–2799, 09–15 Jun 2019.                           arXiv:2303.08774, 2023.
+Hu, E. J., yelong shen, Wallis, P., Allen-Zhu, Z., Li, Y.,             Peng, B., Li, C., He, P., Galley, M., and Gao, J. Instruction
+ Wang, S., Wang, L., and Chen, W. LoRA: Low-rank                         tuning with GPT-4. arXiv preprint arXiv:2304.03277,
+  adaptation of large language models. In International                  2023.
+ Conference on Learning Representations, 2022.
+                                                                       Pfeiffer, J., Vulić, I., Gurevych, I., and Ruder, S. MAD-
+Ivison, H., Wang, Y., Pyatkin, V., Lambert, N., Peters, M.,              X: An Adapter-Based Framework for Multi-Task Cross-
+   Dasigi, P., Jang, J., Wadden, D., Smith, N. A., Beltagy,              Lingual Transfer. In Proceedings of the 2020 Conference
+   I., and Hajishirzi, H. Camels in a changing climate:                  on Empirical Methods in Natural Language Processing
+   Enhancing LM adaptation with Tulu 2. arXiv preprint                   (EMNLP), pp. 7654–7673, Online, November 2020.
+   arXiv:2311.10702, abs/2311.10702, 2023.
+                                                                       Pfeiffer, J., Ruder, S., Vulić, I., and Ponti, E. Modular deep
+Jiang, A. Q., Sablayrolles, A., Mensch, A., Bamford, C.,                 learning. Transactions on Machine Learning Research,
+   Chaplot, D. S., de las Casas, D., Bressand, F., Lengyel,              2023.
+   G., Lample, G., Saulnier, L., Lavaud, L. R., Lachaux,               Sung, Y.-L., Nair, V., and Raffel, C. A. Training neural net-
+   M.-A., Stock, P., Scao, T. L., Lavril, T., Wang, T.,                  works with fixed sparse masks. In Ranzato, M., Beygelz-
+   Lacroix, T., and Sayed, W. E. Mistral 7B. arXiv preprint              imer, A., Dauphin, Y., Liang, P., and Vaughan, J. W. (eds.),
+   arXiv:2310.06825, 2023.                                               Advances in Neural Information Processing Systems, vol-
+Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B.,                  ume 34, pp. 24193–24205, 2021.
+  Chess, B., Child, R., Gray, S., Radford, A., Wu, J., and             Suzgun, M., Scales, N., Schärli, N., Gehrmann, S., Tay,
+  Amodei, D. Scaling laws for neural language models.                    Y., Chung, H. W., Chowdhery, A., Le, Q. V., Chi, E.,
+  arXiv preprint arXiv:2001.08361, 2020.                                 Zhou, D., and Wei, J. Challenging big-bench tasks and
+Kingma, D. P. and Ba, J. Adam: A method for stochastic                   whether chain-of-thought can solve them. In Rogers,
+  optimization. In Bengio, Y. and LeCun, Y. (eds.), 3rd                  A., Boyd-Graber, J. L., and Okazaki, N. (eds.), Find-
+  International Conference on Learning Representations,                  ings of the Association for Computational Linguistics:
+  ICLR 2015, San Diego, CA, USA, May 7-9, 2015, Confer-                  ACL 2023, Toronto, Canada, July 9-14, 2023, pp. 13003–
+  ence Track Proceedings, 2015.                                          13051, 2023.
+
+Lialin, V., Deshpande, V., and Rumshisky, A. Scaling down              Taori, R., Gulrajani, I., Zhang, T., Dubois, Y., Li,
+  to scale up: A guide to parameter-efficient fine-tuning.               X., Guestrin, C., Liang, P., and Hashimoto, T. B.
+  arXiv preprint arXiv:2303.15647, 2023.                                 Stanford Alpaca: An instruction-following LLaMA
+                                                                         model.      https://github.com/tatsu-lab/
+Liu, H., Tam, D., Muqeeth, M., Mohta, J., Huang, T., Bansal,             stanford_alpaca, 2023.
+  M., and Raffel, C. A. Few-shot parameter-efficient fine-
+  tuning is better and cheaper than in-context learning. In            Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi,
+  Koyejo, S., Mohamed, S., Agarwal, A., Belgrave, D.,                    A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P.,
+  Cho, K., and Oh, A. (eds.), Advances in Neural Infor-                  Bhosale, S., Bikel, D., Blecher, L., Ferrer, C. C., Chen,
+  mation Processing Systems, volume 35, pp. 1950–1965,                   M., Cucurull, G., Esiobu, D., Fernandes, J., Fu, J., Fu, W.,
+  2022.                                                                  Fuller, B., Gao, C., Goswami, V., Goyal, N., Hartshorn,
+                                                                         A., Hosseini, S., Hou, R., Inan, H., Kardas, M., Kerkez,
+Longpre, S., Hou, L., Vu, T., Webson, A., Chung, H. W., Tay,             V., Khabsa, M., Kloumann, I., Korenev, A., Koura, P. S.,
+  Y., Zhou, D., Le, Q. V., Zoph, B., Wei, J., and Roberts,               Lachaux, M.-A., Lavril, T., Lee, J., Liskovich, D., Lu, Y.,
+  A. The flan collection: Designing data and methods for                 Mao, Y., Martinet, X., Mihaylov, T., Mishra, P., Molybog,
+  effective instruction tuning. In Krause, A., Brunskill, E.,            I., Nie, Y., Poulton, A., Reizenstein, J., Rungta, R., Saladi,
+  Cho, K., Engelhardt, B., Sabato, S., and Scarlett, J. (eds.),          K., Schelten, A., Silva, R., Smith, E. M., Subramanian, R.,
+  International Conference on Machine Learning, ICML                     Tan, X. E., Tang, B., Taylor, R., Williams, A., Kuan, J. X.,
+  2023, 23-29 July 2023, Honolulu, Hawaii, USA, volume                   Xu, P., Yan, Z., Zarov, I., Zhang, Y., Fan, A., Kambadur,
+  202 of Proceedings of Machine Learning Research, pp.                   M., Narang, S., Rodriguez, A., Stojnic, R., Edunov, S.,
+  22631–22648, 2023.                                                     and Scialom, T. Llama 2: Open foundation and fine-tuned
+                                                                         chat models. arXiv preprint arXiv:2307.09288, 2023.
+Mangrulkar, S., Gugger, S., Debut, L., Belkada, Y., and Paul,
+ S. Peft: State-of-the-art parameter-efficient fine-tuning             Wang, E. Alpaca-LoRA: Instruct-tune LLaMA on con-
+ methods. https://github.com/huggingface/                               sumer hardware. https://github.com/tloen/
+ peft, 2022.                                                            alpaca-lora, 2023.
+
+                                                                  10
+                                       Scaling Sparse Fine-Tuning to Large Language Models
+
+Wang, Y., Ivison, H., Dasigi, P., Hessel, J., Khot, T., Chandu,             where each document is guaranteed to contain the answer
+ K. R., Wadden, D., MacMillan, K., Smith, N. A., Beltagy,                   span. We evaluate models in a 1-shot setting and report F1.
+ I., and Hajishirzi, H. How far can camels go? Exploring
+                                                                            Coding: HumanEval (Chen et al., 2021) is a dataset for
+ the state of instruction tuning on open resources. arXiv
+                                                                            synthesizing programs from docstrings. We evaluate models
+ preprint arXiv:2306.04751, 2023.
+                                                                            with a temperature of 0.1 and report their precision at 1
+                                                                            (P@1)8 .
+
+A. SFT vs LoRA Visualization
+                                                                            C. Training Details and Hyperparameters
+                                                                            To select the most important hyperparameters of the PEFT
+                                                                            methods, we perform a hyperparameter search as detailed
+                                                                            in Appendix D with respect to (i) the number of trainable
+                                                                            parameters (determined by rank r in LoRA or correspond-
+                                                                            ing density in SpIEL)9 ; (ii) the learning rate; (iii) weight
+                                                                            decay strength λ for SpIEL methods. We use the found
+                                                                            hyperparameters of each PEFT method for all fine-tuning
+                                                                            experiments.
+                                                                            For SpIEL, we update the set of trainable parameters η every
+                                                                            S = 20 steps, fix the initial update rate ξ to 0.2, and for
+                                                                            SpIEL-AG, we set the length γ of the gradient estimation
+                                                                            phase to 5 steps. Note that we have performed only minimal
+                                                                            manual tuning on the values of S, ξ and γ due to a large
+                                                                            number of large-scale experiments coupled with constraints
+                                                                            on our computational budget; it is possible that other values
+Figure 3. SFT (lower right) versus LoRA (upper right) applied to
+                                                                            would yield better results.
+a linear layer (the output projection of self-attention) of a Trans-
+former block.                                                               We follow Wang et al. (2023)’s choice for the remaining
+                                                                            hyperparameters: we always train for two epochs, and apply
+                                                                            linear learning rate decay following warmup over the first
+B. Evaluation Setup                                                         3% of training steps. The batch size is fixed at 128 and the
+Following Wang et al. (2023) and Ivison et al. (2023), we                   maximum sequence length at 2,048, with longer sequences
+evaluate the instruction-tuned LLMs on a range of bench-                    truncated. The LoRA dropout rate is set to 0.1 and LoRA
+marks to capture the following abilities:                                   α to 16. LoRA and SpIEL are applied to all linear Trans-
+                                                                            former block layers. The pretrained parameters are stored
+Factuality: Massively Multitask Language Understanding                      in bfloat16 data type, while the PEFT parameters are
+(MMLU; Hendrycks et al., 2021) requires the model to                        stored in float32, except for quantized training, where
+pick an answer from 4 candidates and covers 57 subjects                     they are also stored in bfloat16.
+including STEM, humanities, social sciences, and other
+disciplines. We evaluate models in a 5-shot setting and
+report their accuracy.
+                                                                            D. Hyperparameter Search
+Reasoning: We sub-sample 40 examples per task from BIG-                     We first performed a grid search over (i) learning rate and
+Bench Hard (BBH; Suzgun et al., 2023), a suite of the 23                    (ii) number of PEFT parameters (determined by rank r for
+most challenging tasks from BIG-Bench. We also randomly                     LoRA and dϕ for SpIEL), except for (IA)3 where this num-
+select a subset of 200 examples from Grade School Math                      ber is fixed. For the SpIEL methods, we also wished to
+(GSM; Cobbe et al., 2021), a collection of math problems                    establish a good value for (iii) weight decay strength λ.
+in linguistic form. Both benchmarks require open-ended                      Since we generally obtained a good performance with the
+generation. We evaluate models in a 3-shot setting with                     highest tested equivalent rank of r = 64, and being the
+BBH and 8-shot setting with GSM, and report their exact                     most highly parameterized setting this was the most likely
+match (EM).                                                                 to benefit from regularization, we searched over a range of
+                                                                            λ values with r set to 64 and the learning rate to the best
+Multilinguality: We choose 100 examples per language
+                                                                                8
+from Typologically Diverse Question Answering (TyDiQA;                            Here we differ from Wang et al. (2023) in order to reduce the
+                                                                            variance across evaluation runs.
+Clark et al., 2020), a dataset for extractive question answer-                  9
+                                                                                  The number of trainable parameters for (IA)3 is not tunable.
+ing in 11 languages. We follow the Gold Standard setup
+
+                                                                       11
+                                         Scaling Sparse Fine-Tuning to Large Language Models
+
+value found in the initial search.                                      10 might be better than the 20 steps we used in our main
+                                                                        experiments.
+We searched for the optimal learning rate in the range of
+{3 × 10−6 , 1 × 10−5 , 3 × 10−5 , 1 × 10−4 } for LoRA and
+                                                                                       Schedule           Benchmark
+SpIEL-AG, {4 × 10−4 , 7 × 10−4 , 1 × 10−3 , 2 × 10−3 }
+for SpIEL-MA (the SM3 optimizer generally benefits from                             Type      Steps   MMLU       TyDiQA
+higher learning rates than Adam), and {1 × 10−5 , 3 ×                                          10       52.0         56.4
+10−5 , 1 × 10−4 , 3 × 10−4 } for (IA)3 .                                            Linear
+                                                                                               20       50.7         56.2
+                                                                                               40       51.5         56.5
+As for the number of PEFT parameters, we searched over                                         80       51.3         56.1
+the range r = {8, 16, 32, 64} for LoRA and the equivalent                                      10       51.8         56.3
+dϕ for the SpIEL methods. For LLaMA2-7b, these values                                          20       51.6         56.5
+                                                                                    Cosine
+correspond to 0.30%, 0.59%, 1.2% and 2.3% of the total                                         40       50.2         56.5
+parameter count respectively, and for LLaMA2-13b, they                                         80       50.9         55.4
+correspond to 0.24%, 0.48%, 0.95% and 1.9%.
+                                                                        Table 5. SpIEL-AG results when fine-tuning LLaMA2-7b on Flan
+We searched over λ values in the range {0, 1, 3, 10, 30} for            v2 subset with various frequencies and update schedule types.
+SpIEL-AG and {0, 0.1, 0.3, 1, 3} for SpIEL-MA (since we
+use higher learning rates for SpIEL-MA, a lower weight                  For full fine-tuning, we use the learning rate of 2 × 10−5
+decay strength is required to have the same effect).                    from Wang et al. (2023). To fit the model into a single A100,
+                                                                        we additionally resort to activation checkpointing and paged
+Each hyperparameter setting was evaluated by training on
+                                                                        optimization.
+the Flan v2 subset and taking the 5-shot performance on the
+MMLU development set.
+                                                                        E. Analysis of the Backward Pass for SpIEL
+We present the full results of the hyperparameter search
+in Figure 4 and summarize the best values found for each                Consider the forward pass when sparsely fine-tuning a linear
+configuration in Table 4.                                               layer. We have:
+
+                    LLaMA2-7b                 LLaMA2-13b
+                                                                                              Y = X(W + ∆),                     (12)
+
+  Method            lr        r      λ         lr      r    λ           where the input X ∈ Rb×din , the pretrained weight matrix
+  (IA)3         3 × 10−4       -    -       1 × 10−4    -    -          W and its sparse delta ∆ ∈ Rdin ×dout , and the output Y ∈
+  LoRA          1 × 10−4      64    -       3 × 10−5   64    -          Rb×dout , with b, din and dout being the batch size and input
+  SpIEL-AG      1 × 10−4      64   30       1 × 10−5   64   30          and output dimensions respectively. It can be shown that
+  SpIEL-MA      1 × 10−3      64   0.3      4 × 10−4   64   0
+  Full FT       2 × 10−5       -    -       2 × 10−5    -    -                                 ∂L      ∂L
+                                                                                                  = X⊤    .                     (13)
+                                                                                               ∂∆      ∂Y
+Table 4. Optimal settings yielded by hyperparameter search for                                                        ∂L
+each PEFT method and model size.                                        However, we only need the entries of ∂∆           correspond-
+                                                                        ing to the currently active indices of ∆. Let r ∈
+After our main experiments, we performed some additional                {1, 2, ..., h}N , c ∈ {1, 2, ..., w}N , where h and w are the
+exploration of the drop/growth schedule, adjusting both the             height and width of ∆ respectively, denote the N active
+frequency γ of dropping/growth and the schedule k(i, t) of              indices of ∆, i.e. (ri , ci ) denotes the position of the ith
+number of parameters to drop/grow at each update. We con-               active index in ∆. Then, if we define gi to be the gradient
+sidered drop/growth frequency in the range {10, 20, 40, 80}             of the i-th active index of ∆, we have
+steps and both our default linear schedule and the cosine                                          ∂L
+schedule of Evci et al. (2020), where                                                        gi =                               (14)
+                                                                                                 ∂∆ri ,ci
+                         ξ          tπ                                                             ∂L 
+             k(i, t) =      1 + cos         dϕ(i) ,         (11)                               = X⊤                             (15)
+                         2            T                                                                ∂Y ri ,ci
+                                                                                                        ∂L 
+                                                                                                   ⊤
+recalling that ξ is the initial update rate and T is the total                                 = X:,r            .              (16)
+                                                                                                     i
+                                                                                                         ∂Y :,ci
+number of training steps. Table 5 presents our results for
+SpIEL-AG when fine-tuning LLaMA2-7b on the Flan v2                      That is, the gradient of the i-th sparse update to W is given
+subset with the other hyperparameters as shown in Table                 by the dot product of the ri -th column of X and the ci -th
+4. We find that there is not a clear preference for a linear            column of the gradient of the output Y . We can compute
+or cosine schedule, but that a higher update frequency of               the gradient of the sparse updates in this manner with bN
+
+                                                                   12
+                                       Scaling Sparse Fine-Tuning to Large Language Models
+
+
+
+
+                                                     LLaMA2-7b with SpIEL-AG,                      LLaMA2-7b with SpIEL-MA,
+        LLaMA2-7b with LoRA                          weight decay strength = 0                     weight decay strength = 0
+       44.5 44.3 45.7 50.4                           46.0 47.9 51.6 49.4                            48.7 48.7 49.2 40.8
+  64
+
+
+
+
+                                                64
+
+
+
+
+                                                                                              64
+       44.2 44.9 46.6 49.4                            45.7 47.7 50.4 50.8                           48.5 48.5 50.1 49.6
+  32
+
+
+
+
+                                                32
+
+
+
+
+                                                                                              32
+Rank
+
+
+
+
+                                              Rank
+
+
+
+
+                                                                                            Rank
+       44.0 44.6 46.1 48.6                            45.5 46.7 48.5 50.5                           47.4 47.9 48.6 47.9
+  16
+
+
+
+
+                                                16
+
+
+
+
+                                                                                              16
+       44.4 44.7 46.6 48.5                            44.5 45.9 47.3 49.6                           46.8 47.7 48.0 47.7
+  8
+
+
+
+
+                                                8
+
+
+
+
+                                                                                              8
+       3e-6       1e-5 3e-5            1e-4           3e-6      1e-5 3e-5            1e-4           4e-4      7e-4 1e-3            2e-3
+                  Learning rate                                 Learning rate                                 Learning rate
+                                                     LLaMA2-13b with SpIEL-AG,                     LLaMA2-13b with SpIEL-MA,
+        LLaMA2-13b with LoRA                         weight decay strength = 0                      weight decay strength = 0
+       55.8 55.1 56.9 55.2                            55.9 56.5 55.4 53.4                           56.3 55.6 55.8 54.5
+  64
+
+
+
+
+                                                64
+
+
+
+
+                                                                                              64
+       55.5 55.1 55.7 56.8                            55.6 56.3 55.5 53.6                           55.1 54.6 55.0 54.6
+  32
+
+
+
+
+                                                32
+
+
+
+
+                                                                                              32
+Rank
+
+
+
+
+                                              Rank
+
+
+
+
+                                                                                            Rank
+
+       55.1 54.9 55.9 56.0                            55.1 56.6 55.1 54.3                           56.0 55.1 55.6 53.7
+  16
+
+
+
+
+                                                16
+
+
+
+
+                                                                                              16
+
+
+
+       55.3 54.7 56.4 55.7                            54.8 56.1 55.0 54.9                           55.7 54.9 55.4 54.8
+  8
+
+
+
+
+                                                8
+
+
+
+
+                                                                                              8
+
+
+
+
+       3e-6       1e-5 3e-5            1e-4           3e-6      1e-5 3e-5            1e-4           4e-4      7e-4 1e-3            2e-3
+                  Learning rate                                 Learning rate                                 Learning rate
+            LLaMA2-7b with SpIEL-AG,                    LLaMA2-7b with SpIEL-MA,                     LLaMA2-13b with SpIEL-AG,
+               learning rate = 1e-4                        learning rate = 1e-3                         learning rate = 1e-5
+       52.1      52.1       52.6       52.6          49.1      50.2       48.7       49.5          56.6      55.7       55.7       56.8
+Rank
+
+
+
+
+                                              Rank
+
+
+
+
+                                                                                            Rank
+ 64
+
+
+
+
+                                               64
+
+
+
+
+                                                                                             64
+
+
+
+
+        1          3         10         30            0.1       0.3         1         3              1         3         10         30
+               Weight decay strength                         Weight decay strength                         Weight decay strength
+                                                       LLaMA2-13b with SpIEL-MA,
+                                                          learning rate = 4e-4
+                                                     55.4      55.8       55.8       56.0
+                                              Rank
+                                               64
+
+
+
+
+                                                      0.1       0.3         1         3
+                                                             Weight decay strength
+
+                                              Figure 4. Hyperparameter search results.
+
+
+
+
+                                                                   13
+                                    Scaling Sparse Fine-Tuning to Large Language Models
+
+FLOPs, which is an enormous theoretical improvement over
+the bdin dout FLOPs required to naively perform the full ma-
+trix multiplication in (13) and gather the relevant indices
+from the result, as the SFT density dinNdout ≪ 1.
+While calculating the sparse delta gradient in this manner
+entails a great reduction in FLOPs required, it is not so easy
+to exploit this reduction effectively on a GPU to speed the
+operation up. Writing an efficient CUDA kernel for this
+operation is ongoing work, and the speed results presented
+in this paper were obtained using the naive “gather from the
+full matrix product” method.
+
+F. Measurement of Memory and Time
+   Requirements
+To measure the memory requirements of PEFT methods, we
+use PyTorch’s set per process memory fraction
+function to limit the total available GPU memory, and per-
+form a binary search at 1 GiB granularity to find the lowest
+limit at which training can run successfully. For each limit
+we test, we run 30 steps of Flan v2 training with (equivalent)
+LoRA rank 64. We measure the time as the mean duration
+of each of these 30 steps for the lowest passing memory
+limit. All our experiments are run on a single A100 GPU.
+We note that this may differ from the peak memory usage
+during (unconstrained) training, since deep learning frame-
+works such as PyTorch may allocate more memory than
+they actually require for efficiency reasons.
+
+
+
+
+                                                                 14
+

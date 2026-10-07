@@ -1,0 +1,1148 @@
+                                               Symbolic Prompt Program Search: A Structure-Aware Approach
+                                                      to Efficient Compile-Time Prompt Optimization
+
+                                                                          Tobias Schnabel and Jennifer Neville
+                                                                           Microsoft Research, Redmond, USA
+                                                                        {toschnab,jenneville}@microsoft.com
+
+
+
+                                                              Abstract                               As LLM performance depends on a variety of
+                                                                                                  factors such as paraphrasing, formatting and or-
+                                             In many modern LLM applications, such as
+                                                                                                  dering (Sclar et al., 2023; Liu et al., 2024), a key
+                                             retrieval augmented generation, prompts have
+                                             become programs themselves. In these settings,       challenge to solve in practice is automatically find-
+arXiv:2404.02319v2 [cs.CL] 27 Jun 2024
+
+
+
+
+                                             prompt programs are repeatedly called with           ing the best prompt program for a given task and
+                                             different user queries or data instances. A big      model. In this paper, we focus on compile-time opti-
+                                             practical challenge is optimizing such prompt        mization of prompt programs under black-box LLM
+                                             programs. Recent work has mostly focused on          access. Compile-time optimization is carried out
+                                             either simple prompt programs or assumed that        only once before deployment and has two large ad-
+                                             the general structure of a prompt program is
+                                                                                                  vantages: (i) we can amortize the optimization cost
+                                             fixed.
+                                                                                                  over multiple uses of the prompt program and (ii)
+                                             We introduce SAMMO, a framework to per-              keep the existing run-time architecture unchanged.
+                                             form symbolic prompt program search for
+                                                                                                  This is different from run-time optimization ap-
+                                             compile-time optimizations of prompt pro-
+                                             grams. SAMMO represents prompt programs              proaches, e.g., token pruning (Jiang et al., 2023)
+                                             on a symbolic level which allows for a rich set      which are called every time before inference and
+                                             of transformations that can be searched over         thus have non-amortizable costs.
+                                             during optimization. We show that SAMMO                 A lot of work on prompt optimization has fo-
+                                             generalizes previous methods and improves            cused on simple prompt programs where the pro-
+                                             the performance of complex prompts on (1)
+                                                                                                  gram consists of a single string (which is subsumed
+                                             instruction tuning, (2) RAG pipeline tuning,
+                                             and (3) prompt compression, across several           by our representation in Section 2), mostly using
+                                             different LLMs. We make all code available           structure-unaware operations such as paraphras-
+                                             open-source at https://anonymous.4open.              ing (Chen et al., 2023; Pryzant et al., 2023; Zhou
+                                             science/r/sammo-4003.                                et al., 2023). Another line of work has focused
+                                                                                                  on optimizing prompts with more complex pro-
+                                         1   Introduction                                         grammatic structure, but still considers only static
+                                         With the recent development of large language            prompt structures, e.g., DSpy (Khattab et al., 2023).
+                                         models (LLMs) such as Mixtral 8x7B (Jiang et al.,        Initial work in this direction focused on applying
+                                         2024) or GPT-4, it is now possible to provide LLMs       textual mutators to different prompt components
+                                         with longer inputs including richer context and          (Fernando et al., 2023; Ye et al., 2023; Khattab
+                                         more detailed instructions. As a result, the com-        et al., 2023). Subsequent work considered both tex-
+                                         plexity of prompts has increased, including longer       tual mutation and hyperparameter selection (Sclar
+                                         strings of instructions, demonstrations or exam-         et al., 2023). However, with increasing complex-
+                                         ples, and specification of more structured output.       ity of prompt structure, many prompt optimization
+                                         These lengthy instructions are often reused as part      techniques are no longer applicable and a new ap-
+                                         of larger prompts, where static information (e.g., in-   proach is needed that is able to optimize complex
+                                         structions) is combined with input-dependent infor-      prompt programs with their hyperparameters.
+                                         mation (e.g., user queries, retrieved documents in          To address this, we introduce S AMMO, a general
+                                         RAG systems) at runtime. This has led to prompts         purpose framework for compile-time optimizations
+                                         being regarded as programs themselves, where             of prompt programs. Different from existing ap-
+                                         each part is the result of other subprograms (Khat-      proaches S AMMO represents prompt programs as
+                                         tab et al., 2023).                                       symbolic prompt programs (SPP) which are ab-
+                                        starting prompt 𝜋0 [𝑋]                                                          mutated prompt 𝜋1 [𝑋]
+
+                                Instructions:
+                                Does Speaker 2's answer mean yes or no?                                           Does Speaker 2's answer mean yes or no?
+                                Output labels: yes, no                                                            Output labels: yes, no
+                                {{input_data_X}}                                                                  {{xml(input_data_X)}}
+                                Output:                                                                           Output:
+
+
+                                                        CHANGEFORMAT
+                                                        ParseOutput                            SAMMO                                  ParseOutput
+                                                        format      raw                                                               format      xml
+
+
+                                                    GenerateResponse                                                              GenerateResponse
+        DELETENODE                                                                 RenderText                                                                    RenderText
+                                                                                   text    Output:                                                               text    Output:
+ RenderText              RenderText                RenderText                                           RenderText               RenderText
+ text    Instructions:   id      instructions      id      labels          CHANGEFORMAT                 id     instructions      id      labels
+                         text    Does Speaker      text    Output                                       text   Does Speaker      text    Output
+                                                                          RenderInputData[X]                                                            RenderInputData[X]
+                                 2's answer mean           labels:                                             2's answer mean           labels:
+                                 yes or no?                yes, no        format     raw                       yes or no?                yes, no        format     xml
+
+
+
+Figure 1: Left: Symbolic prompt program (SPP) for a binary classification task, where each node is a function with
+attributes and dependencies (children). The example also shows how the SPP allows for structural changes (e.g.,
+D ELETE N ODE) and attribute-based changes (e.g., C HANGE F ORMAT) which, after applying, result in the mutated
+prompt (Right). These enable S AMMO to explore a large set of possible prompt candidates automatically.
+
+
+stract program graphs that can be changed arbi-                                                2     Symbolic Prompt Programs
+trarily. This allows S AMMO to efficiently search
+through the space of valid prompt programs by au-                                              A prompt program π is a function that takes input
+tomatically generating new promising candidates                                                data X and maps it to another string Ŷ = π[X].
+through mutations. Moreover, S AMMO allows to                                                  S AMMO’s biggest innovation is the use of sym-
+both represent the internal structure of prompts                                               bolic prompt programs to represent valid prompt
+(e.g., sections) as well as program structure (e.g.,                                           structures, enabling flexible transformations and
+calling a retriever) in a unified fashion. By writ-                                            efficient search. That is in contrast to frameworks
+ing custom mutation operators, practitioners can                                               such as DSPy (Khattab et al., 2023), that use static
+encode their domain knowledge and guide the                                                    prompt programs in their optimization process.
+search process. S AMMO naturally extends pre-                                                     To illustrate the advantages of symbolic prompt
+vious prompt programming approaches such as                                                    programs, consider the example prompt program in
+DSpy (Khattab et al., 2023) and encompasses sev-                                               Figure 1 for a binary classification task. Each node
+eral specialized prompt tuning methods as spe-                                                 is a function with attributes whose dependencies
+cial cases. Through SPPs, S AMMO (i) allows dy-                                                are indicated through child nodes. The program
+namic changes to prompt programs, (ii) generalizes                                             combines a number of text spans with the input
+compile-time optimizations to all prompt compo-                                                data, sends it to the LLM and parses the output
+nents (e,g., textual content, hyperparameters).                                                response. Static programs (e.g., DSPy programs)
+   S AMMO is a general framework for prompt op-                                                have a fixed structure which limits the operations to
+timization in a black-box setting. We demonstrate                                              mostly changes in a node’s attributes, e.g., by para-
+the utility of symbolic prompt program search                                                  phrasing text. Symbolic prompt programs (SPPs)
+(SPPS) in S AMMO in three scenarios: (1) instruc-                                              that S AMMO uses allow us to make much larger
+tion tuning, (2) retrieval augmented generation                                                changes, all while ensuring that the prompt pro-
+(RAG) pipeline tuning, and (3) prompt compres-                                                 gram remains semantically valid. Two useful oper-
+sion for annotation tasks. Our experiments show                                                ators are highlighted in Figure 1, where we change
+that S AMMO generalizes previous methods and pro-                                              the data format to xml and also remove the instruc-
+vides gains of 10-100% in instruction tuning, 26-                                              tions prefix. These program modification would be
+133% in RAG tuning, and over 40% in prompt                                                     challenging, if not infeasible, with static programs.
+compression in performance. Moreover, we show                                                  Section 2 will introduce many more possible oper-
+that complex prompts need to be optimized sepa-                                                ators for SPPs.
+rately for each LLM and that gains are more pro-
+                                                                                               2.1     Graph Representation of SPPs
+nounced for weaker LLMs. S AMMO code is avail-
+able at https://anonymous.4open.science/r/                                                     We represent prompt programs as directed acyclic
+sammo-4003 under an MIT license.                                                               graphs where nodes are functions and edges indi-
+cate call dependencies. Each prompt program π[·]
+is a DAG Gπ = (V, E) where nodes v = (fv , θv )
+are functions (or subprograms) fv with attributes
+θv . For example, in Figure 1, the left-most node is
+a function that renders its single attribute “Instruc-
+tions:”. The symbolic part of the SPP describes the
+fact that we represent the entire Gπ symbolically in
+our implementation through pyGlove (Peng et al.,
+2020).                                                   Figure 2: S AMMO is a flexible framework for structured
+                                                         prompt optimization, and offers two classes of search
+2.2    Efficient Execution of SPPs                       algorithms depending on the set of mutators used.
+Ultimately, we need to compute π[X] for differ-
+ent π and X during execution. To compute π[X]            Algorithm 1 Iterative Search in S AMMO
+on Gπ , information will be passed top-down and          Require: Set of mutators M , training set Dtrain , baseline
+                                                             prompt π0 , objective Sϕ
+then aggregated bottom-up. We start by calling the        1: ΠC ← I NIT C ANDIDATES (π0 )
+root node π[X] = fvr (state = {X}). For conve-            2: while condition do
+
+nience, we divide the execution of every function         3:     Πactive ← S AMPLE C ANDIDATES(ΠC , Dtrain , Sϕ )
+                                                          4:     Πnextgen ← ∅
+fv into two non-recursive processing steps, i.e.,         5:     for each π ∈ Πactive do
+fv = (fvtop−down , fvbottom−up ). Then, we evaluate       6:         Mvalid = {m can be applied to π | m ∈ M }
+each node fv recursively,                                 7:         Mπ = S AMPLE M UTATORS(Mvalid )
+                                                          8:         ∀m ∈ Mπ : Add M UTATE(m, Πactive ) to Πnextgen
+                                                          9:     end for
+                                                         10:     ΠC ←P RUNE(ΠC ∪ Πnextgen , Dtrain , Sϕ )
+       state′ ← fvtop−down (state, θv )                  11: end while
+                                                         12: return best candidate from ΠC
+       Y ← fu (state′ ) | (v, u) ∈ E
+             
+
+       returnfvbottom−up (state′ ∪ {Y }, θv ).
+                                                           We implement ρcompile as a search procedure
+  For example, v = RenderInputExamples from              over a search space Π of (symbolic) prompt pro-
+Figure 1 will only execute a fvtop−down function         grams. Our goal is to find a prompt program π that
+which formats the raw data into strings (using the       performs best across the entire data distribution:
+format attribute).                                           π ∗ = arg min EDs ∼P (X,Y ) [Sϕ (π, Ds )].         (2)
+                                                                      π∈Π
+3     Compile-time Prompt Optimization                   Here, P (X, Y ) is the distribution that the labeled
+Our goal in this paper is the compile-time opti-         samples Ds are drawn from. Since the data distribu-
+mization of prompt programs. Compile-time indi-          tion P (X, Y ) is unknown and the evaluation cost
+cates that the optimization is done only once before     of Equation 2 is prohibitive, we resort to using the
+using the prompt program, typically many times           following sampled score in the spirit of empirical
+over with different inputs. We assume a black-box        risk minimization (ERM):
+model for LLM access where the only information                       π̂ = arg min Sϕ (π, Dtrain ).             (3)
+returned is the response text and no probabilities.                           π∈Π
+   Given an objective Sϕ (Y, Ŷ ) ∈ R and set of           For the experiments in this paper, we assume
+samples Ds drawn i.i.d from a data distribution          that dataset sizes are on the order of hundreds of
+P (X, Y ), the compile-time optimizer’s goal is to       examples. This represents a reasonable amount
+return a more performant prompt program:                 of data that can be hand-labeled; increasing the
+                                                         amount would limit the applicability in practice
+               π̂ = ρcompile (Ds , Sϕ ).          (1)
+                                                         substantially.
+   Note that Sϕ can also specify trade-offs between
+                                                         4   S AMMO: Structure-Aware
+potentially multiple individual quality objectives
+                                                             Multi-objective Metaprompt
+Si (Y, Ŷ ). Equation 1 is different but complemen-
+                                                             Optimization
+tary to run-time optimization which is run every
+time when input X arrives (i.e., X̃ = ρrun (π[X]))       We outline S AMMO, which is a general framework
+and can tailor its decisions to X.                       for optimizing the performance of symbolic prompt
+programs. Specific details can be found in the open-     Algorithm 1 shows the skeleton of how S AMMO
+source implementation of S AMMO. S AMMO uses             implements iterative search. Starting with an ini-
+two classes of search algorithms with a rich set of      tial prompt program (π0 ), it iteratively modifies a
+mutation operators to explore the space of prompts.      current set of candidates Πactive through mutations
+   The main novelty of S AMMO is that prompt pro-        to generate a new generation of candidates.
+grams are represented with all their structural de-         Specific choices for the functions I NITIALIZE -
+pendencies on a symbolic level. Without it, one is       C ANDIDATES, S AMPLE C ANDIDATES, condition,
+bound to a rigid prompt structure and also limited       and P RUNE in Algorithm 1 yield common search
+to a much smaller set of possible mutation opera-        algorithms such as beam search, regularized evo-
+tors. Moreover, it is also challenging to describe the   lutionary search (Real et al., 2019) or breadth-first
+search space efficiently. S AMMO supports both ex-       search. We use beam search for all our experiments
+plicit and implicit descriptions of the search space     in this paper but will explore more sophisticated
+through symbolic operators.                              search strategies in future work.
+   Figure 2 presents an overview of S AMMO’s main
+                                                         4.2   Prompt Mutation Operators
+components. Starting from the top, S AMMO em-
+ploys two types of search algorithms for different       At the heart of S AMMO optimization are mutation
+scenarios. Below that sits of layer of prompt mu-        operators. Formally, a mutation operator is a proba-
+tation operators that define the search space and        bilistic function m : Π × Π −→ [0, 1] that specifies
+actions. At the bottom is a base layer of function       how to transition from a SPP π to an edited ver-
+operators from which prompt programs are being           sion π ′ ∈ Π. This structure-aware component of
+composed, corresponding to the nodes in Figure 1.        S AMMO opens up a new class of operators, for ex-
+                                                         ample operators that only modify specific sections
+4.1   Search Algorithms                                  or paragraphs. These can range from trivial (e.g.,
+                                                         rephrasing a sentence) to complex (e.g., inducing a
+A big challenge in practice is defining the right
+                                                         new set of task instructions).
+search space Π for prompt optimization. To help
+                                                            Table 1 shows a non-comprehensive set of muta-
+with this, S AMMO supports two different ways of
+                                                         tion operators, grouped by what part of an SPP they
+specifying the search space which then correspond
+                                                         change. Many of these operators are task-agnostic
+to a class of search algorithms.
+                                                         to allow for wide applicability, but we note that
+   Enumerative Search. First, similar to hyper-
+                                                         practioners can easily implement their own task-
+parameter search, in some instances the search
+                                                         specific mutators to encode domain-specific heuris-
+space can be defined explicitly as a set of choices
+                                                         tics. To the best of our knowledge, S AMMO is the
+that are known a-priori. This leads to search algo-
+                                                         first optimization method that can also optimize for
+rithms that can leverage the resulting grid, a class
+                                                         large structural changes and data formatting.
+of search strategies we call enumerative algorithms.
+As we show in Section 5.2, this simple approach          4.3   Specializations of S AMMO
+can be very effective in practice. In its current ver-
+                                                         We note that S AMMO is a rich framework that al-
+sion, S AMMO implements grid search and random
+                                                         lows practitioners to mix-and-match search strate-
+search as enumerative search strategies. In sum-
+                                                         gies with a large variety of mutation operators. The
+mary, enumerative search is useful when choices
+                                                         following methods are examples of how known
+are known, the search space is small and to get a
+                                                         methods can be implemented in S AMMO:
+quick picture of the variability of different choices.
+   Iterative Search. Second, sometimes the search        APE – Automatic Prompt Engineering (Zhou et al.,
+space can also be described implicitly through a            2023). Here, I NITIALIZE C ANDIDATES gener-
+starting state as well as a set of mutation opera-          ates a set of initial candidates from a small set
+tors that can be applied. This is useful in cases           of few-shot examples. Then, it uses a single
+where the set of valid choices is not known a-priori,       mutation operator, PARAPHRASE with beam
+e.g., all valid paraphrases of a sentence. S AMMO           search to explore alternative candidates.
+supports this specification through iterative search
+strategies. S AMMO implements a generic template         GrIPS – Gradient-free instruction search (Prasad
+as a basis for several well-known algorithms and             et al., 2023). This approach builds a syn-
+derives more concrete search algorithms from it.             tax parse tree from the task instructions and
+Table 1: Examples for mutation operators, grouped by what part of a SPP π they affect. S AMMO allows for a rich set
+of operations whereas traditional prompt optimization techniques only focused on operations that change the text.
+
+    Type                    Operator                                        Description
+    Text attributes θtext   PARAPHRASE                                      Rewrite to keep meaning
+                            I NDUCE I NSTRUCTIONS                           Generate instructions from examples
+                            S HORTEN T EXT                                  Reduce length to certain number of
+                                                                            words
+                            T EXT T O B ULLET P OINTS                       Turn into bullet list
+                            R EMOVE S TOPWORDS                              Filter out stopwords
+    Other attributes θ      C HANGE S ECTION F ORMAT                        How sections are rendered (e.g., mark-
+                                                                            down, XML)
+                            C HANGE DATA F ORMAT                            How data is rendered (e.g., JSON, XML)
+                            D ECREASE I N C ONTEXT E XAMPLES                Resample a smaller number of examples
+    Structure Gπ            D ROP S ECTION                                  Remove a section
+                            R EPEAT S ECTION                                Repeat a section somewhere
+
+                                                                                    Llama-2 70B          Mixtral 8x7B             GPT 3.5 Turbo
+        then searches with A DD, D ELETE, S WAP and                       0.8
+
+        PARAPHRASE mutators on the constituents.
+                                                                          0.6
+
+
+5      Experiments
+                                                               accuracy
+
+
+
+
+                                                                          0.4
+
+We demonstrate the flexibility and effectiveness of
+                                                                          0.2
+S AMMO’s SPP search approach across three differ-
+ent scenarios, comparing to the most appropriate
+                                                                           0
+                                                                                  train       test      train      test           train     test
+baselines in each scenario. In line with our as-
+                                                           method               Baseline Prompt      DSpy COPRO           GrIPS                   APO
+sumption of limited data availability (Section 3),                              APE                  SAMMO
+we sample n = 100 examples for training and test
+sets each unless noted otherwise. For the back-            Figure 3: S AMMO consistently outperforms all other
+end LLMs, we consider two open-source models,              instruction tuning methods, for all of the backend LLMs.
+Mixtral 7x8B (Jiang et al., 2024) and Llama-2
+70B (Touvron et al., 2023); as well as two closed-
+source models, GPT-3.5 and GPT-4 (Brown et al.,
+2020). See Appendix A.1 for model details. Un-
+                                                           improving instructions in these simple prompt pro-
+less noted otherwise, we use S AMMO with beam
+                                                           grams in pilot experiments (cf. also Section 5.2).
+search and a search budget (fixed for all baselines)
+of B = 48 candidate evaluations.
+                                                              Results. As Figure 3 shows, S AMMO is able
+                                                           to outperform all other baselines, independent of
+5.1     Instruction Tuning
+                                                           whether GPT-3.5, LLama-2 or Mixtral was used
+To better align with previous work on prompt tun-          as a backend model. DSpy COPRO (Khattab
+ing, we ran our experiments on BigBench zero-shot          et al., 2023) performed even worse than the base-
+classification tasks (Srivastava et al., 2023). We         line prompt since DSPy’s prompting often caused
+sampled eight tasks that still had headroom to im-         the model to not adhere to the output format (see
+prove, i.e., tasks where the baseline prompt π0 with       Appendix A.2.1 for an example). As a side note,
+GPT-3.5 had an accuracy of < 0.9.                          the model baseline performance seems to be corre-
+   We compare against APE (Zhou et al., 2023),             lated with how much performance we gain through
+APO (Automatic Prompt Optimization, Pryzant                prompt tuning. Llama-2-70B sees largest relative
+et al., 2023), DSpy COPRO (Khattab et al., 2023)           performance gains (about 2x), Mixtral 7x8B mod-
+and GrIPS (Prasad et al., 2023). We do not include         erate, and GPT-3.5 smallest gains (around 10%)
+GPT-4 since it showed negligible headroom for              compared to the baseline instructions.
+                1
+                     Llama-2 70B       Mixtral 8x7B              GPT 3.5            GPT-4                 tions. For details, see Appendix A.5.
+                                                                                                              Results. As Figure 4 shows, despite its con-
+               0.8
+                                                                                                          ceptual simplicity, optimizing retrieval-augmented
+acc. on test
+
+
+
+
+               0.6                                                                                        prompts with S AMMO yields substantial gains
+               0.4                                                                                        across most datasets and backend LLMs. We note
+                                                                                                          that as before, relative gains decrease with increas-
+               0.2
+                                                                                                          ing model strength. Llama-2 sees an average im-
+                0
+                     geo   o    sm     g   o    sm     g   o    sm     g   o    sm
+                        88 verni calf eo88 verni calf eo88 verni calf eo88 verni calf
+                                                                                                          provement of 133% and Mixtral of 44%. How-
+                          0     gh        0     gh        0     gh        0     gh
+                                   t low           t low           t low           t low
+                                                                                                          ever, even GPT-4 can benefit from changes ex-
+                                   method               Baseline Prompt           DSpy            SAMMO   plored by S AMMO with a average relative gain
+                                                                                                          of 30%. DSpy MIPRO does worse than S AMMO in
+Figure 4: S AMMO efficiently improves baseline prompt                                                     all but one setting. Besides outputting answers in
+accuracy across all semantic parsing datasets and back-                                                   the wrong format, MIPRO also suffers from over-
+end LLMs with only 24 candidate evaluations.                                                              fitting as training accuracies can reach 100% (see
+                                                                                                          Appendix A.5.1).
+                                                                                                              Since we searched over the same set of mutations
+                 Llama-2 70B 0.00                 0.37       0.37      0.46
+                                                                                                          with S AMMO across all models, we also measure
+                                                                                            0.5
+                                                                                                          how well search trajectories align between differing
+                 Mixtral 8x7B 0.00                0.00       0.54      0.45                               backend LLMs. Figure 5 plots the correlation of
+                                                                                            0.45          the training scores of the 24 candidates explored
+                       GPT 3.5 0.00               0.00       0.00      0.50                               between LLMs, averaged over all three datasets. As
+                                                                                                          we can see, there is only weak correlation between
+                           GPT-4 0.00             0.00       0.00      0.00
+                                                                                            0.4           LLMs, which indicates that prompts may need to
+                                      Lla             Mi          GP     GP                               be optimized separately for each LLM.
+                                                          xtr
+                                            ma
+                                                 -2           al 8 T 3.5    T-4
+                                                      70          x 7
+                                                         B            B
+                                                                                                          5.3   Prompt Compression
+Figure 5: There is only weak correlation between how                                                      In these experiments, our goal is to optimize the
+well enumerative search candidates do across LLMs.                                                        weighted costs of a prompt program while main-
+                                                                                                          taining its accuracy.
+                                                                                                             The primary objective is the weighted sum of
+5.2                  Optimizing Retrieval Augmentation
+                                                                                                          the number of input tokens with weight one and the
+Towards a more realistic application of prompt                                                            number of output tokens with weight two to reflect
+optimization, we consider improving retrieval-                                                            current billing schemes of popular LLM providers.
+augmented semantic parsing. The overall task is to                                                        Assuming a baseline prompt π0 that has a reason-
+translate a natural user query into a domain-specific                                                     able level of accuracy, we set a threshold τacc such
+language (DSL) construct. Here, we sample 500                                                             that the performance of the compressed prompt is
+examples for retrieval, and use a subset of 100 ex-                                                       required to be above the baseline prompt perfor-
+amples from those to evaluate training performance.                                                       mance with margin ϵ = 0.02. We sampled ten clas-
+We compare to DSpy MIPRO (Khattab et al., 2023),                                                          sification tasks with longer instructions (1000 char-
+a method that optimizes few-shot examples as well                                                         acters or more) from the Super-NaturalInstructions
+the instructions. Since evaluation is expensive in                                                        benchmark (Wang et al., 2022).
+this scenario due to longer prompts, we limit the                                                            Baselines. To make the compression task realis-
+budget to B = 24 candidate evaluations.                                                                   tic and start with a competitive prompt, we batch
+   Following Bogin et al. (2023), we use three                                                            input examples with the newline delimited format
+different datasets/domains: GeoQuery (Zelle and                                                           of Cheng et al. (2023). Based on pilot experiments,
+Mooney, 1996), SMCalFlow (Andreas et al., 2020)                                                           we chose input batch sizes b such that performance
+and Overnight (Wang et al., 2015). We use the                                                             between no batching and input batching was within
+same i.i.d. splits, DSLs and starting prompt for-                                                         ϵ. This resulted in b = 10 for GPT-4, b = 5
+mat as Bogin et al. (2023). We used S AMMO with                                                           for Mixtral and GPT-3.5, and b = 1 for Llama-2.
+enumerative search to optimize the data formats,                                                          We compare S AMMO against four other compile-
+number of few shot examples and DSL specifica-                                                            time prompt compression techniques. Our baseline
+                                                                                                                                                                  weighted costs            Δ baseline accuracy
+
+                                                       GPT-4                                                                                                                 GPT-3.5
+                                    15k                                       0.2                                                                                                                                0.2
+                                                                                                                                                       20k
+
+
+
+
+                                                                                      Δ baseline accuracy
+
+
+
+
+                                                                                                                                                                                                                          Δ baseline accuracy
+                  weighted costs    10k
+
+
+
+
+                                                                                                            weighted costs
+                                                                              0.1                                                                                                                                0.1
+                                                                                                                                                       10k
+                                     5k
+
+                                      0                                       0                                                                          0                                                       0
+
+                                   −5k
+                                                                                                                                                      −10k
+                                                                               −0.1                                                                                                                    −0.1
+                                          Ba        ST AP     Sto    G    S                                                                                  Ba         ST   AP       Sto    G    S
+                                             se lin DC    E      pw PT-4 AMM                                                                                   sel
+                                                                                                                                                                     ine C
+                                                                                                                                                                           D    E        pw PT-4 AMM
+                                                   e               ord   Re                                                                                                                ord   Re
+                                                                       s    wr O                                                                                                               s    wr O
+                                                                              ite                                                                                                                     ite
+                                                     Mixtral-7B                                                                                                         LLama-2 70B
+                                                                              0.2                                                                                                                                0.2
+                                                                                                                                                      100k
+
+
+
+
+                                                                                      Δ baseline accuracy
+
+
+
+
+                                                                                                                                                                                                                          Δ baseline accuracy
+                                    20k
+             weighted costs
+
+
+
+
+                                                                                                            weighted costs
+                                                                              0.1                                                                      50k                                                       0.1
+                                    10k
+
+                                      0                                       0                                                                          0                                                       0
+
+                                   −10k                                                                                                               −50k
+                                                                               −0.1                                                                                                                               −0.1
+                                          Ba         S A      Sto    G    S                                                                                  Ba        ST AP          Sto     GP             SA
+                                               sel TDC PE        pw PT-4 AMM                                                                                    se lin DC    E           pw           T-4       MM
+                                                  ine              ord   Re                                                                                           e                     ord             Re
+                                                                       s    wr O                                                                                                                  s            wr O
+                                                                              ite                                                                                                                                ite
+
+
+
+
+Figure 6: S AMMO is able the achieve high compression rates while still maintaining high accuracy. GPT-4 rewrite
+results in short prompts that perform poorly on the test set.
+
+
+prompt π0 uses the official instructions provided                                                                                                                          ShortenSegment
+
+with a task followed by k = 5 in-context exam-                                                                                                                       SegmentToBulletPoints
+                                                                                                                             chosen mutation action
+
+
+
+
+ples. For S AMMO, we use all mutation operators                                                                                                         RemoveStopWordsFromSegment
+
+                                                                                                                                                                         InduceInstructions
+listed in Table 1 as possible operations, and choose
+                                                                                                                                                                                    DropIntro
+mutators uniformly at random during the search.
+                                                                                                                                                                             DropExamples
+We also compare against APE, with the cost-aware
+                                                                                                                                                             DecreaseInContextExamples
+objective. APO is not applicable since it optimizes                                                                                                                     ChangeDataFormat
+only for accuracy. New baselines that were added                                                                                                                                              0                           0.2                        0.4
+
+include:                                                                                                                                                                                                                 improvement rate
+
+                                                                                                                              LLM                                  GPT-3.5            GPT-4                    Llama-2 70B                      Mixtral 8x7B
+STDC – Syntax-guided Task Definition Compres-
+   sion (Yin et al., 2023a) runs a sequential                                                                   Figure 7: Mutation actions that lead to an improvement
+   search to prune syntax tree constituents.                                                                    in the objective differ from model to model.
+
+Stopwords – This is using S AMMO limited to the
+    RemoveStopwords operators from Table 1.                                                                     only moderate, most likely because their mutation
+                                                                                                                operations are limited. APE and GPT-4 Rewrite
+GPT-4 Rewrite – Using the templates from Li
+                                                                                                                manage to compress prompts to a larger degree, but
+   et al. (2023), we try out ten different templates
+                                                                                                                can result in prompts that do not generalize well to
+   to shorten the instructions.
+                                                                                                                the test set and experience large drops in accuracy.
+   Results. Figure 6 show the the average perfor-                                                                 For each mutation operation chosen by S AMMO
+mance across the ten tasks for all backbone LLMs.                                                              during the search process, we recorded whether it
+We show the final weighted costs on the test set (left                                                         resulted in an improvement of the weighted costs.
+y-axis), as well as the difference of performance                                                              This gives us a rough idea of how much individual
+relative to the baseline prompt which should ideally                                                           operators contribute to the success of the search.
+not exceed ϵ = 0.02 (right y-axis). For all back-                                                              Figure 7 shows the fraction of times each operator
+end models, S AMMO achieves substantial compres-                                                               resulted in an improvement when it was chosen.
+sion rates, reducing the costs by over 40% while                                                               From that, we can see that how successful a muta-
+maintaining the accuracy of the baseline prompt.                                                               tor is depends on the backend LLM, but rewriting
+The STDC and Stopwords baselines achieve some                                                                  operations and dropping in-context examples were
+compression, but the compression rates seen are                                                                the most useful structural mutators compressing
+the prompt. GPT-4’s performance was more robust          improving the accuracy of prompts. Past work
+to lowering the number of in-context examples,           has typically focused on simpler (e.g. single task,
+and also to dropping the introduction, than other        non-batched) prompts with less structure. Again,
+backend LLMs.                                            there are a variety of methods that assume full
+                                                         model access (Lester et al., 2021; Qin and Eisner,
+6   Related Work                                         2021) which we will not discuss further. Work-
+                                                         ing with continuous prompt representations using a
+Related work can be categorized into two areas:          smaller surrogate model, InstructZero (Chen et al.,
+prompt optimization and prompt compression.              2023) optimizes prompts locally via Bayesian op-
+   In prompt compression, one main axis of distinc-      timization and uses calls to the LLM API as feed-
+tion is what model access methods assume. As-            back. The main limitation here is similar to token-
+suming full model access, compression via prompt         level methods; it is unclear how to apply them to
+tuning learns a mapping function that translates         structure-rich prompts. On the discrete optimiza-
+an initial prompt to either soft or hard tokens for      tion side, Automatic Prompt Engineer (APE) (Zhou
+efficiency (e.g., Lester et al. (2021)). For example,    et al., 2023) generates instruction candidates from
+Wingate et al. (2022) uses a distillation objective      a few input-output pairs, and then uses beam search
+to steer text generation with compressed instruc-        over paraphrased candidates. We use a modified
+tions and Mu et al. (2023) use meta-learning to          version with the same objective as S AMMO in our
+compresses prompts into “gist” tokens.                   experiments. Targeting mainly accuracy and not
+   Token-level compression methods operate dur-          compression, GrIPS (Prasad et al., 2023) uses beam
+ing run-time and assume that output probabilities        search with edit, add and delete operations on the
+are known. The basic idea is that only information-      syntax tree after parsing the instructions. Similarily,
+carrying tokens should be preserved. For example,        Automatic Prompt Optimization (APO) (Pryzant
+Li et al. (2023) uses self-information to select and     et al., 2023) re-writes instructions by generating ex-
+merge less probable tokens to compress in-context        planations for errors, changing the prompt to reflect
+examples. Jiang et al. (2023) extend this approach       explanations, and then generating more prompt can-
+by doing it segment-wise and adding a prefiltering       didates by paraphrasing.
+step. Jung and Kim (2023) use a reinforcement
+learning approach to learn which tokens can be           7   Conclusion
+excluded from a prompt without degradation in
+accuracy. However, this requires extensive fine-         In this paper, we introduced S AMMO, a frame-
+tuning with external datasets. Being very low-level,     work for efficient compile-time optimization of
+a practical downside of token-level compression          prompt programs. The key innovation of S AMMO
+methods is that they are not guaranteed to keep          is to represent prompts as symbolic prompt pro-
+important structures intact, such as data formats.       grams. Symbolic prompt programs enable S AMMO
+   In this paper, we assume that practitioners only      to search through the space of possible programs in
+have black-box access to LLMs through an API;            an efficient manner. This approach notably outper-
+they do not have the ability to access the proba-        forms and generalizes existing methods of prompt
+bility distribution of the output tokens or the gra-     optimization and compression, as demonstrated
+dient information. Focusing on compressing task          through several use cases tasks in our experimental
+definitions, Yin et al. (2023b) propose STDC, a          evaluation.
+method that uses breadth-first search to prune the          S AMMO is made available publicly as an open-
+syntax-tree after parsing the instructions. Comple-      source project. It is our hope that similar to
+mentary to that are efforts to improve call efficiency   how compilers accelerated and robustified soft-
+by batching instances together that share the same       ware programming, prompt program compilers
+overall task instructions (Cheng et al., 2023; Lin       like S AMMO will accelerate prompt development,
+et al., 2023). As shown by Cheng et al. (2023),          model evaluation and prompt migration between
+batching only minimally impacts performance as           different architectures.
+long as batch sizes do not exceed a certain model-
+                                                         Limitations
+specific threshold. For this reason, our compression
+experiments have batching enabled by default.            The optimization costs as well as the resulting
+   In prompt optimization, the main focus in on          prompt program performance could be sensitive
+to search hyperparameter choices. Given the high         Albert Q Jiang, Alexandre Sablayrolles, Antoine
+cost of running just one experiment, we could not          Roux, Arthur Mensch, Blanche Savary, Chris Bam-
+                                                           ford, Devendra Singh Chaplot, Diego de las Casas,
+afford to run a full hyperparameter search, but did
+                                                           Emma Bou Hanna, Florian Bressand, et al. 2024.
+our best to choose settings based on recommenda-           Mixtral of experts.
+tions by the authors or previous similar work and
+ensured that all algorithms had the same budget.         Huiqiang Jiang, Qianhui Wu, Chin-Yew Lin, Yuqing
+                                                           Yang, and Lili Qiu. 2023. LLMLingua: Compressing
+   Due to S AMMO high-level operators, we did
+                                                           prompts for accelerated inference of large language
+not observe substantial drops in performance be-           models. In EMNLP.
+tween training and test sets. However, methods that
+mostly optimize in-context examples like DSPy            Hoyoun Jung and Kyung-Joong Kim. 2023. Discrete
+showed a large risk of overfitting (cf. Section 5.2).      prompt compression with reinforcement learning.
+We conclude that more research is needed to un-          Omar Khattab, Arnav Singhvi, Paridhi Maheshwari,
+derstand when and how overfitting occurs prompt           Zhiyuan Zhang, Keshav Santhanam, Sri Vard-
+optimization.                                             hamanan, Saiful Haq, Ashutosh Sharma, Thomas T.
+   All of our experiments have been carried out           Joshi, Hanna Moazam, Heather Miller, Matei Za-
+                                                          haria, and Christopher Potts. 2023. Dspy: Compiling
+with datasets in English; performances for lower-         declarative language model calls into self-improving
+resource language are likely to be lower. While           pipelines.
+S AMMO is generally efficient, tasks need to have
+a certain level of downstream usage in order to          Brian Lester, Rami Al-Rfou, and Noah Constant. 2021.
+                                                           The power of scale for parameter-efficient prompt
+compensate for the upfront costs of optimization.          tuning. In EMNLP.
+Future research could also combine run-time opti-
+mization with compile-time optimization to see if        Yucheng Li, Bo Dong, Frank Guerin, and Chenghua Lin.
+additional gains can be achieved. Finally, S AMMO          2023. Compressing context to enhance inference
+                                                           efficiency of large language models. In EMNLP.
+adopts a supervised learning scenario where labels
+are required; we plan to address more unsupervised       Jianzhe Lin, Maurice Diesendruck, Liang Du, and
+tasks in the future.                                        Robin Abraham. 2023. Batchprompt: Accomplish
+                                                            more with less.
+
+                                                         Nelson F Liu, Kevin Lin, John Hewitt, Ashwin Paran-
+References                                                 jape, Michele Bevilacqua, Fabio Petroni, and Percy
+Jacob Andreas, John Bufe, David Burkett, Charles Chen,     Liang. 2024. Lost in the middle: How language mod-
+   Josh Clausman, Jean Crawford, Kate Crim, Jordan         els use long contexts. Transactions of the Association
+   DeLoach, Leah Dorner, Jason Eisner, et al. 2020.        for Computational Linguistics, 12.
+   Task-oriented dialogue as dataflow synthesis. TACL.
+                                                         Jesse Mu, Xiang Lisa Li, and Noah Goodman. 2023.
+Ben Bogin, Shivanshu Gupta, Peter Clark, and Ashish         Learning to compress prompts with gist tokens. In
+  Sabharwal. 2023. Leveraging code to improve in-           NeurIPS.
+  context learning for semantic parsing.
+                                                         Daiyi Peng, Xuanyi Dong, Esteban Real, Mingxing Tan,
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie              Yifeng Lu, Gabriel Bender, Hanxiao Liu, Adam Kraft,
+  Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind       Chen Liang, and Quoc Le. 2020. Pyglove: Symbolic
+  Neelakantan, Pranav Shyam, Girish Sastry, Amanda         programming for automated machine learning. Ad-
+  Askell, et al. 2020. Language models are few-shot        vances in Neural Information Processing Systems,
+  learners. NeurIPS.                                       33:96–108.
+
+Lichang Chen, Jiuhai Chen, Tom Goldstein, Heng           Archiki Prasad, Peter Hase, Xiang Zhou, and Mohit
+  Huang, and Tianyi Zhou. 2023. Instructzero: Ef-          Bansal. 2023. GrIPS: Gradient-free, edit-based in-
+  ficient instruction optimization for black-box large     struction search for prompting large language models.
+  language models.                                         In EACL.
+
+Zhoujun Cheng, Jungo Kasai, and Tao Yu. 2023. Batch      Reid Pryzant, Dan Iter, Jerry Li, Yin Tat Lee, Chen-
+  prompting: Efficient inference with large language       guang Zhu, and Michael Zeng. 2023. Automatic
+  model apis.                                              prompt optimization with "gradient descent" and
+                                                           beam search.
+Chrisantha Fernando, Dylan Banarse, Henryk
+  Michalewski, Simon Osindero, and Tim Rock-             Guanghui Qin and Jason Eisner. 2021. Learning how to
+  täschel. 2023. Promptbreeder: Self-referential           ask: Querying lms with mixtures of soft prompts. In
+  self-improvement via prompt evolution.                   NAACL.
+Esteban Real, Alok Aggarwal, Yanping Huang, and
+  Quoc V Le. 2019. Regularized evolution for image
+  classifier architecture search. In AAAI.
+Melanie Sclar, Yejin Choi, Yulia Tsvetkov, and Alane
+ Suhr. 2023. Quantifying language models’ sensitiv-
+ ity to spurious features in prompt design or: How i
+ learned to start worrying about prompt formatting.
+Aarohi Srivastava, Abhinav Rastogi, Abhishek Rao,
+  Abu Awal Md Shoeb, Abubakar Abid, Adam Fisch,
+  Adam R Brown, Adam Santoro, Aditya Gupta, Adrià
+  Garriga-Alonso, et al. 2023. Beyond the imitation
+  game: Quantifying and extrapolating the capabilities
+  of language models. TMLR.
+Hugo Touvron, Louis Martin, Kevin Stone, Peter Al-
+  bert, Amjad Almahairi, Yasmine Babaei, Nikolay
+  Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti
+  Bhosale, et al. 2023. Llama 2: Open foundation and
+  fine-tuned chat models.
+Yizhong Wang, Swaroop Mishra, Pegah Alipoor-
+  molabashi, Yeganeh Kordi, Amirreza Mirzaei,
+  Anjana Arunkumar, Arjun Ashok, Arut Selvan
+  Dhanasekaran, Atharva Naik, David Stap, et al. 2022.
+  Super-naturalinstructions:generalization via declara-
+  tive instructions on 1600+ tasks. In EMNLP.
+Yushi Wang, Jonathan Berant, and Percy Liang. 2015.
+  Building a semantic parser overnight. In ACL.
+David Wingate, Mohammad Shoeybi, and Taylor
+  Sorensen. 2022. Prompt compression and contrastive
+  conditioning for controllability and toxicity reduction
+  in language models. In EMNLP: Findings.
+Qinyuan Ye, Maxamed Axmed, Reid Pryzant, and
+  Fereshte Khani. 2023. Prompt engineering a prompt
+  engineer.
+Fan Yin, Jesse Vig, Philippe Laban, Shafiq Joty, Caim-
+  ing Xiong, and Chien-Sheng Wu. 2023a. Did you
+  read the instructions? Rethinking the effectiveness of
+  task definitions in instruction learning. In ACL.
+Fan Yin, Jesse Vig, Philippe Laban, Shafiq Joty, Caim-
+  ing Xiong, and Chien-Sheng Jason Wu. 2023b. Did
+  you read the instructions? rethinking the effective-
+  ness of task definitions in instruction learning.
+John M Zelle and Raymond J Mooney. 1996. Learn-
+  ing to parse database queries using inductive logic
+  programming. In National Conference on Artificial
+  Intelligence.
+Yongchao Zhou, Andrei Ioan Muresanu, Ziwen Han,
+  Keiran Paster, Silviu Pitis, Harris Chan, and Jimmy
+  Ba. 2023. Large language models are human-level
+  prompt engineers.
+A     Appendix
+A.1     Implementation Details
+Model versions used:
+
+    • GPT 3.5: gpt-3.5-turbo-16k-0613
+
+    • GPT 4: gpt-4-0613
+
+    • LLama-2: meta-llama/Llama-2-70b-chat-hf
+
+    • Mixtral 7x8B: cognitivecomputations/dolphin-2.6-mixtral-8x7b
+
+A.2     Instruction Tuning
+A.2.1    DSPy Example Output
+DSpy often caused the model to not adhere to output instructions.
+                                                              Input
+Does Speaker 2's answer mean yes or no?
+---
+Follow the following format.
+Question: ${question}
+Answer: ${answer}
+---
+Question: Speaker 1: 'Should we repay you?' Speaker 2: 'There is no charge for awesomeness, or attractiveness.'
+Answer:
+
+                                                             Output
+ No
+Question: Speaker 1: 'Should we repay you?' Speaker 2: 'There is no charge for awesomeness, or attractiveness.'
+Answer: No
+Question: Speaker 1: 'Should we repay you?' Speaker 2: 'There is no charge for awesomeness, or attractiveness.'
+Answer: No
+Question: Speaker 1: 'Should we repay you?' Speaker 2: 'There is no charge for awesomeness, or attractiveness.'
+Answer: No
+Question: Speaker 1: 'Should we repay you?' Speaker 2: 'There is no charge
+
+
+
+    See Table 2
+
+A.3     Prompt Compression: Table form of main results
+See Table 3 for numeric results.
+
+A.4     Prompt Compression: Examples prompts
+Below prompts are for task 346 with a backend LLM of GPT-3.5.
+
+A.5     RAG optimization
+Mutation operations searched over:
+
+    • In-context examples format: JSON, Plaintext, XML
+
+    • In-context examples grouping: by item, by input/output
+
+    • No. of in-context examples: 5, 10
+
+    • DSL specifications: full, only signatures
+
+    RAG retrieved examples via OpenAI’s text-embedding-3-small embedding model.
+
+A.5.1    Overfitting in DSpy MIPRO
+See Figure 8.
+                                              Llama-2 70B       Mixtral 8x7B       GPT 3.5        GPT-4
+                                         1
+
+
+                                        0.8
+
+
+                                        0.6
+
+
+
+
+                                train
+                                        0.4
+
+
+                                        0.2
+
+
+                                         0
+                                              geo   o    sm     g   o    sm     g   o    sm     g   o    sm
+                                                 88 verni calf eo88 verni calf eo88 verni calf eo88 verni calf
+                                                   0     gh        0     gh        0     gh        0     gh
+                                                            t low           t low           t low           t low
+
+                                                            method         Baseline Prompt    DSpy         SAMMO
+
+
+
+
+                                              Figure 8: Training accuracies on RAG task
+
+
+A.5.2    Baseline
+ # Task
+ In this task, you will be presented with a question, a word, and a POS tag. You have to determine whether the part-of-speech tag
+,→ of the given word in the question is equal to the given POS tag or not. Give your answer with True or False. Here is the
+,→ Alphabetical list of part-of-speech tags used in this task: CC: Coordinating conjunction, CD: Cardinal number, DT:
+,→ Determiner, EX: Existential there, FW: Foreign word, IN: Preposition or subordinating conjunction, JJ: Adjective, JJR:
+,→ Adjective, comparative, JJS: Adjective, superlative, LS: List item marker, MD: Modal, NN: Noun, singular or mass, NNS: Noun,
+,→ plural, NNP: Proper noun, singular, NNPS: Proper noun, plural, PDT: Predeterminer, POS: Possessive ending, PRP: Personal
+,→ pronoun, PRP$: Possessive pronoun, RB: Adverb, RBR: Adverb, comparative, RBS: Adverb, superlative, RP: Particle, SYM: Symbol,
+,→ TO: to, UH: Interjection, VB: Verb, base form, VBD: Verb, past tense, VBG: Verb, gerund or present participle, VBN: Verb,
+,→ past participle, VBP: Verb, non-3rd person singular present, VBZ: Verb, 3rd person singular present, WDT: Wh-determiner, WP:
+,→ Wh-pronoun, WP$: Possessive wh-pronoun, WRB: Wh-adverb
+
+ # Examples
+ Q[0]: What is the nickname of the institution whose current Vice President of the Pastoral Animation of the school is Rev . Fr .
+,→ John Vernil Q. Lopez , S.D.B ?
+ , Word: Rev
+ , POS tag: NNP
+ Q[1]: The youngest Luge Champion listed won what medal in the one year he competed in the Olympics ?
+ , Word: one
+ , POS tag: IN
+ Q[2]: What comedy sitcom did the guest who appeared on September 29 appear on ?
+ , Word: did
+ , POS tag: NN
+ Q[3]: How many main ecosystems does the state in Brazil with a name meaning thick grass or dense woods contain ?
+ , Word: with
+ , POS tag: DT
+ Q[4]: What result was given to the couple that danced to a song from a 2005 crime-comedy ?
+ , Word: couple
+ , POS tag: NN
+ A[0]: True
+ A[1]: False
+ A[2]: False
+ A[3]: False
+ A[4]: True
+
+# Complete and output in the same format as above
+Q[0]: In what town was the director of the film titled `` Take a Sixer '' in English born ?
+, Word: In
+, POS tag: WP
+Q[1]: what is the description of the crime by the person born October 12 , 1971 ?
+, Word: is
+, POS tag: ,
+Q[2]: What is the institution of the Laureate who was Frank Henry Sommer Professor of Law and Philosophy at New York University ?
+, Word: Henry
+, POS tag: NNP
+Q[3]: What is the team whose city straddles the Henares River ?
+, Word: the
+, POS tag: VBZ
+Q[4]: The rider born on July 16 1973 played on which team ?
+, Word: July
+, POS tag: IN
+
+
+
+A.5.3    STDC
+ # Task
+ will be presented with a question, a word, and a POS tagGive your answer with True or FalseHere is : , IN: Preposition or
+,→ subordinating conjunctionJJ: AdjectiveJJR, JJS: Adverb, RBR: Adverb, comparative, RBS: Adverb, superlative, RP: Particle,
+,→ SYM: Symbol, TO: to, UH: Interjection, VB: Verb, base form, VBD: Verb, past tense, VBG: Verb, gerund or present participle,
+,→ VBN: Verb, past participle, VBP:
+
+# Examples
+Q[0]: What is the nickname of the institution whose current Vice President of the Pastoral Animation of the school is Rev . Fr .
+,→  John Vernil Q. Lopez , S.D.B ?
+, Word: Rev
+, POS tag: NNP
+Q[1]: The youngest Luge Champion listed won what medal in the one year he competed in the Olympics ?
+, Word: one
+, POS tag: IN
+Q[2]: What comedy sitcom did the guest who appeared on September 29 appear on ?
+, Word: did
+, POS tag: NN
+Q[3]: How many main ecosystems does the state in Brazil with a name meaning thick grass or dense woods contain ?
+, Word: with
+, POS tag: DT
+Q[4]: What result was given to the couple that danced to a song from a 2005 crime-comedy ?
+, Word: couple
+, POS tag: NN
+A[0]: True
+A[1]: False
+A[2]: False
+A[3]: False
+A[4]: True
+
+# Complete and output in the same format as above
+Q[0]: In what town was the director of the film titled `` Take a Sixer '' in English born ?
+, Word: In
+, POS tag: WP
+Q[1]: what is the description of the crime by the person born October 12 , 1971 ?
+, Word: is
+, POS tag: ,
+Q[2]: What is the institution of the Laureate who was Frank Henry Sommer Professor of Law and Philosophy at New York University ?
+, Word: Henry
+, POS tag: NNP
+Q[3]: What is the team whose city straddles the Henares River ?
+, Word: the
+, POS tag: VBZ
+Q[4]: The rider born on July 16 1973 played on which team ?
+, Word: July
+, POS tag: IN
+
+
+
+
+A.5.4    APE
+# Task
+Provide a true or false response for each input based on the question or statement.
+
+ # Examples
+ Q[0]: What is the nickname of the institution whose current Vice President of the Pastoral Animation of the school is Rev . Fr .
+,→ John Vernil Q. Lopez , S.D.B ?
+ , Word: Rev
+ , POS tag: NNP
+ Q[1]: The youngest Luge Champion listed won what medal in the one year he competed in the Olympics ?
+ , Word: one
+ , POS tag: IN
+ Q[2]: What comedy sitcom did the guest who appeared on September 29 appear on ?
+ , Word: did
+ , POS tag: NN
+ Q[3]: How many main ecosystems does the state in Brazil with a name meaning thick grass or dense woods contain ?
+ , Word: with
+ , POS tag: DT
+ Q[4]: What result was given to the couple that danced to a song from a 2005 crime-comedy ?
+ , Word: couple
+ , POS tag: NN
+ A[0]: True
+ A[1]: False
+ A[2]: False
+ A[3]: False
+ A[4]: True
+
+# Complete and output in the same format as above
+Q[0]: In what town was the director of the film titled `` Take a Sixer '' in English born ?
+, Word: In
+, POS tag: WP
+Q[1]: what is the description of the crime by the person born October 12 , 1971 ?
+, Word: is
+, POS tag: ,
+Q[2]: What is the institution of the Laureate who was Frank Henry Sommer Professor of Law and Philosophy at New York University ?
+, Word: Henry
+, POS tag: NNP
+Q[3]: What is the team whose city straddles the Henares River ?
+, Word: the
+, POS tag: VBZ
+Q[4]: The rider born on July 16 1973 played on which team ?
+, Word: July
+, POS tag: IN
+A.5.5    Stopwords
+ # Task
+ task, presented question, word, POS tag. determine --speech tag given word question equal given POS tag . answer True False.
+,→ Alphabetical list --speech tags task: CC: Coordinating conjunction, CD: Cardinal number, DT: Determiner, EX: Existential ,
+,→ FW: Foreign word, : Preposition subordinating conjunction, JJ: Adjective, JJR: Adjective, comparative, JJS: Adjective,
+,→ superlative, LS: List item marker, MD: Modal, NN: Noun, singular mass, NNS: Noun, plural, NNP: Proper noun, singular, NNPS:
+,→ Proper noun, plural, PDT: Predeterminer, POS: Possessive ending, PRP: Personal pronoun, PRP$: Possessive pronoun, RB: Adverb,
+,→ RBR: Adverb, comparative, RBS: Adverb, superlative, RP: Particle, SYM: Symbol, : , UH: Interjection, VB: Verb, base form,
+,→ VBD: Verb, past tense, VBG: Verb, gerund present participle, VBN: Verb, past participle, VBP: Verb, non-3rd person singular
+,→ present, VBZ: Verb, 3rd person singular present, WDT: Wh-determiner, WP: Wh-pronoun, WP$: Possessive wh-pronoun, WRB:
+,→ Wh-adverb
+
+ # Examples
+ Q[0]: What is the nickname of the institution whose current Vice President of the Pastoral Animation of the school is Rev . Fr .
+,→ John Vernil Q. Lopez , S.D.B ?
+ , Word: Rev
+ , POS tag: NNP
+ Q[1]: The youngest Luge Champion listed won what medal in the one year he competed in the Olympics ?
+ , Word: one
+ , POS tag: IN
+ Q[2]: What comedy sitcom did the guest who appeared on September 29 appear on ?
+ , Word: did
+ , POS tag: NN
+ Q[3]: How many main ecosystems does the state in Brazil with a name meaning thick grass or dense woods contain ?
+ , Word: with
+ , POS tag: DT
+ Q[4]: What result was given to the couple that danced to a song from a 2005 crime-comedy ?
+ , Word: couple
+ , POS tag: NN
+ A[0]: True
+ A[1]: False
+ A[2]: False
+ A[3]: False
+ A[4]: True
+
+# Complete and output in the same format as above
+Q[0]: In what town was the director of the film titled `` Take a Sixer '' in English born ?
+, Word: In
+, POS tag: WP
+Q[1]: what is the description of the crime by the person born October 12 , 1971 ?
+, Word: is
+, POS tag: ,
+Q[2]: What is the institution of the Laureate who was Frank Henry Sommer Professor of Law and Philosophy at New York University ?
+, Word: Henry
+, POS tag: NNP
+Q[3]: What is the team whose city straddles the Henares River ?
+, Word: the
+, POS tag: VBZ
+Q[4]: The rider born on July 16 1973 played on which team ?
+, Word: July
+, POS tag: IN
+
+
+A.5.6    GPT-4 Rewrite
+ # Task
+ Determine if the part-of-speech (POS) tag of the given word in the question matches the provided POS tag. Answer with True or
+,→ False. Here are the POS tags: CC, CD, DT, EX, FW, IN, JJ, JJR, JJS, LS, MD, NN, NNS, NNP, NNPS, PDT, POS, PRP, PRP$, RB, RBR,
+,→ RBS, RP, SYM, TO, UH, VB, VBD, VBG, VBN, VBP, VBZ, WDT, WP, WP$, WRB.
+
+ # Examples
+ Q[0]: What is the nickname of the institution whose current Vice President of the Pastoral Animation of the school is Rev . Fr .
+,→ John Vernil Q. Lopez , S.D.B ?
+ , Word: Rev
+ , POS tag: NNP
+ Q[1]: The youngest Luge Champion listed won what medal in the one year he competed in the Olympics ?
+ , Word: one
+ , POS tag: IN
+ Q[2]: What comedy sitcom did the guest who appeared on September 29 appear on ?
+ , Word: did
+ , POS tag: NN
+ Q[3]: How many main ecosystems does the state in Brazil with a name meaning thick grass or dense woods contain ?
+ , Word: with
+ , POS tag: DT
+ Q[4]: What result was given to the couple that danced to a song from a 2005 crime-comedy ?
+ , Word: couple
+ , POS tag: NN
+ A[0]: True
+ A[1]: False
+ A[2]: False
+ A[3]: False
+ A[4]: True
+
+
+# Complete and output in the same format as above
+Q[0]: In what town was the director of the film titled `` Take a Sixer '' in English born ?
+, Word: In
+, POS tag: WP
+Q[1]: what is the description of the crime by the person born October 12 , 1971 ?
+, Word: is
+, POS tag: ,
+Q[2]: What is the institution of the Laureate who was Frank Henry Sommer Professor of Law and Philosophy at New York University ?
+, Word: Henry
+, POS tag: NNP
+Q[3]: What is the team whose city straddles the Henares River ?
+, Word: the
+, POS tag: VBZ
+Q[4]: The rider born on July 16 1973 played on which team ?
+, Word: July
+, POS tag: IN
+
+
+
+A.5.7    SAMMO
+# Task
+- Check if word matches part-of-speech tag (True/False)
+- Tags: conjunction, number, determiner, adjective, noun, verb
+
+# Examples
+Q[0]: What result was given to the couple that danced to a song from a 2005 crime-comedy ?
+, Word: couple
+, POS tag: NN
+Q[1]: The youngest Luge Champion listed won what medal in the one year he competed in the Olympics ?
+, Word: one
+, POS tag: IN
+Q[2]: What comedy sitcom did the guest who appeared on September 29 appear on ?
+, Word: did
+, POS tag: NN
+A[0]: True
+A[1]: False
+A[2]: False
+
+# Complete and output in the same format as above
+Q[0]: In what town was the director of the film titled `` Take a Sixer '' in English born ?
+, Word: In
+, POS tag: WP
+Q[1]: what is the description of the crime by the person born October 12 , 1971 ?
+, Word: is
+, POS tag: ,
+Q[2]: What is the institution of the Laureate who was Frank Henry Sommer Professor of Law and Philosophy at New York University ?
+, Word: Henry
+, POS tag: NNP
+Q[3]: What is the team whose city straddles the Henares River ?
+, Word: the
+, POS tag: VBZ
+Q[4]: The rider born on July 16 1973 played on which team ?
+, Word: July
+, POS tag: IN
+                Table 2: Results for individual datasets from the BigBench benchmark.
+
+model            task                        APE     APO     Baseline Prompt     GRIPS     SAMMO
+GPT 3.5 Turbo    implicatures        test    0.78    0.78                 0.56      0.76     0.77
+                                     train   0.78    0.83                 0.51      0.81     0.87
+                 metaphor            test    0.89    0.86                 0.87      0.88     0.87
+                                     train   0.89    0.90                 0.84      0.88     0.87
+                 navigate            test    0.64    0.68                 0.62      0.62     0.59
+                                     train   0.65    0.75                 0.72      0.72     0.77
+                 presuppositions     test    0.49    0.48                 0.39      0.42     0.52
+                                     train   0.56    0.57                 0.37      0.47     0.54
+                 sports              test    0.77    0.89                 0.75      0.74     0.87
+                                     train   0.84    0.88                 0.75      0.80     0.88
+                 vitaminc            test    0.71    0.74                 0.74      0.73     0.73
+                                     train   0.75    0.69                 0.67      0.68     0.73
+                 winowhy             test    0.53    0.45                 0.48      0.50     0.61
+                                     train   0.60    0.53                 0.49      0.60     0.61
+                 word                test    0.76    0.75                 0.72      0.72     0.74
+                                     train   0.85    0.85                 0.81      0.81     0.83
+Llama-2 70B      implicatures        test    0.72    0.61                 0.35      0.79     0.78
+                                     train   0.72    0.53                 0.37      0.75     0.73
+                 metaphor            test    0.34    0.50                 0.47      0.47     0.50
+                                     train   0.48    0.48                 0.45      0.45     0.48
+                 navigate            test    0.20    0.15                 0.08      0.08     0.25
+                                     train   0.14    0.17                 0.02      0.02     0.19
+                 presuppositions     test    0.14    0.11                 0.11      0.11     0.11
+                                     train   0.18    0.19                 0.19      0.19     0.19
+                 sports              test    0.61    0.52                 0.13      0.54     0.53
+                                     train   0.64    0.47                 0.16      0.49     0.50
+                 vitaminc            test    0.57    0.49                 0.26      0.26     0.50
+                                     train   0.54    0.48                 0.26      0.26     0.47
+                 winowhy             test    0.16    0.35                 0.09      0.11     0.39
+                                     train   0.19    0.35                 0.08      0.13     0.44
+                 word                test    0.00    0.00                 0.00      0.00     0.00
+                                     train   0.00    0.00                 0.00      0.00     0.00
+Mixtral 8x7B     implicatures        test    0.80    0.68                 0.64      0.84     0.84
+                                     train   0.79    0.69                 0.65      0.82     0.82
+                 metaphor            test    0.85    0.87                 0.86      0.86     0.85
+                                     train   0.85    0.88                 0.86      0.86     0.87
+                 navigate            test    0.59    0.50                 0.50      0.50     0.54
+                                     train   0.62    0.45                 0.45      0.45     0.66
+                 presuppositions     test    0.53    0.59                 0.55      0.60     0.55
+                                     train   0.68    0.69                 0.64      0.70     0.65
+                 sports              test    0.32    0.58                 0.39      0.62     0.62
+                                     train   0.40    0.51                 0.26      0.63     0.63
+                 vitaminc            test    0.75    0.77                 0.75      0.76     0.78
+                                     train   0.73    0.74                 0.67      0.71     0.73
+                 winowhy             test    0.68    0.57                 0.34      0.52     0.62
+                                     train   0.61    0.45                 0.31      0.57     0.66
+                 word                test    0.14    0.23                 0.09      0.17     0.24
+                                     train   0.28    0.31                 0.10      0.22     0.27
+  Table 3: Test accuracy and costs across 10 tasks.
+
+LLM          method              accuracy        costs
+GPT-4        Baseline                0.746     13949
+             STDC                    0.742     11927
+             APE                     0.715     10791
+             Stopwords               0.744     10752
+             GPT-4 Rewrite           0.733      9754
+             SAMMO                   0.736      8410
+GPT-3        Baseline                0.587     21872
+             STDC                    0.568     18608
+             APE                     0.464     14702
+             Stopwords               0.576     19022
+             GPT-4 Rewrite           0.484     15938
+             SAMMO                   0.599     12691
+MIXTRAL      Baseline                0.610     22894
+             STDC                    0.607     19932
+             APE                     0.611     18702
+             Stopwords               0.629     18854
+             GPT-4 Rewrite           0.485     13999
+             SAMMO                   0.637     15292
+LAMA         Baseline                0.380    103606
+             STDC                    0.426     65728
+             APE                     0.328     77980
+             Stopwords               0.337    103573
+             GPT-4 Rewrite           0.335     53192
+             SAMMO                   0.447     53087
+
