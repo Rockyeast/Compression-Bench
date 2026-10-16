@@ -1,0 +1,1 @@
+WikiText-2 raw training split for optional calibration. Load train.parquet with datasets or pyarrow and tokenize with /input/model. This is training data, separate from the public and hidden C4 validation inputs.
